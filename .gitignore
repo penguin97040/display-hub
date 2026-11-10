@@ -1,0 +1,76 @@
+# agent-rules: local agent files and secrets (never publish)
+AGENTS.md
+CLAUDE.md
+HANDOFF.md
+MISTAKES.md
+USER_INSTRUCTIONS.md
+GEMINI.md
+QWEN.md
+CODEX.md
+DEEPSEEK.md
+.claude/agents/
+.qwen/agents/
+.codex/agents/
+.cursor/rules/
+.github/copilot-instructions.md
+
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.dev.vars
+secrets/
+
+# App signing material: never commit
+*.keystore
+*.jks
+*.p12
+*.p8
+*.mobileprovision
+*.provisionprofile
+*.cer
+*.certSigningRequest
+google-services.json
+GoogleService-Info.plist
+local.properties
+
+# Build output varies by project, so add build/, dist/ or target/ here when the project doesn't track them.
+
+# Dependencies and caches
+node_modules/
+DerivedData/
+.gradle/
+.dart_tool/
+Pods/
+*.xcuserstate
+xcuserdata/
+__pycache__/
+*.pyc
+.venv/
+.wrangler/
+.cache/
+
+# OS and editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Logs and screenshots from verification runs
+*.log
+/screenshots/
+
+# display-hub: build output, local run data and the unreviewed starter pack
+/target/
+/dist/
+/dev-data/
+*.db
+*.db-wal
+*.db-shm
+*.dhbundle.json
+/display-hub-starter/
