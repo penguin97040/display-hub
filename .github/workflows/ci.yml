@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 20 * * 1"   # advisories appear without any change here
+
+# Read only. Actions are pinned to commits, so a moved tag can't change what runs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_AUDIT_VERSION: 0.22.2
+  CARGO_DENY_VERSION: 0.20.2
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config \
+            libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-xkb-dev \
+            libx11-xcb-dev libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: tools
+        with:
+          path: ~/.cargo-tools
+          key: cargo-tools-${{ runner.os }}-audit-${{ env.CARGO_AUDIT_VERSION }}-deny-${{ env.CARGO_DENY_VERSION }}
+      - name: Install cargo-audit and cargo-deny
+        if: steps.tools.outputs.cache-hit != 'true'
+        run: |
+          cargo install --locked --root ~/.cargo-tools --version "$CARGO_AUDIT_VERSION" cargo-audit
+          cargo install --locked --root ~/.cargo-tools --version "$CARGO_DENY_VERSION" cargo-deny
+      - name: cargo audit
+        run: ~/.cargo-tools/bin/cargo-audit audit --deny warnings
+      - name: cargo deny
+        run: ~/.cargo-tools/bin/cargo-deny --locked check
+
+  windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+      - name: Build the desktop manager
+        run: cargo build --release --locked -p hub-manager
+      # A hosted runner has no GPU, so this relies on Windows' software renderer (WARP). It proves the
+      # window opens and the first frame renders; it does not show what a person sees.
+      - name: Smoke test the desktop manager
+        run: |
+          set -o pipefail
+          timeout 180 target/release/hub-manager.exe --smoke-test | tee smoke.log
+          grep -qx launched smoke.log
+          grep -qx rendered smoke.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hub-manager-windows-x64
+          path: target/release/hub-manager.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  arm64:
+    # Tests on ARM64 Linux, like the Pi. Release binaries for the Pi are not made here: this runner's
+    # glibc is newer than Raspberry Pi OS Bookworm's (see docs/deploy-raspberry-pi.md).
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Test everything except the desktop manager
+        run: cargo test --workspace --exclude hub-manager --locked --no-fail-fast
