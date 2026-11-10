@@ -1,0 +1,18 @@
+[package]
+name = "hub-protocol"
+version = "0.1.0"
+description = "Display Hub device protocol v1: wire types, bounds and validation"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+jsonschema.workspace = true

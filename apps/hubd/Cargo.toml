@@ -1,0 +1,26 @@
+[package]
+name = "hubd"
+version = "0.1.0"
+description = "Display Hub service for a Raspberry Pi"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hub-protocol.workspace = true
+hub-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+hub-client.workspace = true

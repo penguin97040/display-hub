@@ -1,0 +1,25 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "dashboard_id": "llm-usage",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "tohu",
+      "title": "Tēnā koe — Māori title",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T19:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "metrics": [
+        {
+          "id": "a",
+          "label": "Whakamātautau",
+          "used_percent": 0.0,
+          "resets_at": null
+        }
+      ]
+    }
+  ]
+}

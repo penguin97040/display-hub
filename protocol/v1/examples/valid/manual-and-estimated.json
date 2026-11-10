@@ -1,0 +1,41 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "dashboard_id": "llm-usage",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "opencode-go-plus",
+      "title": "OpenCode Go Plus",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T08:30:00Z",
+      "stale_after_seconds": 86400,
+      "note": "Entered by hand",
+      "metrics": [
+        {
+          "id": "monthly",
+          "label": "Monthly allowance used",
+          "used_percent": 55.5,
+          "resets_at": "2026-12-01T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "claude-max",
+      "title": "Claude Max",
+      "data_quality": "estimated",
+      "updated_at": "2026-11-10T19:50:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 12.25,
+          "resets_at": null
+        }
+      ]
+    }
+  ]
+}

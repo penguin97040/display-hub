@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hub-protocol",
+    "crates/hub-core",
+    "crates/hub-client",
+    "apps/hubd",
+    "apps/hub-manager",
+    "tools/display-simulator",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.99"
+
+# GPUI's Windows backend, with the change that lets a Linux host cross-build it (see vendor/README.md).
+[patch.crates-io]
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+
+# Every version is pinned exactly and Cargo.lock is committed. Upgrade deliberately, on a branch.
+[workspace.dependencies]
+hub-protocol = { path = "crates/hub-protocol" }
+hub-core = { path = "crates/hub-core" }
+hub-client = { path = "crates/hub-client" }
+
+# GPUI: a crates.io snapshot of Zed's GPUI. 0.3.11 matches md-viewer, so the vendored Windows backend applies.
+gpui = { package = "gpui-pre", version = "=0.3.11" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-pre-windows = { version = "=0.3.11", default-features = false }
+
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+time = { version = "=0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+thiserror = "=2.0.21"
+anyhow = "=1.0.104"
+unicode-normalization = "=0.1.26"
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "fs", "io-util"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower = { version = "=0.5.3", features = ["limit", "load-shed", "timeout", "util"] }
+tower-http = { version = "=0.7.1", features = ["limit", "timeout"] }
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
+clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json"] }
+jsonschema = { version = "=0.61.1", default-features = false }
+tempfile = "=3.27.0"
+url = "=2.5.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

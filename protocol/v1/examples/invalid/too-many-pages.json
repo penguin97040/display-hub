@@ -1,0 +1,251 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "dashboard_id": "llm-usage",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "p0",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p1",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p2",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p3",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p4",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p5",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p6",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p7",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p8",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p9",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    },
+    {
+      "id": "p10",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "used_percent": 24.0,
+          "resets_at": "2026-11-15T00:00:00Z"
+        }
+      ]
+    }
+  ]
+}

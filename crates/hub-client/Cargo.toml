@@ -1,0 +1,19 @@
+[package]
+name = "hub-client"
+version = "0.1.0"
+description = "Display Hub client: device, admin and collector calls over pinned TLS"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hub-protocol.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

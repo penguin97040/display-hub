@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "dashboard_id": "llm-usage",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": []
+}

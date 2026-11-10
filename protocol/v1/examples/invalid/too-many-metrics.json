@@ -1,0 +1,86 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "dashboard_id": "llm-usage",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "claude-max",
+      "title": "Claude Max",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "m0",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m1",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m2",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m3",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m4",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m5",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        },
+        {
+          "id": "m6",
+          "label": "M",
+          "used_percent": 1.0,
+          "resets_at": null
+        }
+      ]
+    },
+    {
+      "id": "chatgpt-plus",
+      "title": "ChatGPT Plus",
+      "data_quality": "unavailable",
+      "updated_at": null,
+      "stale_after_seconds": 1800,
+      "note": "No supported source connected yet",
+      "metrics": []
+    },
+    {
+      "id": "opencode-go-plus",
+      "title": "OpenCode Go Plus",
+      "data_quality": "demo",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": "Sample figures, not real usage",
+      "metrics": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "used_percent": 17.0,
+          "resets_at": null
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+[package]
+name = "display-simulator"
+version = "0.1.0"
+description = "Emulates a Display Hub display: polls, caches, renders pages as text and reproduces outages"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hub-protocol.workspace = true
+hub-core.workspace = true
+hub-client.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+hubd = { path = "../../apps/hubd" }
+axum.workspace = true
+tempfile.workspace = true
