@@ -32,6 +32,8 @@
 | GPUI is pinned at `gpui-pre` 0.3.11, with a vendored Windows backend. | It matches md-viewer, a shipping app on the same stack. The vendored backend lets a Linux sandbox cross-build Windows executables. |
 | ECDSA P-256 for the hub's TLS key, TLS 1.2 kept alongside 1.3, and a fixed certificate name. | This is what ESP-IDF's mbedTLS supports well (milestone 2). |
 | Pi releases built against a glibc 2.36 baseline. | One binary runs on Raspberry Pi OS Bookworm and Trixie (milestone 4). |
+| The manager's logic is a plain model (`apps/hub-manager/src/model.rs`) that returns operations; a worker runs them on a tokio runtime; GPUI only draws and forwards input. | The rules are unit-tested without a window, and one test drives the model against a real hub and a simulated display. |
+| One operation at a time in the manager. | Changes reach the hub in the order they were made, and a failure is never hidden by a later success. |
 
 ## Milestones
 
@@ -40,7 +42,7 @@
 | M0 | Plan, toolchain, GPUI start-up check on Linux and a cross-built Windows executable | Done; the Windows run is the owner's to try |
 | M1 | Protocol v1, demo hub on loopback, display simulator, offline tests | Done |
 | M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Done (Linux and mbedTLS; not yet on a Pi) |
-| M3 | Desktop manager on GPUI | Next |
-| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | |
+| M3 | Desktop manager on GPUI, USB provisioning | Done on Linux and built for Windows; the Windows desktop run is the owner's to try |
+| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Next |
 | M5 | Collectors: PC helper for Claude Code and Codex, manual entry for OpenCode Go | |
 | M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | |

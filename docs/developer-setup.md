@@ -32,7 +32,7 @@ sudo apt-get install -y build-essential clang lld cmake pkg-config \
 
 ### Windows
 
-Install Rust with `rustup` and the Visual Studio Build Tools (the "Desktop development with C++" workload). [windows-testing.md](windows-testing.md) has the exact steps once the manager is ready to try.
+Install Rust with `rustup` and the Visual Studio Build Tools (the "Desktop development with C++" workload). [windows-testing.md](windows-testing.md) has the steps for trying the manager.
 
 ## Build and test
 
@@ -66,12 +66,22 @@ cargo run -p hubd -- serve --data-dir dev-data/hub --listen 127.0.0.1:8443
 cargo run -p hubd -- pair-admin --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1
 ```
 
-`pair-admin` prints a `dh1.…` pairing string for the desktop manager. Until the manager exists (milestone 3), the integration tests in `apps/hubd/tests/secure.rs` and `tools/display-simulator/tests/paired.rs` show the whole flow:
+`pair-admin` prints a `dh1.…` pairing string. Paste it into the desktop manager:
 
-1. pair;
-2. add pages;
-3. create an enrolment and build a bundle;
-4. `display-simulator enrol --bundle FILE --state DIR`, then `display-simulator poll --state DIR`.
+```sh
+cargo run -p hub-manager -- --config-dir dev-data/manager
+```
+
+`--config-dir` keeps the manager's settings out of your real configuration folder. Its credential still goes to the system's credential store (the Secret Service on Linux, so a keyring such as GNOME Keyring must be running).
+
+To add a simulated display over "USB", start the simulator's serial end, then type the port it prints into **Displays**, **Add a display**, **Or type a port**:
+
+```sh
+cargo run -p display-simulator -- usb --state dev-data/display --once   # prints "Serial port: /dev/pts/N"
+cargo run -p display-simulator -- poll --state dev-data/display
+```
+
+Or choose **Save as a file** and use `display-simulator enrol --bundle FILE --state DIR`. [windows-testing.md](windows-testing.md) is a full checklist.
 
 Other commands:
 
@@ -108,6 +118,8 @@ cargo build -p hub-manager --release --target x86_64-pc-windows-gnu
 ```
 
 ## Looking at the manager on Linux without a display
+
+The screenshots in milestone 3 were taken this way, with `xdotool` driving the window. A Secret Service is needed for pairing: `dbus-run-session` with `gnome-keyring-daemon --unlock --components=secrets` works headless.
 
 GPUI draws with Vulkan on Linux, and Mesa's software driver (lavapipe) works without a GPU:
 

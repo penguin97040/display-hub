@@ -64,6 +64,15 @@
 3. The display connects over Wi-Fi, checks the certificate and name, and enrols. It receives a revocable device token (`dhd_…`) and keeps it in encrypted flash.
 4. **Revoking a display:** remove it in the manager. Its token stops working on the next poll, and the display shows that it needs setting up again. It never held a provider credential.
 
+## The desktop manager
+
+- **The admin token** goes to the operating system's credential store: Windows Credential Manager, or the Secret Service on Linux. The manager checks the store works before pairing, so the hub never issues a token the PC can't keep, and it never falls back to a file.
+- **`manager.json`** (in `%AppData%\display-hub\` on Windows) holds only the hub's address, port, key hash, the PC's name and when it paired. A test checks no token reaches it.
+- **The pairing string** is cleared from the clipboard as soon as it's pasted, and from the field once used.
+- **Wi-Fi passwords** show as dots, can't be copied out of the field, and are wiped from memory once the setup details are built. **Copy diagnostics** includes no credential, secret or Wi-Fi detail.
+- **Setup details over USB** go only to the port you choose. **Save as a file** writes a file you should delete once the display has checked in; the manager says so.
+- **What it talks to:** only the paired hub, pinned by key. It makes no other network requests and collects nothing.
+
 ## Credentials
 
 | Credential | Who holds it | Can do | Stored on the hub as |
