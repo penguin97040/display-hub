@@ -81,6 +81,45 @@ enum Command {
         #[command(flatten)]
         settings: Settings,
     },
+    /// Copy the database and identity into a new folder. Safe while the hub runs. The folder holds
+    /// the hub's private key: keep it as safe as the Pi.
+    Backup {
+        /// A folder that doesn't exist yet.
+        dest: PathBuf,
+        #[command(flatten)]
+        settings: Settings,
+    },
+    /// Put a backup in place. Stop the hub first. Anything already there is moved aside, not deleted.
+    Restore {
+        /// A folder made by `hubd backup`.
+        src: PathBuf,
+        /// Replace the hub that's there now (it's moved to replaced-<time>/ in the data folder).
+        #[arg(long)]
+        replace: bool,
+        #[command(flatten)]
+        settings: Settings,
+    },
+    /// Check the configuration, data folder, identity and database, changing nothing.
+    Check {
+        #[command(flatten)]
+        settings: Settings,
+    },
+    /// Write a setup file for a display, without the desktop manager (for a headless setup or the
+    /// simulator). It works once, within 10 minutes, and has no Wi-Fi details.
+    DisplayBundle {
+        /// The display's name in the manager.
+        #[arg(long, default_value = "Display")]
+        name: String,
+        /// Addresses the display tries, in order. Repeat for more. Defaults to this machine's
+        /// advertised hosts.
+        #[arg(long = "host")]
+        hosts: Vec<String>,
+        /// Where to write the file (created owner-only).
+        #[arg(long)]
+        out: PathBuf,
+        #[command(flatten)]
+        settings: Settings,
+    },
     /// Development mode: plain HTTP on this computer only, sample figures, no authentication.
     /// Never deploy it.
     Dev {
@@ -109,13 +148,20 @@ enum AdminAction {
 }
 
 fn init_logging() {
+    use std::io::IsTerminal;
     let filter = tracing_subscriber::EnvFilter::try_from_env("HUBD_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
-        .init();
+        .with_ansi(std::io::stderr().is_terminal());
+    // Under systemd, journald adds its own timestamps.
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        builder.without_time().init();
+    } else {
+        builder.init();
+    }
 }
 
 #[tokio::main]
@@ -126,6 +172,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { settings } => {
             let config = settings.load()?;
+            let _lock = hubd::maintenance::lock(&config.data_dir)?;
             let listen = config.listen;
             let hub = hubd::open_hub(config, clock)?;
             let listener = tokio::net::TcpListener::bind(listen)
@@ -204,6 +251,89 @@ async fn main() -> anyhow::Result<()> {
             let hub = hubd::open_hub(settings.load()?, clock)?;
             println!("{}", fingerprint(&hub.identity.spki_sha256));
         }
+        Command::Backup { dest, settings } => {
+            let config = settings.load()?;
+            if !hubd::store::Store::exists(&config.db_path()) {
+                anyhow::bail!("there's no hub in {} to back up", config.data_dir.display());
+            }
+            let hub = hubd::open_hub(config.clone(), clock)?;
+            let s = hubd::maintenance::backup(&hub, &config, &dest)?;
+            println!(
+                "Backed up to {}: {} pages, {} displays.",
+                dest.display(),
+                s.pages,
+                s.displays
+            );
+            println!("Key fingerprint: {}", s.fingerprint);
+            println!("The folder holds the hub's private key. Keep it as safe as the Pi itself.");
+        }
+        Command::Restore {
+            src,
+            replace,
+            settings,
+        } => {
+            let config = settings.load()?;
+            let (s, aside) = hubd::maintenance::restore(&config, &src, replace, clock.as_ref())?;
+            if let Some(a) = aside {
+                println!("Moved the previous hub's files to {}.", a.display());
+            }
+            println!(
+                "Restored: {} pages, {} displays, key fingerprint {}.",
+                s.pages, s.displays, s.fingerprint
+            );
+            println!("Start the hub again: sudo systemctl start display-hub");
+        }
+        Command::Check { settings } => {
+            let config = settings.load()?;
+            let findings = hubd::maintenance::check(&config);
+            for f in &findings {
+                println!("{} {}", if f.ok { "ok     " } else { "PROBLEM" }, f.text);
+            }
+            if findings.iter().any(|f| !f.ok) {
+                std::process::exit(1);
+            }
+        }
+        Command::DisplayBundle {
+            name,
+            hosts,
+            out,
+            settings,
+        } => {
+            let config = settings.load()?;
+            let hosts = if hosts.is_empty() { config.hosts() } else { hosts };
+            let port = config.listen.port();
+            let hub = hubd::open_hub(config, clock)?;
+            let grant = hub.new_enrolment_grant(&name, "command line")?;
+            let bundle = hub_protocol::provisioning::Bundle {
+                format: hub_protocol::provisioning::FORMAT.into(),
+                version: hub_protocol::provisioning::VERSION,
+                hub: hub_protocol::provisioning::HubLocation {
+                    hosts,
+                    port,
+                    server_name: hub_protocol::provisioning::HUB_SERVER_NAME.into(),
+                    trust_anchors: vec![hub_protocol::provisioning::TrustAnchor {
+                        certificate_pem: grant.identity.certificate_pem,
+                        spki_sha256: grant.identity.spki_sha256,
+                    }],
+                },
+                enrolment: hub_protocol::provisioning::Enrolment {
+                    secret: grant.secret,
+                    expires_at: grant.expires_at,
+                },
+                wifi: None,
+            };
+            let problems = bundle.problems();
+            if !problems.is_empty() {
+                anyhow::bail!("the setup file wouldn't be valid: {}", problems.join("; "));
+            }
+            write_private(&out, &serde_json::to_vec_pretty(&bundle)?)?;
+            println!(
+                "Wrote {}. It works once, until {} (UTC).",
+                out.display(),
+                grant.expires_at
+            );
+            println!("It holds a one-time secret: delete it once the display has enrolled.");
+        }
         Command::Dev {
             listen,
             scenario,
@@ -228,5 +358,23 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!("stopped");
         }
     }
+    Ok(())
+}
+
+/// Creates a file only its owner can read, refusing to overwrite one.
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
     Ok(())
 }

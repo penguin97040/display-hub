@@ -115,6 +115,23 @@ impl Hub {
         Ok(raw)
     }
 
+    /// Issues a one-time enrolment secret for a new display, for the manager or `hubd display-bundle`.
+    pub fn new_enrolment_grant(&self, name: &str, by: &str) -> Result<EnrolmentGrant, StoreError> {
+        let name = clean_title(name).unwrap_or_else(|| "Display".into());
+        let (_, code) = new_code();
+        let now = self.clock.now();
+        let expires = now.plus_seconds(CODE_LIFETIME_SECONDS);
+        self.store
+            .add_code(&hash(code.expose()), "device-enrol", &name, now, expires)?;
+        self.store
+            .audit(now, "enrolment_issued", &format!("{name} by {by}"))?;
+        Ok(EnrolmentGrant {
+            secret: code.expose().to_string(),
+            expires_at: expires,
+            identity: self.identity.info(),
+        })
+    }
+
     fn snapshot(&self) -> Result<hub_protocol::Snapshot, StoreError> {
         let pages = self.store.subscriptions()?;
         Ok(build_snapshot(
@@ -458,16 +475,19 @@ async fn admin_pair(
     }
 }
 
-/// Whether the kernel says the clock is synchronised (Linux `adjtimex`).
+/// Whether the clock is synchronised: the kernel's view (`adjtimex`), or, where the service's
+/// sandbox refuses that call (`ProtectClock=`), systemd-timesyncd's marker file.
 #[cfg(target_os = "linux")]
 pub fn clock_synchronised() -> Option<bool> {
     // SAFETY: adjtimex with modes = 0 only reads the kernel's clock state into the struct.
     let mut tx: libc::timex = unsafe { std::mem::zeroed() };
     let state = unsafe { libc::adjtimex(&mut tx) };
-    if state < 0 {
-        return None;
+    if state >= 0 {
+        return Some(state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0);
     }
-    Some(state != libc::TIME_ERROR && tx.status & libc::STA_UNSYNC == 0)
+    std::path::Path::new("/run/systemd/timesync/synchronized")
+        .exists()
+        .then_some(true)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -747,24 +767,9 @@ async fn new_enrolment(
     ApiJson(req): ApiJson<NewEnrolment>,
 ) -> Result<(StatusCode, Json<EnrolmentGrant>), ApiError> {
     let admin = authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let name = clean_title(&req.name).unwrap_or_else(|| "Display".into());
-    let (_, code) = new_code();
-    let now = hub.clock.now();
-    let expires = now.plus_seconds(CODE_LIFETIME_SECONDS);
-    let h = hash(code.expose());
-    db(&hub, move |s| {
-        s.add_code(&h, "device-enrol", &name, now, expires)?;
-        s.audit(now, "enrolment_issued", &format!("{name} by {admin}"))
-    })
-    .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(EnrolmentGrant {
-            secret: code.expose().to_string(),
-            expires_at: expires,
-            identity: hub.identity.info(),
-        }),
-    ))
+    let h = hub.clone();
+    let grant = db(&hub, move |_| h.new_enrolment_grant(&req.name, &admin)).await?;
+    Ok((StatusCode::CREATED, Json(grant)))
 }
 
 async fn preview_snapshot(

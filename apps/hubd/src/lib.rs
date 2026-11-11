@@ -5,6 +5,7 @@ pub mod config;
 pub mod dev;
 pub mod http;
 pub mod identity;
+pub mod maintenance;
 pub mod netpolicy;
 pub mod ratelimit;
 pub mod secret;

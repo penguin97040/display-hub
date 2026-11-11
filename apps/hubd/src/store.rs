@@ -17,6 +17,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::secret::Role;
 
 /// Each entry upgrades the schema by one version. Never edit one that has shipped: add another.
+/// The newest schema this build knows.
+pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
 const MIGRATIONS: &[&str] = &[
     // 1: the first schema.
     r#"

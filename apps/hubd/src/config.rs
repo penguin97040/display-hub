@@ -98,13 +98,33 @@ impl Config {
         if !self.advertise_hosts.is_empty() {
             return self.advertise_hosts.clone();
         }
-        let name = std::fs::read_to_string("/proc/sys/kernel/hostname")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace))
+        let name = hostname()
+            .filter(|s| !s.is_empty() && !s.contains(char::is_whitespace) && !s.contains('.'))
             .unwrap_or_else(|| "raspberrypi".into());
         vec![format!("{name}.local")]
     }
+}
+
+/// This machine's host name, from the kernel (works where `/proc/sys` is hidden, as in the service).
+#[cfg(target_os = "linux")]
+fn hostname() -> Option<String> {
+    let mut buf = [0u8; 256];
+    // SAFETY: gethostname writes at most buf.len() bytes into buf.
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    if r != 0 {
+        return None;
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::str::from_utf8(&buf[..end])
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .ok()
 }
 
 #[cfg(test)]

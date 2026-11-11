@@ -24,8 +24,8 @@ use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use zeroize::Zeroizing;
 
-const CERT_FILE: &str = "hub-cert.pem";
-const KEY_FILE: &str = "hub-key.pem";
+pub const CERT_FILE: &str = "hub-cert.pem";
+pub const KEY_FILE: &str = "hub-key.pem";
 
 pub struct Identity {
     pub cert_der: CertificateDer<'static>,
