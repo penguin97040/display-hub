@@ -6,6 +6,7 @@
 
 pub mod cache;
 pub mod device;
+pub mod paired;
 pub mod render;
 
 pub use device::{ClockJitter, Device, Jitter, Link, NoJitter, Problem};

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use display_simulator::render::screen;
-use display_simulator::{ClockJitter, Device, Link};
+use display_simulator::{paired, ClockJitter, Device, Link};
 use hub_client::HubClient;
 use hub_core::{Clock, SystemClock};
 
@@ -17,16 +17,56 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct Connection {
-    /// The hub's address. Until pairing exists, only a development hub on this computer.
+    /// A display set up with `enrol`: its folder of saved state. Polls over pinned HTTPS.
+    #[arg(long, conflicts_with = "hub")]
+    state: Option<PathBuf>,
+    /// Or a development hub (`hubd dev`) on this computer, over plain HTTP without credentials.
     #[arg(long, default_value = "http://127.0.0.1:8080/")]
     hub: String,
-    /// Where to keep the last good snapshot, as a display keeps it in flash.
+    /// Where to keep the last good snapshot. Defaults to the state folder when there is one.
     #[arg(long)]
     cache: Option<PathBuf>,
 }
 
+/// Where polls go.
+enum Target {
+    Dev(HubClient),
+    Paired(paired::State),
+}
+
+impl Target {
+    async fn poll(&self) -> Result<hub_protocol::Snapshot, hub_client::ClientError> {
+        match self {
+            Target::Dev(c) => c.device_snapshot(None).await,
+            Target::Paired(s) => paired::snapshot(s).await,
+        }
+    }
+
+    async fn heartbeat(&self) {
+        if let Target::Paired(s) = self {
+            if let Err(e) = paired::heartbeat(s).await {
+                eprintln!("display-simulator: heartbeat not sent: {e}");
+            }
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Set this simulated display up from a provisioning bundle, as the manager does over USB.
+    Enrol {
+        /// The provisioning bundle (JSON) the desktop manager saved.
+        #[arg(long)]
+        bundle: PathBuf,
+        /// Folder to keep the display's credentials and saved data in.
+        #[arg(long)]
+        state: PathBuf,
+    },
+    /// Erase the display's credentials and saved data, as a factory reset does.
+    Reset {
+        #[arg(long)]
+        state: PathBuf,
+    },
     /// Poll once, draw the screen and exit. Exit status: 0 online, 3 showing saved data, 4 nothing to show.
     Once {
         #[command(flatten)]
@@ -50,11 +90,24 @@ enum Command {
     },
 }
 
-fn client(conn: &Connection) -> Result<HubClient, ExitCode> {
-    HubClient::loopback_dev(&conn.hub).map_err(|e| {
+fn target(conn: &Connection) -> Result<(Target, Option<PathBuf>), ExitCode> {
+    let fail = |e: String| {
         eprintln!("display-simulator: {e}");
         ExitCode::from(2)
-    })
+    };
+    match &conn.state {
+        Some(dir) => {
+            let state = paired::load(dir).map_err(fail)?;
+            Ok((
+                Target::Paired(state),
+                Some(conn.cache.clone().unwrap_or_else(|| paired::cache_file(dir))),
+            ))
+        }
+        None => Ok((
+            Target::Dev(HubClient::loopback_dev(&conn.hub).map_err(|e| fail(e.to_string()))?),
+            conn.cache.clone(),
+        )),
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -62,13 +115,49 @@ async fn main() -> ExitCode {
     let cli = Cli::parse();
     let clock = SystemClock;
     match cli.command {
+        Command::Enrol { bundle, state } => {
+            let bundle = match std::fs::read(&bundle).map_err(|e| e.to_string()).and_then(|b| {
+                serde_json::from_slice::<hub_protocol::provisioning::Bundle>(&b).map_err(|e| e.to_string())
+            }) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("display-simulator: couldn't read the bundle: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            match paired::enrol(&bundle, &state).await {
+                Ok(s) => {
+                    println!(
+                        "Enrolled as {} with the hub at {}.",
+                        s.device_id,
+                        s.hub.hosts.join(" or ")
+                    );
+                    println!("Delete the bundle file now: its code is used up, but it may hold your Wi-Fi password.");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("display-simulator: enrolment failed: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Command::Reset { state } => match paired::reset(&state) {
+            Ok(()) => {
+                println!("Erased the display's credentials and saved data.");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("display-simulator: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Command::Once { conn } => {
-            let hub = match client(&conn) {
-                Ok(c) => c,
+            let (hub, cache) = match target(&conn) {
+                Ok(t) => t,
                 Err(code) => return code,
             };
-            let mut device = Device::new(conn.cache.clone(), Box::new(ClockJitter::default()));
-            device.accept(clock.now(), hub.device_snapshot(None).await);
+            let mut device = Device::new(cache, Box::new(ClockJitter::default()));
+            device.accept(clock.now(), hub.poll().await);
             print!("{}", screen(&device, clock.now()));
             match (&device.link, &device.held) {
                 (Link::Online { .. }, _) => ExitCode::SUCCESS,
@@ -81,14 +170,21 @@ async fn main() -> ExitCode {
             max_polls,
             max_wait,
         } => {
-            let hub = match client(&conn) {
-                Ok(c) => c,
+            let (hub, cache) = match target(&conn) {
+                Ok(t) => t,
                 Err(code) => return code,
             };
-            let mut device = Device::new(conn.cache.clone(), Box::new(ClockJitter::default()));
+            let mut device = Device::new(cache, Box::new(ClockJitter::default()));
             let mut polls = 0;
+            let mut last_heartbeat: Option<std::time::Instant> = None;
             loop {
-                let mut wait = device.accept(clock.now(), hub.device_snapshot(None).await);
+                let mut wait = device.accept(clock.now(), hub.poll().await);
+                if matches!(device.link, Link::Online { .. })
+                    && last_heartbeat.is_none_or(|t| t.elapsed().as_secs() >= 3600)
+                {
+                    hub.heartbeat().await;
+                    last_heartbeat = Some(std::time::Instant::now());
+                }
                 if let Some(max) = max_wait {
                     wait = wait.min(std::time::Duration::from_secs(max));
                 }

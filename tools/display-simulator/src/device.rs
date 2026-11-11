@@ -14,6 +14,8 @@ use crate::cache::{self, Held};
 pub enum Problem {
     /// The hub couldn't be reached at all.
     Unreachable,
+    /// Something answered at the hub's address, but with a key this display doesn't trust.
+    WrongHub,
     /// The hub answered, but with something the display can't use. Last good data stays.
     BadResponse(String),
     /// The hub is busy or briefly unavailable.
@@ -30,6 +32,7 @@ impl Problem {
     pub fn headline(&self) -> &'static str {
         match self {
             Problem::Unreachable => "Can't reach the hub",
+            Problem::WrongHub => "Something else is answering as the hub",
             Problem::BadResponse(_) => "The hub sent data this display can't read",
             Problem::Busy(_) => "The hub is busy",
             Problem::NeedsSetup(_) => "This display needs setting up again",
@@ -43,6 +46,9 @@ impl Problem {
             Problem::Unreachable => {
                 "Check the Raspberry Pi is switched on and on the same Wi-Fi. Retrying automatically.".into()
             }
+            Problem::WrongHub => "Its security key doesn't match, so nothing was sent. If you reinstalled the hub, \
+                                  set this display up again; otherwise check for an unknown device on your network."
+                .into(),
             Problem::BadResponse(d) => format!("{d}. Retrying automatically."),
             Problem::Busy(d) => format!("{d} Retrying automatically."),
             Problem::NeedsSetup(d) => format!("{d} Use the desktop manager to set it up again."),
@@ -55,6 +61,7 @@ impl Problem {
         match e {
             ClientError::AddressRefused(d) => Problem::Configuration(d.clone()),
             ClientError::Unreachable(_) | ClientError::Timeout => Problem::Unreachable,
+            ClientError::IdentityMismatch => Problem::WrongHub,
             ClientError::TooLarge(_) => Problem::BadResponse("The hub's answer was too large".into()),
             ClientError::Snapshot(r) => match r {
                 hub_protocol::ReceiveError::IncompatibleVersion(v) => Problem::Incompatible(format!(
