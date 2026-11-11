@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Checks that an mbedTLS client configured like ESP-IDF's (see client.c) can talk to hubd, and is
-# refused when the certificate or name is wrong. Needs a C compiler, libmbedtls-dev (mbedTLS 3.6,
-# as in ESP-IDF 5.x) and a built hubd.
+# refused when the certificate or name is wrong. Needs a C compiler, mbedTLS 3.6 (as in ESP-IDF 5.x)
+# and a built hubd. mbedTLS comes from the system (libmbedtls-dev on Debian 13), or from a source
+# tree built with `make lib`, named by MBEDTLS_DIR (CI does this, because Ubuntu 24.04 has 2.28).
 #
-#   cargo build -p hubd && bash tools/mbedtls-interop/run.sh [path/to/hubd]
+#   cargo build -p hubd && [MBEDTLS_DIR=...] bash tools/mbedtls-interop/run.sh [path/to/hubd]
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -14,7 +15,11 @@ pids=()
 cleanup() { for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done; rm -rf "$work"; }
 trap cleanup EXIT
 
-cc -O1 -Wall -Werror -o "$work/client" "$here/client.c" -lmbedtls -lmbedx509 -lmbedcrypto
+flags=()
+if [ -n "${MBEDTLS_DIR:-}" ]; then
+  flags=(-I"$MBEDTLS_DIR/include" -L"$MBEDTLS_DIR/library")
+fi
+cc -O1 -Wall -Werror "${flags[@]}" -o "$work/client" "$here/client.c" -lmbedtls -lmbedx509 -lmbedcrypto
 
 start_hub() { # data-dir port
   "$hubd" serve --data-dir "$1" --listen "127.0.0.1:$2" >"$1.log" 2>&1 &

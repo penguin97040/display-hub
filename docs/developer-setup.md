@@ -83,9 +83,11 @@ Other commands:
 ### mbedTLS interoperability
 
 ```sh
-sudo apt-get install -y libmbedtls-dev
+sudo apt-get install -y libmbedtls-dev     # Debian 13 has mbedTLS 3.6, as ESP-IDF 5.x uses
 cargo build -p hubd && bash tools/mbedtls-interop/run.sh
 ```
+
+Ubuntu 24.04 packages mbedTLS 2.28, which is too old. Build 3.6 from its release instead (CI does this), with `make -C <source> lib`, then run the script with `MBEDTLS_DIR=<source>`.
 
 This builds a small C client configured like ESP-IDF's HTTP client and checks four things:
 
