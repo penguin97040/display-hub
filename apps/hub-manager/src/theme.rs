@@ -35,6 +35,8 @@ pub const H2_SIZE: f32 = 24.0;
 /// Minimum touch target.
 pub const TARGET_MIN: f32 = 44.0;
 pub const PANEL_GAP: f32 = 16.0;
+/// The nominal value; layouts use the guide's `clamp()` (`ui::Metrics`). Checked against the tokens.
+#[allow(dead_code)]
 pub const PANEL_PAD: f32 = 24.0;
 /// Corner tick length on panels (0.75rem) and its stroke.
 pub const TICK: f32 = 12.0;

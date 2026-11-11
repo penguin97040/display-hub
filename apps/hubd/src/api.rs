@@ -495,6 +495,8 @@ async fn admin_status(
         now: hub.clock.now(),
         clock_synchronised: clock_synchronised(),
         identity: hub.identity.info(),
+        hosts: hub.config.hosts(),
+        port: hub.config.listen.port(),
         subscriptions: subs,
         displays,
         admins,

@@ -56,6 +56,12 @@ pub struct HubStatus {
     /// are only as right as this clock.
     pub clock_synchronised: Option<bool>,
     pub identity: HubIdentity,
+    /// Where displays should look for the hub, in order (`advertise_hosts`, or `<hostname>.local`).
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// The port the hub listens on.
+    #[serde(default)]
+    pub port: u16,
     pub subscriptions: usize,
     pub displays: usize,
     pub admins: usize,
