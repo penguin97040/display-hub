@@ -2816,6 +2816,7 @@ name = "hub-manager"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.23.1",
  "dirs 6.0.0",
  "display-simulator",
  "gpui-pre",
@@ -2825,7 +2826,7 @@ dependencies = [
  "hub-core",
  "hub-protocol",
  "hubd",
- "keyring-core",
+ "os-secrets",
  "serde",
  "serde_json",
  "serialport",
@@ -2834,8 +2835,6 @@ dependencies = [
  "time",
  "tokio",
  "unicode-segmentation",
- "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
  "zeroize",
 ]
 
@@ -2851,6 +2850,27 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "unicode-normalization",
+]
+
+[[package]]
+name = "hubctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "dirs 6.0.0",
+ "hub-client",
+ "hub-core",
+ "hub-protocol",
+ "hubd",
+ "os-secrets",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -4478,6 +4498,16 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "os-secrets"
+version = "0.1.0"
+dependencies = [
+ "keyring-core",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
+ "zeroize",
 ]
 
 [[package]]

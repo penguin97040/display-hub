@@ -1,0 +1,18 @@
+[package]
+name = "os-secrets"
+version = "0.1.0"
+description = "Tokens in the operating system's credential store (Windows Credential Manager, Secret Service), never in files"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+keyring-core.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-native-keyring-store.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store.workspace = true

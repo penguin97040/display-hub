@@ -12,8 +12,8 @@ use hub_protocol::provisioning::Bundle;
 use zeroize::Zeroizing;
 
 use crate::model::{Failure, Op, Outcome, PortInfo, Refresh};
-use crate::secrets::TokenStore;
 use crate::settings::{self, SavedHub};
+use os_secrets::TokenStore;
 
 fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -96,11 +96,12 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 async fn refresh(s: &Session) -> Result<Refresh, Failure> {
     let t = s.token.as_str();
-    let (status, pages, displays, preview) = tokio::try_join!(
+    let (status, pages, displays, preview, helpers) = tokio::try_join!(
         s.client.status(t),
         s.client.subscriptions(t),
         s.client.displays(t),
         s.client.preview_snapshot(t),
+        s.client.collectors(t),
     )
     .map_err(Failure::Client)?;
     Ok(Refresh {
@@ -108,6 +109,7 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         pages,
         displays,
         preview,
+        helpers,
     })
 }
 
@@ -190,6 +192,19 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
                 grant,
                 refresh: refresh(&s).await?,
             })
+        }
+        Op::NewHelper(new) => {
+            let s = ctx.session()?;
+            let invite = s.client.new_collector(&s.token, &new).await.map_err(c)?;
+            Ok(Outcome::HelperInvite {
+                invite,
+                refresh: refresh(&s).await?,
+            })
+        }
+        Op::RevokeHelper { id } => {
+            let s = ctx.session()?;
+            s.client.revoke_collector(&s.token, &id).await.map_err(c)?;
+            Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::ListPorts => Ok(Outcome::Ports(blocking(list_ports).await)),
         Op::SendUsb { port, bundle } => blocking(move || send_usb(&port, &bundle))
@@ -296,7 +311,7 @@ mod tests {
 
     use super::*;
     use crate::model::{Model, Outcome};
-    use crate::secrets::MemoryStore;
+    use os_secrets::MemoryStore;
 
     async fn run(model: &mut Model, ctx: &Arc<Ctx>, op: Option<Op>) {
         let op = op.expect("an operation");

@@ -6,7 +6,6 @@ mod assets;
 mod field;
 mod guidance;
 mod model;
-mod secrets;
 mod settings;
 mod theme;
 mod ui;
@@ -88,7 +87,12 @@ fn main() {
             }),
         ),
     };
-    let ctx = worker::Ctx::new(Arc::new(secrets::OsStore), dir);
+    let ctx = worker::Ctx::new(
+        Arc::new(os_secrets::OsStore {
+            service: "display-hub-manager",
+        }),
+        dir,
+    );
     let mut model = Model::new(saved, &pc_name());
     let mut start = None;
     if let Some(hub) = model.hub.clone() {

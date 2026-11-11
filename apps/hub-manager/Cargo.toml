@@ -19,18 +19,15 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 zeroize.workspace = true
+base64.workspace = true
 serialport.workspace = true
-keyring-core.workspace = true
+os-secrets.workspace = true
 dirs.workspace = true
 time = { workspace = true, features = ["local-offset"] }
 unicode-segmentation.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 gpui-pre-windows.workspace = true
-windows-native-keyring-store.workspace = true
-
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-zbus-secret-service-keyring-store.workspace = true
 
 [dev-dependencies]
 hubd = { path = "../hubd" }

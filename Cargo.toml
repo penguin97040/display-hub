@@ -4,8 +4,10 @@ members = [
     "crates/hub-protocol",
     "crates/hub-core",
     "crates/hub-client",
+    "crates/os-secrets",
     "apps/hubd",
     "apps/hub-manager",
+    "apps/hubctl",
     "tools/display-simulator",
 ]
 
@@ -24,6 +26,7 @@ gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
 hub-protocol = { path = "crates/hub-protocol" }
 hub-core = { path = "crates/hub-core" }
 hub-client = { path = "crates/hub-client" }
+os-secrets = { path = "crates/os-secrets" }
 
 # GPUI: a crates.io snapshot of Zed's GPUI. 0.3.11 matches md-viewer, so the vendored Windows backend applies.
 gpui = { package = "gpui-pre", version = "=0.3.11" }

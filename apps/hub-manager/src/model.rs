@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use hub_client::usb::UsbDisplay;
 use hub_client::ClientError;
 use hub_core::api::{
-    DisplayView, EnrolmentGrant, HubStatus, ManualFigures, ManualMetric, NewSubscription, SubscriptionChange,
-    SubscriptionView,
+    CollectorInvite, CollectorView, DisplayView, EnrolmentGrant, HubStatus, ManualFigures, ManualMetric,
+    NewCollector, NewSubscription, SubscriptionChange, SubscriptionView,
 };
 use hub_core::freshness::{short_duration, Freshness};
 use hub_core::model::{clean_note, clean_percent, clean_title};
@@ -20,6 +20,7 @@ use hub_protocol::limits::{MAX_NOTE_LEN, MAX_PAGES, MAX_TITLE_LEN};
 use hub_protocol::pairing::PairingString;
 use hub_protocol::provisioning::{Bundle, Wifi, MAX_HOSTS};
 use hub_protocol::{DataQuality, Snapshot, Timestamp};
+use zeroize::Zeroizing;
 
 use crate::field::Field;
 use crate::guidance::{self, Doing, Guidance, Next, Tone};
@@ -62,6 +63,7 @@ pub struct Refresh {
     pub pages: Vec<SubscriptionView>,
     pub displays: Vec<DisplayView>,
     pub preview: Snapshot,
+    pub helpers: Vec<CollectorView>,
 }
 
 /// A serial port a display might be on.
@@ -97,6 +99,10 @@ pub enum Op {
     NewEnrolment {
         name: String,
     },
+    NewHelper(NewCollector),
+    RevokeHelper {
+        id: String,
+    },
     ListPorts,
     SendUsb {
         port: String,
@@ -111,9 +117,19 @@ pub enum Op {
 
 #[derive(Debug)]
 pub enum Outcome {
-    Paired { hub: SavedHub, refresh: Refresh },
+    Paired {
+        hub: SavedHub,
+        refresh: Refresh,
+    },
     Refreshed(Refresh),
-    Enrolment { grant: EnrolmentGrant, refresh: Refresh },
+    Enrolment {
+        grant: EnrolmentGrant,
+        refresh: Refresh,
+    },
+    HelperInvite {
+        invite: CollectorInvite,
+        refresh: Refresh,
+    },
     Ports(Vec<PortInfo>),
     Sent(UsbDisplay),
     Saved(PathBuf),
@@ -161,6 +177,7 @@ impl Busy {
 pub enum Confirm {
     RemovePage { id: String, title: String },
     RevokeDisplay { id: String, name: String },
+    RevokeHelper { id: String, label: String },
     Forget,
 }
 
@@ -179,6 +196,13 @@ impl Confirm {
                     .into(),
                 "Remove display",
             ),
+            Confirm::RevokeHelper { label, .. } => (
+                format!("Remove the helper on {label}?"),
+                "Its credential stops working straight away. Pages it fed keep their last figures, and go stale. On \
+                 that PC, hubctl logout tidies up."
+                    .into(),
+                "Remove helper",
+            ),
             Confirm::Forget => (
                 "Forget this hub?".into(),
                 "This PC deletes its credential and the hub's details. The hub keeps working. To cut this PC off on \
@@ -190,8 +214,17 @@ impl Confirm {
     }
 }
 
-/// Sources the manager offers. Collectors arrive with the PC helper.
-pub const ADDABLE_SOURCES: [Source; 3] = [Source::Manual, Source::Demo, Source::None];
+/// Sources the manager offers.
+pub const ADDABLE_SOURCES: [Source; 4] = [Source::Manual, Source::Collector, Source::Demo, Source::None];
+
+/// The sources that make sense for a service: the PC helper can report Claude Max (Claude Code) and
+/// ChatGPT Plus (Codex), but nothing reports OpenCode Go.
+pub fn sources_for(service: Service) -> Vec<Source> {
+    ADDABLE_SOURCES
+        .into_iter()
+        .filter(|s| *s != Source::Collector || matches!(service, Service::ClaudeMax | Service::ChatgptPlus))
+        .collect()
+}
 
 pub fn source_label(s: Source) -> &'static str {
     match s {
@@ -301,6 +334,16 @@ pub struct MetricRow {
     pub resets: String,
 }
 
+/// Setting up a PC helper (`hubctl`).
+#[derive(Default)]
+pub struct HelperForm {
+    pub claude: bool,
+    pub chatgpt: bool,
+    /// The `dh1.` string for `hubctl login`, once made. A secret until used or expired.
+    pub string: Option<Zeroizing<String>>,
+    pub expires_at: Option<Timestamp>,
+}
+
 pub struct Model {
     pub hub: Option<SavedHub>,
     /// The saved credential stopped working; show the pairing screen with the hub's details kept.
@@ -318,6 +361,7 @@ pub struct Model {
     pub add: AddPage,
     pub edit: Option<EditPage>,
     pub enrol: Enrol,
+    pub helper: HelperForm,
 }
 
 impl Model {
@@ -343,6 +387,11 @@ impl Model {
             },
             edit: None,
             enrol: Enrol::default(),
+            helper: HelperForm {
+                claude: true,
+                chatgpt: true,
+                ..HelperForm::default()
+            },
         }
     }
 
@@ -772,6 +821,48 @@ impl Model {
         Some(self.hub_now(now)?.seconds_until(b.enrolment.expires_at))
     }
 
+    // ---- PC helpers -----------------------------------------------------------------------------------
+
+    pub fn helpers(&self) -> &[CollectorView] {
+        self.last
+            .as_ref()
+            .map(|r| r.helpers.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn create_helper(&mut self) -> Option<Op> {
+        let services: Vec<Service> = [
+            (self.helper.claude, Service::ClaudeMax),
+            (self.helper.chatgpt, Service::ChatgptPlus),
+        ]
+        .into_iter()
+        .filter_map(|(on, s)| on.then_some(s))
+        .collect();
+        if services.is_empty() {
+            return self.problem(Guidance {
+                tone: Tone::Problem,
+                title: "Choose what the helper reports".into(),
+                detail: "Claude Max (from Claude Code), ChatGPT Plus (from Codex), or both.".into(),
+                next: Next::None,
+            });
+        }
+        let label = clean_title(self.pc_name.trimmed()).unwrap_or_else(|| "PC helper".into());
+        self.helper.string = None;
+        self.start(
+            Busy::Saving { done: String::new() },
+            Op::NewHelper(NewCollector { label, services }),
+        )
+    }
+
+    pub fn ask_revoke_helper(&mut self, id: &str) {
+        if let Some(h) = self.helpers().iter().find(|h| h.id == id) {
+            self.confirm = Some(Confirm::RevokeHelper {
+                id: h.id.clone(),
+                label: h.label.clone(),
+            });
+        }
+    }
+
     // ---- confirmations -------------------------------------------------------------------------------
 
     pub fn confirm_yes(&mut self) -> Option<Op> {
@@ -787,6 +878,10 @@ impl Model {
             Confirm::RevokeDisplay { id, name } => {
                 let done = format!("Removed {name}. Its credential no longer works.");
                 self.start(Busy::Saving { done }, Op::RevokeDisplay { id })
+            }
+            Confirm::RevokeHelper { id, label } => {
+                let done = format!("Removed the helper on {label}.");
+                self.start(Busy::Saving { done }, Op::RevokeHelper { id })
             }
             Confirm::Forget => self.start(Busy::Forgetting, Op::Forget),
         }
@@ -826,7 +921,9 @@ impl Model {
             }
             Ok(Outcome::Refreshed(r)) => {
                 self.take_refresh(r, now);
-                if let Some(Busy::Saving { done }) = busy {
+                if let Some(Busy::Saving { done }) =
+                    busy.filter(|b| !matches!(b, Busy::Saving { done } if done.is_empty()))
+                {
                     self.notice = Some(Guidance::done(done, ""));
                 } else if self.notice.as_ref().is_some_and(|n| n.next == Next::Retry) {
                     // The hub is back.
@@ -854,6 +951,39 @@ impl Model {
                             tone: Tone::Problem,
                             title: "The setup details aren't valid".into(),
                             detail: e,
+                            next: Next::None,
+                        })
+                    }
+                }
+            }
+            Ok(Outcome::HelperInvite { invite, refresh }) => {
+                self.take_refresh(refresh, now);
+                let string = self.hub.as_ref().and_then(|h| {
+                    use base64::Engine;
+                    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&invite.secret)
+                        .ok()?;
+                    let secret: [u8; 16] = raw.try_into().ok()?;
+                    Some(
+                        PairingString {
+                            host: h.host.clone(),
+                            port: h.port,
+                            spki_sha256: h.pin()?,
+                            secret,
+                        }
+                        .encode(),
+                    )
+                });
+                match string {
+                    Some(s) => {
+                        self.helper.string = Some(Zeroizing::new(s));
+                        self.helper.expires_at = Some(invite.expires_at);
+                    }
+                    None => {
+                        self.notice = Some(Guidance {
+                            tone: Tone::Problem,
+                            title: "The hub's answer wasn't understood".into(),
+                            detail: "Update the hub and this app to the same release.".into(),
                             next: Next::None,
                         })
                     }
@@ -1154,6 +1284,7 @@ mod tests {
                 refresh_after_seconds: 300,
                 pages: vec![],
             },
+            helpers: vec![],
         }
     }
 
@@ -1462,5 +1593,99 @@ mod tests {
         m.finish(Ok(Outcome::Forgotten), Instant::now());
         assert!(m.hub.is_none() && m.last.is_none());
         assert_eq!(m.pc_name.text, "Desk PC");
+    }
+}
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn only_services_a_helper_can_report_offer_it() {
+        assert!(sources_for(Service::ClaudeMax).contains(&Source::Collector));
+        assert!(sources_for(Service::ChatgptPlus).contains(&Source::Collector));
+        assert!(!sources_for(Service::OpencodeGoPlus).contains(&Source::Collector));
+    }
+
+    #[test]
+    fn a_helper_needs_a_service() {
+        let mut m = Model::new(None, "PC");
+        m.helper.claude = false;
+        m.helper.chatgpt = false;
+        assert!(m.create_helper().is_none());
+        m.helper.chatgpt = true;
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!((n.label.as_str(), n.services), ("PC", vec![Service::ChatgptPlus]));
+    }
+}
+
+#[cfg(test)]
+mod helper_string_tests {
+    use super::*;
+    use hub_core::api::HubIdentity;
+
+    #[test]
+    fn the_helper_string_names_this_hub_and_carries_the_invite() {
+        let t = Timestamp::parse("2026-11-11T01:00:00Z").unwrap();
+        let hub = SavedHub::new("raspberrypi.local", 8443, &[7; 32], "PC", t);
+        let mut m = Model::new(Some(hub), "PC");
+        let op = m.create_helper();
+        assert!(matches!(op, Some(Op::NewHelper(_))));
+        use base64::Engine;
+        let secret = [9u8; 16];
+        let invite = CollectorInvite {
+            secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
+            expires_at: t.plus_seconds(600),
+            identity: HubIdentity {
+                certificate_pem: String::new(),
+                spki_sha256: String::new(),
+                server_name: String::new(),
+            },
+        };
+        let refresh = Refresh {
+            status: HubStatus {
+                version: "0".into(),
+                started_at: t,
+                now: t,
+                clock_synchronised: None,
+                identity: invite.identity.clone(),
+                hosts: vec![],
+                port: 8443,
+                subscriptions: 0,
+                displays: 0,
+                admins: 1,
+            },
+            pages: vec![],
+            displays: vec![],
+            preview: Snapshot {
+                protocol_version: 1,
+                message_type: "dashboard.snapshot".into(),
+                dashboard_id: "llm-usage".into(),
+                generated_at: t,
+                refresh_after_seconds: 300,
+                pages: vec![],
+            },
+            helpers: vec![],
+        };
+        m.finish(Ok(Outcome::HelperInvite { invite, refresh }), Instant::now());
+        let s = m.helper.string.clone().expect("a string");
+        // As shown: grouped with spaces, which the decoder ignores.
+        let shown: String = s
+            .as_bytes()
+            .chunks(24)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let p = PairingString::decode(&shown).unwrap();
+        assert_eq!(
+            (p.host.as_str(), p.port, p.spki_sha256, p.secret),
+            ("raspberrypi.local", 8443, [7; 32], secret)
+        );
+        assert!(
+            m.notice.is_none(),
+            "no message for a new string; the panel shows it"
+        );
     }
 }

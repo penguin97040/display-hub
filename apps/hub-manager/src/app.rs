@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::accesskit::Role;
+use gpui::accesskit::{Role, Toggled};
 use gpui::{
     canvas, div, fill, font, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, CursorStyle,
     Div, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ShapedLine,
@@ -18,7 +18,7 @@ use hub_protocol::limits::MAX_PAGES;
 
 use crate::field::Field;
 use crate::guidance::{Guidance, Next, Tone};
-use crate::model::{self, Confirm, EnrolStage, Failure, Model, Op, Section, ADDABLE_SOURCES};
+use crate::model::{self, sources_for, Confirm, EnrolStage, Failure, Model, Op, Section};
 use crate::theme::*;
 use crate::ui::{self, c, Metrics};
 use crate::worker::{self, Ctx};
@@ -327,7 +327,7 @@ impl Manager {
                     .on_hover(Self::track_hover(key, cx))
                     .role(Role::RadioButton)
                     .aria_label(SharedString::from(text.to_string()))
-                    .aria_selected(on)
+                    .aria_toggled(if on { Toggled::True } else { Toggled::False })
                     .track_focus(&fh)
                     .p(px(2.0))
                     .border_2()
@@ -1233,11 +1233,16 @@ impl Manager {
             &services,
             self.model.add.service,
             cx,
-            |this, v| this.model.add.service = v,
+            |this, v| {
+                this.model.add.service = v;
+                if !sources_for(v).contains(&this.model.add.source) {
+                    this.model.add.source = Source::Manual;
+                }
+            },
         );
-        let sources: Vec<(Source, &str)> = ADDABLE_SOURCES
-            .iter()
-            .map(|s| (*s, model::source_label(*s)))
+        let sources: Vec<(Source, &str)> = sources_for(self.model.add.service)
+            .into_iter()
+            .map(|s| (s, model::source_label(s)))
             .collect();
         let source = self.choice(
             "src",
@@ -1267,6 +1272,10 @@ impl Manager {
             Source::Demo => {
                 "Sample figures for trying a display out. They always show as DEMO, never as real usage."
             }
+            Source::Collector => {
+                "The PC helper sends what Claude Code or Codex reports on a PC where you're signed in. Set it up \
+                 in Settings. They show as REPORTED."
+            }
             _ => "The page shows as unavailable until figures arrive.",
         };
         ui::with_ticks(
@@ -1291,13 +1300,10 @@ impl Manager {
             e.metrics.iter().map(|x| x.window).collect::<Vec<_>>(),
         );
         let title = self.field(FieldId::EditTitle, "Title on the display", "", window, cx);
-        let mut sources: Vec<(Source, &str)> = ADDABLE_SOURCES
-            .iter()
-            .map(|s| (*s, model::source_label(*s)))
+        let sources: Vec<(Source, &str)> = sources_for(service)
+            .into_iter()
+            .map(|s| (s, model::source_label(s)))
             .collect();
-        if source == Source::Collector {
-            sources.insert(0, (Source::Collector, model::source_label(Source::Collector)));
-        }
         let pick = self.choice("edit-src", "Figures", &sources, source, cx, |this, v| {
             if let Some(e) = this.model.edit.as_mut() {
                 e.source = v;
@@ -1605,6 +1611,7 @@ impl Manager {
                     .child(div().flex().flex_wrap().gap(px(8.0)).child(copy_fp).child(copy_diag).child(forget)),
             ),
         );
+        let helper_panel = self.helper_panel(m, cx);
         let about = ui::with_ticks(
             ui::panel(Some(("About", "")), m).child(
                 ui::body(m)
@@ -1624,7 +1631,16 @@ impl Manager {
                 .flex()
                 .items_start()
                 .gap(px(m.gap))
-                .child(div().flex_1().min_w_0().child(hub_panel))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(m.gap))
+                        .child(hub_panel)
+                        .child(helper_panel),
+                )
                 .child(div().w(px(460.0)).flex_none().child(about))
         } else {
             div()
@@ -1632,9 +1648,203 @@ impl Manager {
                 .flex_col()
                 .gap(px(m.gap))
                 .child(hub_panel)
+                .child(helper_panel)
                 .child(about)
         };
         vec![head, row.into_any_element()]
+    }
+
+    /// An on/off control, for choices that aren't exclusive.
+    fn toggle(
+        &mut self,
+        id: &str,
+        text: &str,
+        on: bool,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut Self) + 'static,
+    ) -> impl IntoElement {
+        let key: SharedString = id.to_string().into();
+        let fh = self.fh(key.clone(), cx);
+        let hot = self.is_hot(&key);
+        div()
+            .id(ElementId::Name(key.clone()))
+            .on_hover(Self::track_hover(key, cx))
+            .role(Role::CheckBox)
+            .aria_label(SharedString::from(text.to_string()))
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
+            .track_focus(&fh)
+            .p(px(2.0))
+            .border_2()
+            .border_color(c(BLACK))
+            .focus_visible(|s| s.border_color(c(BEAK)))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                set(this);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.0))
+                    .min_h(px(TARGET_MIN - 4.0))
+                    .px(px(14.0))
+                    .border_1()
+                    .border_color(c(if on {
+                        BEAK
+                    } else if hot {
+                        TEXT
+                    } else {
+                        MUTED
+                    }))
+                    .text_color(c(if on {
+                        BEAK
+                    } else if hot {
+                        TEXT
+                    } else {
+                        MUTED
+                    }))
+                    .font_family(FONT_MONO)
+                    .text_size(px(BUTTON_SIZE))
+                    .child(
+                        div()
+                            .size(px(10.0))
+                            .when(on, |d| d.bg(c(BEAK)))
+                            .when(!on, |d| d.border_1().border_color(c(MUTED))),
+                    )
+                    .child(ui::spaced(&text.to_uppercase(), BUTTON_SIZE, BUTTON_TRACKING_EM)),
+            )
+    }
+
+    fn helper_panel(&mut self, m: Metrics, cx: &mut Context<Self>) -> Div {
+        let busy = self.model.busy.is_some();
+        let claude = self.toggle(
+            "helper-claude",
+            "Claude Max (Claude Code)",
+            self.model.helper.claude,
+            cx,
+            |this| this.model.helper.claude = !this.model.helper.claude,
+        );
+        let chatgpt = self.toggle(
+            "helper-chatgpt",
+            "ChatGPT Plus (Codex)",
+            self.model.helper.chatgpt,
+            cx,
+            |this| this.model.helper.chatgpt = !this.model.helper.chatgpt,
+        );
+        let create = self.button(
+            "helper-create",
+            "Create helper string",
+            Kind::Secondary,
+            !busy,
+            cx,
+            |this, _, cx| {
+                let op = this.model.create_helper();
+                this.run(op, cx);
+            },
+        );
+        let mut body = ui::body(m)
+            .child(ui::p_muted(
+                "hubctl runs on a PC where Claude Code or Codex is signed in, and forwards the plan limits they \
+                 report there. Pages whose figures are set to PC helper show them, marked REPORTED. It reads \
+                 nothing else: no browser data, passwords or other apps' tokens.",
+            ))
+            .child(div().flex().flex_wrap().gap(px(8.0)).child(claude).child(chatgpt))
+            .child(div().flex().child(create));
+        if let Some(s) = self.model.helper.string.clone() {
+            let shown: String = s
+                .as_bytes()
+                .chunks(24)
+                .map(|c| String::from_utf8_lossy(c).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let full = s.to_string();
+            let copy = self.button(
+                "helper-copy",
+                "Copy helper string",
+                Kind::Primary,
+                true,
+                cx,
+                move |this, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
+                    this.model.notice = Some(Guidance::done(
+                        "Copied the helper string",
+                        "Paste it where hubctl login asks. It works once, within 10 minutes.",
+                    ));
+                },
+            );
+            body = body.child(
+                div()
+                    .id("helper-string")
+                    .role(Role::Group)
+                    .aria_label("Helper string")
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .p(px(14.0))
+                    .border_1()
+                    .border_color(c(LINE))
+                    .child(ui::label("Helper string: works once, within 10 minutes"))
+                    .child(ui::data(shown))
+                    .child(div().flex().child(copy))
+                    .child(ui::p_muted(
+                        "On that PC, run hubctl login and paste it. Then add hubctl claude-statusline as Claude \
+                         Code's status line, or schedule hubctl-sync for Codex: docs/providers.md has the steps.",
+                    )),
+            );
+        }
+        let helpers = self.model.helpers().to_vec();
+        if !helpers.is_empty() {
+            let mut list = div().flex().flex_col().gap(px(8.0)).child(ui::label("Set up"));
+            for h in helpers {
+                let services = h
+                    .services
+                    .iter()
+                    .map(|s| s.default_title())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let id = h.id.clone();
+                let row = div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(12.0))
+                    .py(px(6.0))
+                    .border_t_1()
+                    .border_color(c(LINE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(200.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(ui::h3(h.label.clone()))
+                            .child(ui::label(&format!(
+                                "{services} · paired {}",
+                                nz_date(h.created_at)
+                            ))),
+                    );
+                list = list.child(if h.revoked {
+                    row.child(ui::tag("Removed", MUTED))
+                } else {
+                    row.child(self.button(
+                        format!("helper-revoke-{id}"),
+                        "Remove",
+                        Kind::Quiet,
+                        !busy,
+                        cx,
+                        move |this, window, cx| {
+                            this.model.ask_revoke_helper(&id);
+                            let fh = this.fh("confirm-no", cx);
+                            window.focus(&fh, cx);
+                        },
+                    ))
+                });
+            }
+            body = body.child(list);
+        }
+        ui::with_ticks(ui::panel(Some(("PC helper", "Optional")), m).child(body))
     }
 
     fn confirm_view(&mut self, c: &Confirm, m: Metrics, cx: &mut Context<Self>) -> impl IntoElement {
