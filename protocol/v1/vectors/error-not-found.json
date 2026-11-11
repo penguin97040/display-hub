@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-not-found",
+  "description": "A path the hub doesn't serve.",
+  "response": {
+    "status": 404,
+    "body": "{\"error\":{\"code\":\"not_found\",\"message\":\"Not found.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "fault",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": "not_found",
+    "pages": []
+  }
+}

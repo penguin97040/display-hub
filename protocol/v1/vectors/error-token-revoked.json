@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-token-revoked",
+  "description": "The display was removed in the manager.",
+  "response": {
+    "status": 401,
+    "body": "{\"error\":{\"code\":\"token_revoked\",\"message\":\"This display's access was revoked.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "reprovision",
+    "next_poll": "hourly",
+    "refresh_after_seconds": null,
+    "error_code": "token_revoked",
+    "pages": []
+  }
+}

@@ -55,3 +55,43 @@ fn secrets_never_show_in_debug_output() {
             .unwrap();
     assert!(!format!("{e:?}").contains(&e.enrolment_secret));
 }
+
+#[test]
+fn usb_messages_match_their_schema_and_types() {
+    use hub_protocol::usb::{FromDisplay, ToDisplay};
+    let read = |p: &str| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(dir().join(p)).unwrap()).unwrap()
+    };
+    // The provisioning schema, inlined where usb.schema.json refers to it by its $id.
+    let mut schema = read("usb.schema.json");
+    let mut bundle = read("provisioning.schema.json");
+    bundle
+        .as_object_mut()
+        .unwrap()
+        .retain(|k, _| k != "$schema" && k != "$id");
+    schema["oneOf"][1]["properties"]["bundle"] = bundle;
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for (file, from_manager) in [
+        ("manager-hello.json", true),
+        ("manager-provision.json", true),
+        ("display-hello.json", false),
+        ("display-provisioned.json", false),
+        ("display-error.json", false),
+    ] {
+        let v = read(&format!("examples/usb/{file}"));
+        let errors: Vec<_> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
+        assert!(errors.is_empty(), "{file}: {errors:?}");
+        if from_manager {
+            let _: ToDisplay = round_trip(v);
+        } else {
+            let _: FromDisplay = round_trip(v);
+        }
+    }
+    // Each example is one line, as on the wire.
+    for f in std::fs::read_dir(dir().join("examples/usb")).unwrap() {
+        let text = std::fs::read_to_string(f.unwrap().path()).unwrap();
+        assert_eq!(text.matches('\n').count(), 1);
+        assert!(text.len() <= hub_protocol::usb::MAX_LINE_BYTES);
+    }
+    assert!(!validator.is_valid(&serde_json::json!({"type": "provision", "bundle": {}})));
+}

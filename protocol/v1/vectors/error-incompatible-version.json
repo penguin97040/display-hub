@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-incompatible-version",
+  "description": "The hub doesn't serve this display's protocol version.",
+  "response": {
+    "status": 400,
+    "body": "{\"error\":{\"code\":\"incompatible_version\",\"message\":\"Unsupported protocol version.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "incompatible",
+    "next_poll": "hourly",
+    "refresh_after_seconds": null,
+    "error_code": "incompatible_version",
+    "pages": []
+  }
+}

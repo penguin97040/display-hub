@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-unavailable",
+  "description": "The hub is busy.",
+  "response": {
+    "status": 503,
+    "body": "{\"error\":{\"code\":\"unavailable\",\"message\":\"Try again shortly.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "retry",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": "unavailable",
+    "pages": []
+  }
+}

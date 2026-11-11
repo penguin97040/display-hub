@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-rate-limited",
+  "description": "Too many requests.",
+  "response": {
+    "status": 429,
+    "body": "{\"error\":{\"code\":\"rate_limited\",\"message\":\"Slow down.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "retry",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": "rate_limited",
+    "pages": []
+  }
+}

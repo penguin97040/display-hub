@@ -74,14 +74,19 @@ impl Problem {
             ClientError::Malformed(d) => Problem::BadResponse(capitalise(d)),
             ClientError::Status { status, body } => {
                 let message = body.as_ref().map(|b| b.error.message.clone()).unwrap_or_default();
-                match body.as_ref().map(|b| b.error.code.action()) {
-                    Some(ErrorAction::Reprovision) => Problem::NeedsSetup(message),
-                    Some(ErrorAction::Incompatible) => Problem::Incompatible(message),
-                    Some(ErrorAction::Retry) => Problem::Busy(message),
-                    _ if *status == 401 || *status == 403 => {
-                        Problem::NeedsSetup("The hub didn't accept this display's credentials.".into())
+                // Exactly the protocol's grouping (`ErrorCode::action`), so the vectors and this agree.
+                match body.as_ref().map(|b| (b.error.code, b.error.code.action())) {
+                    Some((_, ErrorAction::Reprovision)) => Problem::NeedsSetup(message),
+                    Some((_, ErrorAction::Incompatible)) => Problem::Incompatible(message),
+                    Some((_, ErrorAction::Retry)) => Problem::Busy(message),
+                    Some((code, ErrorAction::Fault)) => {
+                        Problem::BadResponse(format!("The hub refused the request ({})", code.as_str()))
                     }
-                    _ => Problem::BadResponse(format!("The hub answered with error {status}")),
+                    // No structured error: a proxy or a crash. Server errors pass; others are faults.
+                    None if *status >= 500 => {
+                        Problem::Busy(format!("The hub had a problem (error {status})."))
+                    }
+                    None => Problem::BadResponse(format!("The hub answered with error {status}")),
                 }
             }
         }

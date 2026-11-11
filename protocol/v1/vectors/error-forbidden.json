@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-forbidden",
+  "description": "A credential for another role.",
+  "response": {
+    "status": 403,
+    "body": "{\"error\":{\"code\":\"forbidden\",\"message\":\"Not allowed.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "fault",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": "forbidden",
+    "pages": []
+  }
+}

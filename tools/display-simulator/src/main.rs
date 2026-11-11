@@ -51,6 +51,12 @@ impl Target {
     }
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ConformAction {
+    Check,
+    Write,
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Set this simulated display up from a provisioning bundle, as the manager does over USB.
@@ -92,6 +98,18 @@ enum Command {
         /// Wait at most this many seconds between polls (to watch changes quickly while testing).
         #[arg(long)]
         max_wait: Option<u64>,
+    },
+    /// Conformance vectors for display firmware (protocol/v1/vectors): `check` proves the files match
+    /// this reference display; `write` regenerates them from protocol/v1.
+    Conform {
+        #[arg(value_enum)]
+        action: ConformAction,
+        /// The vectors folder.
+        #[arg(long, default_value = "protocol/v1/vectors")]
+        dir: PathBuf,
+        /// The protocol folder the vectors are built from (for `write`).
+        #[arg(long, default_value = "protocol/v1")]
+        protocol: PathBuf,
     },
     /// Check snapshot files against protocol v1 as a hub must follow it.
     Validate {
@@ -152,6 +170,39 @@ async fn main() -> ExitCode {
             }
         }
         Command::Usb { state, once } => usb(&state, once).await,
+        Command::Conform {
+            action,
+            dir,
+            protocol,
+        } => match action {
+            ConformAction::Write => match display_simulator::conform::write(&protocol, &dir) {
+                Ok(n) => {
+                    println!("Wrote {n} vectors to {}.", dir.display());
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("display-simulator: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            ConformAction::Check => match display_simulator::conform::check(&dir) {
+                Ok((n, failures)) if failures.is_empty() && n > 0 => {
+                    println!("All {n} vectors match the reference display.");
+                    ExitCode::SUCCESS
+                }
+                Ok((n, failures)) => {
+                    for f in &failures {
+                        eprintln!("FAIL {f}");
+                    }
+                    eprintln!("{} of {n} vectors failed", failures.len());
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("display-simulator: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+        },
         Command::Reset { state } => match paired::reset(&state) {
             Ok(()) => {
                 println!("Erased the display's credentials and saved data.");

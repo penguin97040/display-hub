@@ -5,6 +5,7 @@
 //! and explains problems in plain words.
 
 pub mod cache;
+pub mod conform;
 pub mod device;
 pub mod paired;
 pub mod render;

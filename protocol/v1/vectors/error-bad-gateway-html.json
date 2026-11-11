@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-bad-gateway-html",
+  "description": "A proxy's error page, with no structured error.",
+  "response": {
+    "status": 502,
+    "body": "<html>Bad Gateway</html>"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "retry",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": null,
+    "pages": []
+  }
+}

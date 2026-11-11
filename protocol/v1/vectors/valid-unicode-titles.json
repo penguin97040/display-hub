@@ -1,0 +1,36 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "valid-unicode-titles",
+  "description": "A valid snapshot: examples/valid/unicode-titles.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"dashboard_id\": \"llm-usage\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"tohu\",\n      \"title\": \"Tēnā koe — Māori title\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T19:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"metrics\": [\n        {\n          \"id\": \"a\",\n          \"label\": \"Whakamātautau\",\n          \"used_percent\": 0.0,\n          \"resets_at\": null\n        }\n      ]\n    }\n  ]\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": [
+      {
+        "id": "tohu",
+        "title": "Tēnā koe — Māori title",
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 3600,
+        "stale": true,
+        "metrics": [
+          {
+            "id": "a",
+            "label": "Whakamātautau",
+            "used_percent": 0.0,
+            "resets_in_seconds": null,
+            "reset_due": false
+          }
+        ]
+      }
+    ]
+  }
+}

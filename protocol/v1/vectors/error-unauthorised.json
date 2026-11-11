@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-unauthorised",
+  "description": "No usable credential: a fault, not a reason to forget the hub.",
+  "response": {
+    "status": 401,
+    "body": "{\"error\":{\"code\":\"unauthorised\",\"message\":\"The hub doesn't recognise this credential.\"}}"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "fault",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": "unauthorised",
+    "pages": []
+  }
+}

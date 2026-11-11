@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "not-json",
+  "description": "A captive portal or proxy page instead of JSON.",
+  "response": {
+    "status": 200,
+    "body": "<html><body>Sign in to Wi-Fi</body></html>"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "unreadable",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": null,
+    "pages": []
+  }
+}

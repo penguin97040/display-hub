@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:display-hub:protocol:v1:usb",
+  "title": "USB serial provisioning messages",
+  "description": "One UTF-8 JSON object per line, ending in \\n, at most 16 KiB. Lines not starting with { are ignored. See docs/protocol-v1.md, 'Over USB'. The manager sends hello and provision; the display answers hello, provisioned or error.",
+  "oneOf": [
+    {
+      "title": "Manager: hello",
+      "type": "object",
+      "required": ["type", "protocol_version"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "hello" },
+        "protocol_version": { "const": 1 }
+      }
+    },
+    {
+      "title": "Manager: provision",
+      "type": "object",
+      "required": ["type", "bundle"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "provision" },
+        "bundle": { "$ref": "urn:display-hub:protocol:v1:provisioning-bundle" }
+      }
+    },
+    {
+      "title": "Display: hello",
+      "type": "object",
+      "required": ["type", "device_type", "firmware_version", "hardware_revision", "protocol_version", "provisioned"],
+      "properties": {
+        "type": { "const": "hello" },
+        "device_type": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "firmware_version": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "hardware_revision": { "type": "string", "minLength": 1, "maxLength": 48 },
+        "protocol_version": { "type": "integer", "minimum": 1 },
+        "provisioned": { "type": "boolean", "description": "Whether it already holds a bundle. If so it refuses another until factory-reset on the device." }
+      }
+    },
+    {
+      "title": "Display: provisioned",
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "provisioned" } }
+    },
+    {
+      "title": "Display: error",
+      "type": "object",
+      "required": ["type", "code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "error" },
+        "code": { "enum": ["invalid_bundle", "already_provisioned", "storage_failed"] },
+        "message": { "type": "string", "maxLength": 200 }
+      }
+    }
+  ]
+}

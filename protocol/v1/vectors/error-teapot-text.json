@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "error-teapot-text",
+  "description": "A client error with no structured error.",
+  "response": {
+    "status": 418,
+    "body": "no"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "fault",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": null,
+    "pages": []
+  }
+}

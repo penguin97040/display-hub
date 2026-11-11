@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "invalid-unavailable-with-metrics",
+  "description": "A snapshot that breaks the protocol: examples/invalid/unavailable-with-metrics.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"dashboard_id\": \"llm-usage\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"claude-max\",\n      \"title\": \"Claude Max\",\n      \"data_quality\": \"demo\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": \"Sample figures, not real usage\",\n      \"metrics\": [\n        {\n          \"id\": \"five-hour\",\n          \"label\": \"Five-hour allowance used\",\n          \"used_percent\": 42.0,\n          \"resets_at\": \"2026-11-10T22:00:00Z\"\n        },\n        {\n          \"id\": \"weekly\",\n          \"label\": \"Weekly allowance used\",\n          \"used_percent\": 24.0,\n          \"resets_at\": \"2026-11-15T00:00:00Z\"\n        }\n      ]\n    },\n    {\n      \"id\": \"chatgpt-plus\",\n      \"title\": \"ChatGPT Plus\",\n      \"data_quality\": \"unavailable\",\n      \"updated_at\": null,\n      \"stale_after_seconds\": 1800,\n      \"note\": \"No supported source connected yet\",\n      \"metrics\": [\n        {\n          \"id\": \"x\",\n          \"label\": \"X\",\n          \"used_percent\": 1.0,\n          \"resets_at\": null\n        }\n      ]\n    },\n    {\n      \"id\": \"opencode-go-plus\",\n      \"title\": \"OpenCode Go Plus\",\n      \"data_quality\": \"demo\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": \"Sample figures, not real usage\",\n      \"metrics\": [\n        {\n          \"id\": \"five-hour\",\n          \"label\": \"Five-hour allowance used\",\n          \"used_percent\": 17.0,\n          \"resets_at\": null\n        }\n      ]\n    }\n  ]\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "unreadable",
+    "next_poll": "backoff",
+    "refresh_after_seconds": null,
+    "error_code": null,
+    "pages": []
+  }
+}

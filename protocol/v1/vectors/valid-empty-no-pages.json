@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "valid-empty-no-pages",
+  "description": "A valid snapshot: examples/valid/empty-no-pages.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"dashboard_id\": \"llm-usage\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": []\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": []
+  }
+}
