@@ -81,13 +81,21 @@
 - **Setup details over USB** go only to the port you choose. **Save as a file** writes a file you should delete once the display has checked in; the manager says so.
 - **What it talks to:** only the paired hub, pinned by key. It makes no other network requests and collects nothing.
 
+## The PC helper (`hubctl`)
+
+- **What it reads:** only what Claude Code passes its status line on stdin, and what `codex app-server` answers. It reads no browser data, passwords or other apps' tokens, and calls no provider endpoint itself ([providers.md](providers.md)).
+- **What it holds:** a collector token (`dhc_`), in the OS credential store, never a file. `hubctl.json` has only the hub's address and key hash. The helper string is read from stdin, never the command line, so it stays out of shell history and process lists.
+- **What its token can do:** report figures for the services it was invited for (Claude Max, ChatGPT Plus or both), and only to pages whose figures come from "PC helper". The hub refuses other services (403), figures dated more than five minutes ahead, and shares outside 0–100. It can't read anything, change pages, or act as an admin or a display.
+- **Cutting it off:** **Settings**, **PC helper**, **Remove** in the manager. Its token stops working at once. `hubctl logout` deletes it from that PC.
+- **Invites** work once, within 10 minutes. A reused invite is recorded as an `ALARM_` audit event, as pairing codes are.
+
 ## Credentials
 
 | Credential | Who holds it | Can do | Stored on the hub as |
 |---|---|---|---|
 | Admin token `dha_` | Desktop manager (OS credential store) | Everything under `/v1/admin/` | SHA-256 hash |
 | Device token `dhd_` | One display (encrypted NVS) | Read the snapshot, send heartbeats, as itself only | SHA-256 hash |
-| Collector token `dhc_` (milestone 5) | PC helper (OS credential store) | Report figures for the pages it is assigned | SHA-256 hash |
+| Collector token `dhc_` | PC helper `hubctl` (OS credential store) | Report figures for the services it was invited for, to pages whose source is "PC helper". Nothing else. | SHA-256 hash |
 | Pairing and enrolment secrets | Pairing string, bundle | Exchanged once for a token, within 10 minutes | SHA-256 hash |
 
 - Each token type has its own prefix. A token used on another role's route gets `403`.

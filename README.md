@@ -24,6 +24,7 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | `hubd dev`: local demo hub over plain HTTP, loopback only | Working, tested |
 | `display-simulator`: enrolment, polling, saved data, outages, text screen | Working, tested |
 | `hubd serve`: HTTPS with a pinned identity, SQLite, admin pairing, display enrolment and revocation | Working, tested on Linux (including an mbedTLS client). Not yet on a Pi. |
+| PC helper (`apps/hubctl`): Claude Code status line and Codex limits, forwarded as provider-reported | Tested against stand-ins for both tools. Not yet with a live Claude Code or Codex: [docs/providers.md](docs/providers.md). |
 | Raspberry Pi install (`deploy/raspberry-pi`): hardened systemd service, backups, upgrades | Tested in a systemd container and under ARM64 emulation. Not yet on a real Pi: [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md). |
 | Desktop manager (`apps/hub-manager`): pairing, pages, manual figures, displays, USB setup | Working, tested on Linux (including screenshots) and built for Windows. Not yet tried on a Windows desktop: [docs/windows-testing.md](docs/windows-testing.md). |
 

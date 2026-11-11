@@ -9,6 +9,8 @@
 | `crates/hub-client` | Client for the hub's HTTP API, used by the simulator, the manager and the PC helper. |
 | `apps/hubd` | The hub service (library plus a command-line binary). |
 | `apps/hub-manager` | The native desktop manager (GPUI). |
+| `apps/hubctl` | The PC helper: forwards Claude Code and Codex usage figures ([providers.md](providers.md)). |
+| `crates/os-secrets` | Tokens in the OS credential store, shared by the manager and `hubctl`. |
 | `tools/display-simulator` | Emulates a display, for testing without hardware. |
 | `protocol/v1` | JSON Schema and valid and invalid example snapshots. |
 | `design/tokens.json` | The zvx.nz design tokens the manager follows (a copy; see the file's header). |
@@ -107,6 +109,18 @@ This builds a small C client configured like ESP-IDF's HTTP client and checks fo
 - a wrong name is refused.
 
 CI runs it too.
+
+## The PC helper against a local hub
+
+```sh
+cargo run -p hubd -- pair-helper --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1 --service claude-max
+cargo run -p hubctl -- --config-dir dev-data/helper login        # paste the string
+echo '{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1900000000}}}' \
+  | cargo run -p hubctl -- --config-dir dev-data/helper claude-statusline
+cargo run -p hubctl -- --config-dir dev-data/helper status
+```
+
+`pair-helper` makes the same invite as the manager's **Settings**, **PC helper**. The figures appear on Claude Max pages whose figures are set to **PC helper**.
 
 ## Building for the Raspberry Pi
 

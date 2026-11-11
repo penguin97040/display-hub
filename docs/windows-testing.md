@@ -93,6 +93,25 @@ Sending setup details over USB needs the display firmware to speak the serial ex
 
 The manager opens the port with DTR set and RTS clear, so an ESP32 board shouldn't reset when the port opens. If one does, the manager repeats its hello every 2 seconds until the board answers.
 
+## 6. The PC helper (optional)
+
+Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) has the full set-up.
+
+1. In the manager, open **Settings**, then **PC helper**. Choose **Create helper string**, then **Copy helper string**.
+2. Run `.\dist\hubctl.exe login` and paste it. Expect "Paired with the hub at 127.0.0.1:8443 …".
+3. In **Pages**, set a Claude Max page's figures to **PC helper**.
+4. **Claude Code:** add `{"statusLine": {"type": "command", "command": "C:/path/to/dist/hubctl.exe claude-statusline"}}` to `%USERPROFILE%\.claude\settings.json`, and send Claude a message. Use forward slashes: Claude Code runs the command through Git Bash, where backslashes are escape characters.
+   - Expect a status line like `Opus 4.7 · 5h 42% · 7d 18%`.
+   - Within a minute, the page shows those figures as REPORTED.
+   - `.\dist\hubctl.exe status` shows the send.
+5. **Codex:** run `.\dist\hubctl.exe codex-sync --dry-run`.
+   - Expect "Codex reports five-hour …, weekly …".
+   - Without `--dry-run`, it sends them to a ChatGPT Plus page set to **PC helper**.
+   - In Task Scheduler, `dist\hubctl-sync.exe` should run with no window.
+6. Remove the helper in **Settings**. The next send is refused, and `hubctl status` says why.
+
+Also check, anywhere in the manager: a hover highlight follows the pointer and never stays lit after the pointer leaves.
+
 ## Reporting back
 
 Say which rows matched, which didn't, and what you saw instead. A screenshot (Win+Shift+S) helps with anything visual. **Copy diagnostics** in Settings gives a summary with no credentials in it.
