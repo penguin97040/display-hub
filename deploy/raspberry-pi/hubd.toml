@@ -1,0 +1,21 @@
+# Display Hub settings: /etc/display-hub/hubd.toml. Nothing here is secret.
+# Every line is optional; these are the defaults. Restart after a change:
+#   sudo systemctl restart display-hub
+
+# Where to listen. All IPv4 interfaces on port 8443. hubd still refuses connections from outside
+# your local network (private, link-local and loopback addresses only).
+# listen = "0.0.0.0:8443"
+
+# Database and TLS identity. Keep it on the Pi's own storage, readable only by the service.
+# data_dir = "/var/lib/display-hub"
+
+# Also accept link-local and unique local IPv6 sources (never global IPv6). Off by default.
+# allow_ipv6 = false
+
+# How often displays check for changes, in seconds (30-3600).
+# refresh_after_seconds = 300
+
+# Where displays and the desktop manager should look for the hub, in order. Empty means this
+# Pi's name with .local (for example raspberrypi.local). Adding the Pi's fixed address helps
+# displays whose network can't resolve .local names:
+# advertise_hosts = ["raspberrypi.local", "192.168.1.20"]

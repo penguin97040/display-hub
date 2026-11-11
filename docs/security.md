@@ -64,6 +64,14 @@
 3. The display connects over Wi-Fi, checks the certificate and name, and enrols. It receives a revocable device token (`dhd_…`) and keeps it in encrypted flash.
 4. **Revoking a display:** remove it in the manager. Its token stops working on the next poll, and the display shows that it needs setting up again. It never held a provider credential.
 
+## On the Pi
+
+- The service runs as its own `display-hub` user with no capabilities, a read-only view of the system, private `/tmp` and devices, a system-call filter, and only local network addresses. `systemd-analyze security` rates it 1.0 ("OK").
+- `/var/lib/display-hub` is 0700 and the key 0600. `hubd check` reports a data folder others can read.
+- **Backups contain the private key.** `hubd backup` writes them 0700/0600 and says so. Keep copies off the Pi somewhere private.
+- `hubd restore` refuses while the hub runs, and moves whatever it replaces aside instead of deleting it.
+- `hubd display-bundle` writes a setup file, owner-only, for adding a display from the Pi itself. It works once, within 10 minutes.
+
 ## The desktop manager
 
 - **The admin token** goes to the operating system's credential store: Windows Credential Manager, or the Secret Service on Linux. The manager checks the store works before pairing, so the hub never issues a token the PC can't keep, and it never falls back to a file.
@@ -91,7 +99,7 @@
 - `hubd serve` listens on IPv4 port 8443 by default.
 - Before TLS starts, it closes connections from anything except private, link-local and loopback addresses.
 - IPv6 is off by default. When it is on, only link-local and unique local sources are accepted, never global addresses, because a home router's IPv6 firewall can't be relied on.
-- Use the firewall rule in `deploy/raspberry-pi/` (milestone 4) as well. There is no UPnP and no port forwarding.
+- The systemd unit allows the service only local addresses too (`IPAddressAllow=`), and `deploy/raspberry-pi/nftables-display-hub.conf` can drop other sources before they reach it. There is no UPnP and no port forwarding.
 - **Request limits:** request bodies are limited (2 KiB for displays, 16 KiB for admin). Requests time out after 10 seconds, TLS handshakes after 10 seconds, and headers after 10 seconds. At most 128 connections and 64 requests are handled at once.
 - **Rate limits:** failed sign-ins are limited to 20 a minute per address. Pairing and enrolment attempts are limited to 10 per 10 minutes per address. A 128-bit code can't be guessed within those limits.
 
@@ -103,7 +111,7 @@
 | A display's Wi-Fi password changed | Factory-reset the display, then add it again (new bundle). Its old entry can be removed. |
 | The PC with the manager is lost | On the Pi: `hubd admin list`, then `hubd admin revoke <id>`, or `revoke-all`. Pair the new PC with `pair-admin`. |
 | The Pi's address changed | Nothing. Displays try every address in their bundle, and the key, not the address, identifies the hub. A fixed DHCP lease is still recommended. |
-| The SD card failed or the Pi was replaced | Restore the latest backup, which includes the identity (milestone 4). Without the identity, every display and admin must be set up again. |
+| The SD card failed or the Pi was replaced | Install, then `hubd restore` the latest backup, which includes the identity ([deploy-raspberry-pi.md](deploy-raspberry-pi.md#backups)). Without the identity, every display and admin must be set up again. |
 | The key must change (suspected compromise) | Not automated in v0. Stop the hub, move `identity/` and the database aside, start fresh, then pair the manager and re-provision every display. Bundles already have room for two trust anchors, so a later version can roll keys over without re-provisioning. |
 | A pairing or enrolment code appears in the audit log as `ALARM_` | Someone tried a code that had already been used. Check `hubd admin list` and the manager's list of displays, and revoke anything you don't recognise. |
 

@@ -1,0 +1,72 @@
+# Display Hub: serves pages to displays and the desktop manager on the local network.
+# Installed by install.sh as /etc/systemd/system/display-hub.service.
+[Unit]
+Description=Display Hub
+Documentation=https://github.com/penguin97040/display-hub/blob/main/docs/deploy-raspberry-pi.md
+# Starts once the network is up. It doesn't wait for the clock: displays keep working without the
+# internet, and the hub reports an unsynchronised clock instead.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=display-hub
+Group=display-hub
+ExecStart=/usr/local/bin/hubd serve
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# /var/lib/display-hub (0700) and /etc/display-hub, owned and created by systemd.
+StateDirectory=display-hub
+StateDirectoryMode=0700
+ConfigurationDirectory=display-hub
+UMask=0077
+
+# No privileges at all: the port is above 1024.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem: read-only everywhere except the state folder.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel and system.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+PrivateUsers=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A refused system call fails instead of killing the hub.
+SystemCallErrorNumber=EPERM
+
+# Network: IPv4 and IPv6 sockets only, and only to and from local addresses. hubd also refuses
+# other sources itself; this is a second wall. Add your own range if your LAN uses another.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost link-local multicast 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 fc00::/7
+
+# Resources: generous for a few displays, and a ceiling if something goes wrong.
+MemoryMax=256M
+TasksMax=64
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target

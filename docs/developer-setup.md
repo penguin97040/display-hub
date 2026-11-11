@@ -108,6 +108,20 @@ This builds a small C client configured like ESP-IDF's HTTP client and checks fo
 
 CI runs it too.
 
+## Building for the Raspberry Pi
+
+```sh
+cargo install --locked cargo-zigbuild    # and zig 0.15 on PATH
+cargo zigbuild --release --locked -p hubd --target aarch64-unknown-linux-gnu.2.36
+```
+
+[deploy-raspberry-pi.md](deploy-raspberry-pi.md) covers the rest. To test the installer and service without a Pi, in a Debian container running systemd (Docker that allows a privileged container is needed):
+
+```sh
+cargo zigbuild --release --locked -p hubd -p display-simulator --target x86_64-unknown-linux-gnu.2.36
+bash tools/pi-container-test/run.sh
+```
+
 ## Cross-building the desktop manager for Windows from Linux
 
 This build is for trying changes on a Windows machine. It compiles the shaders when the app first starts, using the system's `d3dcompiler_47.dll`.

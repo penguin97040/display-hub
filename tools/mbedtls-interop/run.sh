@@ -34,7 +34,6 @@ start_hub() { # data-dir port
 start_hub "$work/hub-a" 18443
 start_hub "$work/hub-b" 18444
 cert_a=$work/hub-a/identity/hub-cert.pem
-cert_b=$work/hub-b/identity/hub-cert.pem
 name=hub.display-hub.internal
 failures=0
 
@@ -58,4 +57,9 @@ expect "an authenticated route answers over mbedTLS (401 for a fake token)" 0 12
 expect "a different hub (another key) is refused" 2 127.0.0.1 18444 "$cert_a" "$name" tls12 /v1/health
 expect "the wrong server name is refused" 2 127.0.0.1 18443 "$cert_a" raspberrypi.local tls12 /v1/health
 
-[ "$failures" = 0 ] && echo "mbedTLS interop: all passed" || { echo "mbedTLS interop: $failures failed"; exit 1; }
+if [ "$failures" = 0 ]; then
+  echo "mbedTLS interop: all passed"
+else
+  echo "mbedTLS interop: $failures failed"
+  exit 1
+fi

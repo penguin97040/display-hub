@@ -99,6 +99,49 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  pi:
+    # The Raspberry Pi release build (aarch64 against glibc 2.36, so it runs on Raspberry Pi OS
+    # Bookworm and Trixie), then the installer and service tested in a Debian Bookworm container
+    # running systemd. A container, not a Pi.
+    runs-on: ubuntu-24.04
+    env:
+      ZIG_VERSION: 0.15.2
+      ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
+      CARGO_ZIGBUILD_VERSION: 0.24.0
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install zig and cargo-zigbuild
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" \
+            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
+          echo "${ZIG_SHA256}  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/zig"
+          tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
+          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+      - name: Build hubd for the Pi
+        run: |
+          cargo zigbuild --release --locked -p hubd --target aarch64-unknown-linux-gnu.2.36
+          bin=target/aarch64-unknown-linux-gnu/release/hubd
+          readelf -h "$bin" | grep -q AArch64
+          newest=$(readelf -V "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
+          echo "hubd needs at most $newest"
+          [ "$(printf '%s\nGLIBC_2.36\n' "$newest" | sort -V | tail -1)" = GLIBC_2.36 ]
+      - name: Install and run the service in a systemd container
+        run: |
+          cargo zigbuild --release --locked -p hubd -p display-simulator --target x86_64-unknown-linux-gnu.2.36
+          bash tools/pi-container-test/run.sh
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hubd-raspberry-pi-arm64
+          path: target/aarch64-unknown-linux-gnu/release/hubd
+          if-no-files-found: error
+          retention-days: 14
+
   arm64:
     # Tests on ARM64 Linux, like the Pi. Release binaries for the Pi are not made here: this runner's
     # glibc is newer than Raspberry Pi OS Bookworm's (see docs/deploy-raspberry-pi.md).

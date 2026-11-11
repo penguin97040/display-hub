@@ -24,6 +24,7 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | `hubd dev`: local demo hub over plain HTTP, loopback only | Working, tested |
 | `display-simulator`: enrolment, polling, saved data, outages, text screen | Working, tested |
 | `hubd serve`: HTTPS with a pinned identity, SQLite, admin pairing, display enrolment and revocation | Working, tested on Linux (including an mbedTLS client). Not yet on a Pi. |
+| Raspberry Pi install (`deploy/raspberry-pi`): hardened systemd service, backups, upgrades | Tested in a systemd container and under ARM64 emulation. Not yet on a real Pi: [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md). |
 | Desktop manager (`apps/hub-manager`): pairing, pages, manual figures, displays, USB setup | Working, tested on Linux (including screenshots) and built for Windows. Not yet tried on a Windows desktop: [docs/windows-testing.md](docs/windows-testing.md). |
 
 The ESP32 firmware lives in a separate repository, `llm-usage-display`. This repository defines the protocol it follows.

@@ -31,7 +31,9 @@
 | No provider code runs on the Pi. | No provider documents a usage API the Pi could call on its own (see `docs/providers.md`, milestone 5). Figures arrive from a PC helper, from manual entry, or not at all. |
 | GPUI is pinned at `gpui-pre` 0.3.11, with a vendored Windows backend. | It matches md-viewer, a shipping app on the same stack. The vendored backend lets a Linux sandbox cross-build Windows executables. |
 | ECDSA P-256 for the hub's TLS key, TLS 1.2 kept alongside 1.3, and a fixed certificate name. | This is what ESP-IDF's mbedTLS supports well (milestone 2). |
-| Pi releases built against a glibc 2.36 baseline. | One binary runs on Raspberry Pi OS Bookworm and Trixie (milestone 4). |
+| Pi releases built with `cargo zigbuild` against glibc 2.36. | One binary runs on Raspberry Pi OS Bookworm and Trixie. CI checks the ceiling, and the binary ran under emulation on both. |
+| A hardened systemd unit: no capabilities, read-only system, local addresses only. | `systemd-analyze security` rates it 1.0. hubd's own checks stay in place; the unit is a second wall. |
+| Backups are folders, and restores move the old hub aside. | Easy to copy with `scp`, and a mistaken restore loses nothing. |
 | The manager's logic is a plain model (`apps/hub-manager/src/model.rs`) that returns operations; a worker runs them on a tokio runtime; GPUI only draws and forwards input. | The rules are unit-tested without a window, and one test drives the model against a real hub and a simulated display. |
 | One operation at a time in the manager. | Changes reach the hub in the order they were made, and a failure is never hidden by a later success. |
 
@@ -39,10 +41,10 @@
 
 | | Scope | State |
 |---|---|---|
-| M0 | Plan, toolchain, GPUI start-up check on Linux and a cross-built Windows executable | Done; the Windows run is the owner's to try |
+| M0 | Plan, toolchain, GPUI start-up check on Linux and a cross-built Windows executable | Done; the owner ran it on Windows (11/11/2026) |
 | M1 | Protocol v1, demo hub on loopback, display simulator, offline tests | Done |
 | M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Done (Linux and mbedTLS; not yet on a Pi) |
 | M3 | Desktop manager on GPUI, USB provisioning | Done on Linux and built for Windows; the Windows desktop run is the owner's to try |
-| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Next |
-| M5 | Collectors: PC helper for Claude Code and Codex, manual entry for OpenCode Go | |
+| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Done in a systemd container and under emulation; the real Pi is the owner's to try |
+| M5 | Collectors: PC helper for Claude Code and Codex, manual entry for OpenCode Go | Next |
 | M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | |
