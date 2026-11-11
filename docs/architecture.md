@@ -39,8 +39,8 @@
 |---|---|---|
 | M0 | Plan, toolchain, GPUI start-up check on Linux and a cross-built Windows executable | Done; the Windows run is the owner's to try |
 | M1 | Protocol v1, demo hub on loopback, display simulator, offline tests | Done |
-| M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Next |
-| M3 | Desktop manager on GPUI | |
+| M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Done (Linux and mbedTLS; not yet on a Pi) |
+| M3 | Desktop manager on GPUI | Next |
 | M4 | Raspberry Pi install: systemd, backups, ARM64 builds | |
 | M5 | Collectors: PC helper for Claude Code and Codex, manual entry for OpenCode Go | |
 | M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | |

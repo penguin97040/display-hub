@@ -57,6 +57,45 @@ cargo run -p display-simulator -- validate protocol/v1/examples/valid/*.json
 
 `hubd dev` is plain HTTP with no authentication. It refuses any address other than loopback (`127.0.0.1` or `::1`), and must never be deployed. `display-simulator once` exits with `0` when online, `3` when showing saved data, and `4` when it has nothing to show.
 
+## Run a real hub locally
+
+This is the same HTTPS hub that runs on the Pi, with its data in a scratch folder:
+
+```sh
+cargo run -p hubd -- serve --data-dir dev-data/hub --listen 127.0.0.1:8443
+cargo run -p hubd -- pair-admin --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1
+```
+
+`pair-admin` prints a `dh1.…` pairing string for the desktop manager. Until the manager exists (milestone 3), the integration tests in `apps/hubd/tests/secure.rs` and `tools/display-simulator/tests/paired.rs` show the whole flow:
+
+1. pair;
+2. add pages;
+3. create an enrolment and build a bundle;
+4. `display-simulator enrol --bundle FILE --state DIR`, then `display-simulator poll --state DIR`.
+
+Other commands:
+
+- `hubd admin list|revoke <id>|revoke-all`
+- `hubd fingerprint`
+
+`dev-data/` is ignored by Git.
+
+### mbedTLS interoperability
+
+```sh
+sudo apt-get install -y libmbedtls-dev
+cargo build -p hubd && bash tools/mbedtls-interop/run.sh
+```
+
+This builds a small C client configured like ESP-IDF's HTTP client and checks four things:
+
+- TLS 1.2 and 1.3 work;
+- authenticated routes answer;
+- a different hub's key is refused;
+- a wrong name is refused.
+
+CI runs it too.
+
 ## Cross-building the desktop manager for Windows from Linux
 
 This build is for trying changes on a Windows machine. It compiles the shaders when the app first starts, using the system's `d3dcompiler_47.dll`.

@@ -22,8 +22,8 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | Protocol v1 types, schema and examples (`crates/hub-protocol`, `protocol/v1`) | Working, tested |
 | Domain model, freshness and demo provider (`crates/hub-core`) | Working, tested |
 | `hubd dev`: local demo hub over plain HTTP, loopback only | Working, tested |
-| `display-simulator`: polling, saved data, outages, text screen | Working, tested |
-| Pairing, HTTPS and persistent storage | Planned (milestone 2) |
+| `display-simulator`: enrolment, polling, saved data, outages, text screen | Working, tested |
+| `hubd serve`: HTTPS with a pinned identity, SQLite, admin pairing, display enrolment and revocation | Working, tested on Linux (including an mbedTLS client). Not yet on a Pi. |
 | Desktop manager (`apps/hub-manager`) | A start-up check only, for now (milestone 3) |
 
 The ESP32 firmware lives in a separate repository, `llm-usage-display`. This repository defines the protocol it follows.
@@ -36,6 +36,8 @@ You need [Rust](https://rustup.rs). `rust-toolchain.toml` pins the version, and 
 cargo run -p hubd -- dev                          # a demo hub on http://127.0.0.1:8080
 cargo run -p display-simulator -- poll --max-wait 10
 ```
+
+That is the quick demo, with no security. The real thing (pairing, enrolment and HTTPS) is in [docs/developer-setup.md](docs/developer-setup.md#run-a-real-hub-locally).
 
 The simulator prints what a display would show for each page, with its data quality (`DEMO` here) and age. Stop the hub and the simulator switches to its saved data and marks it stale. Start it again and the simulator reconnects. `hubd dev --scenario mixed` shows unavailable and stale pages, and `--fault malformed|wrong-version|oversize|server-error|slow` reproduces faults.
 

@@ -31,13 +31,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang lld cmake pkg-config \
             libxkbcommon-x11-dev libxkbcommon-dev libwayland-dev libxcb1-dev libxcb-xkb-dev \
-            libx11-xcb-dev libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev
+            libx11-xcb-dev libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libmbedtls-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      # An mbedTLS client set up like ESP-IDF's, against the real hub over TLS 1.2 and 1.3.
+      - name: mbedTLS interop
+        run: |
+          dpkg -s libmbedtls-dev | grep '^Version'
+          cargo build --locked -p hubd
+          bash tools/mbedtls-interop/run.sh target/debug/hubd
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: tools
         with:
