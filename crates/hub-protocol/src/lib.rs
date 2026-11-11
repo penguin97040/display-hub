@@ -12,6 +12,7 @@ pub mod provisioning;
 pub mod snapshot;
 pub mod text;
 pub mod timestamp;
+pub mod usb;
 
 pub use error::{ErrorAction, ErrorBody, ErrorCode, ErrorDetail};
 pub use snapshot::{receive, DataQuality, Metric, Page, ReceiveError, Snapshot, Violation};

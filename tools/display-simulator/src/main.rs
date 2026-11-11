@@ -62,6 +62,16 @@ enum Command {
         #[arg(long)]
         state: PathBuf,
     },
+    /// Wait on a pseudo-terminal for the desktop manager to send a bundle over "USB", then enrol
+    /// with it. Prints the port's path for the manager. Unix only.
+    Usb {
+        /// Folder to keep the display's credentials and saved data in.
+        #[arg(long)]
+        state: PathBuf,
+        /// Exit after one bundle instead of waiting for more (which are refused until `reset`).
+        #[arg(long)]
+        once: bool,
+    },
     /// Erase the display's credentials and saved data, as a factory reset does.
     Reset {
         #[arg(long)]
@@ -141,6 +151,7 @@ async fn main() -> ExitCode {
                 }
             }
         }
+        Command::Usb { state, once } => usb(&state, once).await,
         Command::Reset { state } => match paired::reset(&state) {
             Ok(()) => {
                 println!("Erased the display's credentials and saved data.");
@@ -227,4 +238,52 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+#[cfg(unix)]
+async fn usb(state: &std::path::Path, once: bool) -> ExitCode {
+    use serialport::SerialPort as _;
+    use std::io::Write;
+
+    let (mut master, slave) = match serialport::TTYPort::pair() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("display-simulator: couldn't make a pseudo-terminal: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // The manager opens the other end by name, and wants it to itself, so this copy is closed.
+    println!("Serial port: {}", slave.name().unwrap_or_default());
+    drop(slave);
+    println!("Waiting for the desktop manager. Stop with Ctrl+C.");
+    let _ = std::io::stdout().flush();
+    loop {
+        match display_simulator::usb::answer(&mut master, state) {
+            Ok(Some(bundle)) => {
+                println!(
+                    "Received setup details for the hub at {}. Enrolling.",
+                    bundle.hub.hosts.join(" or ")
+                );
+                match paired::enrol(&bundle, state).await {
+                    Ok(s) => println!("Enrolled as {}.", s.device_id),
+                    Err(e) => eprintln!("display-simulator: enrolment failed: {e}"),
+                }
+                let _ = std::io::stdout().flush();
+                if once {
+                    return ExitCode::SUCCESS;
+                }
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) => {
+                eprintln!("display-simulator: the serial port failed: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn usb(_state: &std::path::Path, _once: bool) -> ExitCode {
+    eprintln!("display-simulator: `usb` needs a pseudo-terminal, which only Linux and macOS have");
+    ExitCode::from(2)
 }

@@ -188,6 +188,8 @@ The manager talks to the display over its USB serial port (CDC-ACM or USB-Serial
 Rules:
 
 - Each answer must arrive within 10 seconds.
+- The manager repeats `hello` every 2 seconds until it gets an answer, in case the board restarted when the port opened. Answer every `hello`.
+- The manager opens the port with DTR set and RTS clear, which doesn't reset an ESP32 through its USB serial bridge.
 - A display that is already provisioned answers `already_provisioned`, and keeps its settings, until the owner factory-resets it on the device itself. Someone who plugs a cable in can't silently point it at another hub.
 - A factory reset erases the Wi-Fi settings, trust anchors and token.
 - After `provisioned`, the display joins the Wi-Fi network and enrols. The manager then watches for it to appear in the hub's list of displays.

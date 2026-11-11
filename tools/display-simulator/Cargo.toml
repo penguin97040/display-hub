@@ -18,7 +18,11 @@ serde_json.workspace = true
 time.workspace = true
 tokio.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+serialport.workspace = true
+
 [dev-dependencies]
 hubd = { path = "../../apps/hubd" }
 axum.workspace = true
 tempfile.workspace = true
+serialport.workspace = true

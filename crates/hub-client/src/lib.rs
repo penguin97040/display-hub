@@ -5,6 +5,7 @@
 
 pub mod pin;
 pub mod provisioning;
+pub mod usb;
 
 use std::time::Duration;
 

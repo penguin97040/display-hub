@@ -11,9 +11,28 @@ rust-version.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 anyhow.workspace = true
+hub-protocol.workspace = true
+hub-core.workspace = true
+hub-client.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zeroize.workspace = true
+serialport.workspace = true
+keyring-core.workspace = true
+dirs.workspace = true
+time = { workspace = true, features = ["local-offset"] }
+unicode-segmentation.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 gpui-pre-windows.workspace = true
+windows-native-keyring-store.workspace = true
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+zbus-secret-service-keyring-store.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
+hubd = { path = "../hubd" }
+display-simulator = { path = "../../tools/display-simulator" }
+tempfile.workspace = true

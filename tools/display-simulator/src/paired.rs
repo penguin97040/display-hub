@@ -50,8 +50,17 @@ pub fn load(dir: &Path) -> Result<State, String> {
 }
 
 fn save(dir: &Path, state: &State) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let path = state_file(dir);
+    write_private(
+        &state_file(dir),
+        &serde_json::to_vec_pretty(state).expect("serialises"),
+    )
+}
+
+/// Writes a file only its owner can read, atomically, creating its folder if needed.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("tmp");
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
@@ -61,14 +70,14 @@ fn save(dir: &Path, state: &State) -> std::io::Result<()> {
         opts.mode(0o600);
     }
     let mut f = opts.open(&tmp)?;
-    f.write_all(&serde_json::to_vec_pretty(state).expect("serialises"))?;
+    f.write_all(bytes)?;
     f.sync_all()?;
     std::fs::rename(tmp, path)
 }
 
 /// Erases everything the display holds, as a factory reset must.
 pub fn reset(dir: &Path) -> std::io::Result<()> {
-    for f in [state_file(dir), cache_file(dir)] {
+    for f in [state_file(dir), cache_file(dir), crate::usb::bundle_file(dir)] {
         match std::fs::remove_file(f) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
             _ => {}
@@ -118,6 +127,8 @@ pub async fn enrol(bundle: &Bundle, dir: &Path) -> Result<State, String> {
         device_token: resp.device_token,
     };
     save(dir, &state).map_err(|e| format!("couldn't save the display's state: {e}"))?;
+    // The secret is used up. A display keeps the hub details and its token, never the bundle.
+    let _ = std::fs::remove_file(crate::usb::bundle_file(dir));
     Ok(state)
 }
 

@@ -40,6 +40,7 @@ exceptions = [
     { allow = ["MPL-2.0"], crate = "dwrote" },      # DirectWrite bindings (GPUI font stack)
     { allow = ["MPL-2.0"], crate = "option-ext" },  # dirs-sys, from GPUI's font-kit
     { allow = ["MPL-2.0"], crate = "cbindgen" },    # macOS build script only, not shipped
+    { allow = ["MPL-2.0"], crate = "serialport" },  # USB serial for display setup (manager, simulator)
 ]
 
 [bans]
