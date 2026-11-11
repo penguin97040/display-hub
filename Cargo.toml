@@ -43,7 +43,20 @@ tower-http = { version = "=0.7.1", features = ["limit", "timeout"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["fmt", "env-filter", "std", "ansi"] }
 clap = { version = "=4.6.7", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
-reqwest = { version = "=0.13.5", default-features = false, features = ["json"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls-no-provider"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-webpki = { version = "=0.103.16", default-features = false, features = ["std", "ring"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+ring = "=0.17.14"
+rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
+hyper = { version = "=1.12.0", features = ["server", "http1"] }
+hyper-util = { version = "=0.1.21", features = ["server", "server-graceful", "http1", "tokio", "service"] }
+rusqlite = { version = "=0.41.1", features = ["bundled", "backup"] }
+base64 = "=0.23.1"
+crc32fast = "=1.5.5"
+toml = { version = "=1.2.1", default-features = false, features = ["parse", "serde", "std"] }
+libc = "=0.2.191"
+zeroize = "=1.9.1"
 jsonschema = { version = "=0.61.1", default-features = false }
 tempfile = "=3.27.0"
 url = "=2.5.8"

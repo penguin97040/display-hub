@@ -1,0 +1,26 @@
+{
+  "format": "display-hub.provisioning",
+  "version": 1,
+  "hub": {
+    "hosts": [
+      "raspberrypi.local",
+      "192.168.1.20"
+    ],
+    "port": 8443,
+    "server_name": "hub.display-hub.internal",
+    "trust_anchors": [
+      {
+        "certificate_pem": "-----BEGIN CERTIFICATE-----\nMIIBkzCCATigAwIBAgIQCKIctuOmcCQip+KRNMKusTAKBggqhkjOPQQDAjAjMSEw\nHwYDVQQDDBhodWIuZGlzcGxheS1odWIuaW50ZXJuYWwwIBcNNzAwMTAxMDAwMDAw\nWhgPOTk5OTEyMzEwMDAwMDBaMCMxITAfBgNVBAMMGGh1Yi5kaXNwbGF5LWh1Yi5p\nbnRlcm5hbDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABMkpyxDRz9NCru2/qeQ7\nLOOYI6dWeWbVu4/TPENSMy2aCvNmhkoRfNl00mE9mlbEF2yG9Fvr2A9eK2DG/+8H\nFs+jTDBKMCMGA1UdEQQcMBqCGGh1Yi5kaXNwbGF5LWh1Yi5pbnRlcm5hbDAOBgNV\nHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwEwCgYIKoZIzj0EAwIDSQAw\nRgIhALs0099Up43zviwFobApZs8hWc2HfR4numEGjPw8ofAmAiEAr45zePxbPfQY\nCOw/O416Y9G0QTcHEnC1yA7eUmTthls=\n-----END CERTIFICATE-----\n",
+        "spki_sha256": "9a54396d429aa58fc9ac78413a9e84a0b7a45f125256f91697c977c2acbfde88"
+      }
+    ]
+  },
+  "enrolment": {
+    "secret": "q3H7cX0f2pS9L1mB8vN4wA",
+    "expires_at": "2026-11-10T20:10:00Z"
+  },
+  "wifi": {
+    "ssid": "Example network",
+    "password": "example-passphrase"
+  }
+}

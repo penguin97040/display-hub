@@ -4,8 +4,11 @@
 //! describes it for firmware authors, and `protocol/` holds the JSON Schema and example messages that
 //! the tests here check against.
 
+pub mod device;
 pub mod error;
 pub mod limits;
+pub mod pairing;
+pub mod provisioning;
 pub mod snapshot;
 pub mod text;
 pub mod timestamp;

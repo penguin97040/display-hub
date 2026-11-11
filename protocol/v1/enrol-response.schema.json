@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:display-hub:protocol:v1:enrol-response",
+  "title": "POST /v1/device/enrol response body (201)",
+  "type": "object",
+  "required": [
+    "device_id",
+    "device_token"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "device_id": {
+      "type": "string",
+      "pattern": "^d-[0-9a-f]{12}$"
+    },
+    "device_token": {
+      "type": "string",
+      "pattern": "^dhd_[A-Za-z0-9_-]{43}$"
+    }
+  }
+}

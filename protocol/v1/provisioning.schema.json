@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:display-hub:protocol:v1:provisioning-bundle",
+  "title": "Provisioning bundle, sent to a display over USB",
+  "type": "object",
+  "required": [
+    "format",
+    "version",
+    "hub",
+    "enrolment",
+    "wifi"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "format": {
+      "const": "display-hub.provisioning"
+    },
+    "version": {
+      "const": 1
+    },
+    "hub": {
+      "type": "object",
+      "required": [
+        "hosts",
+        "port",
+        "server_name",
+        "trust_anchors"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "hosts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253,
+            "pattern": "^[^\\s\\u0000-\\u001f]+$"
+          }
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "server_name": {
+          "const": "hub.display-hub.internal"
+        },
+        "trust_anchors": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "certificate_pem",
+              "spki_sha256"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "certificate_pem": {
+                "type": "string",
+                "pattern": "^-----BEGIN CERTIFICATE-----",
+                "maxLength": 4096
+              },
+              "spki_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      }
+    },
+    "enrolment": {
+      "type": "object",
+      "required": [
+        "secret",
+        "expires_at"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "secret": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "expires_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        }
+      }
+    },
+    "wifi": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "ssid",
+            "password"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "ssid": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32
+            },
+            "password": {
+              "type": "string",
+              "maxLength": 63
+            }
+          }
+        }
+      ]
+    }
+  }
+}

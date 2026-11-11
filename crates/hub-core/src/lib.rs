@@ -1,6 +1,7 @@
 //! Display Hub's domain model, with no I/O: subscriptions, data quality, freshness, providers and
 //! building snapshots. Time always comes from a [`Clock`].
 
+pub mod api;
 pub mod build;
 pub mod clock;
 pub mod freshness;

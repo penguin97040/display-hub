@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:display-hub:protocol:v1:error",
+  "title": "Error response body",
+  "description": "Displays must treat a code they don't know as transient.",
+  "type": "object",
+  "required": [
+    "error"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "enum": [
+            "unauthorised",
+            "forbidden",
+            "token_revoked",
+            "unknown_device",
+            "enrolment_used",
+            "enrolment_expired",
+            "incompatible_version",
+            "bad_request",
+            "payload_too_large",
+            "not_found",
+            "conflict",
+            "rate_limited",
+            "unavailable"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 400
+        }
+      }
+    }
+  }
+}
