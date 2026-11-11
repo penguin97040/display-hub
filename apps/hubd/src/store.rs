@@ -72,6 +72,14 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX audit_log_at ON audit_log(at);
     "#,
+    // 2: the services each collector (PC helper) may report figures for.
+    r#"
+    CREATE TABLE collector_scopes (
+        subject TEXT NOT NULL,
+        service TEXT NOT NULL,
+        PRIMARY KEY (subject, service)
+    );
+    "#,
 ];
 
 /// Audit entries older than this are pruned.
@@ -656,6 +664,58 @@ impl Store {
             .find(|s| s.id == id))
     }
 
+    // ----- collectors -----
+
+    pub fn add_collector_scope(&self, subject: &str, services: &[Service]) -> Result<(), StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        for s in services {
+            tx.execute(
+                "INSERT OR IGNORE INTO collector_scopes (subject, service) VALUES (?1, ?2)",
+                params![subject, s.slug()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn collector_services(&self, subject: &str) -> Result<Vec<Service>, StoreError> {
+        let conn = self.conn();
+        let mut st =
+            conn.prepare("SELECT service FROM collector_scopes WHERE subject = ?1 ORDER BY service")?;
+        let rows = st.query_map(params![subject], |r| r.get::<_, String>(0))?;
+        Ok(rows
+            .filter_map(|r| r.ok().and_then(|s| Service::from_slug(&s)))
+            .collect())
+    }
+
+    /// Every collector that has paired, newest first.
+    pub fn collectors(&self) -> Result<Vec<(String, String, Timestamp, bool)>, StoreError> {
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT subject, label, created_at, revoked_at FROM credentials WHERE role = 'collector' ORDER BY created_at DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                ts(r.get(2)?),
+                r.get::<_, Option<i64>>(3)?.is_some(),
+            ))
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The pages a collector's report for `service` goes to: that service, with source `collector`.
+    pub fn collector_pages(&self, service: Service) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT id FROM subscriptions WHERE service = ?1 AND source = 'collector' ORDER BY position",
+        )?;
+        let rows = st.query_map(params![service.slug()], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     // ----- backup -----
 
     /// Copies the live database to `dest` with SQLite's online backup, safe while the hub runs.
@@ -665,5 +725,39 @@ impl Store {
         let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
         backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_version_1_database_upgrades_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        {
+            // Exactly what the first release wrote.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "INSERT INTO subscriptions (id, service, title, source, position, created_at) \
+                 VALUES ('claude-max', 'claude-max', 'Claude Max', 'collector', 0, 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(store.subscription_ids().unwrap(), vec!["claude-max".to_string()]);
+        assert_eq!(
+            store.collector_pages(Service::ClaudeMax).unwrap(),
+            vec!["claude-max".to_string()]
+        );
+        store
+            .add_collector_scope("c-1", &[Service::ClaudeMax, Service::ClaudeMax])
+            .unwrap();
+        assert_eq!(store.collector_services("c-1").unwrap(), vec![Service::ClaudeMax]);
     }
 }

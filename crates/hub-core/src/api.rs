@@ -147,3 +147,86 @@ impl std::fmt::Debug for EnrolmentGrant {
             .finish()
     }
 }
+
+/// `POST /v1/admin/collectors`: invites a PC helper (collector) to report figures for some services.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NewCollector {
+    /// A name for the helper, such as the PC's name. Plain text.
+    pub label: String,
+    /// The services it may report. Its figures go to every page of these services whose source is
+    /// `collector`.
+    pub services: Vec<Service>,
+}
+
+/// The one-time secret for `hubctl login`, valid for 10 minutes.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectorInvite {
+    pub secret: String,
+    pub expires_at: Timestamp,
+    pub identity: HubIdentity,
+}
+
+impl std::fmt::Debug for CollectorInvite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectorInvite")
+            .field("secret", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// `POST /v1/collector/pair`: exchanges the invite's secret for a collector token.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectorPairRequest {
+    pub secret: String,
+}
+
+impl std::fmt::Debug for CollectorPairRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectorPairRequest")
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollectorPairResponse {
+    pub collector_id: String,
+    pub collector_token: String,
+    pub services: Vec<Service>,
+}
+
+impl std::fmt::Debug for CollectorPairResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectorPairResponse")
+            .field("collector_id", &self.collector_id)
+            .field("collector_token", &"[redacted]")
+            .field("services", &self.services)
+            .finish()
+    }
+}
+
+/// `POST /v1/collector/usage`: figures a provider's own tool reported on the PC.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageReport {
+    pub service: Service,
+    /// When the tool reported them, by the PC's clock.
+    pub collected_at: Timestamp,
+    pub metrics: Vec<ManualMetric>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UsageAccepted {
+    /// The pages that now show these figures. Empty when no page of this service uses a collector.
+    pub updated: Vec<String>,
+}
+
+/// One PC helper, as the manager sees it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CollectorView {
+    pub id: String,
+    pub label: String,
+    pub created_at: Timestamp,
+    pub revoked: bool,
+    pub services: Vec<Service>,
+}

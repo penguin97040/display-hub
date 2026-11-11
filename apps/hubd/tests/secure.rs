@@ -555,3 +555,144 @@ fn damaged_or_newer_databases_are_left_alone() {
         "{e}"
     );
 }
+
+#[tokio::test]
+async fn a_pc_helper_reports_only_its_services_to_collector_pages() {
+    use hub_core::api::{NewCollector, UsageReport};
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let c = r.client();
+    let admin = r.admin().await;
+    for (service, source) in [
+        (Service::ClaudeMax, Source::Collector),
+        (Service::ChatgptPlus, Source::Collector),
+        (Service::OpencodeGoPlus, Source::Manual),
+    ] {
+        c.add_subscription(
+            &admin,
+            &NewSubscription {
+                service,
+                source,
+                title: None,
+                id: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Invite for Claude Max only; the invite works once.
+    let invite = c
+        .new_collector(
+            &admin,
+            &NewCollector {
+                label: "Desk PC".into(),
+                services: vec![Service::ClaudeMax],
+            },
+        )
+        .await
+        .unwrap();
+    let paired = c.collector_pair(&invite.secret).await.unwrap();
+    assert!(paired.collector_token.starts_with("dhc_"));
+    assert_eq!(paired.services, vec![Service::ClaudeMax]);
+    let again = c.collector_pair(&invite.secret).await.unwrap_err();
+    assert_eq!(again.code(), Some(ErrorCode::EnrolmentUsed));
+    let token = paired.collector_token;
+
+    let report = |service, pct: Option<f64>, at: &str| UsageReport {
+        service,
+        collected_at: hub_protocol::Timestamp::parse(at).unwrap(),
+        metrics: vec![
+            ManualMetric {
+                window: Window::FiveHour,
+                used_percent: pct,
+                resets_at: Some(hub_protocol::Timestamp::parse("2026-11-10T22:00:00Z").unwrap()),
+            },
+            ManualMetric {
+                window: Window::Weekly,
+                used_percent: None,
+                resets_at: None,
+            },
+        ],
+    };
+    let ok = c
+        .report_usage(
+            &token,
+            &report(Service::ClaudeMax, Some(42.25), "2026-11-10T19:59:00Z"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.updated, vec!["claude-max".to_string()]);
+    let snap = c.preview_snapshot(&admin).await.unwrap();
+    let page = snap.pages.iter().find(|p| p.id == "claude-max").unwrap();
+    assert_eq!(page.data_quality, DataQuality::ProviderReported);
+    assert_eq!(page.metrics[0].used_percent, Some(42.3));
+    assert_eq!(page.metrics[1].used_percent, None, "unknown stays unknown");
+    assert_eq!(page.updated_at.unwrap().to_string(), "2026-11-10T19:59:00Z");
+
+    // Outside its scope, from the future, malformed, or with another role's token: refused.
+    let other = c
+        .report_usage(&token, &report(Service::ChatgptPlus, Some(1.0), NOW))
+        .await
+        .unwrap_err();
+    assert_eq!(other.code(), Some(ErrorCode::Forbidden));
+    let future = c
+        .report_usage(
+            &token,
+            &report(Service::ClaudeMax, Some(1.0), "2026-11-10T21:00:00Z"),
+        )
+        .await;
+    assert_eq!(future.unwrap_err().code(), Some(ErrorCode::BadRequest));
+    let bad = c
+        .report_usage(&token, &report(Service::ClaudeMax, Some(101.0), NOW))
+        .await;
+    assert_eq!(bad.unwrap_err().code(), Some(ErrorCode::BadRequest));
+    assert_eq!(
+        c.report_usage(&admin, &report(Service::ClaudeMax, Some(1.0), NOW))
+            .await
+            .unwrap_err()
+            .code(),
+        Some(ErrorCode::Forbidden)
+    );
+    assert_eq!(
+        c.status(&token).await.unwrap_err().code(),
+        Some(ErrorCode::Forbidden)
+    );
+
+    // A manual page of the same kind is never written by a helper.
+    let manual = c
+        .new_collector(
+            &admin,
+            &NewCollector {
+                label: "x".into(),
+                services: vec![Service::OpencodeGoPlus],
+            },
+        )
+        .await
+        .unwrap();
+    let t2 = c.collector_pair(&manual.secret).await.unwrap().collector_token;
+    let none = c
+        .report_usage(&t2, &report(Service::OpencodeGoPlus, Some(5.0), NOW))
+        .await
+        .unwrap();
+    assert!(none.updated.is_empty());
+
+    // Listed, then revoked: its token stops working.
+    let list = c.collectors(&admin).await.unwrap();
+    assert_eq!(list.len(), 2);
+    let id = list.iter().find(|x| x.label == "Desk PC").unwrap().id.clone();
+    c.revoke_collector(&admin, &id).await.unwrap();
+    let revoked = c
+        .report_usage(&token, &report(Service::ClaudeMax, Some(1.0), NOW))
+        .await
+        .unwrap_err();
+    assert_eq!(revoked.code(), Some(ErrorCode::TokenRevoked));
+    assert!(c
+        .collectors(&admin)
+        .await
+        .unwrap()
+        .iter()
+        .any(|x| x.id == id && x.revoked));
+    r.stop().await;
+}

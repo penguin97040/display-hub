@@ -320,6 +320,46 @@ impl HubClient {
             .await
     }
 
+    pub async fn new_collector(
+        &self,
+        token: &str,
+        new: &NewCollector,
+    ) -> Result<CollectorInvite, ClientError> {
+        self.call(Method::POST, "v1/admin/collectors", token, Some(new))
+            .await
+    }
+
+    pub async fn collectors(&self, token: &str) -> Result<Vec<CollectorView>, ClientError> {
+        self.call(Method::GET, "v1/admin/collectors", token, None::<&()>)
+            .await
+    }
+
+    pub async fn revoke_collector(&self, token: &str, id: &str) -> Result<(), ClientError> {
+        self.call_empty(Method::DELETE, &format!("v1/admin/collectors/{}", seg(id)), token)
+            .await
+    }
+
+    // ----- collector (PC helper) -----
+
+    /// `POST /v1/collector/pair`: the secret from a helper string, for a collector token.
+    pub async fn collector_pair(&self, secret: &str) -> Result<CollectorPairResponse, ClientError> {
+        let req = CollectorPairRequest {
+            secret: secret.to_string(),
+        };
+        self.json(self.request(Method::POST, "v1/collector/pair", None).json(&req))
+            .await
+    }
+
+    /// `POST /v1/collector/usage`.
+    pub async fn report_usage(
+        &self,
+        token: &str,
+        report: &UsageReport,
+    ) -> Result<UsageAccepted, ClientError> {
+        self.call(Method::POST, "v1/collector/usage", token, Some(report))
+            .await
+    }
+
     /// Sends a request and reads at most `cap` bytes of a successful body.
     async fn send(&self, req: reqwest::RequestBuilder, cap: usize) -> Result<Vec<u8>, ClientError> {
         let resp = req.send().await.map_err(classify)?;

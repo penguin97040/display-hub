@@ -132,6 +132,36 @@ impl Hub {
         })
     }
 
+    /// Issues a one-time secret for a PC helper that may report `services`.
+    pub fn new_collector_invite(
+        &self,
+        label: &str,
+        services: &[hub_core::Service],
+        by: &str,
+    ) -> Result<CollectorInvite, StoreError> {
+        let mut services = services.to_vec();
+        services.sort_by_key(|s| s.slug());
+        services.dedup();
+        let label = clean_title(label).unwrap_or_else(|| "PC helper".into());
+        let detail = serde_json::to_string(&InviteDetail {
+            label: label.clone(),
+            services,
+        })
+        .expect("serialises");
+        let (_, code) = new_code();
+        let now = self.clock.now();
+        let expires = now.plus_seconds(CODE_LIFETIME_SECONDS);
+        self.store
+            .add_code(&hash(code.expose()), "collector-pair", &detail, now, expires)?;
+        self.store
+            .audit(now, "collector_invited", &format!("{label} by {by}"))?;
+        Ok(CollectorInvite {
+            secret: code.expose().to_string(),
+            expires_at: expires,
+            identity: self.identity.info(),
+        })
+    }
+
     fn snapshot(&self) -> Result<hub_protocol::Snapshot, StoreError> {
         let pages = self.store.subscriptions()?;
         Ok(build_snapshot(
@@ -275,11 +305,20 @@ pub fn router(hub: AppState) -> Router {
         .route("/v1/admin/devices/{id}", delete(revoke_device))
         .route("/v1/admin/enrolments", post(new_enrolment))
         .route("/v1/admin/preview-snapshot", get(preview_snapshot))
+        .route("/v1/admin/collectors", get(list_collectors).post(new_collector))
+        .route("/v1/admin/collectors/{id}", delete(revoke_collector))
         .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
+    let collector = Router::new()
+        .route("/v1/collector/pair", post(collector_pair))
+        .route("/v1/collector/usage", post(collector_usage))
+        .layer(DefaultBodyLimit::max(
+            hub_protocol::limits::MAX_DEVICE_REQUEST_BYTES,
+        ));
     Router::new()
         .route("/v1/health", get(|| async { Json(Health::ok()) }))
         .merge(device)
         .merge(admin)
+        .merge(collector)
         .fallback(|| async { ApiError::not_found() })
         .layer(middleware::from_fn(log_request))
         .layer(
@@ -672,12 +711,27 @@ async fn set_manual(
             "This page doesn't take manual figures. Change its source to manual first.",
         ));
     }
+    let metrics = clean_metrics(sub.service, &req.metrics)?;
+    let now = hub.clock.now();
+    let data = PageData {
+        quality: DataQuality::Manual,
+        updated_at: Some(now),
+        metrics,
+        note: req.note.as_deref().and_then(clean_note),
+    };
+    let (id2, d2) = (id.clone(), data.clone());
+    db(&hub, move |s| s.put_page_data(&id2, &d2, now)).await?;
+    Ok(Json(view((sub, Some(data)))))
+}
+
+/// Checks figures against the service's windows and bounds. Unknown stays unknown.
+fn clean_metrics(service: hub_core::Service, input: &[ManualMetric]) -> Result<Vec<MetricValue>, ApiError> {
     let mut metrics = Vec::new();
-    for m in &req.metrics {
-        if !sub.service.windows().contains(&m.window) {
+    for m in input {
+        if !service.windows().contains(&m.window) {
             return Err(ApiError::bad_request(format!(
                 "{} has no {} window.",
-                sub.service.default_title(),
+                service.default_title(),
                 m.window.id()
             )));
         }
@@ -699,16 +753,191 @@ async fn set_manual(
             resets_at: m.resets_at,
         });
     }
+    Ok(metrics)
+}
+
+// ----- collectors (PC helpers) -----
+
+/// What a collector invite's code row holds in its label column, until it is used.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct InviteDetail {
+    label: String,
+    services: Vec<hub_core::Service>,
+}
+
+/// How far a report's time may be ahead of the hub's clock (PC and Pi clocks differ a little).
+const REPORT_FUTURE_SKEW_SECONDS: i64 = 300;
+
+async fn new_collector(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<NewCollector>,
+) -> Result<(StatusCode, Json<CollectorInvite>), ApiError> {
+    let admin = authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    if req.services.is_empty() {
+        return Err(ApiError::bad_request(
+            "Choose at least one service for the helper to report.",
+        ));
+    }
+    let h = hub.clone();
+    let invite = db(&hub, move |_| {
+        h.new_collector_invite(&req.label, &req.services, &admin)
+    })
+    .await?;
+    Ok((StatusCode::CREATED, Json(invite)))
+}
+
+async fn collector_pair(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    ApiJson(req): ApiJson<CollectorPairRequest>,
+) -> Result<Json<CollectorPairResponse>, ApiError> {
+    let ip = peer.ip();
+    if hub.code_attempts.blocked(ip, Instant::now()) {
+        return Err(too_many(&hub.code_attempts, ip));
+    }
+    hub.code_attempts.hit(ip, Instant::now());
     let now = hub.clock.now();
-    let data = PageData {
-        quality: DataQuality::Manual,
-        updated_at: Some(now),
-        metrics,
-        note: req.note.as_deref().and_then(clean_note),
+    let h = hash(req.secret.trim());
+    let (outcome, detail) = db(&hub, move |s| s.use_code(&h, "collector-pair", now)).await?;
+    match outcome {
+        CodeUse::Accepted => {
+            let invite: InviteDetail = detail
+                .as_deref()
+                .and_then(|d| serde_json::from_str(d).ok())
+                .ok_or_else(|| {
+                    ApiError::bad_request("This invite is damaged. Make a new one in the manager.")
+                })?;
+            let subject = new_id("c");
+            let token = new_token(Role::Collector);
+            let (sub2, th, inv) = (subject.clone(), hash(token.expose()), invite.services.clone());
+            let label = invite.label.clone();
+            db(&hub, move |s| {
+                s.add_credential(&th, Role::Collector, &sub2, &label, now)?;
+                s.add_collector_scope(&sub2, &inv)?;
+                s.audit(now, "collector_paired", &format!("{sub2} ({label}) from {ip}"))
+            })
+            .await?;
+            tracing::info!(collector = %subject, label = %invite.label, "collector paired");
+            Ok(Json(CollectorPairResponse {
+                collector_id: subject,
+                collector_token: token.expose().to_string(),
+                services: invite.services,
+            }))
+        }
+        CodeUse::AlreadyUsed => {
+            tracing::warn!(%ip, "a helper invite was used twice: someone else may have seen it");
+            db(&hub, move |s| {
+                s.audit(now, "ALARM_collector_code_reused", &format!("from {ip}"))
+            })
+            .await?;
+            Err(ApiError::new(
+                StatusCode::CONFLICT,
+                ErrorCode::EnrolmentUsed,
+                "This helper string was already used. If that wasn't you, check the helpers in the manager's Settings.",
+            ))
+        }
+        CodeUse::Unknown => Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::EnrolmentExpired,
+            "This helper string has expired or doesn't exist. Make a new one in the manager's Settings.",
+        )),
+    }
+}
+
+async fn collector_usage(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<UsageReport>,
+) -> Result<Json<UsageAccepted>, ApiError> {
+    let subject = authenticate(&hub, &headers, peer.ip(), Role::Collector).await?;
+    let sub2 = subject.clone();
+    let allowed = db(&hub, move |s| s.collector_services(&sub2)).await?;
+    if !allowed.contains(&req.service) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            ErrorCode::Forbidden,
+            "This helper isn't set up to report that service.",
+        ));
+    }
+    let now = hub.clock.now();
+    if req.collected_at.seconds_until(now) < -REPORT_FUTURE_SKEW_SECONDS {
+        return Err(ApiError::bad_request(
+            "These figures are dated in the future. Check the PC's clock is set automatically.",
+        ));
+    }
+    let metrics = clean_metrics(req.service, &req.metrics)?;
+    // Never later than the hub's own clock, so ages are never negative.
+    let updated_at = if req.collected_at.seconds_until(now) < 0 {
+        now
+    } else {
+        req.collected_at
     };
-    let (id2, d2) = (id.clone(), data.clone());
-    db(&hub, move |s| s.put_page_data(&id2, &d2, now)).await?;
-    Ok(Json(view((sub, Some(data)))))
+    let data = PageData {
+        quality: DataQuality::ProviderReported,
+        updated_at: Some(updated_at),
+        metrics,
+        note: None,
+    };
+    let service = req.service;
+    let updated = db(&hub, move |s| {
+        let pages = s.collector_pages(service)?;
+        for id in &pages {
+            s.put_page_data(id, &data, now)?;
+        }
+        Ok(pages)
+    })
+    .await?;
+    Ok(Json(UsageAccepted { updated }))
+}
+
+async fn list_collectors(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<CollectorView>>, ApiError> {
+    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    let views = db(&hub, |s| {
+        s.collectors()?
+            .into_iter()
+            .map(|(id, label, created_at, revoked)| {
+                let services = s.collector_services(&id)?;
+                Ok(CollectorView {
+                    id,
+                    label,
+                    created_at,
+                    revoked,
+                    services,
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()
+    })
+    .await?;
+    Ok(Json(views))
+}
+
+async fn revoke_collector(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let admin = authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    let now = hub.clock.now();
+    let n = db(&hub, move |s| {
+        let n = s.revoke(Role::Collector, &id, now)?;
+        if n > 0 {
+            s.audit(now, "collector_revoked", &format!("{id} by {admin}"))?;
+        }
+        Ok(n)
+    })
+    .await?;
+    if n == 0 {
+        return Err(ApiError::not_found());
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_devices(

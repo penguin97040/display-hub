@@ -69,6 +69,20 @@ enum Command {
         #[arg(long, default_value = "Desktop manager")]
         label: String,
     },
+    /// Print a one-time string for `hubctl login` on a PC (valid 10 minutes), without the manager.
+    PairHelper {
+        #[command(flatten)]
+        settings: Settings,
+        /// Host name or address the helper should use, if not this machine's `.local` name.
+        #[arg(long)]
+        host: Option<String>,
+        /// A service the helper may report: claude-max or chatgpt-plus. Repeat for both.
+        #[arg(long = "service", required = true)]
+        services: Vec<String>,
+        /// A name for the helper, such as the PC's name.
+        #[arg(long, default_value = "PC helper")]
+        label: String,
+    },
     /// List or revoke admin access.
     Admin {
         #[command(subcommand)]
@@ -211,6 +225,37 @@ async fn main() -> anyhow::Result<()> {
             println!("  {}\n", pairing.encode());
             println!("Hub fingerprint: {}", fingerprint(&hub.identity.spki_sha256));
             println!("Paste the whole string into the desktop manager. Don't share it or save it anywhere.");
+        }
+        Command::PairHelper {
+            settings,
+            host,
+            services,
+            label,
+        } => {
+            let services = services
+                .iter()
+                .map(|s| {
+                    hub_core::Service::from_slug(s).ok_or_else(|| anyhow::anyhow!("unknown service {s:?}"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let config = settings.load()?;
+            let port = config.listen.port();
+            let host = host.unwrap_or_else(|| config.hosts().remove(0));
+            let hub = hubd::open_hub(config, clock)?;
+            let invite = hub.new_collector_invite(&label, &services, "command line")?;
+            let mut secret = [0u8; 16];
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&invite.secret)?;
+            secret.copy_from_slice(&raw);
+            let pairing = PairingString {
+                host,
+                port,
+                spki_sha256: hub.identity.spki_sha256,
+                secret,
+            };
+            println!("Helper string for `hubctl login` on your PC. It works once, within 10 minutes:\n");
+            println!("  {}\n", pairing.encode());
+            println!("Paste it when `hubctl login` asks. Don't share it or save it anywhere.");
         }
         Command::Admin { action, settings } => {
             let hub = hubd::open_hub(settings.load()?, clock.clone())?;
