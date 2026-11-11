@@ -52,6 +52,8 @@ const HELLO_REPEAT: Duration = Duration::from_secs(2);
 struct Conn<'a, P: Read + Write> {
     port: &'a mut P,
     lines: LineReader,
+    /// Lines read but not yet handled: one read can bring several.
+    pending: std::collections::VecDeque<Line>,
 }
 
 impl<P: Read + Write> Conn<'_, P> {
@@ -68,9 +70,8 @@ impl<P: Read + Write> Conn<'_, P> {
     ) -> Result<Option<FromDisplay>, UsbError> {
         let mut last_sent = Instant::now();
         let mut buf = [0u8; 1024];
-        let mut pending = std::collections::VecDeque::new();
         loop {
-            if let Some(line) = pending.pop_front() {
+            if let Some(line) = self.pending.pop_front() {
                 match line {
                     Line::Json(s) => {
                         return Ok(Some(serde_json::from_str(&s).map_err(|_| UsbError::Unexpected)?))
@@ -89,7 +90,10 @@ impl<P: Read + Write> Conn<'_, P> {
             }
             match self.port.read(&mut buf) {
                 Ok(0) => std::thread::sleep(Duration::from_millis(20)),
-                Ok(n) => pending.extend(self.lines.push(&buf[..n])),
+                Ok(n) => {
+                    let lines = self.lines.push(&buf[..n]);
+                    self.pending.extend(lines)
+                }
                 Err(e)
                     if matches!(
                         e.kind(),
@@ -114,6 +118,7 @@ pub fn hello<P: Read + Write>(port: &mut P) -> Result<UsbDisplay, UsbError> {
     let mut conn = Conn {
         port,
         lines: LineReader::default(),
+        pending: Default::default(),
     };
     hello_on(&mut conn)
 }
@@ -144,6 +149,7 @@ pub fn provision<P: Read + Write>(port: &mut P, bundle: &Bundle) -> Result<UsbDi
     let mut conn = Conn {
         port,
         lines: LineReader::default(),
+        pending: Default::default(),
     };
     let display = hello_on(&mut conn)?;
     if display.provisioned {
@@ -169,5 +175,55 @@ pub fn provision<P: Read + Write>(port: &mut P, bundle: &Bundle) -> Result<UsbDi
             // Repeated hellos may be answered more than once.
             Some(FromDisplay::Hello { .. }) => continue,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// A port that hands back scripted chunks, one per read.
+    struct Scripted {
+        reads: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.reads.pop_front() {
+                Some(c) => {
+                    buf[..c.len()].copy_from_slice(&c);
+                    Ok(c.len())
+                }
+                None => Err(std::io::ErrorKind::TimedOut.into()),
+            }
+        }
+    }
+
+    impl Write for Scripted {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn several_answers_in_one_read_are_all_handled() {
+        let bundle: Bundle = serde_json::from_str(include_str!(
+            "../../../protocol/v1/examples/device/provisioning-bundle.json"
+        ))
+        .unwrap();
+        let hello = r#"{"type":"hello","device_type":"d","firmware_version":"1","hardware_revision":"r","protocol_version":1,"provisioned":false}"#;
+        // A repeated hello answered twice, then "provisioned", all in one chunk.
+        let chunk = format!("{hello}\n{hello}\n{{\"type\":\"provisioned\"}}\n");
+        let mut port = Scripted {
+            reads: VecDeque::from([chunk.into_bytes()]),
+            written: Vec::new(),
+        };
+        assert!(provision(&mut port, &bundle).is_ok());
     }
 }

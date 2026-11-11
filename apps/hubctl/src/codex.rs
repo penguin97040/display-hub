@@ -186,33 +186,36 @@ pub fn read_limits<R: Read + Send + 'static, W: Write>(
         .map_err(|e| CodexError::Unexpected(e.to_string()))
 }
 
-/// How to start Codex: `--codex <path>`, or `codex` on PATH. On Windows the npm install is a
-/// `codex.cmd` shim, which only `cmd.exe` can run, with fixed arguments.
-fn command(path: Option<&std::path::Path>) -> Command {
-    if let Some(p) = path {
-        let mut c = Command::new(p);
-        c.arg("app-server");
-        return c;
-    }
-    #[cfg(windows)]
-    {
-        let on_path = std::env::var_os("PATH")
-            .map(|p| std::env::split_paths(&p).any(|d| d.join("codex.exe").is_file()))
-            .unwrap_or(false);
-        if !on_path {
-            let mut c = Command::new("cmd.exe");
-            c.args(["/d", "/c", "codex", "app-server"]);
-            return c;
-        }
-    }
-    let mut c = Command::new("codex");
-    c.arg("app-server");
-    c
+/// Finds `codex` in the PATH folders only, never the current folder. On Windows the npm install is
+/// a `codex.cmd` shim; Rust runs a batch file by its full path with safely escaped arguments.
+fn find_on_path() -> Option<std::path::PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["codex.exe", "codex.cmd", "codex.bat"]
+    } else {
+        &["codex"]
+    };
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .filter(|d| d.is_absolute())
+        .flat_map(|d| names.iter().map(move |n| d.join(n)))
+        .find(|p| p.is_file())
+}
+
+/// How to start Codex: `--codex <path>`, or `codex` found on PATH. It runs in the temporary folder,
+/// so nothing in whatever folder the helper was started from can stand in for it.
+fn command(path: Option<&std::path::Path>) -> Result<Command, CodexError> {
+    let program = match path {
+        Some(p) => p.to_path_buf(),
+        None => find_on_path().ok_or_else(|| CodexError::Start("codex isn't on PATH".into()))?,
+    };
+    let mut c = Command::new(program);
+    c.arg("app-server").current_dir(std::env::temp_dir());
+    Ok(c)
 }
 
 /// Starts `codex app-server`, reads the limits and stops it.
 pub fn run(path: Option<&std::path::Path>) -> Result<Snapshot, CodexError> {
-    let mut cmd = command(path);
+    let mut cmd = command(path)?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());

@@ -109,12 +109,13 @@ fn inspect(dir: &Path) -> Result<BackupSummary, MaintenanceError> {
             dir.display()
         )));
     }
-    let store = Store::open(&db)?;
+    // Read-only, with no migrations: checking a backup or a running hub must change nothing.
+    let (schema_version, pages, displays) = Store::inspect(&db)?;
     Ok(BackupSummary {
         fingerprint: fingerprint(&identity.spki_sha256),
-        schema_version: store.schema_version()?,
-        pages: store.subscription_ids()?.len(),
-        displays: store.devices()?.len(),
+        schema_version,
+        pages,
+        displays,
     })
 }
 
@@ -337,6 +338,19 @@ mod tests {
         let dest = tmp.path().join("backup");
         let made = backup(&hub, &a, &dest).unwrap();
         assert_eq!(made.pages, 1);
+        // One self-contained file, and looking at it leaves nothing behind.
+        let listed = |d: &Path| {
+            let mut v: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            v.sort();
+            v
+        };
+        let before = listed(&dest);
+        assert!(!before.iter().any(|n| n.ends_with("-wal")), "{before:?}");
+        inspect(&dest).unwrap();
+        assert_eq!(listed(&dest), before);
         assert!(backup(&hub, &a, &dest).is_err(), "never overwrites a backup");
         #[cfg(unix)]
         {
@@ -393,6 +407,24 @@ mod tests {
             .contains("systemctl stop"));
         drop(held);
         assert!(lock(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn check_never_upgrades_a_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = config(&tmp.path().join("hub"));
+        crate::open_hub(cfg.clone(), Arc::new(FakeClock::parse("2026-11-11T01:00:00Z"))).unwrap();
+        // Pretend the database is from the first release.
+        let conn = rusqlite::Connection::open(cfg.db_path()).unwrap();
+        conn.execute_batch("DROP TABLE collector_scopes; PRAGMA user_version = 1;")
+            .unwrap();
+        drop(conn);
+        assert!(check(&cfg).iter().any(|f| f.text.contains("database schema 1")));
+        let version: i64 = rusqlite::Connection::open(cfg.db_path())
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1, "check changed nothing");
     }
 
     #[test]

@@ -156,6 +156,35 @@ impl Store {
         Self::prepare(conn, path)
     }
 
+    /// What a read-only look at a database finds: its schema version and how many pages and displays.
+    /// Opens it read-only and runs no migrations, so checking a backup or a live hub changes nothing.
+    pub fn inspect(path: &Path) -> Result<(i64, usize, usize), StoreError> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn = Connection::open_with_flags(path, flags)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let check: String = conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(|e| StoreError::Corrupt {
+                path: path.into(),
+                detail: e.to_string(),
+            })?;
+        if check != "ok" {
+            return Err(StoreError::Corrupt {
+                path: path.into(),
+                detail: check,
+            });
+        }
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let count = |table: &str| -> Result<usize, StoreError> {
+            let sql = match table {
+                "subscriptions" => "SELECT COUNT(*) FROM subscriptions",
+                _ => "SELECT COUNT(*) FROM devices",
+            };
+            Ok(conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as usize)
+        };
+        Ok((version, count("subscriptions")?, count("devices")?))
+    }
+
     /// An in-memory database, for tests.
     pub fn in_memory() -> Result<Self, StoreError> {
         Self::prepare(Connection::open_in_memory()?, Path::new(":memory:"))
@@ -724,6 +753,9 @@ impl Store {
         let mut out = Connection::open(dest)?;
         let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
         backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
+        drop(backup);
+        // One self-contained file: no write-ahead log beside it.
+        out.pragma_update(None, "journal_mode", "DELETE")?;
         Ok(())
     }
 }

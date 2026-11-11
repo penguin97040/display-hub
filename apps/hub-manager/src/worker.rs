@@ -284,17 +284,59 @@ fn send_usb(port: &str, bundle: &Bundle) -> Result<hub_client::usb::UsbDisplay, 
 fn save_bundle(path: &Path, bundle: &Bundle) -> Result<(), String> {
     use std::io::Write;
     let fail = |e: std::io::Error| format!("couldn't write {}: {e}", path.display());
+    // Always a new owner-only file, renamed over the target: writing into an existing file would
+    // keep whatever permissions it had, and this one holds a secret and perhaps a Wi-Fi password.
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path).map_err(fail)?;
-    f.write_all(&serde_json::to_vec_pretty(bundle).expect("serialises"))
-        .map_err(fail)?;
-    f.sync_all().map_err(fail)
+    let mut f = opts.open(&tmp).map_err(fail)?;
+    let written = f
+        .write_all(&serde_json::to_vec_pretty(bundle).expect("serialises"))
+        .and_then(|_| f.sync_all())
+        .and_then(|_| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written.map_err(fail)
+}
+
+#[cfg(all(test, unix))]
+mod save_tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn saving_over_a_readable_file_leaves_an_owner_only_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("setup.json");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let bundle: hub_protocol::provisioning::Bundle = serde_json::from_str(include_str!(
+            "../../../protocol/v1/examples/device/provisioning-bundle.json"
+        ))
+        .unwrap();
+        super::save_bundle(&path, &bundle).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("display-hub.provisioning"));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
+    }
 }
 
 #[cfg(test)]

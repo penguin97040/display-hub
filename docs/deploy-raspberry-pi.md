@@ -107,8 +107,11 @@ sudo -u display-hub hubd backup /var/backups/display-hub/$(date +%F)
 This is safe while the hub runs. To keep a copy off the Pi:
 
 ```sh
-sudo tar -C /var/backups/display-hub -czf ~/display-hub-backup.tgz $(date +%F)
+sudo sh -c "umask 077; tar -C /var/backups/display-hub -czf $HOME/display-hub-backup.tgz $(date +%F)"
+sudo chown "$USER" ~/display-hub-backup.tgz
 ```
+
+`umask 077` makes the copy readable by you alone; a plain `sudo tar` would leave it readable by everyone on the Pi.
 
 Then, from your PC:
 

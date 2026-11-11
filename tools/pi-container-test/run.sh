@@ -90,7 +90,7 @@ check "restarted: running again" active
 check "restarted: same key" test "$(fingerprint)" = "$key"
 check "restarted: the display still polls" display_online
 
-box systemctl kill -s KILL display-hub
+box systemctl kill --kill-whom=main -s KILL display-hub
 sleep 7
 check "killed: systemd starts it again" active
 check "killed: the display still polls" display_online
