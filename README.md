@@ -28,7 +28,7 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | Raspberry Pi install (`deploy/raspberry-pi`): hardened systemd service, backups, upgrades | Tested in a systemd container and under ARM64 emulation. Not yet on a real Pi: [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md). |
 | Desktop manager (`apps/hub-manager`): pairing, pages, manual figures, displays, USB setup | Working, tested on Linux (including screenshots) and built for Windows. Not yet tried on a Windows desktop: [docs/windows-testing.md](docs/windows-testing.md). |
 
-The ESP32 firmware lives in a separate repository, `llm-usage-display`. This repository defines the protocol it follows.
+The ESP32 firmware lives in a separate repository, `llm-usage-display`. This repository defines the protocol it follows, with schemas, examples and 40 conformance vectors: [docs/firmware-handoff.md](docs/firmware-handoff.md) is the brief.
 
 ## Try it
 

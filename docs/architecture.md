@@ -48,4 +48,4 @@
 | M3 | Desktop manager on GPUI, USB provisioning | Done on Linux and built for Windows; the Windows desktop run is the owner's to try |
 | M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Done in a systemd container and under emulation; the real Pi is the owner's to try |
 | M5 | Collectors: PC helper for Claude Code and Codex, manual entry for OpenCode Go | Done and tested against stand-ins; not yet against a live Claude Code or Codex |
-| M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | Next |
+| M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | Done: [firmware-handoff.md](firmware-handoff.md). The firmware itself is built in `llm-usage-display`. |

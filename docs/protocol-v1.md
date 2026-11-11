@@ -140,7 +140,9 @@ Errors are JSON: `{"error": {"code": "...", "message": "..."}}`. The `message` i
 | `token_revoked`, `unknown_device`, `enrolment_used`, `enrolment_expired` | Stop polling (retry hourly). Show that the display needs setting up again from the desktop manager. |
 | `incompatible_version` | Show that the hub and display software don't match. Retry hourly. |
 | `rate_limited`, `unavailable`, and any code you don't recognise | Keep the last good data, and retry with backoff. |
-| `unauthorised`, `forbidden`, `bad_request`, `payload_too_large`, `not_found`, `conflict` | Treat as a fault. Retry slowly, and log the code. |
+| `unauthorised`, `forbidden`, `bad_request`, `payload_too_large`, `not_found`, `conflict` | Treat as a fault. Keep the last good data, retry with the same backoff (up to 15 minutes), and log the code. |
+
+An error with no JSON body, such as a proxy's page, counts as `unavailable` for a 5xx status and as a fault otherwise.
 
 ## What a display does
 
@@ -202,6 +204,10 @@ Rules:
 - A hub never removes or renames a field within v1, never changes a field's meaning, and never loosens a bound. The published schema stays strict, describing exactly what a v1 hub sends.
 - A breaking change needs `protocol_version: 2`. A hub serves every version from `MIN_SUPPORTED_PROTOCOL_VERSION` (currently 1) up to its own. A display that sends a version the hub doesn't serve gets `incompatible_version`.
 
+## Finding the hub
+
+The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.local` then a fixed address. Resolving a `.local` name needs mDNS. ESP-IDF's lwIP resolves `name.local` through `gethostbyname()` when `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` is enabled ([ESP-IDF lwIP guide](https://docs.espressif.com/projects/esp-idf/en/stable/api-guides/lwip.html)). Check on the board that your HTTP client resolves it that way too. Either way, try every host in the list, and recommend that owners add the Pi's fixed address (`advertise_hosts` in `hubd.toml`). The certificate check, not the address, proves it's the hub.
+
 ## Conformance
 
 - `protocol/v1/examples/valid/*.json` must be accepted and drawn.
@@ -209,3 +215,5 @@ Rules:
   - `extra-field` is accepted, because unknown fields are ignored;
   - `unknown-quality` and `missing-used-percent` are accepted, read as unavailable and unknown respectively.
 - `crates/hub-protocol/tests/conformance.rs` shows the exact expectation for each file.
+- **`protocol/v1/vectors/`** has 40 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
+- USB messages have `usb.schema.json` and examples in `examples/usb/`.

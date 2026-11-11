@@ -55,6 +55,7 @@ cargo run -p hubd -- dev [--scenario demo|mixed|empty] [--fault none|malformed|w
 cargo run -p display-simulator -- once  [--hub http://127.0.0.1:8080/] [--cache sim-cache.json]
 cargo run -p display-simulator -- poll  [--max-polls N] [--max-wait SECONDS]
 cargo run -p display-simulator -- validate protocol/v1/examples/valid/*.json
+cargo run -p display-simulator -- conform check      # the firmware vectors still match the reference display
 ```
 
 `hubd dev` is plain HTTP with no authentication. It refuses any address other than loopback (`127.0.0.1` or `::1`), and must never be deployed. `display-simulator once` exits with `0` when online, `3` when showing saved data, and `4` when it has nothing to show.
