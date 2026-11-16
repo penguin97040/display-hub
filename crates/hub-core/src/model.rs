@@ -1,8 +1,9 @@
-//! Subscriptions (the pages a display shows) and the figures stored for them.
+//! Pages as the hub stores them, and usage subscriptions (meter pages) with their figures.
 
 use hub_protocol::limits::{MAX_LABEL_LEN, MAX_NOTE_LEN, MAX_TITLE_LEN};
+use hub_protocol::shapes::KIND_METER;
 use hub_protocol::text::sanitise_text;
-use hub_protocol::{DataQuality, Timestamp};
+use hub_protocol::{DataQuality, Meter, MeterItem, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// A subscription service the hub knows how to describe.
@@ -184,6 +185,87 @@ pub struct StoredContent {
     /// The page's `data`, in the shape its kind names. `None` when there is nothing to show.
     pub data: Option<serde_json::Value>,
     pub note: Option<String>,
+}
+
+// Usage subscriptions are meter pages: the service is the page's feed, and each allowance window is
+// a meter item.
+
+impl PageData {
+    /// The figures as a meter page's content.
+    pub fn to_content(&self) -> StoredContent {
+        let items: Vec<MeterItem> = self
+            .metrics
+            .iter()
+            .map(|m| MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at))
+            .collect();
+        StoredContent {
+            quality: self.quality,
+            updated_at: self.updated_at,
+            data: Some(serde_json::to_value(Meter { items }).expect("meters always serialise")),
+            note: self.note.clone(),
+        }
+    }
+}
+
+impl Subscription {
+    /// The subscription as a meter page, with its figures if it has any.
+    pub fn to_page(&self, data: Option<&PageData>) -> StoredPage {
+        StoredPage {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            kind: KIND_METER.into(),
+            source: self.source,
+            feed: Some(self.service.slug().into()),
+            stale_after_seconds: self.source.stale_after_seconds(),
+            content: data.map(PageData::to_content),
+        }
+    }
+}
+
+impl StoredPage {
+    /// The usage service a meter page belongs to, if it is a usage page.
+    pub fn usage_service(&self) -> Option<Service> {
+        (self.kind == KIND_METER)
+            .then(|| Service::from_slug(self.feed.as_deref()?))
+            .flatten()
+    }
+
+    /// A usage page as a subscription with its figures. Meter items that aren't allowance windows
+    /// are left out.
+    pub fn to_subscription(&self) -> Option<(Subscription, Option<PageData>)> {
+        let service = self.usage_service()?;
+        let data = self.content.as_ref().map(|c| PageData {
+            quality: c.quality,
+            updated_at: c.updated_at,
+            metrics: c
+                .data
+                .clone()
+                .and_then(|d| serde_json::from_value::<Meter>(d).ok())
+                .map(|m| {
+                    m.items
+                        .into_iter()
+                        .filter_map(|i| {
+                            Some(MetricValue {
+                                window: Window::from_id(&i.id)?,
+                                used_percent: i.percent,
+                                resets_at: i.resets_at,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            note: c.note.clone(),
+        });
+        Some((
+            Subscription {
+                id: self.id.clone(),
+                service,
+                title: self.title.clone(),
+                source: self.source,
+            },
+            data,
+        ))
+    }
 }
 
 /// Owner-supplied page titles and notes, made safe for the wire.

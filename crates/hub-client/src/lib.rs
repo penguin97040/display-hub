@@ -321,9 +321,25 @@ impl HubClient {
         .await
     }
 
+    /// The first pages of all, as a display that shows every page would receive them.
     pub async fn preview_snapshot(&self, token: &str) -> Result<Snapshot, ClientError> {
         self.call(Method::GET, "v1/admin/preview-snapshot", token, None::<&()>)
             .await
+    }
+
+    /// What one display receives now: its first ticked pages.
+    pub async fn preview_display_snapshot(
+        &self,
+        token: &str,
+        display: &str,
+    ) -> Result<Snapshot, ClientError> {
+        self.call(
+            Method::GET,
+            &format!("v1/admin/preview-snapshot?display={}", seg(display)),
+            token,
+            None::<&()>,
+        )
+        .await
     }
 
     pub async fn new_collector(

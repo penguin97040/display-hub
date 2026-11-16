@@ -189,7 +189,7 @@ For anything the shapes don't cover, such as `nearby-flights/1`:
 - The whole snapshot is at most **32 KiB**.
 - Each page, counted as its compact serialised JSON, is at most **3072 bytes** (`MAX_PAGE_BYTES`). Ten pages of that size, plus the envelope, still fit in 32 KiB.
 - A full `list` with four-byte characters everywhere can be over 3072 bytes, so a hub must keep a long list within the page limit. The other ready-made shapes always fit.
-- A hub never sends an over-size or invalid page. `hubd` checks every page it builds, and swaps one that breaks the page rules for an unavailable page with the same `id` and `title` and a note (for example "This page is too big to show"), so one bad page never stops the others being sent.
+- A hub never sends an over-size or invalid page. `hubd` checks every page it builds, and swaps one that breaks the page rules for an unavailable page with the same `id`, `kind`, `title` and `stale_after_seconds` and a note (for example "This page is too big to show"), so one bad page never stops the others being sent. The title is cleaned first, and a `kind` that is neither a shape nor a custom kind becomes `text`. An unavailable page carries no `data`, so the stand-in passes the same checks as any other page; one that still can't (a bad `id`, say) is left off.
 
 ### What a display does with a page it can't show
 

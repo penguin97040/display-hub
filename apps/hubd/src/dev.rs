@@ -13,7 +13,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use hub_core::provider::{DemoProvider, Provider};
-use hub_core::{build_snapshot, Clock, PageData, Service, Source, Subscription};
+use hub_core::{build_snapshot, Clock, PageData, Service, Source, StoredPage, Subscription};
 use hub_protocol::limits::{MAX_DEVICE_REQUEST_BYTES, MAX_SNAPSHOT_BYTES};
 use hub_protocol::Health;
 use tower::ServiceBuilder;
@@ -101,8 +101,8 @@ fn sub(service: Service, source: Source) -> Subscription {
 }
 
 /// The pages a scenario shows, with any stored figures.
-pub fn scenario_pages(scenario: Scenario, clock: &dyn Clock) -> Vec<(Subscription, Option<PageData>)> {
-    match scenario {
+pub fn scenario_pages(scenario: Scenario, clock: &dyn Clock) -> Vec<StoredPage> {
+    let pages: Vec<(Subscription, Option<PageData>)> = match scenario {
         Scenario::Demo => Service::ALL
             .into_iter()
             .map(|s| (sub(s, Source::Demo), None))
@@ -122,7 +122,8 @@ pub fn scenario_pages(scenario: Scenario, clock: &dyn Clock) -> Vec<(Subscriptio
             ]
         }
         Scenario::Empty => Vec::new(),
-    }
+    };
+    pages.iter().map(|(s, d)| s.to_page(d.as_ref())).collect()
 }
 
 async fn snapshot(State(st): State<DevState>, headers: HeaderMap) -> Result<Response, ApiError> {

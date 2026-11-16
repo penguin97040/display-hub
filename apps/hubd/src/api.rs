@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::error_handling::HandleErrorLayer;
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Request, State};
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -162,13 +162,21 @@ impl Hub {
         })
     }
 
-    fn snapshot(&self) -> Result<hub_protocol::Snapshot, StoreError> {
-        let pages = self.store.subscriptions()?;
-        Ok(build_snapshot(
+    /// The snapshot `display` receives: its first ticked pages. With no display, the first pages
+    /// of all. `None` if there is no such active display.
+    fn snapshot(&self, display: Option<&str>) -> Result<Option<hub_protocol::Snapshot>, StoreError> {
+        let pages = match display {
+            Some(id) => match self.store.display_pages(id)? {
+                Some(pages) => pages,
+                None => return Ok(None),
+            },
+            None => self.store.pages()?,
+        };
+        Ok(Some(build_snapshot(
             self.clock.now(),
             self.config.refresh_after_seconds,
             &pages,
-        ))
+        )))
     }
 }
 
@@ -443,7 +451,10 @@ async fn device_snapshot(
     let device = authenticate(&hub, &headers, peer.ip(), Role::Device).await?;
     note_seen(&hub, &device, None);
     let h = hub.clone();
-    let snap = db(&hub, move |_| h.snapshot()).await?;
+    // A display revoked since it authenticated has nothing to show.
+    let snap = db(&hub, move |_| h.snapshot(Some(&device)))
+        .await?
+        .ok_or_else(ApiError::not_found)?;
     let body = snap.to_wire().map_err(|v| {
         tracing::error!(violations = ?v, "refusing to send an invalid snapshot");
         ApiError::unavailable("The hub could not build a valid snapshot.")
@@ -1001,12 +1012,25 @@ async fn new_enrolment(
     Ok((StatusCode::CREATED, Json(grant)))
 }
 
+/// `GET /v1/admin/preview-snapshot[?display=<id>]`.
+#[derive(serde::Deserialize)]
+struct PreviewQuery {
+    display: Option<String>,
+}
+
+/// What a display would receive now, or with no display given, the first pages of all.
 async fn preview_snapshot(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    query: Result<Query<PreviewQuery>, QueryRejection>,
 ) -> Result<Json<hub_protocol::Snapshot>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    let Query(query) =
+        query.map_err(|e| ApiError::bad_request(format!("The query isn't valid: {}", e.body_text())))?;
     let h = hub.clone();
-    Ok(Json(db(&hub, move |_| h.snapshot()).await?))
+    db(&hub, move |_| h.snapshot(query.display.as_deref()))
+        .await?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
 }

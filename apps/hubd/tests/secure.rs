@@ -213,6 +213,60 @@ async fn enrolled_displays_see_pages_and_codes_work_once() {
 }
 
 #[tokio::test]
+async fn each_display_gets_its_own_ticked_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let add = |service| NewSubscription {
+        service,
+        source: Source::Demo,
+        title: None,
+        id: None,
+    };
+    c.add_subscription(&admin, &add(Service::ClaudeMax))
+        .await
+        .unwrap();
+    let (desk, desk_token) = enrolled(&r, &admin, "Desk").await;
+    // A page added after a display enrols shows on it too.
+    c.add_subscription(&admin, &add(Service::ChatgptPlus))
+        .await
+        .unwrap();
+    let (kitchen, kitchen_token) = enrolled(&r, &admin, "Kitchen").await;
+    let ids = |s: &hub_protocol::Snapshot| s.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
+    for token in [&desk_token, &kitchen_token] {
+        let snap = c.device_snapshot(Some(token)).await.unwrap();
+        assert_eq!(ids(&snap), ["claude-max", "chatgpt-plus"]);
+    }
+
+    assert!(r
+        .hub
+        .store
+        .set_display_pages(&kitchen, &["chatgpt-plus".into()])
+        .unwrap());
+    let snap = c.device_snapshot(Some(&kitchen_token)).await.unwrap();
+    assert_eq!(ids(&snap), ["chatgpt-plus"]);
+    let snap = c.device_snapshot(Some(&desk_token)).await.unwrap();
+    assert_eq!(ids(&snap), ["claude-max", "chatgpt-plus"]);
+
+    // The preview shows one display's pages, or with none named, all of them.
+    let preview = c.preview_display_snapshot(&admin, &kitchen).await.unwrap();
+    assert_eq!(ids(&preview), ["chatgpt-plus"]);
+    let preview = c.preview_snapshot(&admin).await.unwrap();
+    assert_eq!(ids(&preview), ["claude-max", "chatgpt-plus"]);
+    let unknown = c.preview_display_snapshot(&admin, "d-nope").await.unwrap_err();
+    assert_eq!(code(&unknown), Some(ErrorCode::NotFound));
+
+    // A revoked display has no preview, and its ticks are gone.
+    c.revoke_display(&admin, &desk).await.unwrap();
+    let gone = c.preview_display_snapshot(&admin, &desk).await.unwrap_err();
+    assert_eq!(code(&gone), Some(ErrorCode::NotFound));
+    assert_eq!(r.hub.store.display_page_ids(&desk).unwrap(), None);
+    r.stop().await;
+}
+
+#[tokio::test]
 async fn admin_changes_reach_the_next_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);

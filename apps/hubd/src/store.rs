@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hub_core::{MetricValue, PageData, Service, Source, StoredContent, StoredPage, Subscription, Window};
+use hub_core::{PageData, Service, Source, StoredContent, StoredPage, Subscription};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::limits::{MAX_METER_ITEMS, MAX_TITLE_LEN};
 use hub_protocol::shapes::KIND_METER;
@@ -246,6 +246,10 @@ fn move_to_pages(conn: &Connection) -> Result<(), StoreError> {
     conn.execute_batch("DROP TABLE page_data; DROP TABLE subscriptions;")?;
     Ok(())
 }
+
+/// The most pages the hub holds. Each display shows at most its first
+/// [`MAX_PAGES`](hub_protocol::limits::MAX_PAGES) ticked ones.
+pub const MAX_STORED_PAGES: usize = 50;
 
 /// Audit entries older than this are pruned.
 pub const AUDIT_RETENTION_SECONDS: i64 = 90 * 86_400;
@@ -683,7 +687,9 @@ impl Store {
         info: &DeviceInfo,
         now: Timestamp,
     ) -> Result<(), StoreError> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO devices (id, name, enrolled_at, last_seen_at, info) VALUES (?1, ?2, ?3, ?3, ?4)",
             params![
                 id,
@@ -692,6 +698,12 @@ impl Store {
                 serde_json::to_string(info).expect("serialises")
             ],
         )?;
+        // A new display shows every page.
+        tx.execute(
+            "INSERT INTO display_pages (device_id, page_id) SELECT ?1, id FROM pages",
+            params![id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -727,8 +739,84 @@ impl Store {
             "UPDATE credentials SET revoked_at = ?1 WHERE role = 'device' AND subject = ?2 AND revoked_at IS NULL",
             params![now.unix(), id],
         )?;
+        tx.execute("DELETE FROM display_pages WHERE device_id = ?1", params![id])?;
         tx.commit()?;
         Ok(n > 0)
+    }
+
+    /// Whether `id` is a display that hasn't been revoked.
+    pub fn device_active(&self, id: &str) -> Result<bool, StoreError> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1 AND revoked_at IS NULL)",
+            params![id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The ids of the pages a display shows (its ticks), in the shared page order. `None` if there
+    /// is no such active display.
+    pub fn display_page_ids(&self, device: &str) -> Result<Option<Vec<String>>, StoreError> {
+        if !self.device_active(device)? {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT p.id FROM display_pages t JOIN pages p ON p.id = t.page_id
+             WHERE t.device_id = ?1 ORDER BY p.position, p.created_at",
+        )?;
+        let rows = st.query_map(params![device], |r| r.get(0))?;
+        Ok(Some(rows.collect::<Result<_, _>>()?))
+    }
+
+    /// Sets which pages a display shows. Each id must be a page; order and repeats don't matter,
+    /// since displays share one page order. False if there is no such active display.
+    pub fn set_display_pages(&self, device: &str, ids: &[String]) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let active: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1 AND revoked_at IS NULL)",
+            params![device],
+            |r| r.get(0),
+        )?;
+        if !active {
+            return Ok(false);
+        }
+        for id in ids {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pages WHERE id = ?1)",
+                params![id],
+                |r| r.get(0),
+            )?;
+            if !exists {
+                return Err(StoreError::Invalid(format!("no page with id {id:?}")));
+            }
+        }
+        tx.execute("DELETE FROM display_pages WHERE device_id = ?1", params![device])?;
+        for id in ids {
+            tx.execute(
+                "INSERT OR IGNORE INTO display_pages (device_id, page_id) VALUES (?1, ?2)",
+                params![device, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The pages a display's snapshot is built from: its first
+    /// [`MAX_PAGES`](hub_protocol::limits::MAX_PAGES) ticked pages, in order. `None` if there is
+    /// no such active display.
+    pub fn display_pages(&self, device: &str) -> Result<Option<Vec<StoredPage>>, StoreError> {
+        let Some(ids) = self.display_page_ids(device)? else {
+            return Ok(None);
+        };
+        let ticked: std::collections::HashSet<String> = ids.into_iter().collect();
+        Ok(Some(
+            self.pages()?
+                .into_iter()
+                .filter(|p| ticked.contains(&p.id))
+                .take(hub_protocol::limits::MAX_PAGES)
+                .collect(),
+        ))
     }
 
     /// Writes buffered last-seen times and heartbeat details in one transaction.
@@ -819,10 +907,9 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let count: i64 = tx.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))?;
-        if count as usize >= hub_protocol::limits::MAX_PAGES {
+        if count as usize >= MAX_STORED_PAGES {
             return Err(StoreError::Invalid(format!(
-                "a display shows at most {} pages; remove one first",
-                hub_protocol::limits::MAX_PAGES
+                "the hub holds at most {MAX_STORED_PAGES} pages; remove one first"
             )));
         }
         let exists: bool = tx.query_row(
@@ -856,6 +943,11 @@ impl Store {
         if let Some(content) = &page.content {
             write_content(&tx, &page.id, content, now)?;
         }
+        // A new page shows on every display; each display's ticks can then take it off.
+        tx.execute(
+            "INSERT INTO display_pages (device_id, page_id) SELECT id, ?1 FROM devices WHERE revoked_at IS NULL",
+            params![page.id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -961,22 +1053,15 @@ impl Store {
     // service, and whose meter items are the allowance windows.
 
     pub fn subscriptions(&self) -> Result<Vec<(Subscription, Option<PageData>)>, StoreError> {
-        Ok(self.pages()?.into_iter().filter_map(as_subscription).collect())
+        Ok(self
+            .pages()?
+            .iter()
+            .filter_map(StoredPage::to_subscription)
+            .collect())
     }
 
     pub fn add_subscription(&self, sub: &Subscription, now: Timestamp) -> Result<(), StoreError> {
-        self.add_page(
-            &StoredPage {
-                id: sub.id.clone(),
-                title: sub.title.clone(),
-                kind: KIND_METER.into(),
-                source: sub.source,
-                feed: Some(sub.service.slug().into()),
-                stale_after_seconds: sub.source.stale_after_seconds(),
-                content: None,
-            },
-            now,
-        )
+        self.add_page(&sub.to_page(None), now)
     }
 
     pub fn subscription_ids(&self) -> Result<Vec<String>, StoreError> {
@@ -998,22 +1083,11 @@ impl Store {
 
     /// Stores figures for a usage page as meter data.
     pub fn put_page_data(&self, id: &str, data: &PageData, now: Timestamp) -> Result<bool, StoreError> {
-        let items = data
-            .metrics
-            .iter()
-            .map(|m| MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at))
-            .collect();
-        let content = StoredContent {
-            quality: data.quality,
-            updated_at: data.updated_at,
-            data: Some(serde_json::to_value(Meter { items }).expect("serialises")),
-            note: data.note.clone(),
-        };
-        self.put_content(id, &content, now)
+        self.put_content(id, &data.to_content(), now)
     }
 
     pub fn subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
-        Ok(self.page(id)?.and_then(as_subscription).map(|(s, _)| s))
+        Ok(self.page(id)?.and_then(|p| p.to_subscription()).map(|(s, _)| s))
     }
 
     /// The pages a collector's report for `service` goes to.
@@ -1091,44 +1165,6 @@ fn write_content(conn: &Connection, id: &str, c: &StoredContent, now: Timestamp)
         "UPDATE pages SET quality = ?2, updated_at = ?3, data = ?4, note = ?5, stored_at = ?6 WHERE id = ?1",
         params![id, quality, updated_at, data, note, now.unix()],
     )
-}
-
-/// A meter page of a known usage service, as a subscription with its figures.
-fn as_subscription(p: StoredPage) -> Option<(Subscription, Option<PageData>)> {
-    let service = Service::from_slug(p.feed.as_deref()?)?;
-    if p.kind != KIND_METER {
-        return None;
-    }
-    let data = p.content.map(|c| PageData {
-        quality: c.quality,
-        updated_at: c.updated_at,
-        metrics: c
-            .data
-            .and_then(|d| serde_json::from_value::<Meter>(d).ok())
-            .map(|m| {
-                m.items
-                    .into_iter()
-                    .filter_map(|i| {
-                        Some(MetricValue {
-                            window: Window::from_id(&i.id)?,
-                            used_percent: i.percent,
-                            resets_at: i.resets_at,
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        note: c.note,
-    });
-    Some((
-        Subscription {
-            id: p.id,
-            service,
-            title: p.title,
-            source: p.source,
-        },
-        data,
-    ))
 }
 
 /// Copies `conn`'s database to `dest` with SQLite's online backup, as one self-contained file.
@@ -1283,9 +1319,17 @@ mod tests {
         // What the schema 2 code built from the same data, captured before it was replaced.
         let expected: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/schema-2-pages.json")).unwrap();
-        let snap = hub_core::build_snapshot(ts(NOW), 300, &store.subscriptions().unwrap());
-        snap.validate().unwrap();
-        assert_eq!(serde_json::to_value(&snap.pages).unwrap(), expected);
+        // Each display, with every page ticked, gets what every display got before; so does the
+        // all-pages preview.
+        for display in ["d-desk", "d-kitchen"] {
+            let pages = store.display_pages(display).unwrap().unwrap();
+            let snap = hub_core::build_snapshot(ts(NOW), 300, &pages);
+            snap.validate().unwrap();
+            assert_eq!(serde_json::to_value(&snap.pages).unwrap(), expected, "{display}");
+        }
+        assert_eq!(store.display_pages("d-old").unwrap(), None);
+        let all = hub_core::build_snapshot(ts(NOW), 300, &store.pages().unwrap());
+        assert_eq!(serde_json::to_value(&all.pages).unwrap(), expected);
 
         let conn = store.conn();
         assert_eq!(untouched_tables(&conn), before);
@@ -1446,5 +1490,121 @@ mod tests {
             store.put_content("nope", &page.content.unwrap(), now),
             Err(StoreError::Invalid(_))
         ));
+    }
+
+    fn text_page(id: &str) -> StoredPage {
+        StoredPage {
+            id: id.into(),
+            title: id.into(),
+            kind: "text".into(),
+            source: Source::Manual,
+            feed: None,
+            stale_after_seconds: 600,
+            content: None,
+        }
+    }
+
+    fn device(store: &Store, id: &str) {
+        let info = DeviceInfo {
+            device_type: "test-display".into(),
+            firmware_version: "0.0.0-test".into(),
+            hardware_revision: "simulated".into(),
+            protocol_version: 1,
+        };
+        store.add_device(id, id, &info, ts(NOW)).unwrap();
+    }
+
+    #[test]
+    fn each_display_shows_its_ticked_pages_in_the_shared_order() {
+        let store = Store::in_memory().unwrap();
+        store.add_page(&text_page("a"), ts(NOW)).unwrap();
+        device(&store, "d-1");
+        store.add_page(&text_page("b"), ts(NOW)).unwrap();
+        device(&store, "d-2");
+        let ids = |d: &str| store.display_page_ids(d).unwrap().unwrap();
+        // A new page shows on every display, and a new display shows every page.
+        assert_eq!(ids("d-1"), ["a", "b"]);
+        assert_eq!(ids("d-2"), ["a", "b"]);
+        store.add_page(&text_page("c"), ts(NOW)).unwrap();
+
+        // Ticks are a set: the shared order decides how they are shown.
+        assert!(store
+            .set_display_pages("d-1", &["c".into(), "a".into(), "c".into()])
+            .unwrap());
+        assert_eq!(ids("d-1"), ["a", "c"]);
+        assert_eq!(ids("d-2"), ["a", "b", "c"]);
+        store.reorder(&["c".into(), "b".into(), "a".into()]).unwrap();
+        assert_eq!(ids("d-1"), ["c", "a"]);
+        let shown: Vec<String> = store
+            .display_pages("d-1")
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(shown, ["c", "a"]);
+
+        assert!(matches!(
+            store.set_display_pages("d-1", &["nope".into()]),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(ids("d-1"), ["c", "a"], "a refused change changes nothing");
+        assert!(!store.set_display_pages("d-unknown", &[]).unwrap());
+        assert!(store.set_display_pages("d-2", &[]).unwrap());
+        assert!(ids("d-2").is_empty());
+
+        // Removing a page or revoking a display takes its ticks with it.
+        assert!(store.remove_page("c").unwrap());
+        assert_eq!(ids("d-1"), ["a"]);
+        assert!(store.revoke_device("d-1", ts(NOW)).unwrap());
+        assert_eq!(store.display_page_ids("d-1").unwrap(), None);
+        let left: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM display_pages WHERE device_id = 'd-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0);
+        assert!(!store.set_display_pages("d-1", &["a".into()]).unwrap());
+    }
+
+    #[test]
+    fn the_hub_holds_50_pages_and_each_display_gets_its_first_10_ticked() {
+        let store = Store::in_memory().unwrap();
+        device(&store, "d-1");
+        for i in 0..MAX_STORED_PAGES {
+            store.add_page(&text_page(&format!("p{i}")), ts(NOW)).unwrap();
+        }
+        assert!(matches!(
+            store.add_page(&text_page("one-more"), ts(NOW)),
+            Err(StoreError::Invalid(_))
+        ));
+        assert_eq!(store.pages().unwrap().len(), MAX_STORED_PAGES);
+        assert_eq!(
+            store.display_page_ids("d-1").unwrap().unwrap().len(),
+            MAX_STORED_PAGES
+        );
+        let shown = |store: &Store| -> Vec<String> {
+            store
+                .display_pages("d-1")
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|p| p.id)
+                .collect()
+        };
+        let first: Vec<String> = (0..10).map(|i| format!("p{i}")).collect();
+        assert_eq!(shown(&store), first);
+        // Unticking pages brings later ticked ones forward.
+        let odd: Vec<String> = (0..MAX_STORED_PAGES)
+            .filter(|i| i % 2 == 1)
+            .map(|i| format!("p{i}"))
+            .collect();
+        store.set_display_pages("d-1", &odd).unwrap();
+        assert_eq!(shown(&store), odd[..10]);
+        let snap = hub_core::build_snapshot(ts(NOW), 300, &store.display_pages("d-1").unwrap().unwrap());
+        assert_eq!(snap.pages.len(), hub_protocol::limits::MAX_PAGES);
     }
 }
