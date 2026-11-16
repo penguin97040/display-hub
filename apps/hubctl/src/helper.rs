@@ -1,16 +1,16 @@
-//! The helper's connection to the hub: a collector token in the OS credential store, and the hub's
+//! The helper's connection to the hub: a helper token in the OS credential store, and the hub's
 //! address and key in `hubctl.json` (no secrets), in `%AppData%\display-hub\hubctl\` on Windows.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use hub_client::{ClientError, HubClient};
-use hub_core::api::{UsageAccepted, UsageReport};
-use hub_core::Service;
+use hub_core::api::FeedAccepted;
 use hub_protocol::pairing::{hex, PairingString};
 use hub_protocol::Timestamp;
 use os_secrets::TokenStore;
 use serde::{Deserialize, Serialize};
+use usage::UsageReport;
 use zeroize::Zeroizing;
 
 /// The credential store's service name for the helper's token.
@@ -43,8 +43,12 @@ pub struct HelperConfig {
     pub port: u16,
     /// SHA-256 of the hub's public key, lower-case hex: the only key the helper accepts.
     pub spki_sha256: String,
-    pub collector_id: String,
-    pub services: Vec<Service>,
+    /// Files written before helpers sent to feeds name the same things differently.
+    #[serde(alias = "collector_id")]
+    pub helper_id: String,
+    /// The feeds it may send to: a service's feed has the service's slug as its name.
+    #[serde(alias = "services")]
+    pub feeds: Vec<String>,
     pub paired_at: Timestamp,
 }
 
@@ -61,6 +65,8 @@ impl HelperConfig {
         bytes.try_into().ok()
     }
 
+    /// The credential store's account for the token. Its name is older than helpers sending to
+    /// feeds, and stays so a token already stored is still found.
     fn token_account(&self) -> String {
         format!(
             "collector-token-{}",
@@ -126,17 +132,17 @@ pub async fn login(
     // Check the store first, so the hub never issues a token this PC can't keep.
     store.check().map_err(HelperError::Store)?;
     let client = HubClient::pinned(&pairing.host, pairing.port, vec![pairing.spki_sha256])?;
-    let resp = client.collector_pair(&pairing.secret_text()).await?;
+    let resp = client.helper_pair(&pairing.secret_text()).await?;
     let cfg = HelperConfig {
         host: pairing.host.clone(),
         port: pairing.port,
         spki_sha256: hex(&pairing.spki_sha256),
-        collector_id: resp.collector_id,
-        services: resp.services,
+        helper_id: resp.helper_id,
+        feeds: resp.feeds,
         paired_at: now,
     };
     store
-        .save(&cfg.token_account(), &resp.collector_token)
+        .save(&cfg.token_account(), &resp.helper_token)
         .map_err(HelperError::Store)?;
     write_private(
         &dir.join(CONFIG),
@@ -180,8 +186,10 @@ impl Helper {
         })
     }
 
-    pub async fn send(&self, report: &UsageReport) -> Result<UsageAccepted, HelperError> {
-        Ok(self.client.report_usage(&self.token, report).await?)
+    /// Sends a report as a meter page to its service's feed, once its figures pass the usage checks.
+    pub async fn send(&self, report: &UsageReport) -> Result<FeedAccepted, HelperError> {
+        let (feed, body) = report.to_feed_content().map_err(ClientError::Invalid)?;
+        Ok(self.client.put_feed(&self.token, feed, &body).await?)
     }
 
     pub async fn reachable(&self) -> Result<(), HelperError> {
@@ -218,4 +226,21 @@ pub fn log_tail(dir: &Path, lines: usize) -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_settings_file_from_before_feeds_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"host": "raspberrypi.local", "port": 8443, "spki_sha256": "ab", "collector_id": "c-1",
+                      "services": ["claude-max", "chatgpt-plus"], "paired_at": "2026-11-10T20:00:00Z"}"#;
+        std::fs::write(dir.path().join(CONFIG), old).unwrap();
+        let cfg = load_config(dir.path()).unwrap();
+        assert_eq!(cfg.helper_id, "c-1");
+        assert_eq!(cfg.feeds, ["claude-max", "chatgpt-plus"]);
+        assert_eq!(cfg.token_account(), "collector-token-ab");
+    }
 }

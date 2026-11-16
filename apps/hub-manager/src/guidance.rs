@@ -135,6 +135,7 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
         ClientError::AddressRefused(m) => {
             Guidance::problem("That address can't be used", m.clone(), Next::None)
         }
+        ClientError::Invalid(m) => Guidance::problem("That can't be saved", one_line(m), Next::None),
         ClientError::TooLarge(_) | ClientError::Malformed(_) | ClientError::Snapshot(_) => Guidance::problem(
             "The hub's answer wasn't understood",
             "The hub and this app may be different versions. Update both to the same release.",

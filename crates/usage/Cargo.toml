@@ -1,0 +1,16 @@
+[package]
+name = "usage"
+version = "0.1.0"
+description = "Usage-limit pages for Display Hub: Claude, ChatGPT and OpenCode allowances as meter pages"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+hub-protocol.workspace = true
+hub-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+thiserror.workspace = true

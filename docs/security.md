@@ -11,7 +11,7 @@
 
 | Threat | In scope | Defence |
 |---|---|---|
-| Another device on the home Wi-Fi reading figures or changing settings | Yes | Every request is authenticated, with separate admin, display and collector credentials. The hub is LAN-only and accepts private source addresses only. |
+| Another device on the home Wi-Fi reading figures or changing settings | Yes | Every request is authenticated, with separate admin, display and helper credentials. The hub is LAN-only and accepts private source addresses only. |
 | A spoofed mDNS answer or a hijacked IP address impersonating the hub | Yes | Discovery is never trust. Clients pin the hub's certificate and key, installed out of band. |
 | An unknown or unpaired display | Yes | It has no credential, so it gets nothing. Enrolment needs a short-lived, single-use secret from an admin. |
 | A lost or stolen display | Yes | Revoke it in the manager. Its token stops working immediately. It never held provider credentials. |
@@ -84,8 +84,8 @@
 ## The PC helper (`hubctl`)
 
 - **What it reads:** only what Claude Code passes its status line on stdin, and what `codex app-server` answers. It reads no browser data, passwords or other apps' tokens, and calls no provider endpoint itself ([providers.md](providers.md)).
-- **What it holds:** a collector token (`dhc_`), in the OS credential store, never a file. `hubctl.json` has only the hub's address and key hash. The helper string is read from stdin, never the command line, so it stays out of shell history and process lists.
-- **What its token can do:** report figures for the services it was invited for (Claude Max, ChatGPT Plus or both), and only to pages whose figures come from "PC helper". The hub refuses other services (403), figures dated more than five minutes ahead, and shares outside 0–100. It can't read anything, change pages, or act as an admin or a display.
+- **What it holds:** a helper token (`dhc_`), in the OS credential store, never a file. `hubctl.json` has only the hub's address and key hash. The helper string is read from stdin, never the command line, so it stays out of shell history and process lists.
+- **What its token can do:** send page content to the feeds it was invited for (for the PC helper, Claude Max's, ChatGPT Plus's or both), and only to pages of those feeds whose figures come from "PC helper" and whose kind matches. The hub refuses other feeds (403), content dated more than five minutes ahead, and content that breaks the page rules, such as shares outside 0–100 or a page over 3072 bytes. It can't read anything, change pages, or act as an admin or a display. `hubctl` also checks the figures against the service's windows before sending them.
 - **Cutting it off:** **Settings**, **PC helper**, **Remove** in the manager. Its token stops working at once. `hubctl logout` deletes it from that PC.
 - **Invites** work once, within 10 minutes. A reused invite is recorded as an `ALARM_` audit event, as pairing codes are.
 
@@ -95,7 +95,7 @@
 |---|---|---|---|
 | Admin token `dha_` | Desktop manager (OS credential store) | Everything under `/v1/admin/` | SHA-256 hash |
 | Device token `dhd_` | One display (encrypted NVS) | Read the snapshot, send heartbeats, as itself only | SHA-256 hash |
-| Collector token `dhc_` | PC helper `hubctl` (OS credential store) | Report figures for the services it was invited for, to pages whose source is "PC helper". Nothing else. | SHA-256 hash |
+| Helper token `dhc_` | A helper, such as the PC helper `hubctl` (OS credential store) | Send page content to the feeds it was invited for, for pages whose source is "PC helper" and whose kind matches. Nothing else. | SHA-256 hash |
 | Pairing and enrolment secrets | Pairing string, bundle | Exchanged once for a token, within 10 minutes | SHA-256 hash |
 
 - Each token type has its own prefix. A token used on another role's route gets `403`.

@@ -1,12 +1,12 @@
-//! Runs pairing, enrolment, polling, heartbeats and revocation with every log level turned on, for
-//! every crate, and checks no credential or one-time code appears in the output.
+//! Runs pairing, enrolment, helpers, polling, heartbeats and revocation with every log level turned
+//! on, for every crate, and checks no credential or one-time code appears in the output.
 
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use hub_client::HubClient;
-use hub_core::api::NewSubscription;
-use hub_core::{FakeClock, Service, Source};
+use hub_core::api::{FeedContent, NewHelper, NewPage};
+use hub_core::{FakeClock, Source};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::pairing::PairingString;
 use hubd::config::Config;
@@ -64,17 +64,40 @@ async fn no_credential_reaches_the_logs() {
     secrets.push(pairing.encode());
     let admin = c.pair(&pairing.secret_text(), "PC").await.unwrap().admin_token;
     secrets.push(admin.clone());
-    c.add_subscription(
+    c.add_page(
         &admin,
-        &NewSubscription {
-            service: Service::ClaudeMax,
-            source: Source::Demo,
-            title: None,
+        &NewPage {
+            title: "Garden".into(),
+            kind: "meter".into(),
+            source: Source::Helper,
+            feed: Some("garden".into()),
             id: None,
+            stale_after_seconds: None,
         },
     )
     .await
     .unwrap();
+    let invite = c
+        .new_helper(
+            &admin,
+            &NewHelper {
+                label: "PC".into(),
+                feeds: vec!["garden".into()],
+            },
+        )
+        .await
+        .unwrap();
+    secrets.push(invite.secret.clone());
+    let helper = c.helper_pair(&invite.secret).await.unwrap().helper_token;
+    secrets.push(helper.clone());
+    let body = FeedContent {
+        kind: "meter".into(),
+        data: serde_json::json!({"items": [{"id": "soil", "label": "Soil", "percent": 40}]}),
+        collected_at: None,
+        note: None,
+    };
+    c.put_feed(&helper, "garden", &body).await.unwrap();
+    let _ = c.helper_pair(&invite.secret).await; // a reuse, which raises an alarm
     let grant = c.new_enrolment(&admin, "Desk").await.unwrap();
     secrets.push(grant.secret.clone());
     let info = DeviceInfo {

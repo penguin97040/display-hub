@@ -5,14 +5,51 @@ use std::path::Path;
 use std::sync::Arc;
 
 use hub_client::{ClientError, HubClient};
-use hub_core::api::{ManualFigures, ManualMetric, NewSubscription, SubscriptionChange};
-use hub_core::{Clock, FakeClock, Service, Source, Window};
+use hub_core::api::{FeedContent, NewHelper, NewPage, PageChange, PageContentInput, PageView};
+use hub_core::{Clock, FakeClock, Source};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::pairing::PairingString;
 use hub_protocol::{DataQuality, ErrorAction, ErrorCode};
 use hubd::api::Hub;
 use hubd::config::Config;
+use serde_json::{json, Value};
 use tokio::sync::oneshot;
+
+/// A meter page fed by `feed`, with the feed as its id.
+fn meter(feed: &str, source: Source) -> NewPage {
+    NewPage {
+        title: feed.into(),
+        kind: "meter".into(),
+        source,
+        feed: Some(feed.into()),
+        id: None,
+        stale_after_seconds: None,
+    }
+}
+
+/// A meter's data with one bar.
+fn bar(percent: f64) -> Value {
+    json!({"items": [{"id": "a", "label": "A", "percent": percent}]})
+}
+
+fn content(data: Value) -> PageContentInput {
+    PageContentInput {
+        data: Some(data),
+        note: None,
+    }
+}
+
+/// Adds a meter page; a demo one is given sample content, as the manager does.
+async fn add_meter(c: &HubClient, admin: &str, feed: &str, source: Source) -> PageView {
+    let page = c.add_page(admin, &meter(feed, source)).await.unwrap();
+    if source == Source::Demo {
+        return c
+            .set_page_content(admin, &page.id, &content(bar(42.0)))
+            .await
+            .unwrap();
+    }
+    page
+}
 
 /// The items of a page that must be a meter.
 fn items(page: &hub_protocol::Page) -> Vec<hub_protocol::MeterItem> {
@@ -169,22 +206,12 @@ async fn enrolled_displays_see_pages_and_codes_work_once() {
     let r = Running::start(dir.path(), &clock).await;
     let admin = r.admin().await;
     let c = r.client();
-    for (service, source) in [
-        (Service::ClaudeMax, Source::Demo),
-        (Service::ChatgptPlus, Source::None),
-        (Service::OpencodeGoPlus, Source::Manual),
+    for (feed, source) in [
+        ("garden", Source::Demo),
+        ("kitchen", Source::None),
+        ("garage", Source::Manual),
     ] {
-        c.add_subscription(
-            &admin,
-            &NewSubscription {
-                service,
-                source,
-                title: None,
-                id: None,
-            },
-        )
-        .await
-        .unwrap();
+        add_meter(&c, &admin, feed, source).await;
     }
     let grant = c.new_enrolment(&admin, "Desk").await.unwrap();
     let e = c.enrol(&grant.secret, info("simulated")).await.unwrap();
@@ -192,7 +219,7 @@ async fn enrolled_displays_see_pages_and_codes_work_once() {
 
     let snap = c.device_snapshot(Some(&e.device_token)).await.unwrap();
     let ids: Vec<_> = snap.pages.iter().map(|p| p.id.as_str()).collect();
-    assert_eq!(ids, ["claude-max", "chatgpt-plus", "opencode-go-plus"]);
+    assert_eq!(ids, ["garden", "kitchen", "garage"]);
     assert_eq!(snap.pages[0].data_quality, DataQuality::Demo);
     assert_eq!(snap.pages[1].data_quality, DataQuality::Unavailable);
     assert_eq!(
@@ -219,42 +246,32 @@ async fn each_display_gets_its_own_ticked_pages() {
     let r = Running::start(dir.path(), &clock).await;
     let admin = r.admin().await;
     let c = r.client();
-    let add = |service| NewSubscription {
-        service,
-        source: Source::Demo,
-        title: None,
-        id: None,
-    };
-    c.add_subscription(&admin, &add(Service::ClaudeMax))
-        .await
-        .unwrap();
+    add_meter(&c, &admin, "garden", Source::Demo).await;
     let (desk, desk_token) = enrolled(&r, &admin, "Desk").await;
     // A page added after a display enrols shows on it too.
-    c.add_subscription(&admin, &add(Service::ChatgptPlus))
-        .await
-        .unwrap();
+    add_meter(&c, &admin, "kitchen", Source::Demo).await;
     let (kitchen, kitchen_token) = enrolled(&r, &admin, "Kitchen").await;
     let ids = |s: &hub_protocol::Snapshot| s.pages.iter().map(|p| p.id.clone()).collect::<Vec<_>>();
     for token in [&desk_token, &kitchen_token] {
         let snap = c.device_snapshot(Some(token)).await.unwrap();
-        assert_eq!(ids(&snap), ["claude-max", "chatgpt-plus"]);
+        assert_eq!(ids(&snap), ["garden", "kitchen"]);
     }
 
     assert!(r
         .hub
         .store
-        .set_display_pages(&kitchen, &["chatgpt-plus".into()])
+        .set_display_pages(&kitchen, &["kitchen".into()])
         .unwrap());
     let snap = c.device_snapshot(Some(&kitchen_token)).await.unwrap();
-    assert_eq!(ids(&snap), ["chatgpt-plus"]);
+    assert_eq!(ids(&snap), ["kitchen"]);
     let snap = c.device_snapshot(Some(&desk_token)).await.unwrap();
-    assert_eq!(ids(&snap), ["claude-max", "chatgpt-plus"]);
+    assert_eq!(ids(&snap), ["garden", "kitchen"]);
 
     // The preview shows one display's pages, or with none named, all of them.
     let preview = c.preview_display_snapshot(&admin, &kitchen).await.unwrap();
-    assert_eq!(ids(&preview), ["chatgpt-plus"]);
+    assert_eq!(ids(&preview), ["kitchen"]);
     let preview = c.preview_snapshot(&admin).await.unwrap();
-    assert_eq!(ids(&preview), ["claude-max", "chatgpt-plus"]);
+    assert_eq!(ids(&preview), ["garden", "kitchen"]);
     let unknown = c.preview_display_snapshot(&admin, "d-nope").await.unwrap_err();
     assert_eq!(code(&unknown), Some(ErrorCode::NotFound));
 
@@ -273,106 +290,64 @@ async fn admin_changes_reach_the_next_snapshot() {
     let r = Running::start(dir.path(), &clock).await;
     let admin = r.admin().await;
     let c = r.client();
-    for service in Service::ALL {
-        c.add_subscription(
-            &admin,
-            &NewSubscription {
-                service,
-                source: Source::Manual,
-                title: None,
-                id: None,
-            },
-        )
-        .await
-        .unwrap();
+    for feed in ["garden", "kitchen", "garage"] {
+        add_meter(&c, &admin, feed, Source::Manual).await;
     }
     let (_, token) = enrolled(&r, &admin, "Desk").await;
 
-    c.reorder(
-        &admin,
-        vec![
-            "opencode-go-plus".into(),
-            "claude-max".into(),
-            "chatgpt-plus".into(),
-        ],
-    )
-    .await
-    .unwrap();
-    c.remove_subscription(&admin, "chatgpt-plus").await.unwrap();
-    c.change_subscription(
-        &admin,
-        "claude-max",
-        &SubscriptionChange {
-            title: Some("  Work Claude ".into()),
-            source: None,
-        },
-    )
-    .await
-    .unwrap();
-    c.set_manual(
-        &admin,
-        "claude-max",
-        &ManualFigures {
-            metrics: vec![ManualMetric {
-                window: Window::FiveHour,
-                used_percent: Some(33.33),
-                resets_at: None,
-            }],
-            note: Some("Typed in".into()),
-        },
-    )
-    .await
-    .unwrap();
+    c.reorder_pages(&admin, vec!["garage".into(), "garden".into(), "kitchen".into()])
+        .await
+        .unwrap();
+    c.remove_page(&admin, "kitchen").await.unwrap();
+    let title = PageChange {
+        title: Some("  Vege garden ".into()),
+        ..PageChange::default()
+    };
+    c.change_page(&admin, "garden", &title).await.unwrap();
+    let typed = PageContentInput {
+        data: Some(bar(33.3)),
+        note: Some("Typed in".into()),
+    };
+    c.set_page_content(&admin, "garden", &typed).await.unwrap();
 
     let snap = c.device_snapshot(Some(&token)).await.unwrap();
     let ids: Vec<_> = snap.pages.iter().map(|p| p.id.as_str()).collect();
-    assert_eq!(ids, ["opencode-go-plus", "claude-max"]);
-    assert_eq!(snap.pages[1].title, "Work Claude");
+    assert_eq!(ids, ["garage", "garden"]);
+    assert_eq!(snap.pages[1].title, "Vege garden");
     assert_eq!(snap.pages[1].data_quality, DataQuality::Manual);
     assert_eq!(items(&snap.pages[1])[0].percent, Some(33.3));
 
-    // Reorders must be complete, manual figures only on manual pages, windows must exist.
-    let e = c.reorder(&admin, vec!["claude-max".into()]).await.unwrap_err();
+    // Reorders must be complete, content only on manual and demo pages, shares in range.
+    let e = c.reorder_pages(&admin, vec!["garden".into()]).await.unwrap_err();
     assert_eq!(code(&e), Some(ErrorCode::Conflict));
-    c.change_subscription(
-        &admin,
-        "claude-max",
-        &SubscriptionChange {
-            title: None,
-            source: Some(Source::Demo),
-        },
-    )
-    .await
-    .unwrap();
+    let to_helper = PageChange {
+        source: Some(Source::Helper),
+        ..PageChange::default()
+    };
+    c.change_page(&admin, "garden", &to_helper).await.unwrap();
     let e = c
-        .set_manual(
-            &admin,
-            "claude-max",
-            &ManualFigures {
-                metrics: vec![],
-                note: None,
-            },
-        )
+        .set_page_content(&admin, "garden", &content(bar(1.0)))
         .await
         .unwrap_err();
     assert_eq!(code(&e), Some(ErrorCode::Conflict));
     let e = c
-        .set_manual(
-            &admin,
-            "opencode-go-plus",
-            &ManualFigures {
-                metrics: vec![ManualMetric {
-                    window: Window::FiveHour,
-                    used_percent: Some(101.0),
-                    resets_at: None,
-                }],
-                note: None,
-            },
-        )
+        .set_page_content(&admin, "garage", &content(bar(101.0)))
         .await
         .unwrap_err();
     assert_eq!(code(&e), Some(ErrorCode::BadRequest));
-    assert!(e.to_string().contains("Percentages must be 0 to 100."), "{e}");
+    assert!(e.to_string().contains("must be 0-100"), "{e}");
+
+    // A demo page takes content too, labelled demo.
+    let to_demo = PageChange {
+        source: Some(Source::Demo),
+        ..PageChange::default()
+    };
+    c.change_page(&admin, "garage", &to_demo).await.unwrap();
+    let sample = c
+        .set_page_content(&admin, "garage", &content(bar(5.0)))
+        .await
+        .unwrap();
+    assert_eq!(sample.content.unwrap().quality, DataQuality::Demo);
     r.stop().await;
 }
 
@@ -386,7 +361,7 @@ async fn roles_are_separate() {
     let c = r.client();
     for e in [
         c.status(&device).await.unwrap_err(),
-        c.subscriptions(&device).await.unwrap_err(),
+        c.pages(&device).await.unwrap_err(),
         c.new_enrolment(&device, "Sneaky").await.unwrap_err(),
         c.displays(&device).await.unwrap_err(),
     ] {
@@ -526,31 +501,10 @@ async fn data_and_identity_survive_a_restart() {
     let r = Running::start(dir.path(), &clock).await;
     let admin = r.admin().await;
     let c = r.client();
-    c.add_subscription(
-        &admin,
-        &NewSubscription {
-            service: Service::ClaudeMax,
-            source: Source::Manual,
-            title: None,
-            id: None,
-        },
-    )
-    .await
-    .unwrap();
-    c.set_manual(
-        &admin,
-        "claude-max",
-        &ManualFigures {
-            metrics: vec![ManualMetric {
-                window: Window::Weekly,
-                used_percent: Some(61.0),
-                resets_at: None,
-            }],
-            note: None,
-        },
-    )
-    .await
-    .unwrap();
+    add_meter(&c, &admin, "garden", Source::Manual).await;
+    c.set_page_content(&admin, "garden", &content(bar(61.0)))
+        .await
+        .unwrap();
     let (id, token) = enrolled(&r, &admin, "Desk").await;
     c.device_snapshot(Some(&token)).await.unwrap();
     let pin = r.hub.identity.spki_sha256;
@@ -620,99 +574,147 @@ fn damaged_or_newer_databases_are_left_alone() {
 }
 
 #[tokio::test]
-async fn a_pc_helper_reports_only_its_services_to_collector_pages() {
-    use hub_core::api::{NewCollector, UsageReport};
+async fn a_helper_sends_only_to_its_feeds_and_only_pages_of_the_same_kind() {
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
     let r = Running::start(dir.path(), &clock).await;
     let c = r.client();
     let admin = r.admin().await;
-    for (service, source) in [
-        (Service::ClaudeMax, Source::Collector),
-        (Service::ChatgptPlus, Source::Collector),
-        (Service::OpencodeGoPlus, Source::Manual),
+    for (feed, source) in [
+        ("garden", Source::Helper),
+        ("kitchen", Source::Helper),
+        ("garage", Source::Manual),
     ] {
-        c.add_subscription(
-            &admin,
-            &NewSubscription {
-                service,
-                source,
-                title: None,
-                id: None,
-            },
-        )
-        .await
-        .unwrap();
+        add_meter(&c, &admin, feed, source).await;
     }
+    // A second page of the garden feed, of another kind, and a manual one of the same kind.
+    let words = NewPage {
+        title: "Garden words".into(),
+        kind: "text".into(),
+        id: Some("garden-words".into()),
+        ..meter("garden", Source::Helper)
+    };
+    c.add_page(&admin, &words).await.unwrap();
+    let manual = NewPage {
+        id: Some("garden-typed".into()),
+        ..meter("garden", Source::Manual)
+    };
+    c.add_page(&admin, &manual).await.unwrap();
 
-    // Invite for Claude Max only; the invite works once.
+    // Bad invites are refused; this one, for the garden only, works once.
+    for feeds in [vec![], vec!["Garden".to_string()], vec!["a--b".to_string()]] {
+        let bad = NewHelper {
+            label: "x".into(),
+            feeds,
+        };
+        let e = c.new_helper(&admin, &bad).await.unwrap_err();
+        assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{bad:?}");
+    }
     let invite = c
-        .new_collector(
+        .new_helper(
             &admin,
-            &NewCollector {
+            &NewHelper {
                 label: "Desk PC".into(),
-                services: vec![Service::ClaudeMax],
+                feeds: vec!["garden".into(), "garden".into()],
             },
         )
         .await
         .unwrap();
-    let paired = c.collector_pair(&invite.secret).await.unwrap();
-    assert!(paired.collector_token.starts_with("dhc_"));
-    assert_eq!(paired.services, vec![Service::ClaudeMax]);
-    let again = c.collector_pair(&invite.secret).await.unwrap_err();
+    let paired = c.helper_pair(&invite.secret).await.unwrap();
+    assert!(paired.helper_token.starts_with("dhc_"));
+    assert_eq!(paired.feeds, ["garden"]);
+    let again = c.helper_pair(&invite.secret).await.unwrap_err();
     assert_eq!(again.code(), Some(ErrorCode::EnrolmentUsed));
-    let token = paired.collector_token;
+    let token = paired.helper_token;
 
-    let report = |service, pct: Option<f64>, at: &str| UsageReport {
-        service,
-        collected_at: hub_protocol::Timestamp::parse(at).unwrap(),
-        metrics: vec![
-            ManualMetric {
-                window: Window::FiveHour,
-                used_percent: pct,
-                resets_at: Some(hub_protocol::Timestamp::parse("2026-11-10T22:00:00Z").unwrap()),
-            },
-            ManualMetric {
-                window: Window::Weekly,
-                used_percent: None,
-                resets_at: None,
-            },
-        ],
+    let body = |data: Value, at: Option<&str>| FeedContent {
+        kind: "meter".into(),
+        data,
+        collected_at: at.map(|a| hub_protocol::Timestamp::parse(a).unwrap()),
+        note: Some("  From the shed ".into()),
     };
     let ok = c
-        .report_usage(
-            &token,
-            &report(Service::ClaudeMax, Some(42.25), "2026-11-10T19:59:00Z"),
-        )
+        .put_feed(&token, "garden", &body(bar(42.25), Some("2026-11-10T19:59:00Z")))
         .await
         .unwrap();
-    assert_eq!(ok.updated, vec!["claude-max".to_string()]);
+    assert_eq!(ok.updated, ["garden"]);
+    assert_eq!(
+        ok.skipped,
+        ["garden-words"],
+        "the text page of the feed is left alone"
+    );
     let snap = c.preview_snapshot(&admin).await.unwrap();
-    let page = snap.pages.iter().find(|p| p.id == "claude-max").unwrap();
-    assert_eq!(page.data_quality, DataQuality::ProviderReported);
-    assert_eq!(items(page)[0].percent, Some(42.3));
-    assert_eq!(items(page)[1].percent, None, "unknown stays unknown");
-    assert_eq!(page.updated_at.unwrap().to_string(), "2026-11-10T19:59:00Z");
+    let page = |id: &str| snap.pages.iter().find(|p| p.id == id).unwrap().clone();
+    let garden = page("garden");
+    assert_eq!(garden.data_quality, DataQuality::ProviderReported);
+    assert_eq!(items(&garden)[0].percent, Some(42.25), "stored as sent");
+    assert_eq!(garden.note.as_deref(), Some("From the shed"));
+    assert_eq!(garden.updated_at.unwrap().to_string(), "2026-11-10T19:59:00Z");
+    assert_eq!(page("garden-words").data_quality, DataQuality::Unavailable);
+    assert_eq!(page("garden-typed").data_quality, DataQuality::Unavailable);
+    // A little ahead of the hub's clock is taken as now; with no time at all, it is now.
+    for at in [Some("2026-11-10T20:04:00Z"), None] {
+        c.put_feed(&token, "garden", &body(bar(1.0), at)).await.unwrap();
+        let p = c.page(&admin, "garden").await.unwrap();
+        assert_eq!(p.content.unwrap().updated_at.unwrap().to_string(), NOW);
+    }
 
-    // Outside its scope, from the future, malformed, or with another role's token: refused.
+    // Any kind of page can take content from a helper.
+    let words_only = FeedContent {
+        kind: "text".into(),
+        data: json!({"text": "Watered at 6 am"}),
+        collected_at: None,
+        note: None,
+    };
+    let ok = c.put_feed(&token, "garden", &words_only).await.unwrap();
+    assert_eq!(
+        (ok.updated, ok.skipped),
+        (vec!["garden-words".into()], vec!["garden".into()])
+    );
+
+    // Outside its feeds, from the future, breaking the page rules, or with another role's token:
+    // refused, and nothing is stored.
+    let before = c.pages(&admin).await.unwrap();
     let other = c
-        .report_usage(&token, &report(Service::ChatgptPlus, Some(1.0), NOW))
+        .put_feed(&token, "kitchen", &body(bar(1.0), None))
         .await
         .unwrap_err();
     assert_eq!(other.code(), Some(ErrorCode::Forbidden));
     let future = c
-        .report_usage(
-            &token,
-            &report(Service::ClaudeMax, Some(1.0), "2026-11-10T21:00:00Z"),
-        )
-        .await;
-    assert_eq!(future.unwrap_err().code(), Some(ErrorCode::BadRequest));
-    let bad = c
-        .report_usage(&token, &report(Service::ClaudeMax, Some(101.0), NOW))
-        .await;
-    assert_eq!(bad.unwrap_err().code(), Some(ErrorCode::BadRequest));
+        .put_feed(&token, "garden", &body(bar(1.0), Some("2026-11-10T21:00:00Z")))
+        .await
+        .unwrap_err();
+    assert_eq!(future.code(), Some(ErrorCode::BadRequest));
+    assert!(future.to_string().contains("dated in the future"), "{future}");
+    let out_of_range = c
+        .put_feed(&token, "garden", &body(bar(101.0), None))
+        .await
+        .unwrap_err();
+    assert_eq!(out_of_range.code(), Some(ErrorCode::BadRequest));
+    assert!(
+        out_of_range.to_string().contains("must be 0-100"),
+        "{out_of_range}"
+    );
+    let wrong_shape = c
+        .put_feed(&token, "garden", &body(json!({"text": "not a meter"}), None))
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_shape.code(), Some(ErrorCode::BadRequest));
+    let huge = FeedContent {
+        kind: "nearby-flights/1".into(),
+        data: json!({"big": "x".repeat(4000)}),
+        ..words_only.clone()
+    };
+    let e = c.put_feed(&token, "garden", &huge).await.unwrap_err();
+    assert!(e.to_string().contains("at most 3072 bytes"), "{e}");
+    let odd_kind = FeedContent {
+        kind: "Not A Kind".into(),
+        ..words_only.clone()
+    };
+    let e = c.put_feed(&token, "garden", &odd_kind).await.unwrap_err();
+    assert_eq!(e.code(), Some(ErrorCode::BadRequest));
     assert_eq!(
-        c.report_usage(&admin, &report(Service::ClaudeMax, Some(1.0), NOW))
+        c.put_feed(&admin, "garden", &body(bar(1.0), None))
             .await
             .unwrap_err()
             .code(),
@@ -722,42 +724,67 @@ async fn a_pc_helper_reports_only_its_services_to_collector_pages() {
         c.status(&token).await.unwrap_err().code(),
         Some(ErrorCode::Forbidden)
     );
+    assert_eq!(c.pages(&admin).await.unwrap(), before);
 
-    // A manual page of the same kind is never written by a helper.
-    let manual = c
-        .new_collector(
+    // A feed no page uses yet is fine: nothing is updated.
+    let spare = c
+        .new_helper(
             &admin,
-            &NewCollector {
-                label: "x".into(),
-                services: vec![Service::OpencodeGoPlus],
+            &NewHelper {
+                label: "Spare".into(),
+                feeds: vec!["garage".into()],
             },
         )
         .await
         .unwrap();
-    let t2 = c.collector_pair(&manual.secret).await.unwrap().collector_token;
-    let none = c
-        .report_usage(&t2, &report(Service::OpencodeGoPlus, Some(5.0), NOW))
-        .await
-        .unwrap();
-    assert!(none.updated.is_empty());
+    let t2 = c.helper_pair(&spare.secret).await.unwrap().helper_token;
+    let none = c.put_feed(&t2, "garage", &body(bar(5.0), None)).await.unwrap();
+    assert!(none.updated.is_empty() && none.skipped.is_empty());
 
     // Listed, then revoked: its token stops working.
-    let list = c.collectors(&admin).await.unwrap();
+    let list = c.helpers(&admin).await.unwrap();
     assert_eq!(list.len(), 2);
-    let id = list.iter().find(|x| x.label == "Desk PC").unwrap().id.clone();
-    c.revoke_collector(&admin, &id).await.unwrap();
+    let desk = list.iter().find(|x| x.label == "Desk PC").unwrap();
+    assert_eq!(desk.feeds, ["garden"]);
+    let id = desk.id.clone();
+    c.revoke_helper(&admin, &id).await.unwrap();
     let revoked = c
-        .report_usage(&token, &report(Service::ClaudeMax, Some(1.0), NOW))
+        .put_feed(&token, "garden", &body(bar(1.0), None))
         .await
         .unwrap_err();
     assert_eq!(revoked.code(), Some(ErrorCode::TokenRevoked));
     assert!(c
-        .collectors(&admin)
+        .helpers(&admin)
         .await
         .unwrap()
         .iter()
         .any(|x| x.id == id && x.revoked));
     r.stop().await;
+}
+
+/// What the schema 2 release served from `fixtures/schema-2-data.sql`, as an upgraded hub serves it.
+/// Since schema 4, demo figures are stored rather than made up by the hub, and have no reset times.
+fn schema_2_pages() -> Value {
+    let mut pages: Value = serde_json::from_str(include_str!("fixtures/schema-2-pages.json")).unwrap();
+    for p in pages.as_array_mut().unwrap() {
+        if p["data_quality"] == "demo" {
+            for item in p["data"]["items"].as_array_mut().unwrap() {
+                item.as_object_mut().unwrap().remove("resets_at");
+            }
+        }
+    }
+    pages
+}
+
+/// A hub's data folder with its identity, and a database at `schema` holding `data`.
+async fn old_hub(dir: &Path, clock: &FakeClock, schema: i64, data: &str) {
+    Running::start(dir, clock).await.stop().await;
+    for f in ["hub.db", "hub.db-wal", "hub.db-shm"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let conn = rusqlite::Connection::open(dir.join("hub.db")).unwrap();
+    hubd::store::create_at_schema(&conn, schema).unwrap();
+    conn.execute_batch(data).unwrap();
 }
 
 #[tokio::test]
@@ -766,15 +793,9 @@ async fn an_upgraded_hub_serves_each_display_what_it_did_before() {
     let clock = FakeClock::parse(NOW);
     // A hub as the schema 2 release left it: its identity, and a database with representative data
     // and credentials whose tokens this test knows.
-    Running::start(dir.path(), &clock).await.stop().await;
-    for f in ["hub.db", "hub.db-wal", "hub.db-shm"] {
-        let _ = std::fs::remove_file(dir.path().join(f));
-    }
+    old_hub(dir.path(), &clock, 2, include_str!("fixtures/schema-2-data.sql")).await;
     {
         let conn = rusqlite::Connection::open(dir.path().join("hub.db")).unwrap();
-        hubd::store::create_at_schema(&conn, 2).unwrap();
-        conn.execute_batch(include_str!("fixtures/schema-2-data.sql"))
-            .unwrap();
         for (token, role, subject) in [
             ("dha_test_admin", "admin", "a-test"),
             ("dhd_test_desk", "device", "d-desk"),
@@ -788,9 +809,8 @@ async fn an_upgraded_hub_serves_each_display_what_it_did_before() {
         }
     }
     let r = Running::start(dir.path(), &clock).await;
-    assert_eq!(r.hub.store.schema_version().unwrap(), 3);
-    let expected: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/schema-2-pages.json")).unwrap();
+    assert_eq!(r.hub.store.schema_version().unwrap(), hubd::store::SCHEMA_VERSION);
+    let expected = schema_2_pages();
     let c = r.client();
     for token in ["dhd_test_desk", "dhd_test_kitchen"] {
         let snap = c.device_snapshot(Some(token)).await.unwrap();
@@ -798,13 +818,13 @@ async fn an_upgraded_hub_serves_each_display_what_it_did_before() {
     }
     let preview = c.preview_snapshot("dha_test_admin").await.unwrap();
     assert_eq!(serde_json::to_value(&preview.pages).unwrap(), expected);
-    // The manager's usage view still lists every page, in order.
-    let usage: Vec<String> = c
-        .subscriptions("dha_test_admin")
+    // The admin list still has every page, in order.
+    let listed: Vec<String> = c
+        .pages("dha_test_admin")
         .await
         .unwrap()
         .into_iter()
-        .map(|s| s.id)
+        .map(|p| p.id)
         .collect();
     let ids: Vec<&str> = expected
         .as_array()
@@ -812,14 +832,48 @@ async fn an_upgraded_hub_serves_each_display_what_it_did_before() {
         .iter()
         .map(|p| p["id"].as_str().unwrap())
         .collect();
-    assert_eq!(usage, ids);
+    assert_eq!(listed, ids);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn a_helper_paired_before_the_upgrade_to_feeds_keeps_working() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    old_hub(dir.path(), &clock, 3, include_str!("fixtures/schema-3-data.sql")).await;
+    let r = Running::start(dir.path(), &clock).await;
+    assert_eq!(r.hub.store.schema_version().unwrap(), 4);
+    let c = r.client();
+    // Its token, issued for services, now sends to the feeds of the same names.
+    let body = FeedContent {
+        kind: "meter".into(),
+        data: json!({"items": [{"id": "weekly", "label": "Weekly allowance used", "percent": 31.0}]}),
+        collected_at: None,
+        note: None,
+    };
+    let ok = c.put_feed("dhc_test_helper", "claude-max", &body).await.unwrap();
+    assert_eq!(ok.updated, ["claude-max"]);
+    let none = c
+        .put_feed("dhc_test_helper", "chatgpt-plus", &body)
+        .await
+        .unwrap();
+    assert!(none.updated.is_empty(), "the ChatGPT page is a demo page");
+    let e = c.put_feed("dhc_test_helper", "words", &body).await.unwrap_err();
+    assert_eq!(e.code(), Some(ErrorCode::Forbidden));
+    let snap = c.device_snapshot(Some("dhd_test_desk")).await.unwrap();
+    assert_eq!(items(&snap.pages[0])[0].percent, Some(31.0));
+    assert_eq!(snap.pages[2].data_quality, DataQuality::Demo);
+    // An invite made before the upgrade pairs, for the feeds of the services it named.
+    let paired = c.helper_pair("invite-before-upgrade").await.unwrap();
+    assert_eq!(paired.feeds, ["claude-max"]);
+    let helpers = c.helpers("dha_test_admin").await.unwrap();
+    let pc = helpers.iter().find(|h| h.id == "c-pc").unwrap();
+    assert_eq!(pc.feeds, ["chatgpt-plus", "claude-max"]);
     r.stop().await;
 }
 
 #[tokio::test]
 async fn pages_of_any_kind_through_the_admin_api() {
-    use hub_core::api::{NewPage, PageChange, PageContentInput};
-    use serde_json::json;
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
     let r = Running::start(dir.path(), &clock).await;
@@ -833,18 +887,7 @@ async fn pages_of_any_kind_through_the_admin_api() {
         id: None,
         stale_after_seconds: None,
     };
-    let usage = c
-        .add_subscription(
-            &admin,
-            &NewSubscription {
-                service: Service::ClaudeMax,
-                source: Source::Demo,
-                title: None,
-                id: None,
-            },
-        )
-        .await
-        .unwrap();
+    let fed = add_meter(&c, &admin, "garden", Source::Helper).await;
     let flights = c
         .add_page(&admin, &new("Flights overhead!", "nearby-flights/1"))
         .await
@@ -876,7 +919,7 @@ async fn pages_of_any_kind_through_the_admin_api() {
         assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{bad:?}");
     }
 
-    // Content is checked against the kind's rules and the size cap, and only manual pages take it.
+    // Content is checked against the kind's rules and the size cap, and helper pages don't take it.
     let data = json!({"flights": [{"callsign": "ANZ1", "altitude_m": 10000}]});
     let set = |data: serde_json::Value| PageContentInput {
         data: Some(data),
@@ -903,7 +946,7 @@ async fn pages_of_any_kind_through_the_admin_api() {
         .unwrap_err();
     assert!(e.to_string().contains("at most 3072 bytes"), "{e}");
     let e = c
-        .set_page_content(&admin, &usage.id, &set(json!({"items": []})))
+        .set_page_content(&admin, &fed.id, &set(json!({"items": []})))
         .await
         .unwrap_err();
     assert_eq!(code(&e), Some(ErrorCode::Conflict));
@@ -929,11 +972,9 @@ async fn pages_of_any_kind_through_the_admin_api() {
     );
     assert!(changed.content.is_some());
 
-    // The manager's usage reorder leaves other pages where they are.
     let (display, token) = enrolled(&r, &admin, "Desk").await;
-    let order = ["note-2", "claude-max", "note", "flights-overhead"].map(String::from);
+    let order = ["note-2", "garden", "note", "flights-overhead"].map(String::from);
     c.reorder_pages(&admin, order.to_vec()).await.unwrap();
-    c.reorder(&admin, vec!["claude-max".into()]).await.unwrap();
     let ids: Vec<String> = c.pages(&admin).await.unwrap().into_iter().map(|p| p.id).collect();
     assert_eq!(ids, order);
 
@@ -974,8 +1015,6 @@ async fn pages_of_any_kind_through_the_admin_api() {
 
 #[tokio::test]
 async fn the_admin_api_keeps_its_page_rules() {
-    use hub_core::api::{NewPage, PageChange, PageContentInput};
-    use serde_json::json;
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
     let r = Running::start(dir.path(), &clock).await;
@@ -994,44 +1033,40 @@ async fn the_admin_api_keeps_its_page_rules() {
         assert!(e.to_string().contains(words), "{e}");
     };
 
-    // Collector pages are meters with a feed, until collectors can fill other kinds.
+    // Helper pages need a feed, whose name is a slug; any kind will do.
     let e = c
-        .add_page(&admin, &new("T", "text", Source::Collector, Some("claude-max")))
+        .add_page(&admin, &new("M", "meter", Source::Helper, None))
         .await
         .unwrap_err();
-    refused(e, "Only a meter page with a feed");
-    let e = c
-        .add_page(&admin, &new("M", "meter", Source::Collector, None))
-        .await
-        .unwrap_err();
-    refused(e, "Only a meter page with a feed");
-    c.add_page(&admin, &new("M", "meter", Source::Collector, Some("claude-max")))
-        .await
-        .unwrap();
+    refused(e, "needs a feed");
+    for bad in ["Garden", "garden-", "a--b", "kāpiti"] {
+        let e = c
+            .add_page(&admin, &new("M", "meter", Source::Helper, Some(bad)))
+            .await
+            .unwrap_err();
+        refused(e, "A feed name is lower-case");
+    }
+    for (kind, feed) in [
+        ("text", "claude-max"),
+        ("nearby-flights/1", "opencode-go-plus"),
+        ("meter", "chatgpt-plus"),
+    ] {
+        c.add_page(&admin, &new("Fed", kind, Source::Helper, Some(feed)))
+            .await
+            .unwrap();
+    }
     let words = c
         .add_page(&admin, &new("Words", "text", Source::Manual, None))
         .await
         .unwrap();
-    let to_collector = PageChange {
-        source: Some(Source::Collector),
+    let to_helper = PageChange {
+        source: Some(Source::Helper),
         ..PageChange::default()
     };
-    let e = c.change_page(&admin, &words.id, &to_collector).await.unwrap_err();
-    refused(e, "Only a meter page with a feed");
+    let e = c.change_page(&admin, &words.id, &to_helper).await.unwrap_err();
+    refused(e, "needs a feed");
     assert_eq!(c.page(&admin, &words.id).await.unwrap().source, Source::Manual);
-    let usage = c
-        .add_subscription(
-            &admin,
-            &NewSubscription {
-                service: Service::ClaudeMax,
-                source: Source::Manual,
-                title: Some("Mine".into()),
-                id: Some("mine".into()),
-            },
-        )
-        .await
-        .unwrap();
-    let e = c.change_page(&admin, "nope", &to_collector).await.unwrap_err();
+    let e = c.change_page(&admin, "nope", &to_helper).await.unwrap_err();
     assert_eq!(code(&e), Some(ErrorCode::NotFound));
 
     // `order` is the reorder route's, never a page's.
@@ -1052,93 +1087,49 @@ async fn the_admin_api_keeps_its_page_rules() {
         .unwrap();
     assert_eq!(order.id, "order-2");
 
-    // The hub checks typed-in usage figures against the service, with its old wording.
-    let figures = |windows: &[Window]| ManualFigures {
-        metrics: windows
-            .iter()
-            .map(|&window| ManualMetric {
-                window,
-                used_percent: Some(10.0),
-                resets_at: None,
-            })
-            .collect(),
-        note: None,
-    };
-    let e = c
-        .set_manual(&admin, &usage.id, &figures(&[Window::Monthly]))
-        .await
-        .unwrap_err();
-    refused(e, "Claude Max has no monthly window.");
-    let e = c
-        .set_manual(&admin, &usage.id, &figures(&[Window::FiveHour, Window::FiveHour]))
-        .await
-        .unwrap_err();
-    refused(e, "The five-hour window is listed twice.");
-    // Through the generic route too: a meter item that isn't one of the service's windows.
-    let e = c
-        .set_page_content(
-            &admin,
-            &usage.id,
-            &PageContentInput {
-                data: Some(json!({"items": [{"id": "daily", "label": "Daily", "percent": 1}]})),
-                note: None,
-            },
-        )
-        .await
-        .unwrap_err();
-    refused(e, "Claude Max has no daily window.");
-    assert_eq!(
-        c.page(&admin, &usage.id).await.unwrap().content,
-        None,
-        "nothing was stored"
-    );
-    // Shares are rounded to one decimal place, and labels are the service's own.
-    let e = c
-        .set_page_content(
-            &admin,
-            &usage.id,
-            &PageContentInput {
-                data: Some(json!({"items": [{"id": "weekly", "label": "Mine", "percent": 42.25}]})),
-                note: None,
-            },
-        )
-        .await
-        .unwrap();
-    let items = &e.content.unwrap().data.unwrap()["items"];
-    assert_eq!(items[0]["percent"], json!(42.3));
-    assert_eq!(items[0]["label"], json!("Weekly allowance used"));
-
-    // No figures at all is "no figures yet", as it always was; other meter rules stay strict.
-    let saved = c.set_manual(&admin, &usage.id, &figures(&[])).await.unwrap();
-    let data = saved.data.unwrap();
-    assert_eq!((data.quality, data.metrics.len()), (DataQuality::Manual, 0));
-    let preview = c.preview_snapshot(&admin).await.unwrap();
-    let page = preview.pages.iter().find(|p| p.id == usage.id).unwrap();
-    assert_eq!(page.data_quality, DataQuality::Unavailable);
-    assert_eq!(page.note.as_deref(), Some(hub_core::build::NO_FIGURES_NOTE));
-    let e = c
-        .set_page_content(
-            &admin,
-            &usage.id,
-            &PageContentInput {
-                data: Some(json!({"items": [], "extra": 1})),
-                note: None,
-            },
-        )
-        .await
-        .unwrap_err();
-    refused(e, "unknown field");
-    // The same holds for any manual meter page, not only usage pages.
-    let plain = c
+    // The hub stores meter content as sent: rounding and labels are the sender's business.
+    let gauges = c
         .add_page(&admin, &new("Gauges", "meter", Source::Manual, None))
         .await
         .unwrap();
-    let empty = PageContentInput {
-        data: Some(json!({"items": []})),
-        note: None,
-    };
-    let stored = c.set_page_content(&admin, &plain.id, &empty).await.unwrap();
+    let stored = c
+        .set_page_content(
+            &admin,
+            &gauges.id,
+            &content(json!({"items": [{"id": "daily", "label": "Mine", "percent": 42.25}]})),
+        )
+        .await
+        .unwrap();
+    let items = &stored.content.unwrap().data.unwrap()["items"];
+    assert_eq!(
+        (items[0]["percent"].clone(), items[0]["label"].clone()),
+        (json!(42.25), json!("Mine"))
+    );
+
+    // No items at all is "no figures yet"; other meter rules stay strict.
+    let stored = c
+        .set_page_content(&admin, &gauges.id, &content(json!({"items": []})))
+        .await
+        .unwrap();
     assert_eq!(stored.content.unwrap().data, Some(json!({"items": []})));
+    let preview = c.preview_snapshot(&admin).await.unwrap();
+    let page = preview.pages.iter().find(|p| p.id == gauges.id).unwrap();
+    assert_eq!(page.data_quality, DataQuality::Unavailable);
+    assert_eq!(page.note.as_deref(), Some(hub_core::build::NO_FIGURES_NOTE));
+    let e = c
+        .set_page_content(&admin, &gauges.id, &content(json!({"items": [], "extra": 1})))
+        .await
+        .unwrap_err();
+    refused(e, "unknown field");
+    let dupes = json!({"items": [
+        {"id": "a", "label": "A", "percent": 1},
+        {"id": "a", "label": "B", "percent": 2}
+    ]});
+    let e = c
+        .set_page_content(&admin, &gauges.id, &content(dupes))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::BadRequest));
 
     // Ticks are a set, so repeats don't count towards the limit.
     let display = enrolled(&r, &admin, "Desk").await.0;

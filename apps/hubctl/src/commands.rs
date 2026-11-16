@@ -4,10 +4,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use hub_core::api::UsageReport;
 use hub_core::{Clock, SystemClock};
 use hub_protocol::pairing::PairingString;
 use os_secrets::{OsStore, TokenStore};
+use usage::{Service, UsageReport};
 
 use crate::claude::{self, Sent};
 use crate::codex;
@@ -31,10 +31,11 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("a runtime starts")
 }
 
+/// What the helper reports, by service name where its feed is a service's.
 fn service_names(cfg: &helper::HelperConfig) -> String {
-    cfg.services
+    cfg.feeds
         .iter()
-        .map(|s| s.default_title())
+        .map(|f| Service::from_slug(f).map_or(f.as_str(), |s| s.default_title()))
         .collect::<Vec<_>>()
         .join(" and ")
 }

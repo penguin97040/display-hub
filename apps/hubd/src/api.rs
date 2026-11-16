@@ -17,8 +17,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hub_core::api::*;
-use hub_core::model::{clean_note, clean_title, valid_page_id};
-use hub_core::{build_snapshot, Clock, MetricValue, PageData, Source, StoredContent, StoredPage};
+use hub_core::model::{clean_note, clean_title, valid_feed, valid_page_id, MAX_FEED_LEN};
+use hub_core::{build_snapshot, Clock, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
 use hub_protocol::shapes::{classify_kind, KindClass};
 use hub_protocol::{CantShow, DataQuality, ErrorCode, Health, Page, Timestamp};
@@ -30,9 +30,7 @@ use crate::http::{check_protocol, handle_layer_error, ApiError, MAX_CONCURRENT_R
 use crate::identity::Identity;
 use crate::ratelimit::Limiter;
 use crate::secret::{hash, new_code, new_id, new_token, Role};
-use crate::store::{
-    collector_can_fill, CodeUse, ContentWrite, PageUpdate, Store, StoreError, MAX_STORED_PAGES,
-};
+use crate::store::{CodeUse, ContentWrite, PageUpdate, Store, StoreError, MAX_STORED_PAGES};
 
 /// One-time codes (pairing and enrolment) last this long.
 pub const CODE_LIFETIME_SECONDS: i64 = 600;
@@ -135,30 +133,31 @@ impl Hub {
         })
     }
 
-    /// Issues a one-time secret for a PC helper that may report `services`.
-    pub fn new_collector_invite(
+    /// Issues a one-time secret for a helper that may send to `feeds`, which the caller has checked
+    /// with [`check_feeds`].
+    pub fn new_helper_invite(
         &self,
         label: &str,
-        services: &[hub_core::Service],
+        feeds: &[String],
         by: &str,
-    ) -> Result<CollectorInvite, StoreError> {
-        let mut services = services.to_vec();
-        services.sort_by_key(|s| s.slug());
-        services.dedup();
+    ) -> Result<HelperInvite, StoreError> {
+        let mut feeds = feeds.to_vec();
+        feeds.sort();
+        feeds.dedup();
         let label = clean_title(label).unwrap_or_else(|| "PC helper".into());
         let detail = serde_json::to_string(&InviteDetail {
             label: label.clone(),
-            services,
+            feeds,
         })
         .expect("serialises");
         let (_, code) = new_code();
         let now = self.clock.now();
         let expires = now.plus_seconds(CODE_LIFETIME_SECONDS);
         self.store
-            .add_code(&hash(code.expose()), "collector-pair", &detail, now, expires)?;
+            .add_code(&hash(code.expose()), "helper-pair", &detail, now, expires)?;
         self.store
-            .audit(now, "collector_invited", &format!("{label} by {by}"))?;
-        Ok(CollectorInvite {
+            .audit(now, "helper_invited", &format!("{label} by {by}"))?;
+        Ok(HelperInvite {
             secret: code.expose().to_string(),
             expires_at: expires,
             identity: self.identity.info(),
@@ -277,7 +276,7 @@ async fn authenticate(
         let msg = match cred.role {
             Role::Device => "This display's access was revoked. Set it up again from the desktop manager.",
             Role::Admin => "This admin access was revoked. Pair again with `hubd pair-admin` on the hub.",
-            Role::Collector => "This helper's access was revoked. Set it up again from the desktop manager.",
+            Role::Helper => "This helper's access was revoked. Set it up again from the desktop manager.",
         };
         return Err(fail(ErrorCode::TokenRevoked, msg));
     }
@@ -317,20 +316,19 @@ pub fn router(hub: AppState) -> Router {
         )
         .route("/v1/admin/enrolments", post(new_enrolment))
         .route("/v1/admin/preview-snapshot", get(preview_snapshot))
-        .route("/v1/admin/collectors", get(list_collectors).post(new_collector))
-        .route("/v1/admin/collectors/{id}", delete(revoke_collector))
+        .route("/v1/admin/helpers", get(list_helpers).post(new_helper))
+        .route("/v1/admin/helpers/{id}", delete(revoke_helper))
         .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
-    let collector = Router::new()
-        .route("/v1/collector/pair", post(collector_pair))
-        .route("/v1/collector/usage", post(collector_usage))
-        .layer(DefaultBodyLimit::max(
-            hub_protocol::limits::MAX_DEVICE_REQUEST_BYTES,
-        ));
+    // A feed body is a whole page, so it may be as large as an admin one.
+    let helper = Router::new()
+        .route("/v1/helper/pair", post(helper_pair))
+        .route("/v1/helper/feeds/{feed}", put(put_feed))
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
     Router::new()
         .route("/v1/health", get(|| async { Json(Health::ok()) }))
         .merge(device)
         .merge(admin)
-        .merge(collector)
+        .merge(helper)
         .fallback(|| async { ApiError::not_found() })
         .layer(middleware::from_fn(log_request))
         .layer(
@@ -619,17 +617,36 @@ fn check_stale(stale: u32) -> Result<u32, ApiError> {
 /// Ids the admin routes use for themselves (`/v1/admin/pages/order`), so no page may have them.
 const RESERVED_PAGE_IDS: &[&str] = &["order"];
 
-/// Until collectors can fill other kinds, a collector page is a meter with a feed to match a
-/// helper's scope against.
-fn check_collector(source: Source, kind: &str, feed: Option<&str>) -> Result<(), ApiError> {
-    if source == Source::Collector && !collector_can_fill(kind, feed) {
-        return Err(collector_refused());
+/// A helper page needs a feed for helpers to send to.
+fn check_helper(source: Source, feed: Option<&str>) -> Result<(), ApiError> {
+    if source == Source::Helper && feed.is_none() {
+        return Err(helper_refused());
     }
     Ok(())
 }
 
-fn collector_refused() -> ApiError {
-    ApiError::bad_request("Only a meter page with a feed can take figures from a PC helper, for now.")
+fn helper_refused() -> ApiError {
+    ApiError::bad_request("A page needs a feed before a helper can fill it. Give it one when you add it.")
+}
+
+fn bad_feed() -> ApiError {
+    ApiError::bad_request(format!(
+        "A feed name is lower-case letters and digits, in words joined by single hyphens, such as \
+         garden-weather, up to {MAX_FEED_LEN} characters."
+    ))
+}
+
+/// Checks a helper invite's feeds: at least one, each a valid name.
+pub fn check_feeds(feeds: &[String]) -> Result<(), ApiError> {
+    if feeds.is_empty() {
+        return Err(ApiError::bad_request(
+            "Choose at least one feed for the helper to send to.",
+        ));
+    }
+    if feeds.len() > MAX_STORED_PAGES || !feeds.iter().all(|f| valid_feed(f)) {
+        return Err(bad_feed());
+    }
+    Ok(())
 }
 
 /// `base` made into a page id: lower case, other characters as hyphens, at most 40 long.
@@ -662,14 +679,10 @@ async fn add_page(
             "A page's kind is meter, big_number, text, list or a custom kind such as nearby-flights/1.",
         ));
     }
-    if let Some(feed) = &req.feed {
-        if !valid_page_id(feed) {
-            return Err(ApiError::bad_request(
-                "A feed name uses a-z, 0-9 and '-', up to 48 characters.",
-            ));
-        }
+    if req.feed.as_deref().is_some_and(|f| !valid_feed(f)) {
+        return Err(bad_feed());
     }
-    check_collector(req.source, &req.kind, req.feed.as_deref())?;
+    check_helper(req.source, req.feed.as_deref())?;
     let stale_after_seconds = check_stale(
         req.stale_after_seconds
             .unwrap_or_else(|| req.source.stale_after_seconds()),
@@ -725,8 +738,8 @@ async fn change_page(
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let title = req.title.as_deref().map(clean_page_title).transpose()?;
     let stale = req.stale_after_seconds.map(check_stale).transpose()?;
-    // The collector rule is checked in the same transaction as the change, and only when the
-    // source actually changes.
+    // The helper rule is checked in the same transaction as the change, and only when the source
+    // actually changes.
     let (outcome, page) = db(&hub, move |s| {
         let outcome = s.update_page(&id, title.as_deref(), req.source, stale)?;
         Ok((outcome, s.page(&id)?))
@@ -734,7 +747,7 @@ async fn change_page(
     .await?;
     match (outcome, page) {
         (PageUpdate::Updated, Some(page)) => Ok(Json(page)),
-        (PageUpdate::CollectorNeedsMeterWithFeed, _) => Err(collector_refused()),
+        (PageUpdate::HelperNeedsFeed, _) => Err(helper_refused()),
         _ => Err(ApiError::not_found()),
     }
 }
@@ -768,7 +781,7 @@ async fn reorder(
     Ok(Json(list))
 }
 
-/// Sets what a manual page shows, after checking it as a hub checks a page before sending it.
+/// Sets what a manual or demo page shows, after checking it as a hub checks a page before sending it.
 async fn set_content(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -781,35 +794,26 @@ async fn set_content(
     let page = db(&hub, move |s| s.page(&id2))
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if page.source != Source::Manual {
-        return Err(not_manual());
-    }
+    let (source, quality) = match page.source {
+        Source::Manual => (Source::Manual, DataQuality::Manual),
+        Source::Demo => (Source::Demo, DataQuality::Demo),
+        Source::Helper | Source::None => return Err(not_manual()),
+    };
     let now = hub.clock.now();
     let note = req.note.as_deref().and_then(clean_note);
-    let mut data = req.data.filter(|d| !d.is_null());
-    if let Some(d) = data.as_mut() {
-        // A usage page's items must be the service's windows, which is said in the owner's terms
-        // first. Then the data is checked as sent, and once more as rewritten (rounded shares and
-        // the service's labels can change its size).
-        let usage = match page.usage_service() {
-            Some(service) => usage_figures(service, d)?,
-            None => None,
-        };
-        check_content(&page, d, &note, now)?;
-        if let Some(rewritten) = usage {
-            *d = rewritten;
-            check_content(&page, d, &note, now)?;
-        }
+    let data = req.data.filter(|d| !d.is_null());
+    if let Some(d) = &data {
+        check_content(&page, d, &note, quality, now)?;
     }
     let content = StoredContent {
-        quality: DataQuality::Manual,
+        quality,
         updated_at: Some(now),
         data,
         note,
     };
     let c2 = content.clone();
-    // Written only while the page is still manual, in case it changed since it was read.
-    match db(&hub, move |s| s.put_content(&id, Source::Manual, &c2, now)).await? {
+    // Written only while the page keeps its source, in case it changed since it was read.
+    match db(&hub, move |s| s.put_content(&id, source, &c2, now)).await? {
         ContentWrite::Written | ContentWrite::Unchanged => Ok(Json(StoredPage {
             content: Some(content),
             ..page
@@ -819,20 +823,21 @@ async fn set_content(
     }
 }
 
-/// Checks content for a manual page as the hub checks a page before sending it, and explains a
-/// refusal. A meter with no items means "no figures yet", as typed-in usage figures always could:
-/// only that minimum is relaxed, for any manual meter page, and every other rule still applies.
+/// Checks content for a page as the hub checks a page before sending it, and explains a refusal.
+/// A meter with no items means "no figures yet": only that minimum is relaxed, for any meter page,
+/// and every other rule still applies.
 fn check_content(
     page: &StoredPage,
     data: &serde_json::Value,
     note: &Option<String>,
+    quality: DataQuality,
     now: Timestamp,
 ) -> Result<(), ApiError> {
     let wire = Page {
         id: page.id.clone(),
         title: clean_title(&page.title).unwrap_or_default(),
         kind: page.kind.clone(),
-        data_quality: DataQuality::Manual,
+        data_quality: quality,
         updated_at: Some(now),
         stale_after_seconds: page.stale_after_seconds,
         note: note.clone(),
@@ -857,44 +862,8 @@ fn not_manual() -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
         ErrorCode::Conflict,
-        "This page doesn't take typed-in content. Change its source to manual first.",
+        "This page doesn't take content from the manager. Change its source to typed in (manual) or demo first.",
     )
-}
-
-/// Typed-in figures for a usage page: each meter item must be one of the service's allowance
-/// windows, listed once, with a share from 0 to 100. Gives the meter rewritten with shares rounded
-/// to one decimal place and the service's labels. Data that doesn't read as a meter at all gives
-/// `None`, for the page checks to explain.
-fn usage_figures(
-    service: hub_core::Service,
-    data: &serde_json::Value,
-) -> Result<Option<serde_json::Value>, ApiError> {
-    let Ok(meter) = serde_json::from_value::<hub_protocol::Meter>(data.clone()) else {
-        return Ok(None);
-    };
-    let mut figures = Vec::new();
-    for item in &meter.items {
-        let Some(window) = hub_core::Window::from_id(&item.id) else {
-            return Err(ApiError::bad_request(format!(
-                "{} has no {} window.",
-                service.default_title(),
-                item.id
-            )));
-        };
-        figures.push(ManualMetric {
-            window,
-            used_percent: item.percent,
-            resets_at: item.resets_at,
-        });
-    }
-    let metrics = clean_figures(service, &figures).map_err(ApiError::bad_request)?;
-    let items: Vec<hub_protocol::MeterItem> = metrics
-        .iter()
-        .map(|m| hub_protocol::MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at))
-        .collect();
-    Ok(Some(
-        serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise"),
-    ))
 }
 
 async fn display_pages(
@@ -937,48 +906,39 @@ async fn set_display_pages(
     .ok_or_else(ApiError::not_found)
 }
 
-/// Checks a PC helper's figures against the service's windows and bounds.
-fn clean_metrics(service: hub_core::Service, input: &[ManualMetric]) -> Result<Vec<MetricValue>, ApiError> {
-    clean_figures(service, input).map_err(ApiError::bad_request)
-}
+// ----- helpers -----
 
-// ----- collectors (PC helpers) -----
-
-/// What a collector invite's code row holds in its label column, until it is used.
+/// What a helper invite's code row holds in its label column, until it is used. Invites made before
+/// helpers sent to feeds named services, which are the feeds of the same names.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct InviteDetail {
     label: String,
-    services: Vec<hub_core::Service>,
+    #[serde(alias = "services")]
+    feeds: Vec<String>,
 }
 
-/// How far a report's time may be ahead of the hub's clock (PC and Pi clocks differ a little).
+/// How far a helper's collection time may be ahead of the hub's clock (PC and Pi clocks differ a
+/// little).
 const REPORT_FUTURE_SKEW_SECONDS: i64 = 300;
 
-async fn new_collector(
+async fn new_helper(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    ApiJson(req): ApiJson<NewCollector>,
-) -> Result<(StatusCode, Json<CollectorInvite>), ApiError> {
+    ApiJson(req): ApiJson<NewHelper>,
+) -> Result<(StatusCode, Json<HelperInvite>), ApiError> {
     let admin = authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    if req.services.is_empty() {
-        return Err(ApiError::bad_request(
-            "Choose at least one service for the helper to report.",
-        ));
-    }
+    check_feeds(&req.feeds)?;
     let h = hub.clone();
-    let invite = db(&hub, move |_| {
-        h.new_collector_invite(&req.label, &req.services, &admin)
-    })
-    .await?;
+    let invite = db(&hub, move |_| h.new_helper_invite(&req.label, &req.feeds, &admin)).await?;
     Ok((StatusCode::CREATED, Json(invite)))
 }
 
-async fn collector_pair(
+async fn helper_pair(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    ApiJson(req): ApiJson<CollectorPairRequest>,
-) -> Result<Json<CollectorPairResponse>, ApiError> {
+    ApiJson(req): ApiJson<HelperPairRequest>,
+) -> Result<Json<HelperPairResponse>, ApiError> {
     let ip = peer.ip();
     if hub.code_attempts.blocked(ip, Instant::now()) {
         return Err(too_many(&hub.code_attempts, ip));
@@ -986,7 +946,7 @@ async fn collector_pair(
     hub.code_attempts.hit(ip, Instant::now());
     let now = hub.clock.now();
     let h = hash(req.secret.trim());
-    let (outcome, detail) = db(&hub, move |s| s.use_code(&h, "collector-pair", now)).await?;
+    let (outcome, detail) = db(&hub, move |s| s.use_code(&h, "helper-pair", now)).await?;
     match outcome {
         CodeUse::Accepted => {
             let invite: InviteDetail = detail
@@ -995,27 +955,27 @@ async fn collector_pair(
                 .ok_or_else(|| {
                     ApiError::bad_request("This invite is damaged. Make a new one in the manager.")
                 })?;
-            let subject = new_id("c");
-            let token = new_token(Role::Collector);
-            let (sub2, th, inv) = (subject.clone(), hash(token.expose()), invite.services.clone());
+            let subject = new_id("h");
+            let token = new_token(Role::Helper);
+            let (sub2, th, feeds) = (subject.clone(), hash(token.expose()), invite.feeds.clone());
             let label = invite.label.clone();
             db(&hub, move |s| {
-                s.add_credential(&th, Role::Collector, &sub2, &label, now)?;
-                s.add_collector_scope(&sub2, &inv)?;
-                s.audit(now, "collector_paired", &format!("{sub2} ({label}) from {ip}"))
+                s.add_credential(&th, Role::Helper, &sub2, &label, now)?;
+                s.add_helper_feeds(&sub2, &feeds)?;
+                s.audit(now, "helper_paired", &format!("{sub2} ({label}) from {ip}"))
             })
             .await?;
-            tracing::info!(collector = %subject, label = %invite.label, "collector paired");
-            Ok(Json(CollectorPairResponse {
-                collector_id: subject,
-                collector_token: token.expose().to_string(),
-                services: invite.services,
+            tracing::info!(helper = %subject, label = %invite.label, "helper paired");
+            Ok(Json(HelperPairResponse {
+                helper_id: subject,
+                helper_token: token.expose().to_string(),
+                feeds: invite.feeds,
             }))
         }
         CodeUse::AlreadyUsed => {
             tracing::warn!(%ip, "a helper invite was used twice: someone else may have seen it");
             db(&hub, move |s| {
-                s.audit(now, "ALARM_collector_code_reused", &format!("from {ip}"))
+                s.audit(now, "ALARM_helper_code_reused", &format!("from {ip}"))
             })
             .await?;
             Err(ApiError::new(
@@ -1032,63 +992,90 @@ async fn collector_pair(
     }
 }
 
-async fn collector_usage(
+/// `PUT /v1/helper/feeds/{feed}`: a helper's page body, for every helper page of the feed that is
+/// of the same kind. It is checked as the hub checks a page before sending it, against each page it
+/// would go to, and nothing is stored unless it passes for all of them.
+async fn put_feed(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    ApiJson(req): ApiJson<UsageReport>,
-) -> Result<Json<UsageAccepted>, ApiError> {
-    let subject = authenticate(&hub, &headers, peer.ip(), Role::Collector).await?;
-    let sub2 = subject.clone();
-    let allowed = db(&hub, move |s| s.collector_services(&sub2)).await?;
-    if !allowed.contains(&req.service) {
+    Path(feed): Path<String>,
+    ApiJson(req): ApiJson<FeedContent>,
+) -> Result<Json<FeedAccepted>, ApiError> {
+    let subject = authenticate(&hub, &headers, peer.ip(), Role::Helper).await?;
+    let allowed = db(&hub, move |s| s.helper_feeds(&subject)).await?;
+    if !allowed.contains(&feed) {
         return Err(ApiError::new(
             StatusCode::FORBIDDEN,
             ErrorCode::Forbidden,
-            "This helper isn't set up to report that service.",
+            "This helper isn't set up to send to that feed. Invite it for the feed in the manager's Settings.",
+        ));
+    }
+    if classify_kind(&req.kind) == KindClass::Invalid {
+        return Err(ApiError::bad_request(
+            "A page's kind is meter, big_number, text, list or a custom kind such as nearby-flights/1.",
         ));
     }
     let now = hub.clock.now();
-    if req.collected_at.seconds_until(now) < -REPORT_FUTURE_SKEW_SECONDS {
+    let collected_at = req.collected_at.unwrap_or(now);
+    if collected_at.seconds_until(now) < -REPORT_FUTURE_SKEW_SECONDS {
         return Err(ApiError::bad_request(
-            "These figures are dated in the future. Check the PC's clock is set automatically.",
+            "This content is dated in the future. Check the clock on the helper's computer is set automatically.",
         ));
     }
-    let metrics = clean_metrics(req.service, &req.metrics)?;
-    // Never later than the hub's own clock, so ages are never negative.
-    let updated_at = if req.collected_at.seconds_until(now) < 0 {
-        now
-    } else {
-        req.collected_at
+    let note = req.note.as_deref().and_then(clean_note);
+    let quality = DataQuality::ProviderReported;
+    // Checked as a page of this feed would be, even when none takes it yet, and then against each
+    // page it goes to: their ids and titles count towards the size cap.
+    let stand_in = StoredPage {
+        id: feed.clone(),
+        title: feed.clone(),
+        kind: req.kind.clone(),
+        source: Source::Helper,
+        feed: Some(feed.clone()),
+        stale_after_seconds: Source::Helper.stale_after_seconds(),
+        content: None,
     };
-    let data = PageData {
-        quality: DataQuality::ProviderReported,
-        updated_at: Some(updated_at),
-        metrics,
-        note: None,
+    check_content(&stand_in, &req.data, &note, quality, now)?;
+    let pages = db(&hub, |s| s.pages()).await?;
+    for page in pages
+        .iter()
+        .filter(|p| p.source == Source::Helper && p.feed.as_deref() == Some(&feed) && p.kind == req.kind)
+    {
+        check_content(page, &req.data, &note, quality, now)?;
+    }
+    let content = StoredContent {
+        quality,
+        // Never later than the hub's own clock, so ages are never negative.
+        updated_at: Some(collected_at.min(now)),
+        data: Some(req.data),
+        note,
     };
-    let (feed, content) = (req.service.slug(), data.to_content());
-    let updated = db(&hub, move |s| s.put_feed_content(feed, &content, now)).await?;
-    Ok(Json(UsageAccepted { updated }))
+    let kind = req.kind;
+    let written = db(&hub, move |s| s.put_feed_content(&feed, &kind, &content, now)).await?;
+    Ok(Json(FeedAccepted {
+        updated: written.updated,
+        skipped: written.skipped,
+    }))
 }
 
-async fn list_collectors(
+async fn list_helpers(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-) -> Result<Json<Vec<CollectorView>>, ApiError> {
+) -> Result<Json<Vec<HelperView>>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let views = db(&hub, |s| {
-        s.collectors()?
+        s.helpers()?
             .into_iter()
             .map(|(id, label, created_at, revoked)| {
-                let services = s.collector_services(&id)?;
-                Ok(CollectorView {
+                let feeds = s.helper_feeds(&id)?;
+                Ok(HelperView {
                     id,
                     label,
                     created_at,
                     revoked,
-                    services,
+                    feeds,
                 })
             })
             .collect::<Result<Vec<_>, StoreError>>()
@@ -1097,7 +1084,7 @@ async fn list_collectors(
     Ok(Json(views))
 }
 
-async fn revoke_collector(
+async fn revoke_helper(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
@@ -1106,9 +1093,9 @@ async fn revoke_collector(
     let admin = authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let now = hub.clock.now();
     let n = db(&hub, move |s| {
-        let n = s.revoke(Role::Collector, &id, now)?;
+        let n = s.revoke(Role::Helper, &id, now)?;
         if n > 0 {
-            s.audit(now, "collector_revoked", &format!("{id} by {admin}"))?;
+            s.audit(now, "helper_revoked", &format!("{id} by {admin}"))?;
         }
         Ok(n)
     })

@@ -3,7 +3,7 @@
 use hub_protocol::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{MetricValue, PageData, Service, Source, StoredPage, Window};
+use crate::model::{Source, StoredPage};
 
 /// `POST /v1/admin/pair`: exchanges the one-time secret from `hubd pair-admin` for an admin token.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -80,7 +80,8 @@ pub struct NewPage {
     /// It can't be changed later.
     pub kind: String,
     pub source: Source,
-    /// The named feed that fills the page, such as a usage service.
+    /// The named feed that fills the page ([`valid_feed`](crate::model::valid_feed)). A page whose
+    /// source is `helper` needs one.
     #[serde(default)]
     pub feed: Option<String>,
     /// Defaults to the feed, or else the title, made into an unused id.
@@ -103,8 +104,9 @@ pub struct PageChange {
     pub stale_after_seconds: Option<u32>,
 }
 
-/// `PUT /v1/admin/pages/{id}/content`: what a manual page shows, checked against its kind's rules
-/// and the page size cap. It is stored as `manual`, updated now.
+/// `PUT /v1/admin/pages/{id}/content`: what a manual or demo page shows, checked against its kind's
+/// rules and the page size cap. It is stored as `manual` or `demo` (after the page's source),
+/// updated now.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PageContentInput {
     /// The page's `data`. Absent or `null` means nothing to show yet.
@@ -125,128 +127,6 @@ pub struct Order {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DisplayPages {
     pub ids: Vec<String>,
-}
-
-// Usage subscriptions, as the manager shows them: meter pages whose feed is the service. These are
-// how clients see usage pages, not bodies the hub takes.
-
-/// One usage page, with its stored figures.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SubscriptionView {
-    pub id: String,
-    pub service: Service,
-    pub title: String,
-    pub source: Source,
-    pub data: Option<PageData>,
-}
-
-impl SubscriptionView {
-    /// A usage page as the manager sees it; `None` for any other page.
-    pub fn from_page(page: &StoredPage) -> Option<Self> {
-        let (s, data) = page.to_subscription()?;
-        Some(Self {
-            id: s.id,
-            service: s.service,
-            title: s.title,
-            source: s.source,
-            data,
-        })
-    }
-}
-
-/// A new usage page.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NewSubscription {
-    pub service: Service,
-    pub source: Source,
-    /// Defaults to the service's name.
-    pub title: Option<String>,
-    /// Defaults to the service's slug, made unique.
-    pub id: Option<String>,
-}
-
-impl NewSubscription {
-    pub fn to_new_page(&self) -> NewPage {
-        NewPage {
-            title: self
-                .title
-                .clone()
-                .unwrap_or_else(|| self.service.default_title().into()),
-            kind: hub_protocol::shapes::KIND_METER.into(),
-            source: self.source,
-            feed: Some(self.service.slug().into()),
-            id: self.id.clone(),
-            stale_after_seconds: None,
-        }
-    }
-}
-
-/// A change to a usage page's title or source.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct SubscriptionChange {
-    pub title: Option<String>,
-    pub source: Option<Source>,
-}
-
-/// Figures typed in by the owner for a usage page.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ManualFigures {
-    pub metrics: Vec<ManualMetric>,
-    pub note: Option<String>,
-}
-
-impl ManualFigures {
-    /// The figures as a usage page's meter content, as typed. The hub checks them against the
-    /// service's windows and rounds the shares ([`clean_figures`]).
-    pub fn to_content(&self) -> PageContentInput {
-        let items: Vec<hub_protocol::MeterItem> = self
-            .metrics
-            .iter()
-            .map(|m| {
-                hub_protocol::MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at)
-            })
-            .collect();
-        PageContentInput {
-            data: Some(serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise")),
-            note: self.note.clone(),
-        }
-    }
-}
-
-/// Checks typed-in or reported figures against the service's windows and bounds, and rounds shares
-/// to one decimal place. Unknown stays unknown. The error is a sentence for the owner.
-pub fn clean_figures(service: Service, input: &[ManualMetric]) -> Result<Vec<MetricValue>, String> {
-    let mut metrics: Vec<MetricValue> = Vec::new();
-    for m in input {
-        if !service.windows().contains(&m.window) {
-            return Err(format!(
-                "{} has no {} window.",
-                service.default_title(),
-                m.window.id()
-            ));
-        }
-        if metrics.iter().any(|x| x.window == m.window) {
-            return Err(format!("The {} window is listed twice.", m.window.id()));
-        }
-        let used_percent = match m.used_percent {
-            Some(p) => Some(crate::model::clean_percent(p).ok_or("Percentages must be 0 to 100.")?),
-            None => None,
-        };
-        metrics.push(MetricValue {
-            window: m.window,
-            used_percent,
-            resets_at: m.resets_at,
-        });
-    }
-    Ok(metrics)
-}
-
-/// One allowance figure, as typed in or reported by a PC helper.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct ManualMetric {
-    pub window: Window,
-    pub used_percent: Option<f64>,
-    pub resets_at: Option<Timestamp>,
 }
 
 /// One display, as the manager sees it.
@@ -282,85 +162,96 @@ impl std::fmt::Debug for EnrolmentGrant {
     }
 }
 
-/// `POST /v1/admin/collectors`: invites a PC helper (collector) to report figures for some services.
+/// `POST /v1/admin/helpers`: invites a helper, such as the PC helper, to send pages to some feeds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct NewCollector {
+pub struct NewHelper {
     /// A name for the helper, such as the PC's name. Plain text.
     pub label: String,
-    /// The services it may report. Its figures go to every page of these services whose source is
-    /// `collector`.
-    pub services: Vec<Service>,
+    /// The feeds it may send to ([`valid_feed`](crate::model::valid_feed)). What it sends goes to
+    /// every page of these feeds whose source is `helper`.
+    pub feeds: Vec<String>,
 }
 
-/// The one-time secret for `hubctl login`, valid for 10 minutes.
+/// The one-time secret for pairing a helper (`hubctl login`), valid for 10 minutes.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollectorInvite {
+pub struct HelperInvite {
     pub secret: String,
     pub expires_at: Timestamp,
     pub identity: HubIdentity,
 }
 
-impl std::fmt::Debug for CollectorInvite {
+impl std::fmt::Debug for HelperInvite {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CollectorInvite")
+        f.debug_struct("HelperInvite")
             .field("secret", &"[redacted]")
             .field("expires_at", &self.expires_at)
             .finish()
     }
 }
 
-/// `POST /v1/collector/pair`: exchanges the invite's secret for a collector token.
+/// `POST /v1/helper/pair`: exchanges the invite's secret for a helper token.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollectorPairRequest {
+pub struct HelperPairRequest {
     pub secret: String,
 }
 
-impl std::fmt::Debug for CollectorPairRequest {
+impl std::fmt::Debug for HelperPairRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CollectorPairRequest")
+        f.debug_struct("HelperPairRequest")
             .field("secret", &"[redacted]")
             .finish()
     }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct CollectorPairResponse {
-    pub collector_id: String,
-    pub collector_token: String,
-    pub services: Vec<Service>,
+pub struct HelperPairResponse {
+    pub helper_id: String,
+    pub helper_token: String,
+    /// The feeds it may send to.
+    pub feeds: Vec<String>,
 }
 
-impl std::fmt::Debug for CollectorPairResponse {
+impl std::fmt::Debug for HelperPairResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CollectorPairResponse")
-            .field("collector_id", &self.collector_id)
-            .field("collector_token", &"[redacted]")
-            .field("services", &self.services)
+        f.debug_struct("HelperPairResponse")
+            .field("helper_id", &self.helper_id)
+            .field("helper_token", &"[redacted]")
+            .field("feeds", &self.feeds)
             .finish()
     }
 }
 
-/// `POST /v1/collector/usage`: figures a provider's own tool reported on the PC.
+/// `PUT /v1/helper/feeds/{feed}`: a whole page body for every page of the feed whose source is
+/// `helper` and whose kind is `kind`. The hub checks it with the same rules and size cap as any
+/// page, and stores it as `provider_reported`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UsageReport {
-    pub service: Service,
-    /// When the tool reported them, by the PC's clock.
-    pub collected_at: Timestamp,
-    pub metrics: Vec<ManualMetric>,
+pub struct FeedContent {
+    /// The kind the content is in. Pages of the feed that take another kind are skipped.
+    pub kind: String,
+    /// The page's `data`, in the shape `kind` names.
+    pub data: serde_json::Value,
+    /// When the helper collected it, by its own clock. Defaults to now; never later than the hub's
+    /// clock, and refused if more than five minutes ahead of it.
+    #[serde(default)]
+    pub collected_at: Option<Timestamp>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct UsageAccepted {
-    /// The pages that now show these figures. Empty when no page of this service uses a collector.
+pub struct FeedAccepted {
+    /// The pages that now show this content. Empty when no page of the feed takes it from a helper.
     pub updated: Vec<String>,
+    /// Pages of the feed that take content from a helper, but of another kind, left as they were.
+    pub skipped: Vec<String>,
 }
 
-/// One PC helper, as the manager sees it.
+/// One helper, as the manager sees it.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct CollectorView {
+pub struct HelperView {
     pub id: String,
     pub label: String,
     pub created_at: Timestamp,
     pub revoked: bool,
-    pub services: Vec<Service>,
+    pub feeds: Vec<String>,
 }

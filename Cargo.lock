@@ -1486,6 +1486,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "usage",
 ]
 
 [[package]]
@@ -2790,15 +2791,18 @@ version = "0.1.0"
 dependencies = [
  "hub-core",
  "hub-protocol",
+ "hubd",
  "reqwest",
  "ring",
  "rustls",
  "rustls-webpki",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "url",
+ "usage",
 ]
 
 [[package]]
@@ -2808,7 +2812,6 @@ dependencies = [
  "hub-protocol",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
  "time",
 ]
 
@@ -2836,6 +2839,7 @@ dependencies = [
  "time",
  "tokio",
  "unicode-segmentation",
+ "usage",
  "zeroize",
 ]
 
@@ -2871,6 +2875,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "usage",
  "zeroize",
 ]
 
@@ -6689,6 +6694,18 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+]
+
+[[package]]
+name = "usage"
+version = "0.1.0"
+dependencies = [
+ "hub-core",
+ "hub-protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
 ]
 
 [[package]]

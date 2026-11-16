@@ -6,12 +6,15 @@ use hub_protocol::snapshot::MESSAGE_TYPE;
 use hub_protocol::{CantShow, Page, Snapshot, Timestamp, PROTOCOL_VERSION};
 use serde_json::Value;
 
-use crate::model::{clean_note, clean_title, PageData, Source, StoredContent, StoredPage};
-use crate::provider::generated;
+use crate::model::{clean_note, clean_title, Source, StoredContent, StoredPage};
 
+/// A meter item's window reset since its share was stored.
 pub const RESET_NOTE: &str = "Window reset since the last report";
 pub const NO_SOURCE_NOTE: &str = "No supported source connected yet";
+/// A helper page that no helper has sent to yet.
 pub const NEVER_COLLECTED_NOTE: &str = "Waiting for the first report";
+/// A demo page with no sample content stored.
+pub const NO_SAMPLE_NOTE: &str = "No sample content yet";
 /// A page with a source but nothing to show yet, such as a meter with no items.
 pub const NO_FIGURES_NOTE: &str = "No figures yet";
 /// Stand-ins for a page that breaks the page-level rules, so one bad page never blanks the rest.
@@ -22,7 +25,7 @@ pub const UNTITLED: &str = "Untitled page";
 pub const DEFAULT_REFRESH_SECONDS: u32 = 300;
 
 /// Builds a snapshot. `pages` are in display order, each with what was last stored for it. Demo
-/// pages are generated fresh. Pages past the limit are left off.
+/// pages show theirs as fresh. Pages past the limit are left off.
 pub fn build_snapshot(now: Timestamp, refresh_after_seconds: u32, pages: &[StoredPage]) -> Snapshot {
     let mut snap = Snapshot {
         protocol_version: PROTOCOL_VERSION,
@@ -74,27 +77,25 @@ fn guard(page: Page) -> Page {
     Page::unavailable(page.id, title, kind, page.stale_after_seconds, Some(note.into()))
 }
 
-/// Fresh figures for a page whose source generates them (today, demo usage pages).
-fn generated_content(now: Timestamp, page: &StoredPage) -> Option<StoredContent> {
-    let service = page.usage_service()?;
-    let data: PageData = generated(service, page.source)?.fetch(now).ok()?;
-    Some(data.to_content())
-}
-
 fn page(now: Timestamp, p: &StoredPage) -> Page {
-    let fresh = generated_content(now, p);
     let unavailable = |note: &str| StoredContent {
         quality: hub_protocol::DataQuality::Unavailable,
         updated_at: None,
         data: None,
         note: Some(note.into()),
     };
-    let content = match (p.source, fresh, p.content.as_ref()) {
-        (Source::None, _, _) => unavailable(NO_SOURCE_NOTE),
-        (_, Some(g), _) => g,
-        (_, None, Some(s)) => s.clone(),
-        (Source::Collector, None, None) => unavailable(NEVER_COLLECTED_NOTE),
-        (_, None, None) => unavailable(NO_SOURCE_NOTE),
+    let content = match (p.source, p.content.as_ref()) {
+        (Source::None, _) => unavailable(NO_SOURCE_NOTE),
+        // Sample content is always labelled demo, and never goes stale.
+        (Source::Demo, Some(s)) => StoredContent {
+            quality: hub_protocol::DataQuality::Demo,
+            updated_at: Some(now),
+            ..s.clone()
+        },
+        (_, Some(s)) => s.clone(),
+        (Source::Demo, None) => unavailable(NO_SAMPLE_NOTE),
+        (Source::Helper, None) => unavailable(NEVER_COLLECTED_NOTE),
+        (Source::Manual, None) => unavailable(NO_SOURCE_NOTE),
     };
 
     let title = clean_title(&p.title).unwrap_or_else(|| UNTITLED.to_string());
@@ -166,18 +167,11 @@ fn clear_reset_items(now: Timestamp, data: &mut Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{MetricValue, Service, Subscription, Window};
     use hub_protocol::{DataQuality, Meter, MeterItem, PageContent};
     use serde_json::json;
 
     fn ts(s: &str) -> Timestamp {
         Timestamp::parse(s).unwrap()
-    }
-
-    /// The builder, fed usage subscriptions as meter pages.
-    fn build_snapshot(now: Timestamp, refresh: u32, pages: &[(Subscription, Option<PageData>)]) -> Snapshot {
-        let pages: Vec<StoredPage> = pages.iter().map(|(s, d)| s.to_page(d.as_ref())).collect();
-        super::build_snapshot(now, refresh, &pages)
     }
 
     fn stored(id: &str, kind: &str, data: Value) -> StoredPage {
@@ -197,29 +191,41 @@ mod tests {
         }
     }
 
-    fn sub(id: &str, service: Service, source: Source) -> Subscription {
-        Subscription {
-            id: id.into(),
-            service,
-            title: service.default_title().into(),
+    /// A meter page from `source`, with `content` stored for it.
+    fn meter(id: &str, source: Source, content: Option<StoredContent>) -> StoredPage {
+        StoredPage {
             source,
+            stale_after_seconds: source.stale_after_seconds(),
+            content,
+            ..stored(id, "meter", json!({}))
         }
+    }
+
+    fn content(quality: DataQuality, updated_at: Option<&str>, data: Value) -> StoredContent {
+        StoredContent {
+            quality,
+            updated_at: updated_at.map(ts),
+            data: Some(data),
+            note: None,
+        }
+    }
+
+    fn bar(percent: f64) -> Value {
+        json!({"items": [{"id": "a", "label": "A", "percent": percent}]})
     }
 
     #[test]
     fn keeps_order_and_produces_a_valid_snapshot() {
         let now = ts("2026-11-10T20:00:00Z");
+        let sample = content(DataQuality::Demo, None, bar(17.0));
         let pages = vec![
-            (
-                sub("opencode-go-plus", Service::OpencodeGoPlus, Source::Demo),
-                None,
-            ),
-            (sub("chatgpt-plus", Service::ChatgptPlus, Source::None), None),
-            (sub("claude-max", Service::ClaudeMax, Source::Demo), None),
+            meter("third", Source::Demo, Some(sample.clone())),
+            meter("second", Source::None, None),
+            meter("first", Source::Demo, Some(sample)),
         ];
         let s = build_snapshot(now, 300, &pages);
         let ids: Vec<_> = s.pages.iter().map(|p| p.id.as_str()).collect();
-        assert_eq!(ids, ["opencode-go-plus", "chatgpt-plus", "claude-max"]);
+        assert_eq!(ids, ["third", "second", "first"]);
         assert_eq!(s.pages[0].data_quality, DataQuality::Demo);
         assert_eq!(s.pages[1].data_quality, DataQuality::Unavailable);
         assert!(s.pages[1].data.is_none());
@@ -227,98 +233,72 @@ mod tests {
     }
 
     #[test]
-    fn a_reset_window_loses_its_old_figure() {
+    fn demo_pages_show_their_sample_content_as_fresh() {
         let now = ts("2026-11-10T20:00:00Z");
-        let stored = PageData {
-            quality: DataQuality::ProviderReported,
-            updated_at: Some(ts("2026-11-10T14:00:00Z")),
-            metrics: vec![
-                MetricValue {
-                    window: Window::FiveHour,
-                    used_percent: Some(80.0),
-                    resets_at: Some(ts("2026-11-10T19:00:00Z")),
-                },
-                MetricValue {
-                    window: Window::Weekly,
-                    used_percent: Some(30.0),
-                    resets_at: Some(ts("2026-11-15T00:00:00Z")),
-                },
-            ],
-            note: None,
+        // Stored long ago, under another label: still demo, and as of now.
+        let old = StoredContent {
+            note: Some("Sample".into()),
+            ..content(DataQuality::Manual, Some("2026-01-01T00:00:00Z"), bar(5.0))
         };
         let s = build_snapshot(
             now,
             300,
-            &[(
-                sub("claude-max", Service::ClaudeMax, Source::Collector),
-                Some(stored),
-            )],
+            &[
+                meter("sample", Source::Demo, Some(old)),
+                meter("empty", Source::Demo, None),
+            ],
         );
         let p = &s.pages[0];
-        let Some(PageContent::Meter(m)) = p.content().unwrap() else {
-            panic!("not a meter")
-        };
-        assert_eq!(m.items[0].percent, None);
-        assert_eq!(m.items[0].resets_at, None);
-        assert_eq!(m.items[1].percent, Some(30.0));
-        assert_eq!(p.note.as_deref(), Some(RESET_NOTE));
+        assert_eq!(
+            (p.data_quality, p.updated_at, p.note.as_deref()),
+            (DataQuality::Demo, Some(now), Some("Sample"))
+        );
+        assert_eq!(p.data, Some(bar(5.0)));
+        assert_eq!(s.pages[1].data_quality, DataQuality::Unavailable);
+        assert_eq!(s.pages[1].note.as_deref(), Some(NO_SAMPLE_NOTE));
         s.validate().unwrap();
     }
 
     #[test]
-    fn collector_pages_wait_for_their_first_report() {
+    fn helper_pages_wait_for_their_first_report() {
         let s = build_snapshot(
             ts("2026-11-10T20:00:00Z"),
             300,
-            &[(sub("claude-max", Service::ClaudeMax, Source::Collector), None)],
+            &[meter("m", Source::Helper, None)],
         );
         assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
         assert_eq!(s.pages[0].note.as_deref(), Some(NEVER_COLLECTED_NOTE));
     }
 
     #[test]
-    fn hostile_titles_and_figures_are_cleaned() {
+    fn hostile_titles_and_future_times_are_cleaned() {
         let now = ts("2026-11-10T20:00:00Z");
-        let mut s1 = sub("x", Service::ClaudeMax, Source::Manual);
-        s1.title = "\u{202e}  Mine\u{7}  ".into();
-        let stored = PageData {
-            quality: DataQuality::Manual,
-            updated_at: Some(ts("2026-11-11T20:00:00Z")), // in the future
-            metrics: vec![MetricValue {
-                window: Window::FiveHour,
-                used_percent: Some(f64::NAN),
-                resets_at: None,
-            }],
-            note: Some("\n".into()),
-        };
-        let s = build_snapshot(now, 5, &[(s1, Some(stored))]);
+        let mut p = meter(
+            "x",
+            Source::Manual,
+            Some(StoredContent {
+                note: Some("\n".into()),
+                // In the future.
+                ..content(DataQuality::Manual, Some("2026-11-11T20:00:00Z"), bar(1.0))
+            }),
+        );
+        p.title = "\u{202e}  Mine\u{7}  ".into();
+        let s = build_snapshot(now, 5, &[p]);
         let p = &s.pages[0];
         assert_eq!(p.title, "Mine");
         assert_eq!(p.updated_at, Some(now));
-        let Some(PageContent::Meter(m)) = p.content().unwrap() else {
-            panic!("not a meter")
-        };
-        assert_eq!(m.items[0].percent, None);
+        assert_eq!(p.note, None);
         assert_eq!(s.refresh_after_seconds, 30);
         s.validate().unwrap();
     }
 
     #[test]
     fn unavailable_figures_are_never_shown() {
-        let stored = PageData {
-            quality: DataQuality::Unavailable,
-            updated_at: Some(ts("2026-11-10T19:00:00Z")),
-            metrics: vec![MetricValue {
-                window: Window::FiveHour,
-                used_percent: Some(50.0),
-                resets_at: None,
-            }],
-            note: None,
-        };
+        let stored = content(DataQuality::Unavailable, Some("2026-11-10T19:00:00Z"), bar(50.0));
         let s = build_snapshot(
             ts("2026-11-10T20:00:00Z"),
             300,
-            &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
+            &[meter("a", Source::Manual, Some(stored))],
         );
         assert!(s.pages[0].data.is_none());
         assert_eq!(s.pages[0].updated_at, None);
@@ -327,41 +307,25 @@ mod tests {
 
     #[test]
     fn a_page_with_a_source_but_no_figures_is_unavailable() {
-        let stored = PageData {
-            quality: DataQuality::Manual,
-            updated_at: Some(ts("2026-11-10T19:00:00Z")),
-            metrics: Vec::new(),
-            note: None,
-        };
+        let empty = content(
+            DataQuality::Manual,
+            Some("2026-11-10T19:00:00Z"),
+            json!({"items": []}),
+        );
+        // Figures with no update time can't be shown either.
+        let undated = content(DataQuality::Manual, None, bar(50.0));
         let s = build_snapshot(
             ts("2026-11-10T20:00:00Z"),
             300,
-            &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
+            &[
+                meter("a", Source::Manual, Some(empty)),
+                meter("b", Source::Manual, Some(undated)),
+            ],
         );
-        assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
-        assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
-        s.validate().unwrap();
-    }
-
-    #[test]
-    fn a_page_with_no_update_time_but_a_figure_showing_source_says_no_figures() {
-        let stored = PageData {
-            quality: DataQuality::Manual,
-            updated_at: None,
-            metrics: vec![MetricValue {
-                window: Window::FiveHour,
-                used_percent: Some(50.0),
-                resets_at: None,
-            }],
-            note: None,
-        };
-        let s = build_snapshot(
-            ts("2026-11-10T20:00:00Z"),
-            300,
-            &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
-        );
-        assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
-        assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
+        for p in &s.pages {
+            assert_eq!(p.data_quality, DataQuality::Unavailable);
+            assert_eq!(p.note.as_deref(), Some(NO_FIGURES_NOTE));
+        }
         s.validate().unwrap();
     }
 
@@ -371,9 +335,9 @@ mod tests {
         let t = ts("2026-11-10T20:00:00Z");
         let long = "x".repeat(4000);
         let pages = vec![
-            (sub("Bad ID", Service::ClaudeMax, Source::Demo), None),
-            (sub(&long, Service::ClaudeMax, Source::Demo), None),
-            (sub("good", Service::ClaudeMax, Source::Demo), None),
+            stored("Bad ID", "text", json!({"text": "x"})),
+            stored(&long, "text", json!({"text": "x"})),
+            stored("good", "text", json!({"text": "x"})),
         ];
         let snap = build_snapshot(t, 300, &pages);
         let ids: Vec<&str> = snap.pages.iter().map(|p| p.id.as_str()).collect();
@@ -385,7 +349,7 @@ mod tests {
     fn one_bad_page_is_replaced_and_the_rest_still_go_out() {
         let t = ts("2026-11-10T20:00:00Z");
         let item = |i: usize| MeterItem::new(format!("m{i}"), "M", Some(1.0), None);
-        let meter = |items| Meter { items };
+        let meter_of = |items| Meter { items };
         // Over the page cap (here through a huge title) and with data that breaks its shape
         // (seven meter items).
         let big = Page::with_content(
@@ -395,7 +359,7 @@ mod tests {
             Some(t),
             1800,
             None,
-            meter(vec![item(0)]),
+            meter_of(vec![item(0)]),
         );
         let bad = Page::with_content(
             "bad",
@@ -404,11 +368,15 @@ mod tests {
             Some(t),
             1800,
             None,
-            meter((0..7).map(item).collect()),
+            meter_of((0..7).map(item).collect()),
         );
         let fine = guard(page(
             t,
-            &sub("claude-max", Service::ClaudeMax, Source::Demo).to_page(None),
+            &meter(
+                "fine",
+                Source::Demo,
+                Some(content(DataQuality::Demo, None, bar(1.0))),
+            ),
         ));
         let (big, bad) = (guard(big), guard(bad));
         assert_eq!(big.note.as_deref(), Some(TOO_BIG_NOTE));
@@ -450,7 +418,7 @@ mod tests {
                 json!({"items": [{"text": "Milk", "detail": "2 L"}]}),
             ),
         ];
-        let snap = super::build_snapshot(t, 300, &pages);
+        let snap = build_snapshot(t, 300, &pages);
         snap.validate().unwrap();
         for (out, inp) in snap.pages.iter().zip(&pages) {
             assert_eq!(out.kind, inp.kind);
@@ -463,7 +431,7 @@ mod tests {
             stored("l", "list", json!({"items": []})),
             stored("m", "meter", json!({"items": []})),
         ];
-        let snap = super::build_snapshot(t, 300, &empty);
+        let snap = build_snapshot(t, 300, &empty);
         assert_eq!(snap.pages[0].data_quality, DataQuality::Manual);
         assert_eq!(snap.pages[1].data_quality, DataQuality::Unavailable);
         assert_eq!(snap.pages[1].kind, "meter");
@@ -476,7 +444,7 @@ mod tests {
         let pages: Vec<StoredPage> = (0..12)
             .map(|i| stored(&format!("p{i}"), "text", json!({"text": "x"})))
             .collect();
-        let snap = super::build_snapshot(t, 300, &pages);
+        let snap = build_snapshot(t, 300, &pages);
         assert_eq!(snap.pages.len(), MAX_PAGES);
         assert_eq!(snap.pages.last().unwrap().id, "p9");
     }
@@ -493,7 +461,7 @@ mod tests {
             stored("huge", "text", json!({"text": "x".repeat(4000)})),
             stored("odd", "Not A Kind", json!({})),
         ];
-        let snap = super::build_snapshot(t, 300, &pages);
+        let snap = build_snapshot(t, 300, &pages);
         snap.validate().unwrap();
         let got: Vec<(&str, &str, Option<&str>)> = snap
             .pages
@@ -528,7 +496,7 @@ mod tests {
             Some(t),
             600,
             None,
-            hub_protocol::PageContent::custom(long, json!({})),
+            PageContent::custom(long, json!({})),
         );
         let stand_in = guard(bad);
         assert_eq!(stand_in.kind, KIND_TEXT);
@@ -547,7 +515,7 @@ mod tests {
             ],
         };
         let p = stored("m", "meter", serde_json::to_value(meter).unwrap());
-        let snap = super::build_snapshot(t, 300, &[p]);
+        let snap = build_snapshot(t, 300, &[p]);
         let Some(PageContent::Meter(m)) = snap.pages[0].content().unwrap() else {
             panic!("not a meter")
         };

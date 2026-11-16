@@ -20,7 +20,7 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | Part | State |
 |---|---|
 | Protocol v1 types, schema and examples (`crates/hub-protocol`, `protocol/v1`) | Working, tested |
-| Domain model, freshness and demo provider (`crates/hub-core`) | Working, tested |
+| Generic page model and freshness (`crates/hub-core`); usage-limit model (`crates/usage`) | Working, tested |
 | `hubd dev`: local demo hub over plain HTTP, loopback only | Working, tested |
 | `display-simulator`: enrolment, polling, saved data, outages, text screen | Working, tested |
 | `hubd serve`: HTTPS with a pinned identity, SQLite, admin pairing, display enrolment and revocation | Working, tested on Linux (including an mbedTLS client). Not yet on a Pi. |

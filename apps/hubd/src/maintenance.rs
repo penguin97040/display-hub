@@ -306,7 +306,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use hub_core::{FakeClock, Service, Source};
+    use hub_core::{FakeClock, Source};
 
     fn config(dir: &Path) -> Config {
         Config {
@@ -321,13 +321,15 @@ mod tests {
         let clock = FakeClock::parse("2026-11-11T01:00:00Z");
         let a = config(&tmp.path().join("a"));
         let hub = crate::open_hub(a.clone(), Arc::new(clock.clone())).unwrap();
-        let page = hub_core::Subscription {
-            id: "claude-max".into(),
-            service: Service::ClaudeMax,
-            title: "Claude Max".into(),
+        let page = hub_core::StoredPage {
+            id: "words".into(),
+            title: "Words".into(),
+            kind: "text".into(),
             source: Source::Demo,
-        }
-        .to_page(None);
+            feed: None,
+            stale_after_seconds: Source::Demo.stale_after_seconds(),
+            content: None,
+        };
         hub.store.add_page(&page, clock.now()).unwrap();
         let dest = tmp.path().join("backup");
         let made = backup(&hub, &a, &dest).unwrap();
@@ -411,7 +413,7 @@ mod tests {
         crate::open_hub(cfg.clone(), Arc::new(FakeClock::parse("2026-11-11T01:00:00Z"))).unwrap();
         // Pretend the database is from the first release.
         let conn = rusqlite::Connection::open(cfg.db_path()).unwrap();
-        conn.execute_batch("DROP TABLE collector_scopes; PRAGMA user_version = 1;")
+        conn.execute_batch("DROP TABLE helper_feeds; PRAGMA user_version = 1;")
             .unwrap();
         drop(conn);
         assert!(check(&cfg).iter().any(|f| f.text.contains("database schema 1")));

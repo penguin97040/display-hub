@@ -20,6 +20,7 @@ path = "src/bin/hubctl-sync.rs"
 hub-protocol.workspace = true
 hub-core.workspace = true
 hub-client.workspace = true
+usage.workspace = true
 os-secrets.workspace = true
 serde.workspace = true
 serde_json.workspace = true

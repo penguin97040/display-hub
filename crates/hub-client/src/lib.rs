@@ -10,6 +10,7 @@ pub mod usb;
 use std::time::Duration;
 
 use hub_core::api::*;
+use hub_core::Source;
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse};
 use hub_protocol::limits::MAX_SNAPSHOT_BYTES;
 use hub_protocol::{ErrorBody, ReceiveError, Snapshot, PROTOCOL_HEADER, PROTOCOL_VERSION};
@@ -17,6 +18,7 @@ use reqwest::Method;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use url::Url;
+use usage::{ManualFigures, NewSubscription, SubscriptionChange, SubscriptionView};
 
 /// The largest response body the client reads from any endpoint.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
@@ -48,6 +50,10 @@ pub enum ClientError {
     Snapshot(#[from] ReceiveError),
     #[error("the hub's answer was not understood: {0}")]
     Malformed(String),
+    /// Refused before anything was sent, such as figures a usage page can't take. A sentence for
+    /// the owner.
+    #[error("{0}")]
+    Invalid(String),
 }
 
 impl ClientError {
@@ -282,7 +288,7 @@ impl HubClient {
             .await
     }
 
-    /// Sets what a manual page shows.
+    /// Sets what a manual or demo page shows.
     pub async fn set_page_content(
         &self,
         token: &str,
@@ -340,12 +346,30 @@ impl HubClient {
             .collect())
     }
 
+    /// Adds a usage page. A demo one is given the service's sample figures.
     pub async fn add_subscription(
         &self,
         token: &str,
         new: &NewSubscription,
     ) -> Result<SubscriptionView, ClientError> {
-        usage(self.add_page(token, &new.to_new_page()).await?)
+        let page = self.add_page(token, &new.to_new_page()).await?;
+        if new.source == Source::Demo {
+            return self.set_demo(token, &page.id, new.service).await;
+        }
+        as_usage(page)
+    }
+
+    /// Gives a demo usage page its service's sample figures.
+    async fn set_demo(
+        &self,
+        token: &str,
+        id: &str,
+        service: usage::Service,
+    ) -> Result<SubscriptionView, ClientError> {
+        as_usage(
+            self.set_page_content(token, id, &usage::provider::demo_content(service))
+                .await?,
+        )
     }
 
     pub async fn change_subscription(
@@ -354,12 +378,19 @@ impl HubClient {
         id: &str,
         change: &SubscriptionChange,
     ) -> Result<SubscriptionView, ClientError> {
+        let to_demo = change.source == Some(Source::Demo);
         let change = PageChange {
             title: change.title.clone(),
             source: change.source,
             stale_after_seconds: None,
         };
-        usage(self.change_page(token, id, &change).await?)
+        let page = self.change_page(token, id, &change).await?;
+        let view = as_usage(page)?;
+        // A page that becomes demo is given the sample figures; one that already was keeps them.
+        if to_demo && view.data.is_none() {
+            return self.set_demo(token, id, view.service).await;
+        }
+        Ok(view)
     }
 
     pub async fn remove_subscription(&self, token: &str, id: &str) -> Result<(), ClientError> {
@@ -372,7 +403,7 @@ impl HubClient {
         let mut wanted = ids.into_iter();
         let mut order: Vec<String> = all
             .iter()
-            .map(|p| match p.usage_service() {
+            .map(|p| match usage::usage_service(p) {
                 Some(_) => wanted.next().unwrap_or_else(|| p.id.clone()),
                 None => p.id.clone(),
             })
@@ -387,15 +418,18 @@ impl HubClient {
             .collect())
     }
 
-    /// Typed-in figures for a usage page, as its meter. The hub refuses a window the service doesn't
-    /// have, a window listed twice or a share out of range, with a sentence saying which.
+    /// Typed-in figures for a usage page, as its meter. A window the service doesn't have, a window
+    /// listed twice or a share out of range is refused before anything is sent, with a sentence
+    /// saying which ([`usage::clean_figures`]).
     pub async fn set_manual(
         &self,
         token: &str,
         id: &str,
         figures: &ManualFigures,
     ) -> Result<SubscriptionView, ClientError> {
-        usage(self.set_page_content(token, id, &figures.to_content()).await?)
+        let service = as_usage(self.page(token, id).await?)?.service;
+        let content = figures.to_content(service).map_err(ClientError::Invalid)?;
+        as_usage(self.set_page_content(token, id, &content).await?)
     }
 
     pub async fn displays(&self, token: &str) -> Result<Vec<DisplayView>, ClientError> {
@@ -441,44 +475,46 @@ impl HubClient {
         .await
     }
 
-    pub async fn new_collector(
-        &self,
-        token: &str,
-        new: &NewCollector,
-    ) -> Result<CollectorInvite, ClientError> {
-        self.call(Method::POST, "v1/admin/collectors", token, Some(new))
+    pub async fn new_helper(&self, token: &str, new: &NewHelper) -> Result<HelperInvite, ClientError> {
+        self.call(Method::POST, "v1/admin/helpers", token, Some(new))
             .await
     }
 
-    pub async fn collectors(&self, token: &str) -> Result<Vec<CollectorView>, ClientError> {
-        self.call(Method::GET, "v1/admin/collectors", token, None::<&()>)
+    pub async fn helpers(&self, token: &str) -> Result<Vec<HelperView>, ClientError> {
+        self.call(Method::GET, "v1/admin/helpers", token, None::<&()>)
             .await
     }
 
-    pub async fn revoke_collector(&self, token: &str, id: &str) -> Result<(), ClientError> {
-        self.call_empty(Method::DELETE, &format!("v1/admin/collectors/{}", seg(id)), token)
+    pub async fn revoke_helper(&self, token: &str, id: &str) -> Result<(), ClientError> {
+        self.call_empty(Method::DELETE, &format!("v1/admin/helpers/{}", seg(id)), token)
             .await
     }
 
-    // ----- collector (PC helper) -----
+    // ----- helper -----
 
-    /// `POST /v1/collector/pair`: the secret from a helper string, for a collector token.
-    pub async fn collector_pair(&self, secret: &str) -> Result<CollectorPairResponse, ClientError> {
-        let req = CollectorPairRequest {
+    /// `POST /v1/helper/pair`: the secret from a helper string, for a helper token.
+    pub async fn helper_pair(&self, secret: &str) -> Result<HelperPairResponse, ClientError> {
+        let req = HelperPairRequest {
             secret: secret.to_string(),
         };
-        self.json(self.request(Method::POST, "v1/collector/pair", None).json(&req))
+        self.json(self.request(Method::POST, "v1/helper/pair", None).json(&req))
             .await
     }
 
-    /// `POST /v1/collector/usage`.
-    pub async fn report_usage(
+    /// `PUT /v1/helper/feeds/{feed}`: a page body for the feed's helper pages.
+    pub async fn put_feed(
         &self,
         token: &str,
-        report: &UsageReport,
-    ) -> Result<UsageAccepted, ClientError> {
-        self.call(Method::POST, "v1/collector/usage", token, Some(report))
-            .await
+        feed: &str,
+        content: &FeedContent,
+    ) -> Result<FeedAccepted, ClientError> {
+        self.call(
+            Method::PUT,
+            &format!("v1/helper/feeds/{}", seg(feed)),
+            token,
+            Some(content),
+        )
+        .await
     }
 
     /// Sends a request and reads at most `cap` bytes of a successful body.
@@ -553,7 +589,7 @@ fn is_dns_failure(e: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// A page the hub answered with, as a usage page.
-fn usage(page: PageView) -> Result<SubscriptionView, ClientError> {
+fn as_usage(page: PageView) -> Result<SubscriptionView, ClientError> {
     SubscriptionView::from_page(&page)
         .ok_or_else(|| ClientError::Malformed(format!("page {:?} isn't a usage page", page.id)))
 }

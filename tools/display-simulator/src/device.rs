@@ -59,7 +59,8 @@ impl Problem {
 
     pub fn from_error(e: &ClientError) -> Problem {
         match e {
-            ClientError::AddressRefused(d) => Problem::Configuration(d.clone()),
+            // A display's calls are never refused before sending, but the two would be told alike.
+            ClientError::AddressRefused(d) | ClientError::Invalid(d) => Problem::Configuration(d.clone()),
             ClientError::Unreachable(_) | ClientError::NameNotFound { .. } | ClientError::Timeout => {
                 Problem::Unreachable
             }

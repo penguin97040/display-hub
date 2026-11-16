@@ -6,10 +6,10 @@ use std::sync::Arc;
 use display_simulator::render::{count_pages, screen};
 use display_simulator::{paired, Device, Link, NoJitter, Problem};
 use hub_client::HubClient;
-use hub_core::api::NewSubscription;
-use hub_core::{Clock, FakeClock, Service, Source};
+use hub_core::{Clock, FakeClock, Source};
 use hub_protocol::pairing::PairingString;
 use hubd::config::Config;
+use usage::{NewSubscription, Service};
 
 #[tokio::test]
 async fn a_bundle_enrols_the_display_which_then_follows_the_hub() {

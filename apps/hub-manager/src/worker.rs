@@ -101,7 +101,7 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         s.client.subscriptions(t),
         s.client.displays(t),
         s.client.preview_snapshot(t),
-        s.client.collectors(t),
+        s.client.helpers(t),
     )
     .map_err(Failure::Client)?;
     Ok(Refresh {
@@ -195,7 +195,7 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
         }
         Op::NewHelper(new) => {
             let s = ctx.session()?;
-            let invite = s.client.new_collector(&s.token, &new).await.map_err(c)?;
+            let invite = s.client.new_helper(&s.token, &new).await.map_err(c)?;
             Ok(Outcome::HelperInvite {
                 invite,
                 refresh: refresh(&s).await?,
@@ -203,7 +203,7 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
         }
         Op::RevokeHelper { id } => {
             let s = ctx.session()?;
-            s.client.revoke_collector(&s.token, &id).await.map_err(c)?;
+            s.client.revoke_helper(&s.token, &id).await.map_err(c)?;
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::ListPorts => Ok(Outcome::Ports(blocking(list_ports).await)),
@@ -348,8 +348,9 @@ mod tests {
 
     use display_simulator::render::{count_pages, screen};
     use display_simulator::{paired, Device, NoJitter};
-    use hub_core::{FakeClock, Service, Source};
+    use hub_core::{FakeClock, Source};
     use hub_protocol::pairing::PairingString;
+    use usage::Service;
 
     use super::*;
     use crate::model::{Model, Outcome};

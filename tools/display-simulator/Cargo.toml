@@ -23,6 +23,7 @@ serialport.workspace = true
 
 [dev-dependencies]
 hubd = { path = "../../apps/hubd" }
+usage.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 serialport.workspace = true

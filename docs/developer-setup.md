@@ -5,7 +5,8 @@
 | Path | What it is |
 |---|---|
 | `crates/hub-protocol` | Protocol v1: wire types, bounds and validation. No I/O. The contract with firmware. |
-| `crates/hub-core` | Domain: pages as stored, data quality, freshness, providers, admin API bodies and snapshot building. No I/O. |
+| `crates/hub-core` | Domain: pages as stored, data quality, freshness, admin and helper API bodies and snapshot building. Nothing about any particular kind of page. No I/O. |
+| `crates/usage` | Usage limits (Claude Max, ChatGPT Plus, OpenCode Go Plus) as meter pages: services, windows, figure checks and demo figures. Used by the manager and the PC helper, never by the hub. |
 | `crates/hub-client` | Client for the hub's HTTP API, used by the simulator, the manager and the PC helper. |
 | `apps/hubd` | The hub service (library plus a command-line binary). |
 | `apps/hub-manager` | The native desktop manager (GPUI). |
@@ -114,14 +115,14 @@ CI runs it too.
 ## The PC helper against a local hub
 
 ```sh
-cargo run -p hubd -- pair-helper --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1 --service claude-max
+cargo run -p hubd -- pair-helper --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1 --feed claude-max
 cargo run -p hubctl -- --config-dir dev-data/helper login        # paste the string
 echo '{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1900000000}}}' \
   | cargo run -p hubctl -- --config-dir dev-data/helper claude-statusline
 cargo run -p hubctl -- --config-dir dev-data/helper status
 ```
 
-`pair-helper` makes the same invite as the manager's **Settings**, **PC helper**. The figures appear on Claude Max pages whose figures are set to **PC helper**.
+`pair-helper` makes the same invite as the manager's **Settings**, **PC helper**: each `--feed` is a feed the helper may send to, and Claude Max's feed is `claude-max`. The figures appear on Claude Max pages whose figures are set to **PC helper**.
 
 ## Building for the Raspberry Pi
 

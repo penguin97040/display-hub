@@ -12,10 +12,11 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use hub_core::provider::{DemoProvider, Provider};
-use hub_core::{build_snapshot, Clock, PageData, Service, Source, StoredPage, Subscription};
+use hub_core::{build_snapshot, Clock, Source, StoredContent, StoredPage};
 use hub_protocol::limits::{MAX_DEVICE_REQUEST_BYTES, MAX_SNAPSHOT_BYTES};
+use hub_protocol::DataQuality;
 use hub_protocol::Health;
+use serde_json::json;
 use tower::ServiceBuilder;
 
 use crate::http::{check_protocol, handle_layer_error, ApiError, MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT};
@@ -91,39 +92,84 @@ async fn health() -> Json<Health> {
     Json(Health::ok())
 }
 
-fn sub(service: Service, source: Source) -> Subscription {
-    Subscription {
-        id: service.slug().into(),
-        service,
-        title: service.default_title().into(),
+/// A sample meter page. Its items reset `hours` from `now`, so the countdowns always show.
+fn sample(clock: &dyn Clock, id: &str, title: &str, source: Source, shares: &[(f64, i64)]) -> StoredPage {
+    let now = clock.now();
+    let labels = [
+        ("five-hour", "Five-hour allowance used"),
+        ("weekly", "Weekly allowance used"),
+        ("monthly", "Monthly allowance used"),
+    ];
+    let items: Vec<_> = shares
+        .iter()
+        .zip(labels)
+        .map(|(&(percent, hours), (id, label))| {
+            json!({"id": id, "label": label, "percent": percent, "resets_at": now.plus_seconds(hours * 3600)})
+        })
+        .collect();
+    StoredPage {
+        id: id.into(),
+        title: title.into(),
+        kind: "meter".into(),
         source,
+        feed: Some(id.into()),
+        stale_after_seconds: source.stale_after_seconds(),
+        content: Some(StoredContent {
+            quality: DataQuality::Demo,
+            updated_at: Some(now),
+            data: Some(json!({ "items": items })),
+            note: Some("Sample figures, not real usage".into()),
+        }),
     }
 }
 
 /// The pages a scenario shows, with any stored figures.
 pub fn scenario_pages(scenario: Scenario, clock: &dyn Clock) -> Vec<StoredPage> {
-    let pages: Vec<(Subscription, Option<PageData>)> = match scenario {
-        Scenario::Demo => Service::ALL
-            .into_iter()
-            .map(|s| (sub(s, Source::Demo), None))
-            .collect(),
+    let claude = || {
+        sample(
+            clock,
+            "claude-max",
+            "Claude Max",
+            Source::Demo,
+            &[(42.0, 2), (24.0, 120)],
+        )
+    };
+    match scenario {
+        Scenario::Demo => vec![
+            claude(),
+            sample(
+                clock,
+                "chatgpt-plus",
+                "ChatGPT Plus",
+                Source::Demo,
+                &[(63.0, 2), (38.0, 120)],
+            ),
+            sample(
+                clock,
+                "opencode-go-plus",
+                "OpenCode Go Plus",
+                Source::Demo,
+                &[(17.0, 2), (31.0, 120), (9.0, 480)],
+            ),
+        ],
         Scenario::Mixed => {
-            // Demo figures collected two hours ago, on a source that goes stale after 30 minutes.
-            let stale = DemoProvider {
-                service: Service::OpencodeGoPlus,
-                age_seconds: 7200,
+            // Demo figures sent two hours ago, on a source that goes stale after 30 minutes.
+            let mut stale = sample(
+                clock,
+                "opencode-go-plus",
+                "OpenCode Go Plus",
+                Source::Helper,
+                &[(17.0, 2), (31.0, 120), (9.0, 480)],
+            );
+            if let Some(c) = stale.content.as_mut() {
+                c.updated_at = Some(clock.now().plus_seconds(-7200));
             }
-            .fetch(clock.now())
-            .expect("demo figures never fail");
-            vec![
-                (sub(Service::ClaudeMax, Source::Demo), None),
-                (sub(Service::ChatgptPlus, Source::None), None),
-                (sub(Service::OpencodeGoPlus, Source::Collector), Some(stale)),
-            ]
+            let mut none = sample(clock, "chatgpt-plus", "ChatGPT Plus", Source::None, &[]);
+            none.content = None;
+            vec![claude(), none, stale]
         }
         Scenario::Empty => Vec::new(),
-    };
-    pages.iter().map(|(s, d)| s.to_page(d.as_ref())).collect()
+    }
 }
 
 async fn snapshot(State(st): State<DevState>, headers: HeaderMap) -> Result<Response, ApiError> {

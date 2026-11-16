@@ -107,7 +107,7 @@ Neither Anthropic nor OpenAI documents an API that returns a consumer subscripti
    2. Leave **Run only when user is logged on** selected, so it can reach your Credential Manager.
    3. Add a trigger **At log on**, repeating every 15 minutes indefinitely.
    4. For the action, choose **Start a program**: `hubctl-sync.exe`. It's the same as `hubctl codex-sync`, without a console window. Add `--codex <path>` if needed.
-4. In the manager, set a ChatGPT Plus page's figures to **PC helper**. Collector figures are stale after 30 minutes, so a 15-minute schedule keeps the page fresh while the PC is on.
+4. In the manager, set a ChatGPT Plus page's figures to **PC helper**. Figures from a helper are stale after 30 minutes, so a 15-minute schedule keeps the page fresh while the PC is on.
 
 **Verification report (11/11/2026):**
 

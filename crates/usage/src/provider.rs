@@ -1,11 +1,13 @@
-//! The interface every source of figures implements, and the demo source.
+//! The interface every source of usage figures implements, and the demo source.
 //!
 //! No provider runs untrusted code or reaches the internet from the hub. Real usage arrives from
-//! collectors on the owner's PC (see `docs/providers.md`), and is checked by [`crate::collect`].
+//! helpers on the owner's PC (see `docs/providers.md`).
 
+use hub_core::api::PageContentInput;
+use hub_core::Source;
 use hub_protocol::{DataQuality, Timestamp};
 
-use crate::model::{MetricValue, PageData, Service, Source, Window};
+use crate::model::{meter_data, MetricValue, PageData, Service, Window};
 
 /// What a provider can do, so the manager can explain it before the owner chooses it.
 #[derive(Clone, Debug, PartialEq)]
@@ -88,6 +90,25 @@ impl Provider for DemoProvider {
     }
 }
 
+/// What a demo usage page holds on the hub: the service's sample figures and note. The hub shows a
+/// demo page's content as fresh for as long as it keeps it, so the figures carry no reset times,
+/// which would pass and clear them.
+pub fn demo_content(service: Service) -> PageContentInput {
+    let mut figures = DemoProvider {
+        service,
+        age_seconds: 0,
+    }
+    .fetch(Timestamp::from_unix(0).expect("in range"))
+    .expect("demo figures never fail");
+    for m in &mut figures.metrics {
+        m.resets_at = None;
+    }
+    PageContentInput {
+        data: Some(meter_data(&figures.metrics)),
+        note: figures.note,
+    }
+}
+
 /// The next five-hour, weekly (Monday 00:00 UTC) or monthly (1st, 00:00 UTC) boundary after `t`.
 pub fn next_boundary(t: Timestamp, window: Window) -> Timestamp {
     let s = t.unix();
@@ -111,17 +132,6 @@ pub fn next_boundary(t: Timestamp, window: Window) -> Timestamp {
     }
 }
 
-/// The provider for a subscription, if its figures are generated rather than stored.
-pub fn generated(service: Service, source: Source) -> Option<Box<dyn Provider>> {
-    match source {
-        Source::Demo => Some(Box::new(DemoProvider {
-            service,
-            age_seconds: 0,
-        })),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +151,19 @@ mod tests {
             a.metrics[0].resets_at.unwrap().to_string(),
             "2026-11-10T22:00:00Z"
         );
+    }
+
+    #[test]
+    fn demo_content_has_the_figures_but_no_reset_times() {
+        let c = demo_content(Service::OpencodeGoPlus);
+        let items = c.data.unwrap()["items"].as_array().unwrap().clone();
+        let got: Vec<(&str, f64)> = items
+            .iter()
+            .map(|i| (i["id"].as_str().unwrap(), i["percent"].as_f64().unwrap()))
+            .collect();
+        assert_eq!(got, [("five-hour", 17.0), ("weekly", 31.0), ("monthly", 9.0)]);
+        assert!(items.iter().all(|i| i.get("resets_at").is_none()));
+        assert_eq!(c.note.as_deref(), Some(DEMO_NOTE));
     }
 
     #[test]

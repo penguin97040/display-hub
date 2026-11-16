@@ -7,12 +7,13 @@ use ring::rand::{SecureRandom, SystemRandom};
 use zeroize::Zeroize;
 
 /// Who a token belongs to. The prefix makes a leaked token recognisable, and stops one kind being
-/// used as another.
+/// used as another. A helper's prefix is older than the name "helper", and stays as it is so tokens
+/// already issued keep working.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     Admin,
     Device,
-    Collector,
+    Helper,
 }
 
 impl Role {
@@ -20,7 +21,7 @@ impl Role {
         match self {
             Role::Admin => "dha_",
             Role::Device => "dhd_",
-            Role::Collector => "dhc_",
+            Role::Helper => "dhc_",
         }
     }
 
@@ -28,19 +29,19 @@ impl Role {
         match self {
             Role::Admin => "admin",
             Role::Device => "device",
-            Role::Collector => "collector",
+            Role::Helper => "helper",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        [Role::Admin, Role::Device, Role::Collector]
+        [Role::Admin, Role::Device, Role::Helper]
             .into_iter()
             .find(|r| r.as_str() == s)
     }
 
     /// The role a token's prefix claims. Says nothing about whether the token is real.
     pub fn of_token(token: &str) -> Option<Self> {
-        [Role::Admin, Role::Device, Role::Collector]
+        [Role::Admin, Role::Device, Role::Helper]
             .into_iter()
             .find(|r| token.starts_with(r.prefix()))
     }

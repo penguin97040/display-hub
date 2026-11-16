@@ -9,18 +9,20 @@ use std::time::{Duration, Instant};
 
 use hub_client::usb::UsbDisplay;
 use hub_client::ClientError;
-use hub_core::api::{
-    CollectorInvite, CollectorView, DisplayView, EnrolmentGrant, HubStatus, ManualFigures, ManualMetric,
-    NewCollector, NewSubscription, SubscriptionChange, SubscriptionView,
-};
+use hub_core::api::{DisplayView, EnrolmentGrant, HelperInvite, HelperView, HubStatus, NewHelper};
 use hub_core::freshness::{short_duration, Freshness};
-use hub_core::model::{clean_note, clean_percent, clean_title};
-use hub_core::{Service, Source, Window};
+use hub_core::model::{clean_note, clean_title};
+use hub_core::Source;
 use hub_protocol::limits::{MAX_NOTE_LEN, MAX_PAGES, MAX_TITLE_LEN};
 use hub_protocol::pairing::PairingString;
 use hub_protocol::provisioning::{Bundle, Wifi, MAX_HOSTS};
 use hub_protocol::{DataQuality, Snapshot, Timestamp};
 use zeroize::Zeroizing;
+
+use usage::{
+    clean_percent, ManualFigures, ManualMetric, NewSubscription, Service, SubscriptionChange,
+    SubscriptionView, Window,
+};
 
 use crate::field::Field;
 use crate::guidance::{self, Doing, Guidance, Next, Tone};
@@ -63,7 +65,7 @@ pub struct Refresh {
     pub pages: Vec<SubscriptionView>,
     pub displays: Vec<DisplayView>,
     pub preview: Snapshot,
-    pub helpers: Vec<CollectorView>,
+    pub helpers: Vec<HelperView>,
 }
 
 /// A serial port a display might be on.
@@ -99,7 +101,7 @@ pub enum Op {
     NewEnrolment {
         name: String,
     },
-    NewHelper(NewCollector),
+    NewHelper(NewHelper),
     RevokeHelper {
         id: String,
     },
@@ -117,19 +119,10 @@ pub enum Op {
 
 #[derive(Debug)]
 pub enum Outcome {
-    Paired {
-        hub: SavedHub,
-        refresh: Refresh,
-    },
+    Paired { hub: SavedHub, refresh: Refresh },
     Refreshed(Refresh),
-    Enrolment {
-        grant: EnrolmentGrant,
-        refresh: Refresh,
-    },
-    HelperInvite {
-        invite: CollectorInvite,
-        refresh: Refresh,
-    },
+    Enrolment { grant: EnrolmentGrant, refresh: Refresh },
+    HelperInvite { invite: HelperInvite, refresh: Refresh },
     Ports(Vec<PortInfo>),
     Sent(UsbDisplay),
     Saved(PathBuf),
@@ -215,14 +208,14 @@ impl Confirm {
 }
 
 /// Sources the manager offers.
-pub const ADDABLE_SOURCES: [Source; 4] = [Source::Manual, Source::Collector, Source::Demo, Source::None];
+pub const ADDABLE_SOURCES: [Source; 4] = [Source::Manual, Source::Helper, Source::Demo, Source::None];
 
 /// The sources that make sense for a service: the PC helper can report Claude Max (Claude Code) and
 /// ChatGPT Plus (Codex), but nothing reports OpenCode Go.
 pub fn sources_for(service: Service) -> Vec<Source> {
     ADDABLE_SOURCES
         .into_iter()
-        .filter(|s| *s != Source::Collector || matches!(service, Service::ClaudeMax | Service::ChatgptPlus))
+        .filter(|s| *s != Source::Helper || matches!(service, Service::ClaudeMax | Service::ChatgptPlus))
         .collect()
 }
 
@@ -230,7 +223,7 @@ pub fn source_label(s: Source) -> &'static str {
     match s {
         Source::Demo => "Demo figures",
         Source::Manual => "Typed in",
-        Source::Collector => "PC helper",
+        Source::Helper => "PC helper",
         Source::None => "Nothing yet",
     }
 }
@@ -823,7 +816,7 @@ impl Model {
 
     // ---- PC helpers -----------------------------------------------------------------------------------
 
-    pub fn helpers(&self) -> &[CollectorView] {
+    pub fn helpers(&self) -> &[HelperView] {
         self.last
             .as_ref()
             .map(|r| r.helpers.as_slice())
@@ -831,14 +824,16 @@ impl Model {
     }
 
     pub fn create_helper(&mut self) -> Option<Op> {
-        let services: Vec<Service> = [
+        // Each service the helper reports is the feed of the same name.
+        let feeds: Vec<String> = [
             (self.helper.claude, Service::ClaudeMax),
             (self.helper.chatgpt, Service::ChatgptPlus),
         ]
         .into_iter()
-        .filter_map(|(on, s)| on.then_some(s))
+        .filter(|&(on, _)| on)
+        .map(|(_, s)| s.slug().to_string())
         .collect();
-        if services.is_empty() {
+        if feeds.is_empty() {
             return self.problem(Guidance {
                 tone: Tone::Problem,
                 title: "Choose what the helper reports".into(),
@@ -850,7 +845,7 @@ impl Model {
         self.helper.string = None;
         self.start(
             Busy::Saving { done: String::new() },
-            Op::NewHelper(NewCollector { label, services }),
+            Op::NewHelper(NewHelper { label, feeds }),
         )
     }
 
@@ -1240,7 +1235,7 @@ pub fn preview_freshness(page: &hub_protocol::Page, snapshot: &Snapshot) -> (Str
 mod tests {
     use super::*;
     use hub_core::api::HubIdentity;
-    use hub_core::model::{MetricValue, PageData};
+    use usage::{MetricValue, PageData};
 
     fn ts(s: &str) -> Timestamp {
         Timestamp::parse(s).unwrap()
@@ -1601,9 +1596,9 @@ mod helper_tests {
 
     #[test]
     fn only_services_a_helper_can_report_offer_it() {
-        assert!(sources_for(Service::ClaudeMax).contains(&Source::Collector));
-        assert!(sources_for(Service::ChatgptPlus).contains(&Source::Collector));
-        assert!(!sources_for(Service::OpencodeGoPlus).contains(&Source::Collector));
+        assert!(sources_for(Service::ClaudeMax).contains(&Source::Helper));
+        assert!(sources_for(Service::ChatgptPlus).contains(&Source::Helper));
+        assert!(!sources_for(Service::OpencodeGoPlus).contains(&Source::Helper));
     }
 
     #[test]
@@ -1616,7 +1611,10 @@ mod helper_tests {
         let Some(Op::NewHelper(n)) = m.create_helper() else {
             panic!("helper")
         };
-        assert_eq!((n.label.as_str(), n.services), ("PC", vec![Service::ChatgptPlus]));
+        assert_eq!(
+            (n.label.as_str(), n.feeds),
+            ("PC", vec!["chatgpt-plus".to_string()])
+        );
     }
 }
 
@@ -1634,7 +1632,7 @@ mod helper_string_tests {
         assert!(matches!(op, Some(Op::NewHelper(_))));
         use base64::Engine;
         let secret = [9u8; 16];
-        let invite = CollectorInvite {
+        let invite = HelperInvite {
             secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
             expires_at: t.plus_seconds(600),
             identity: HubIdentity {

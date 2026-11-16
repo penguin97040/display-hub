@@ -75,7 +75,7 @@ mod tests {
 
     #[test]
     fn accepts_plain_text() {
-        assert_eq!(check_text("Claude Max", 48), Ok(()));
+        assert_eq!(check_text("Kitchen Display", 48), Ok(()));
         assert_eq!(check_text("Tēnā koe", 48), Ok(()));
     }
 
@@ -92,8 +92,8 @@ mod tests {
     #[test]
     fn sanitises_into_valid_text() {
         assert_eq!(
-            sanitise_text("  Claude \n\t Max\u{0} ", 48).as_deref(),
-            Some("Claude Max")
+            sanitise_text("  Kitchen \n\t Display\u{0} ", 48).as_deref(),
+            Some("Kitchen Display")
         );
         assert_eq!(sanitise_text("e\u{301}", 48).as_deref(), Some("é"));
         assert_eq!(sanitise_text("\u{202e}\u{200b}", 48), None);

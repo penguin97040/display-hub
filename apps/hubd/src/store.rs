@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use hub_core::{Service, Source, StoredContent, StoredPage};
+use hub_core::{Source, StoredContent, StoredPage};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::limits::{MAX_METER_ITEMS, MAX_TITLE_LEN};
 use hub_protocol::shapes::KIND_METER;
@@ -110,11 +110,56 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (device_id, page_id)
     );
     "#,
+    // 4: PC helpers become helpers that send pages to named feeds. Each helper's services become
+    // feeds of the same names, and the old name for helpers, in sources, roles and code purposes,
+    // becomes `helper`. Tokens and pairings keep working: only names change. SQLite can't change a
+    // CHECK constraint in place, so the two tables that have one are copied into new ones.
+    r#"
+    CREATE TABLE helper_feeds (
+        subject TEXT NOT NULL,
+        feed TEXT NOT NULL,
+        PRIMARY KEY (subject, feed)
+    );
+    INSERT INTO helper_feeds (subject, feed) SELECT subject, service FROM collector_scopes;
+    DROP TABLE collector_scopes;
+    UPDATE pages SET source = 'helper' WHERE source = 'collector';
+
+    CREATE TABLE credentials_new (
+        token_hash BLOB PRIMARY KEY,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'device', 'helper')),
+        subject TEXT NOT NULL,
+        label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    INSERT INTO credentials_new (token_hash, role, subject, label, created_at, revoked_at)
+        SELECT token_hash, CASE role WHEN 'collector' THEN 'helper' ELSE role END,
+               subject, label, created_at, revoked_at
+        FROM credentials;
+    DROP TABLE credentials;
+    ALTER TABLE credentials_new RENAME TO credentials;
+    CREATE INDEX credentials_subject ON credentials(role, subject);
+
+    CREATE TABLE one_time_codes_new (
+        code_hash BLOB PRIMARY KEY,
+        purpose TEXT NOT NULL CHECK (purpose IN ('admin-pair', 'device-enrol', 'helper-pair')),
+        label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER
+    );
+    INSERT INTO one_time_codes_new (code_hash, purpose, label, created_at, expires_at, used_at)
+        SELECT code_hash, CASE purpose WHEN 'collector-pair' THEN 'helper-pair' ELSE purpose END,
+               label, created_at, expires_at, used_at
+        FROM one_time_codes;
+    DROP TABLE one_time_codes;
+    ALTER TABLE one_time_codes_new RENAME TO one_time_codes;
+    "#,
 ];
 
 /// Data an upgrade moves with code rather than SQL: run straight after that version's SQL, in the
 /// same transaction. Never edit one that has shipped either.
-const DATA_MOVES: &[(i64, DataMove)] = &[(3, move_to_pages)];
+const DATA_MOVES: &[(i64, DataMove)] = &[(3, move_to_pages), (4, store_demo_samples)];
 
 type DataMove = fn(&Connection) -> Result<(), StoreError>;
 
@@ -262,6 +307,58 @@ fn move_to_pages(conn: &Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Version 4: the hub no longer makes up demo figures for usage pages, so each demo usage page
+/// that has nothing stored is given the sample figures it showed before, as its stored content.
+/// The hub shows a demo page's content as fresh for as long as it keeps it, so the figures carry no
+/// reset times, which would pass and clear them.
+///
+/// This keeps its own copy of the sample figures of that time, as [`move_to_pages`] does of names.
+fn store_demo_samples(conn: &Connection) -> Result<(), StoreError> {
+    const NOTE: &str = "Sample figures, not real usage";
+    /// A sample meter item: its id, label and share.
+    type Item = (&'static str, &'static str, f64);
+    const SAMPLES: [(&str, &[Item]); 3] = [
+        (
+            "claude-max",
+            &[
+                ("five-hour", "Five-hour allowance used", 42.0),
+                ("weekly", "Weekly allowance used", 24.0),
+            ],
+        ),
+        (
+            "chatgpt-plus",
+            &[
+                ("five-hour", "Five-hour allowance used", 63.0),
+                ("weekly", "Weekly allowance used", 38.0),
+            ],
+        ),
+        (
+            "opencode-go-plus",
+            &[
+                ("five-hour", "Five-hour allowance used", 17.0),
+                ("weekly", "Weekly allowance used", 31.0),
+                ("monthly", "Monthly allowance used", 9.0),
+            ],
+        ),
+    ];
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    for (feed, figures) in SAMPLES {
+        let items = figures
+            .iter()
+            .map(|&(id, label, percent)| MeterItem::new(id, label, Some(percent), None))
+            .collect();
+        let data = serde_json::to_string(&Meter { items }).expect("serialises");
+        conn.execute(
+            "UPDATE pages SET quality = 'demo', updated_at = ?2, data = ?3, note = ?4, stored_at = ?2
+             WHERE source = 'demo' AND kind = ?5 AND feed = ?1 AND quality IS NULL",
+            params![feed, now, data, NOTE, KIND_METER],
+        )?;
+    }
+    Ok(())
+}
+
 /// What [`Store::put_content`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ContentWrite {
@@ -278,15 +375,17 @@ pub enum ContentWrite {
 pub enum PageUpdate {
     Updated,
     NoPage,
-    /// The change would make it a collector page, which must be a meter with a feed
-    /// ([`collector_can_fill`]). Nothing was changed.
-    CollectorNeedsMeterWithFeed,
+    /// The change would make it a helper page, which needs a feed for helpers to send to. Nothing
+    /// was changed.
+    HelperNeedsFeed,
 }
 
-/// Whether a page of `kind` and `feed` may have source `collector`. Until collectors can fill
-/// other kinds, a collector page is a meter, with a feed to match a helper's scope against.
-pub fn collector_can_fill(kind: &str, feed: Option<&str>) -> bool {
-    kind == KIND_METER && feed.is_some()
+/// What [`Store::put_feed_content`] did: the pages it wrote to, and the pages of the feed that take
+/// content from a helper but are of another kind, which it left alone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeedWrite {
+    pub updated: Vec<String>,
+    pub skipped: Vec<String>,
 }
 
 /// The most pages the hub holds. Each display shows at most its first
@@ -975,19 +1074,17 @@ impl Store {
     ) -> Result<PageUpdate, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, String, Option<String>)> = tx
-            .query_row(
-                "SELECT source, kind, feed FROM pages WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-            )
+        let row: Option<(String, Option<String>)> = tx
+            .query_row("SELECT source, feed FROM pages WHERE id = ?1", params![id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .optional()?;
-        let Some((current, kind, feed)) = row else {
+        let Some((current, feed)) = row else {
             return Ok(PageUpdate::NoPage);
         };
         let new_source = source.filter(|s| s.slug() != current);
-        if new_source == Some(Source::Collector) && !collector_can_fill(&kind, feed.as_deref()) {
-            return Ok(PageUpdate::CollectorNeedsMeterWithFeed);
+        if new_source == Some(Source::Helper) && feed.is_none() {
+            return Ok(PageUpdate::HelperNeedsFeed);
         }
         if let Some(t) = title {
             tx.execute("UPDATE pages SET title = ?1 WHERE id = ?2", params![t, id])?;
@@ -1077,19 +1174,27 @@ impl Store {
         Ok(ContentWrite::Written)
     }
 
-    /// Writes a collector's report to every meter page of `feed` whose source is `collector`, in one
-    /// transaction, and returns their ids. Pages it wouldn't change are not rewritten.
+    /// Writes a helper's content to every page of `feed` whose source is `helper` and whose kind is
+    /// `kind`, in one transaction. Pages it wouldn't change are not rewritten.
     pub fn put_feed_content(
         &self,
         feed: &str,
+        kind: &str,
         content: &StoredContent,
         now: Timestamp,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<FeedWrite, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let ids = feed_page_ids(&tx, feed)?;
+        let mut out = FeedWrite::default();
+        for (id, page_kind) in feed_pages(&tx, feed)? {
+            if page_kind == kind {
+                out.updated.push(id);
+            } else {
+                out.skipped.push(id);
+            }
+        }
         let (quality, updated_at, data, note) = content_columns(content);
-        for id in &ids {
+        for id in &out.updated {
             tx.execute(
                 "UPDATE pages SET quality = ?2, updated_at = ?3, data = ?4, note = ?5, stored_at = ?6
                  WHERE id = ?1 AND NOT (quality IS ?2 AND updated_at IS ?3 AND data IS ?4 AND note IS ?5)",
@@ -1097,39 +1202,37 @@ impl Store {
             )?;
         }
         tx.commit()?;
-        Ok(ids)
+        Ok(out)
     }
 
-    // ----- collectors -----
+    // ----- helpers -----
 
-    pub fn add_collector_scope(&self, subject: &str, services: &[Service]) -> Result<(), StoreError> {
+    pub fn add_helper_feeds(&self, subject: &str, feeds: &[String]) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        for s in services {
+        for f in feeds {
             tx.execute(
-                "INSERT OR IGNORE INTO collector_scopes (subject, service) VALUES (?1, ?2)",
-                params![subject, s.slug()],
+                "INSERT OR IGNORE INTO helper_feeds (subject, feed) VALUES (?1, ?2)",
+                params![subject, f],
             )?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn collector_services(&self, subject: &str) -> Result<Vec<Service>, StoreError> {
+    /// The feeds a helper may send to, in name order.
+    pub fn helper_feeds(&self, subject: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.conn();
-        let mut st =
-            conn.prepare("SELECT service FROM collector_scopes WHERE subject = ?1 ORDER BY service")?;
+        let mut st = conn.prepare("SELECT feed FROM helper_feeds WHERE subject = ?1 ORDER BY feed")?;
         let rows = st.query_map(params![subject], |r| r.get::<_, String>(0))?;
-        Ok(rows
-            .filter_map(|r| r.ok().and_then(|s| Service::from_slug(&s)))
-            .collect())
+        Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// Every collector that has paired, newest first.
-    pub fn collectors(&self) -> Result<Vec<(String, String, Timestamp, bool)>, StoreError> {
+    /// Every helper that has paired, newest first.
+    pub fn helpers(&self) -> Result<Vec<(String, String, Timestamp, bool)>, StoreError> {
         let conn = self.conn();
         let mut st = conn.prepare(
-            "SELECT subject, label, created_at, revoked_at FROM credentials WHERE role = 'collector' ORDER BY created_at DESC",
+            "SELECT subject, label, created_at, revoked_at FROM credentials WHERE role = 'helper' ORDER BY created_at DESC",
         )?;
         let rows = st.query_map([], |r| {
             Ok((
@@ -1173,12 +1276,12 @@ static DISPLAY_PAGES_SQL: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
-fn feed_page_ids(conn: &Connection, feed: &str) -> Result<Vec<String>, StoreError> {
+/// The pages of `feed` whose source is `helper`, with their kinds, in order.
+fn feed_pages(conn: &Connection, feed: &str) -> Result<Vec<(String, String)>, StoreError> {
     let mut st = conn.prepare(
-        "SELECT id FROM pages WHERE feed = ?1 AND source = 'collector' AND kind = 'meter'
-         ORDER BY position, created_at",
+        "SELECT id, kind FROM pages WHERE feed = ?1 AND source = 'helper' ORDER BY position, created_at",
     )?;
-    let rows = st.query_map(params![feed], |r| r.get::<_, String>(0))?;
+    let rows = st.query_map(params![feed], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
@@ -1293,19 +1396,54 @@ mod tests {
         conn.execute_batch(SCHEMA_2_DATA).unwrap();
     }
 
-    /// Every row of the tables an upgrade must not touch, as text.
+    /// What the schema 2 code built from [`SCHEMA_2_DATA`], captured before it was replaced, as an
+    /// upgraded hub serves it. Since version 4, demo figures are stored rather than made up by the
+    /// hub, and have no reset times.
+    fn schema_2_pages() -> serde_json::Value {
+        let mut pages: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/schema-2-pages.json")).unwrap();
+        for p in pages.as_array_mut().unwrap() {
+            if p["data_quality"] == "demo" {
+                for item in p["data"]["items"].as_array_mut().unwrap() {
+                    item.as_object_mut().unwrap().remove("resets_at");
+                }
+            }
+        }
+        pages
+    }
+
+    /// Every row of the tables an upgrade must keep, as text. Version 4 renamed helpers' role, code
+    /// purpose and table of scopes, so those are read under today's names.
     fn untouched_tables(conn: &Connection) -> Vec<String> {
+        let upgraded: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = 'helper_feeds')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let scopes = if upgraded {
+            "SELECT subject, feed FROM helper_feeds"
+        } else {
+            "SELECT subject, service FROM collector_scopes"
+        };
+        let role = "CASE role WHEN 'collector' THEN 'helper' ELSE role END";
+        let purpose = "CASE purpose WHEN 'collector-pair' THEN 'helper-pair' ELSE purpose END";
         let mut out = Vec::new();
-        for (table, order) in [
-            ("devices", "id"),
-            ("credentials", "token_hash"),
-            ("one_time_codes", "code_hash"),
-            ("collector_scopes", "subject, service"),
-            ("audit_log", "id"),
+        for (table, sql) in [
+            ("devices", "SELECT * FROM devices ORDER BY id".to_string()),
+            (
+                "credentials",
+                format!("SELECT token_hash, {role}, subject, label, created_at, revoked_at FROM credentials ORDER BY token_hash"),
+            ),
+            (
+                "one_time_codes",
+                format!("SELECT code_hash, {purpose}, label, created_at, expires_at, used_at FROM one_time_codes ORDER BY code_hash"),
+            ),
+            ("helper_feeds", format!("{scopes} ORDER BY 1, 2")),
+            ("audit_log", "SELECT * FROM audit_log ORDER BY id".to_string()),
         ] {
-            let mut st = conn
-                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
-                .unwrap();
+            let mut st = conn.prepare(&sql).unwrap();
             let n = st.column_count();
             let rows = st
                 .query_map([], |r| {
@@ -1359,13 +1497,16 @@ mod tests {
             note: None,
         };
         assert_eq!(
-            store.put_feed_content("claude-max", &report, ts(NOW)).unwrap(),
+            store
+                .put_feed_content("claude-max", "meter", &report, ts(NOW))
+                .unwrap()
+                .updated,
             vec!["claude-max".to_string()]
         );
         store
-            .add_collector_scope("c-1", &[Service::ClaudeMax, Service::ClaudeMax])
+            .add_helper_feeds("h-1", &["claude-max".into(), "claude-max".into()])
             .unwrap();
-        assert_eq!(store.collector_services("c-1").unwrap(), vec![Service::ClaudeMax]);
+        assert_eq!(store.helper_feeds("h-1").unwrap(), vec!["claude-max".to_string()]);
         let saved = copies(dir.path());
         assert_eq!(saved.len(), 1);
         let name = saved[0].file_name().unwrap().to_str().unwrap();
@@ -1380,10 +1521,8 @@ mod tests {
         let before = untouched_tables(&Connection::open(&path).unwrap());
 
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
-        // What the schema 2 code built from the same data, captured before it was replaced.
-        let expected: serde_json::Value =
-            serde_json::from_str(include_str!("../tests/fixtures/schema-2-pages.json")).unwrap();
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let expected = schema_2_pages();
         // Each display, with every page ticked, gets what every display got before; so does the
         // all-pages preview.
         for display in ["d-desk", "d-kitchen"] {
@@ -1541,8 +1680,6 @@ mod tests {
         };
         store.add_page(&page, now).unwrap();
         assert_eq!(store.pages().unwrap(), vec![page.clone()]);
-        // A custom page is not a usage page.
-        assert_eq!(store.pages().unwrap()[0].usage_service(), None);
         let content = page.content.clone().unwrap();
         assert_eq!(
             store
@@ -1711,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn collector_reports_reach_only_collector_meter_pages_of_their_feed() {
+    fn helper_content_reaches_only_helper_pages_of_its_feed_and_kind() {
         let store = Store::in_memory().unwrap();
         let now = ts(NOW);
         let page = |id: &str, kind: &str, source: Source, feed: Option<&str>| StoredPage {
@@ -1721,23 +1858,26 @@ mod tests {
             ..text_page(id)
         };
         for p in [
-            page("meter", "meter", Source::Collector, Some("claude-max")),
-            page("text", "text", Source::Collector, Some("claude-max")),
-            page("manual", "meter", Source::Manual, Some("claude-max")),
-            page("other", "meter", Source::Collector, Some("chatgpt-plus")),
-            page("later", "meter", Source::Collector, Some("claude-max")),
+            page("meter", "meter", Source::Helper, Some("garden")),
+            page("text", "text", Source::Helper, Some("garden")),
+            page("manual", "meter", Source::Manual, Some("garden")),
+            page("other", "meter", Source::Helper, Some("kitchen")),
+            page("later", "meter", Source::Helper, Some("garden")),
         ] {
             store.add_page(&p, now).unwrap();
         }
         let content = StoredContent {
             quality: DataQuality::ProviderReported,
             updated_at: Some(now),
-            data: Some(json!({"items": [{"id": "weekly", "label": "Weekly", "percent": 5.0}]})),
+            data: Some(json!({"items": [{"id": "soil", "label": "Soil moisture", "percent": 5.0}]})),
             note: None,
         };
         assert_eq!(
-            store.put_feed_content("claude-max", &content, now).unwrap(),
-            ["meter", "later"]
+            store.put_feed_content("garden", "meter", &content, now).unwrap(),
+            FeedWrite {
+                updated: vec!["meter".into(), "later".into()],
+                skipped: vec!["text".into()],
+            }
         );
         let stored: Vec<(String, bool)> = store
             .pages()
@@ -1755,43 +1895,147 @@ mod tests {
                 ("later".into(), true),
             ]
         );
+        assert_eq!(
+            store.put_feed_content("nobody", "meter", &content, now).unwrap(),
+            FeedWrite::default()
+        );
     }
 
     #[test]
-    fn switching_to_collector_needs_a_meter_with_a_feed_and_changes_nothing_otherwise() {
+    fn switching_to_helper_needs_a_feed_and_changes_nothing_otherwise() {
         let store = Store::in_memory().unwrap();
         let now = ts(NOW);
-        let meter = StoredPage {
-            kind: "meter".into(),
-            feed: Some("claude-max".into()),
-            ..text_page("m")
+        let fed = StoredPage {
+            feed: Some("garden".into()),
+            ..text_page("fed")
         };
-        let bare = StoredPage {
-            kind: "meter".into(),
-            ..text_page("bare")
-        };
-        for p in [text_page("t"), meter, bare] {
-            store.add_page(&p, now).unwrap();
-        }
-        let to_collector = |id: &str| {
+        store.add_page(&text_page("bare"), now).unwrap();
+        store.add_page(&fed, now).unwrap();
+        let to_helper = |id: &str| {
             store
-                .update_page(id, Some("Changed"), Some(Source::Collector), Some(900))
+                .update_page(id, Some("Changed"), Some(Source::Helper), Some(900))
                 .unwrap()
         };
-        assert_eq!(to_collector("t"), PageUpdate::CollectorNeedsMeterWithFeed);
-        assert_eq!(to_collector("bare"), PageUpdate::CollectorNeedsMeterWithFeed);
-        for id in ["t", "bare"] {
-            let p = store.page(id).unwrap().unwrap();
-            assert_eq!(
-                (p.title.as_str(), p.source, p.stale_after_seconds),
-                (id, Source::Manual, 600)
-            );
-        }
-        assert_eq!(to_collector("m"), PageUpdate::Updated);
-        assert_eq!(store.page("m").unwrap().unwrap().source, Source::Collector);
+        assert_eq!(to_helper("bare"), PageUpdate::HelperNeedsFeed);
+        let p = store.page("bare").unwrap().unwrap();
+        assert_eq!(
+            (p.title.as_str(), p.source, p.stale_after_seconds),
+            ("bare", Source::Manual, 600)
+        );
+        // Any kind may take content from a helper.
+        assert_eq!(to_helper("fed"), PageUpdate::Updated);
+        assert_eq!(store.page("fed").unwrap().unwrap().source, Source::Helper);
         // Not a change of source, so the rule doesn't apply; nor does it to a missing page.
-        assert_eq!(to_collector("m"), PageUpdate::Updated);
-        assert_eq!(to_collector("nope"), PageUpdate::NoPage);
+        assert_eq!(to_helper("fed"), PageUpdate::Updated);
+        assert_eq!(to_helper("nope"), PageUpdate::NoPage);
+    }
+
+    /// Representative data in the layout schema 3 used.
+    const SCHEMA_3_DATA: &str = include_str!("../tests/fixtures/schema-3-data.sql");
+
+    #[test]
+    fn upgrading_schema_3_makes_scopes_feeds_and_keeps_helpers_working() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_at_schema(&conn, 3).unwrap();
+            conn.execute_batch(SCHEMA_3_DATA).unwrap();
+        }
+        let before = untouched_tables(&Connection::open(&path).unwrap());
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
+        let saved = copies(dir.path());
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hub-before-upgrade-schema-3-"), "{name}");
+        assert_eq!(Store::inspect(&saved[0]).unwrap(), (3, 4, 1));
+
+        // Every row is kept, under the new names.
+        assert_eq!(untouched_tables(&store.conn()), before);
+        assert_eq!(
+            store.helper_feeds("c-pc").unwrap(),
+            ["chatgpt-plus", "claude-max"]
+        );
+        let token = crate::secret::hash("dhc_test_helper");
+        assert_eq!(
+            store.credential(&token).unwrap(),
+            Some(Credential {
+                role: Role::Helper,
+                subject: "c-pc".into(),
+                revoked: false,
+            })
+        );
+        let helpers = store.helpers().unwrap();
+        assert_eq!(
+            helpers.iter().map(|h| (h.0.as_str(), h.3)).collect::<Vec<_>>(),
+            [("c-old", true), ("c-pc", false)]
+        );
+        // An invite made before the upgrade can still be used once.
+        let invite = crate::secret::hash("invite-before-upgrade");
+        assert_eq!(
+            store.use_code(&invite, "helper-pair", ts(NOW)).unwrap().0,
+            CodeUse::Accepted
+        );
+
+        // The helper page's source is renamed and its figures kept; a demo usage page with nothing
+        // stored gets the sample figures it showed before, with no reset times.
+        let pages = store.pages().unwrap();
+        let sources: Vec<(&str, Source)> = pages.iter().map(|p| (p.id.as_str(), p.source)).collect();
+        assert_eq!(
+            sources,
+            [
+                ("claude-max", Source::Helper),
+                ("words", Source::Manual),
+                ("chatgpt-plus", Source::Demo),
+                ("flights", Source::Demo),
+            ]
+        );
+        let reported = pages[0].content.as_ref().unwrap();
+        assert_eq!(reported.quality, DataQuality::ProviderReported);
+        assert_eq!(
+            reported.data.as_ref().unwrap()["items"][1]["percent"],
+            json!(30.5)
+        );
+        let demo = pages[2].content.as_ref().unwrap();
+        assert_eq!(demo.quality, DataQuality::Demo);
+        assert_eq!(
+            demo.data,
+            Some(json!({"items": [
+                {"id": "five-hour", "label": "Five-hour allowance used", "percent": 63.0},
+                {"id": "weekly", "label": "Weekly allowance used", "percent": 38.0}
+            ]}))
+        );
+        assert_eq!(demo.note.as_deref(), Some("Sample figures, not real usage"));
+        assert_eq!(pages[3].content, None, "only demo usage pages get sample figures");
+        let snap = hub_core::build_snapshot(ts(NOW), 300, &store.display_pages("d-desk").unwrap().unwrap());
+        snap.validate().unwrap();
+        assert_eq!(snap.pages.len(), 4);
+        assert_eq!(snap.pages[2].data_quality, DataQuality::Demo);
+
+        // The helper's figures still reach its page through its feed.
+        let content = StoredContent {
+            quality: DataQuality::ProviderReported,
+            updated_at: Some(ts(NOW)),
+            data: Some(json!({"items": []})),
+            note: None,
+        };
+        assert_eq!(
+            store
+                .put_feed_content("claude-max", "meter", &content, ts(NOW))
+                .unwrap()
+                .updated,
+            ["claude-max"]
+        );
+        let leftovers: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('collector_scopes', 'credentials_new', 'one_time_codes_new')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]

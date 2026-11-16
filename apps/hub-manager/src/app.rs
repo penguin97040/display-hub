@@ -13,8 +13,9 @@ use gpui::{
     Div, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ShapedLine,
     SharedString, Stateful, TextRun, Window,
 };
-use hub_core::{Service, Source};
+use hub_core::Source;
 use hub_protocol::limits::MAX_PAGES;
+use usage::Service;
 
 use crate::field::Field;
 use crate::guidance::{Guidance, Next, Tone};
@@ -1266,7 +1267,7 @@ impl Manager {
             Source::Demo => {
                 "Sample figures for trying a display out. They always show as DEMO, never as real usage."
             }
-            Source::Collector => {
+            Source::Helper => {
                 "The PC helper sends what Claude Code or Codex reports on a PC where you're signed in. Set it up \
                  in Settings. They show as REPORTED."
             }
@@ -1791,10 +1792,11 @@ impl Manager {
         if !helpers.is_empty() {
             let mut list = div().flex().flex_col().gap(px(8.0)).child(ui::label("Set up"));
             for h in helpers {
+                // A service's feed shows as the service; any other feed by its name.
                 let services = h
-                    .services
+                    .feeds
                     .iter()
-                    .map(|s| s.default_title())
+                    .map(|f| Service::from_slug(f).map_or(f.as_str(), |s| s.default_title()))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let id = h.id.clone();

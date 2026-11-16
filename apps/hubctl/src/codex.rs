@@ -13,11 +13,10 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use hub_core::api::{ManualMetric, UsageReport};
-use hub_core::{Service, Window};
 use hub_protocol::Timestamp;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use usage::{ManualMetric, Service, UsageReport, Window};
 
 /// How long the whole exchange may take, including Codex starting up.
 pub const TIMEOUT: Duration = Duration::from_secs(30);

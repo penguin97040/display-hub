@@ -4,12 +4,13 @@
 use std::sync::Arc;
 
 use hub_client::HubClient;
-use hub_core::api::{NewCollector, NewSubscription};
-use hub_core::{FakeClock, Service, Source, Window};
+use hub_core::api::NewHelper;
+use hub_core::{FakeClock, Source};
 use hub_protocol::pairing::PairingString;
 use hub_protocol::DataQuality;
 use hubctl::commands;
 use os_secrets::{MemoryStore, TokenStore};
+use usage::{NewSubscription, Service, Window};
 
 /// The items of a page that must be a meter.
 fn items(page: &hub_protocol::Page) -> Vec<hub_protocol::MeterItem> {
@@ -24,7 +25,7 @@ const STATUS_JSON: &str = r#"{"model":{"display_name":"Opus 4.7"},
                  "seven_day":{"used_percentage":17,"resets_at":1900500000}}}"#;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn helper_figures_reach_collector_pages() {
+async fn helper_figures_reach_helper_pages() {
     let dir = tempfile::tempdir().unwrap();
     // The hub's clock is real time here: the helper stamps reports with the PC's clock.
     let hub = hubd::open_hub(
@@ -64,7 +65,7 @@ async fn helper_figures_reach_collector_pages() {
                 &admin,
                 &NewSubscription {
                     service,
-                    source: Source::Collector,
+                    source: Source::Helper,
                     title: None,
                     id: None,
                 },
@@ -73,11 +74,11 @@ async fn helper_figures_reach_collector_pages() {
             .unwrap();
     }
     let invite = manager
-        .new_collector(
+        .new_helper(
             &admin,
-            &NewCollector {
+            &NewHelper {
                 label: "Desk PC".into(),
-                services: vec![Service::ClaudeMax, Service::ChatgptPlus],
+                feeds: vec!["claude-max".into(), "chatgpt-plus".into()],
             },
         )
         .await
@@ -178,8 +179,8 @@ async fn helper_figures_reach_collector_pages() {
     }
 
     // Removed in the manager: the helper's next send is refused, and says why in its log.
-    let id = manager.collectors(&admin).await.unwrap()[0].id.clone();
-    manager.revoke_collector(&admin, &id).await.unwrap();
+    let id = manager.helpers(&admin).await.unwrap()[0].id.clone();
+    manager.revoke_helper(&admin, &id).await.unwrap();
     std::fs::remove_file(hdir.join("claude-sent.json")).unwrap();
     let (d, s) = (hdir.clone(), store.clone());
     let after = tokio::task::spawn_blocking(move || {

@@ -7,10 +7,9 @@
 //! that is still running when the next update comes, so `hubctl claude-statusline` prints at once and
 //! leaves sending to a separate process (`send-pending`), at most once a minute.
 
-use hub_core::api::{ManualMetric, UsageReport};
-use hub_core::{Service, Window};
 use hub_protocol::Timestamp;
 use serde::{Deserialize, Serialize};
+use usage::{ManualMetric, Service, UsageReport, Window};
 
 /// The most stdin the helper reads from Claude Code.
 pub const MAX_INPUT_BYTES: usize = 256 * 1024;

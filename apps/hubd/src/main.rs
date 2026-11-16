@@ -76,9 +76,9 @@ enum Command {
         /// Host name or address the helper should use, if not this machine's `.local` name.
         #[arg(long)]
         host: Option<String>,
-        /// A service the helper may report: claude-max or chatgpt-plus. Repeat for both.
-        #[arg(long = "service", required = true)]
-        services: Vec<String>,
+        /// A feed the helper may send to, such as garden-weather. Repeat for more than one.
+        #[arg(long = "feed", required = true)]
+        feeds: Vec<String>,
         /// A name for the helper, such as the PC's name.
         #[arg(long, default_value = "PC helper")]
         label: String,
@@ -234,20 +234,17 @@ async fn main() -> anyhow::Result<()> {
         Command::PairHelper {
             settings,
             host,
-            services,
+            feeds,
             label,
         } => {
-            let services = services
-                .iter()
-                .map(|s| {
-                    hub_core::Service::from_slug(s).ok_or_else(|| anyhow::anyhow!("unknown service {s:?}"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
+            if let Err(e) = hubd::api::check_feeds(&feeds) {
+                anyhow::bail!("{}", e.body.error.message);
+            }
             let config = settings.load()?;
             let port = config.listen.port();
             let host = host.unwrap_or_else(|| config.hosts().remove(0));
             let hub = hubd::open_hub(config, clock)?;
-            let invite = hub.new_collector_invite(&label, &services, "command line")?;
+            let invite = hub.new_helper_invite(&label, &feeds, "command line")?;
             let mut secret = [0u8; 16];
             use base64::Engine;
             let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&invite.secret)?;
