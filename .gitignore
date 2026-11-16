@@ -74,3 +74,18 @@ desktop.ini
 *.db-shm
 *.dhbundle.json
 /display-hub-starter/
+
+# agent-rules: rules v2
+# More local agent files, tool folders and settings (never publish)
+CLAUDE.local.md
+AGENTS.override.md
+.claude/
+.codex/
+.qwen/
+.opencode/
+.cursor/
+.mcp.json
+opencode.json
+opencode.jsonc
+.cursorrules
+.windsurfrules
