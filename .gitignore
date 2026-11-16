@@ -69,6 +69,10 @@ desktop.ini
 /target/
 /dist/
 /dev-data/
+# Test hubs and simulator state from USER_TESTS.md (they hold keys and tokens)
+/hub-test/
+/sim-test/
+/sim-pi/
 *.db
 *.db-wal
 *.db-shm
