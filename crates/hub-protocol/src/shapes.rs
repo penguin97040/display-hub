@@ -330,10 +330,22 @@ fn opt_text_field(path: &str, s: &Option<String>, max: usize) -> Result<(), Cant
     s.as_deref().map_or(Ok(()), |s| text_field(path, s, max))
 }
 
+/// [`read_with`] with the usual rules: a meter has at least one item.
+#[cfg(test)]
+pub(crate) fn read(kind: &str, data: Option<&Value>, strict: bool) -> Result<PageContent, CantShow> {
+    read_with(kind, data, strict, 1)
+}
+
 /// Reads and checks `data` for a page that shows figures. `strict` is what a hub does: it also
 /// refuses fields the shape doesn't have and keys that must be present (`percent`, `value`), which
-/// a display tolerates.
-pub(crate) fn read(kind: &str, data: Option<&Value>, strict: bool) -> Result<PageContent, CantShow> {
+/// a display tolerates. `min_meter_items` is the fewest items a `meter` may have: 1, except for a
+/// hub storing a meter that has nothing to show yet, which passes 0. Nothing is sent with none.
+pub(crate) fn read_with(
+    kind: &str,
+    data: Option<&Value>,
+    strict: bool,
+    min_meter_items: usize,
+) -> Result<PageContent, CantShow> {
     let class = classify_kind(kind);
     if class == KindClass::Invalid {
         return Err(CantShow::UnknownKind);
@@ -354,7 +366,7 @@ pub(crate) fn read(kind: &str, data: Option<&Value>, strict: bool) -> Result<Pag
     match kind {
         KIND_METER => {
             check_keys(data, "data", &["items"], &["items"], strict)?;
-            let raw = items_of(data, MAX_METER_ITEMS, 1)?;
+            let raw = items_of(data, MAX_METER_ITEMS, min_meter_items)?;
             for (i, it) in raw.iter().enumerate() {
                 let p = format!("items[{i}]");
                 check_keys(

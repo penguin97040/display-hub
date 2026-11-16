@@ -14,7 +14,7 @@ use hub_protocol::pairing::fingerprint;
 use crate::api::Hub;
 use crate::config::Config;
 use crate::identity::Identity;
-use crate::store::Store;
+use crate::store::{file_stamp, Store};
 
 /// Marks a folder as a Display Hub backup, and says what's in it.
 pub const MARKER: &str = "DISPLAY-HUB-BACKUP.txt";
@@ -207,7 +207,7 @@ pub fn restore(
                 data.display()
             )));
         }
-        let aside = data.join(format!("replaced-{}", stamp(clock.now())));
+        let aside = data.join(format!("replaced-{}", file_stamp(clock.now())));
         private_dir(&aside)?;
         for p in &existing {
             let to = aside.join(p.file_name().expect("named"));
@@ -227,8 +227,6 @@ pub fn restore(
     Store::open(&data.join("hub.db"))?.audit(clock.now(), "backup_restored", &src.display().to_string())?;
     Ok((restored, moved_to))
 }
-
-use crate::store::file_stamp as stamp;
 
 /// One line of `hubd check`.
 #[derive(Debug, PartialEq, Eq)]

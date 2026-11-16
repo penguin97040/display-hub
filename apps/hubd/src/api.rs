@@ -20,7 +20,7 @@ use hub_core::api::*;
 use hub_core::model::{clean_note, clean_title, valid_page_id};
 use hub_core::{build_snapshot, Clock, MetricValue, PageData, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
-use hub_protocol::shapes::{classify_kind, KindClass, KIND_METER};
+use hub_protocol::shapes::{classify_kind, KindClass};
 use hub_protocol::{CantShow, DataQuality, ErrorCode, Health, Page, Timestamp};
 use serde::de::DeserializeOwned;
 use tower::ServiceBuilder;
@@ -30,7 +30,9 @@ use crate::http::{check_protocol, handle_layer_error, ApiError, MAX_CONCURRENT_R
 use crate::identity::Identity;
 use crate::ratelimit::Limiter;
 use crate::secret::{hash, new_code, new_id, new_token, Role};
-use crate::store::{CodeUse, Store, StoreError, MAX_STORED_PAGES};
+use crate::store::{
+    collector_can_fill, CodeUse, ContentWrite, PageUpdate, Store, StoreError, MAX_STORED_PAGES,
+};
 
 /// One-time codes (pairing and enrolment) last this long.
 pub const CODE_LIFETIME_SECONDS: i64 = 600;
@@ -620,12 +622,14 @@ const RESERVED_PAGE_IDS: &[&str] = &["order"];
 /// Until collectors can fill other kinds, a collector page is a meter with a feed to match a
 /// helper's scope against.
 fn check_collector(source: Source, kind: &str, feed: Option<&str>) -> Result<(), ApiError> {
-    if source == Source::Collector && (kind != KIND_METER || feed.is_none()) {
-        return Err(ApiError::bad_request(
-            "Only a meter page with a feed can take figures from a PC helper, for now.",
-        ));
+    if source == Source::Collector && !collector_can_fill(kind, feed) {
+        return Err(collector_refused());
     }
     Ok(())
+}
+
+fn collector_refused() -> ApiError {
+    ApiError::bad_request("Only a meter page with a feed can take figures from a PC helper, for now.")
 }
 
 /// `base` made into a page id: lower case, other characters as hyphens, at most 40 long.
@@ -721,22 +725,18 @@ async fn change_page(
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let title = req.title.as_deref().map(clean_page_title).transpose()?;
     let stale = req.stale_after_seconds.map(check_stale).transpose()?;
-    if let Some(source) = req.source {
-        let id2 = id.clone();
-        let page = db(&hub, move |s| s.page(&id2))
-            .await?
-            .ok_or_else(ApiError::not_found)?;
-        check_collector(source, &page.kind, page.feed.as_deref())?;
-    }
-    db(&hub, move |s| {
-        if !s.update_page(&id, title.as_deref(), req.source, stale)? {
-            return Ok(None);
-        }
-        s.page(&id)
+    // The collector rule is checked in the same transaction as the change, and only when the
+    // source actually changes.
+    let (outcome, page) = db(&hub, move |s| {
+        let outcome = s.update_page(&id, title.as_deref(), req.source, stale)?;
+        Ok((outcome, s.page(&id)?))
     })
-    .await?
-    .map(Json)
-    .ok_or_else(ApiError::not_found)
+    .await?;
+    match (outcome, page) {
+        (PageUpdate::Updated, Some(page)) => Ok(Json(page)),
+        (PageUpdate::CollectorNeedsMeterWithFeed, _) => Err(collector_refused()),
+        _ => Err(ApiError::not_found()),
+    }
 }
 
 async fn remove_page(
@@ -782,60 +782,119 @@ async fn set_content(
         .await?
         .ok_or_else(ApiError::not_found)?;
     if page.source != Source::Manual {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            ErrorCode::Conflict,
-            "This page doesn't take typed-in content. Change its source to manual first.",
-        ));
+        return Err(not_manual());
     }
     let now = hub.clock.now();
+    let note = req.note.as_deref().and_then(clean_note);
+    let mut data = req.data.filter(|d| !d.is_null());
+    if let Some(d) = data.as_mut() {
+        // A usage page's items must be the service's windows, which is said in the owner's terms
+        // first. Then the data is checked as sent, and once more as rewritten (rounded shares and
+        // the service's labels can change its size).
+        let usage = match page.usage_service() {
+            Some(service) => usage_figures(service, d)?,
+            None => None,
+        };
+        check_content(&page, d, &note, now)?;
+        if let Some(rewritten) = usage {
+            *d = rewritten;
+            check_content(&page, d, &note, now)?;
+        }
+    }
     let content = StoredContent {
         quality: DataQuality::Manual,
         updated_at: Some(now),
-        data: req.data.filter(|d| !d.is_null()),
-        note: req.note.as_deref().and_then(clean_note),
+        data,
+        note,
     };
-    // A meter with no items is how a usage page says "no figures yet", as typed-in usage pages
-    // always could. Every other meter rule still applies.
-    let empty_meter = page.kind == KIND_METER && content.data == Some(serde_json::json!({ "items": [] }));
-    if let Some(data) = content.data.as_ref().filter(|_| !empty_meter) {
-        let wire = Page {
-            id: page.id.clone(),
-            title: clean_title(&page.title).unwrap_or_default(),
-            kind: page.kind.clone(),
-            data_quality: content.quality,
-            updated_at: content.updated_at,
-            stale_after_seconds: page.stale_after_seconds,
-            note: content.note.clone(),
-            data: Some(data.clone()),
-        };
-        match wire.check() {
-            Ok(()) => {}
-            Err(CantShow::TooLarge) => {
-                return Err(ApiError::bad_request(format!(
-                    "This page would be {} bytes; a page may be at most {} bytes.",
-                    wire.size(),
-                    hub_protocol::limits::MAX_PAGE_BYTES
-                )))
-            }
-            Err(CantShow::BadData(why)) => {
-                return Err(ApiError::bad_request(format!(
-                    "This data doesn't fit a {} page: {why}.",
-                    page.kind
-                )))
-            }
-            Err(CantShow::UnknownKind) => {
-                return Err(ApiError::bad_request("This page's kind isn't one the hub knows."))
-            }
-        }
-    }
     let c2 = content.clone();
     // Written only while the page is still manual, in case it changed since it was read.
-    db(&hub, move |s| s.put_content(&id, Source::Manual, &c2, now)).await?;
-    Ok(Json(StoredPage {
-        content: Some(content),
-        ..page
-    }))
+    match db(&hub, move |s| s.put_content(&id, Source::Manual, &c2, now)).await? {
+        ContentWrite::Written | ContentWrite::Unchanged => Ok(Json(StoredPage {
+            content: Some(content),
+            ..page
+        })),
+        ContentWrite::SourceChanged => Err(not_manual()),
+        ContentWrite::NoPage => Err(ApiError::not_found()),
+    }
+}
+
+/// Checks content for a manual page as the hub checks a page before sending it, and explains a
+/// refusal. A meter with no items means "no figures yet", as typed-in usage figures always could:
+/// only that minimum is relaxed, for any manual meter page, and every other rule still applies.
+fn check_content(
+    page: &StoredPage,
+    data: &serde_json::Value,
+    note: &Option<String>,
+    now: Timestamp,
+) -> Result<(), ApiError> {
+    let wire = Page {
+        id: page.id.clone(),
+        title: clean_title(&page.title).unwrap_or_default(),
+        kind: page.kind.clone(),
+        data_quality: DataQuality::Manual,
+        updated_at: Some(now),
+        stale_after_seconds: page.stale_after_seconds,
+        note: note.clone(),
+        data: Some(data.clone()),
+    };
+    match wire.check_allowing_empty_meter() {
+        Ok(()) => Ok(()),
+        Err(CantShow::TooLarge) => Err(ApiError::bad_request(format!(
+            "This page would be {} bytes; a page may be at most {} bytes.",
+            wire.size(),
+            hub_protocol::limits::MAX_PAGE_BYTES
+        ))),
+        Err(CantShow::BadData(why)) => Err(ApiError::bad_request(format!(
+            "This data doesn't fit a {} page: {why}.",
+            page.kind
+        ))),
+        Err(CantShow::UnknownKind) => Err(ApiError::bad_request("This page's kind isn't one the hub knows.")),
+    }
+}
+
+fn not_manual() -> ApiError {
+    ApiError::new(
+        StatusCode::CONFLICT,
+        ErrorCode::Conflict,
+        "This page doesn't take typed-in content. Change its source to manual first.",
+    )
+}
+
+/// Typed-in figures for a usage page: each meter item must be one of the service's allowance
+/// windows, listed once, with a share from 0 to 100. Gives the meter rewritten with shares rounded
+/// to one decimal place and the service's labels. Data that doesn't read as a meter at all gives
+/// `None`, for the page checks to explain.
+fn usage_figures(
+    service: hub_core::Service,
+    data: &serde_json::Value,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    let Ok(meter) = serde_json::from_value::<hub_protocol::Meter>(data.clone()) else {
+        return Ok(None);
+    };
+    let mut figures = Vec::new();
+    for item in &meter.items {
+        let Some(window) = hub_core::Window::from_id(&item.id) else {
+            return Err(ApiError::bad_request(format!(
+                "{} has no {} window.",
+                service.default_title(),
+                item.id
+            )));
+        };
+        figures.push(ManualMetric {
+            window,
+            used_percent: item.percent,
+            resets_at: item.resets_at,
+        });
+    }
+    let metrics = clean_figures(service, &figures).map_err(ApiError::bad_request)?;
+    let items: Vec<hub_protocol::MeterItem> = metrics
+        .iter()
+        .map(|m| hub_protocol::MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at))
+        .collect();
+    Ok(Some(
+        serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise"),
+    ))
 }
 
 async fn display_pages(
@@ -859,14 +918,16 @@ async fn set_display_pages(
     ApiJson(req): ApiJson<DisplayPages>,
 ) -> Result<Json<DisplayPages>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let distinct: std::collections::HashSet<&String> = req.ids.iter().collect();
-    if distinct.len() > MAX_STORED_PAGES {
+    // Ticks are a set: repeats are dropped before anything else.
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<String> = req.ids.into_iter().filter(|id| seen.insert(id.clone())).collect();
+    if ids.len() > MAX_STORED_PAGES {
         return Err(ApiError::bad_request(format!(
             "The hub holds at most {MAX_STORED_PAGES} pages."
         )));
     }
     db(&hub, move |s| {
-        if !s.set_display_pages(&id, &req.ids)? {
+        if !s.set_display_pages(&id, &ids)? {
             return Ok(None);
         }
         s.display_page_ids(&id)

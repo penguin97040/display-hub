@@ -103,6 +103,10 @@ impl Page {
     }
 
     fn read(&self, strict: bool) -> Result<Option<PageContent>, CantShow> {
+        self.read_with(strict, 1)
+    }
+
+    fn read_with(&self, strict: bool, min_meter_items: usize) -> Result<Option<PageContent>, CantShow> {
         if self.size() > MAX_PAGE_BYTES {
             return Err(CantShow::TooLarge);
         }
@@ -111,7 +115,7 @@ impl Page {
                 Err(CantShow::BadData("an unavailable page carries no data".into()))
             }
             q if !q.shows_figures() => Ok(None),
-            _ => shapes::read(&self.kind, self.data.as_ref(), strict).map(Some),
+            _ => shapes::read_with(&self.kind, self.data.as_ref(), strict, min_meter_items).map(Some),
         }
     }
 
@@ -119,6 +123,13 @@ impl Page {
     /// strictly. The common fields are checked by [`Snapshot::violations`].
     pub fn check(&self) -> Result<(), CantShow> {
         self.read(true).map(|_| ())
+    }
+
+    /// [`check`](Self::check), except that a `meter` may have no items. This is for a hub storing
+    /// what a page will show, where an empty meter means "no figures yet"; it never sends one, and
+    /// every other rule still applies.
+    pub fn check_allowing_empty_meter(&self) -> Result<(), CantShow> {
+        self.read_with(true, 0).map(|_| ())
     }
 
     /// The serialised size of the page object.
@@ -386,4 +397,44 @@ pub fn reread(body: &[u8]) -> Result<Snapshot, ReceiveError> {
         return Err(ReceiveError::Invalid(serious.join("; ")));
     }
     Ok(snap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn meter(data: Value, note: Option<String>) -> Page {
+        Page {
+            id: "m".into(),
+            title: "M".into(),
+            kind: "meter".into(),
+            data_quality: DataQuality::Manual,
+            updated_at: Some(Timestamp::parse("2026-11-10T20:00:00Z").unwrap()),
+            stale_after_seconds: 600,
+            note,
+            data: Some(data),
+        }
+    }
+
+    #[test]
+    fn only_the_item_minimum_is_relaxed_for_an_empty_meter() {
+        let empty = meter(json!({"items": []}), None);
+        assert!(empty.check().is_err());
+        empty.check_allowing_empty_meter().unwrap();
+        // Every other rule still applies.
+        let extra = meter(json!({"items": [], "x": 1}), None);
+        assert!(matches!(
+            extra.check_allowing_empty_meter(),
+            Err(CantShow::BadData(_))
+        ));
+        let big = meter(json!({"items": []}), Some("x".repeat(4000)));
+        assert_eq!(big.check_allowing_empty_meter(), Err(CantShow::TooLarge));
+        let seven: Vec<Value> = (0..7)
+            .map(|i| json!({"id": format!("i{i}"), "label": "L", "percent": 1}))
+            .collect();
+        assert!(meter(json!({ "items": seven }), None)
+            .check_allowing_empty_meter()
+            .is_err());
+    }
 }

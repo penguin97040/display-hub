@@ -196,18 +196,20 @@ pub struct ManualFigures {
 }
 
 impl ManualFigures {
-    /// The figures as a usage page's meter content, once they pass [`clean_figures`].
-    pub fn to_content(&self, service: Service) -> Result<PageContentInput, String> {
-        let items: Vec<hub_protocol::MeterItem> = clean_figures(service, &self.metrics)?
+    /// The figures as a usage page's meter content, as typed. The hub checks them against the
+    /// service's windows and rounds the shares ([`clean_figures`]).
+    pub fn to_content(&self) -> PageContentInput {
+        let items: Vec<hub_protocol::MeterItem> = self
+            .metrics
             .iter()
             .map(|m| {
                 hub_protocol::MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at)
             })
             .collect();
-        Ok(PageContentInput {
+        PageContentInput {
             data: Some(serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise")),
             note: self.note.clone(),
-        })
+        }
     }
 }
 

@@ -132,7 +132,6 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
             ),
             Next::Retry,
         ),
-        ClientError::Refused(m) => Guidance::problem("The hub would refuse that", one_line(m), Next::None),
         ClientError::AddressRefused(m) => {
             Guidance::problem("That address can't be used", m.clone(), Next::None)
         }

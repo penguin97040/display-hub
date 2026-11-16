@@ -371,11 +371,8 @@ async fn admin_changes_reach_the_next_snapshot() {
         )
         .await
         .unwrap_err();
-    // Checked before sending, with the hub's old wording.
-    assert!(
-        matches!(&e, ClientError::Refused(m) if m == "Percentages must be 0 to 100."),
-        "{e}"
-    );
+    assert_eq!(code(&e), Some(ErrorCode::BadRequest));
+    assert!(e.to_string().contains("Percentages must be 0 to 100."), "{e}");
     r.stop().await;
 }
 
@@ -1055,7 +1052,7 @@ async fn the_admin_api_keeps_its_page_rules() {
         .unwrap();
     assert_eq!(order.id, "order-2");
 
-    // Typed-in usage figures are checked against the service before anything is sent.
+    // The hub checks typed-in usage figures against the service, with its old wording.
     let figures = |windows: &[Window]| ManualFigures {
         metrics: windows
             .iter()
@@ -1071,23 +1068,45 @@ async fn the_admin_api_keeps_its_page_rules() {
         .set_manual(&admin, &usage.id, &figures(&[Window::Monthly]))
         .await
         .unwrap_err();
-    assert!(
-        matches!(&e, ClientError::Refused(m) if m == "Claude Max has no monthly window."),
-        "{e}"
-    );
+    refused(e, "Claude Max has no monthly window.");
     let e = c
         .set_manual(&admin, &usage.id, &figures(&[Window::FiveHour, Window::FiveHour]))
         .await
         .unwrap_err();
-    assert!(
-        matches!(&e, ClientError::Refused(m) if m == "The five-hour window is listed twice."),
-        "{e}"
-    );
+    refused(e, "The five-hour window is listed twice.");
+    // Through the generic route too: a meter item that isn't one of the service's windows.
+    let e = c
+        .set_page_content(
+            &admin,
+            &usage.id,
+            &PageContentInput {
+                data: Some(json!({"items": [{"id": "daily", "label": "Daily", "percent": 1}]})),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    refused(e, "Claude Max has no daily window.");
     assert_eq!(
         c.page(&admin, &usage.id).await.unwrap().content,
         None,
-        "nothing was sent"
+        "nothing was stored"
     );
+    // Shares are rounded to one decimal place, and labels are the service's own.
+    let e = c
+        .set_page_content(
+            &admin,
+            &usage.id,
+            &PageContentInput {
+                data: Some(json!({"items": [{"id": "weekly", "label": "Mine", "percent": 42.25}]})),
+                note: None,
+            },
+        )
+        .await
+        .unwrap();
+    let items = &e.content.unwrap().data.unwrap()["items"];
+    assert_eq!(items[0]["percent"], json!(42.3));
+    assert_eq!(items[0]["label"], json!("Weekly allowance used"));
 
     // No figures at all is "no figures yet", as it always was; other meter rules stay strict.
     let saved = c.set_manual(&admin, &usage.id, &figures(&[])).await.unwrap();
@@ -1109,6 +1128,17 @@ async fn the_admin_api_keeps_its_page_rules() {
         .await
         .unwrap_err();
     refused(e, "unknown field");
+    // The same holds for any manual meter page, not only usage pages.
+    let plain = c
+        .add_page(&admin, &new("Gauges", "meter", Source::Manual, None))
+        .await
+        .unwrap();
+    let empty = PageContentInput {
+        data: Some(json!({"items": []})),
+        note: None,
+    };
+    let stored = c.set_page_content(&admin, &plain.id, &empty).await.unwrap();
+    assert_eq!(stored.content.unwrap().data, Some(json!({"items": []})));
 
     // Ticks are a set, so repeats don't count towards the limit.
     let display = enrolled(&r, &admin, "Desk").await.0;

@@ -45,7 +45,7 @@ Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, excep
 | `POST /v1/admin/pair` | Exchanges a pairing secret for an admin token. |
 | `GET /v1/admin/status` | Version, clocks, identity, addresses, and how many pages, displays and admins. |
 | `GET /v1/admin/pages` | Every page, in order, with what was last stored for it. |
-| `POST /v1/admin/pages` | Adds a page (title, kind, source, and optionally feed, id and stale time) at the end, ticked on every display. The hub holds at most 50. The id `order` is reserved for the route below. For now, a page with source `collector` must be a `meter` with a feed. |
+| `POST /v1/admin/pages` | Adds a page (title, kind, source, and optionally feed, id and stale time) at the end, ticked on every display. The hub holds at most 50. The id `order` is reserved for the route below (the schema 3 upgrade renamed any page that had it to `order-2`, or the next unused number). For now, a page with source `collector` must be a `meter` with a feed. |
 | `GET`, `PATCH`, `DELETE /v1/admin/pages/{id}` | One page; change its title, source or stale time (a new source drops what was stored, and the collector rule above applies); remove it. The kind can't change. |
 | `PUT /v1/admin/pages/order` | The new order, naming every page once. |
 | `PUT /v1/admin/pages/{id}/content` | What a manual page shows: `data` in its kind's shape, and a note. It is checked as the hub checks a page before sending it (the kind's rules and the 3072-byte page cap), and a refusal says which rule broke. A meter with no items (`{"items": []}`) is also accepted, and shows as "No figures yet". The page must still be manual when the write happens. |
@@ -55,7 +55,7 @@ Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, excep
 | `GET /v1/admin/preview-snapshot` | The snapshot a display would get now. With `?display=<id>`, that display's; without, the first 10 of all pages. |
 | `GET`, `POST /v1/admin/collectors`, `DELETE /v1/admin/collectors/{id}` | PC helpers: list, invite (scoped to services), revoke. |
 
-The manager still works in usage subscriptions. `hub-client` maps them onto meter pages, and leaves other pages where they are when it reorders. It checks typed-in figures against the service's windows before sending them (`hub_core::api::clean_figures`, which the PC helper's reports go through on the hub too).
+The manager still works in usage subscriptions. `hub-client` maps them onto meter pages, and leaves other pages where they are when it reorders. For a usage page, the hub checks typed-in content against the service's windows (each item one of its windows, listed once, with a share from 0 to 100) and rounds shares to one decimal place, as it does a PC helper's reports (`hub_core::api::clean_figures`).
 
 A PC helper reports with `POST /v1/collector/usage` and its own token. The hub writes the figures to every `meter` page whose feed is that service and whose source is `collector`, and only for services the helper's invite named.
 

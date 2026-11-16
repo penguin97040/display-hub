@@ -59,8 +59,7 @@ impl Problem {
 
     pub fn from_error(e: &ClientError) -> Problem {
         match e {
-            // A display makes no request the client checks first, but keeps the reason if one does.
-            ClientError::AddressRefused(d) | ClientError::Refused(d) => Problem::Configuration(d.clone()),
+            ClientError::AddressRefused(d) => Problem::Configuration(d.clone()),
             ClientError::Unreachable(_) | ClientError::NameNotFound { .. } | ClientError::Timeout => {
                 Problem::Unreachable
             }
