@@ -236,9 +236,108 @@ impl HubClient {
             .await
     }
 
-    pub async fn subscriptions(&self, token: &str) -> Result<Vec<SubscriptionView>, ClientError> {
-        self.call(Method::GET, "v1/admin/subscriptions", token, None::<&()>)
+    // ----- pages -----
+
+    pub async fn pages(&self, token: &str) -> Result<Vec<PageView>, ClientError> {
+        self.call(Method::GET, "v1/admin/pages", token, None::<&()>).await
+    }
+
+    pub async fn page(&self, token: &str, id: &str) -> Result<PageView, ClientError> {
+        self.call(
+            Method::GET,
+            &format!("v1/admin/pages/{}", seg(id)),
+            token,
+            None::<&()>,
+        )
+        .await
+    }
+
+    pub async fn add_page(&self, token: &str, new: &NewPage) -> Result<PageView, ClientError> {
+        self.call(Method::POST, "v1/admin/pages", token, Some(new)).await
+    }
+
+    pub async fn change_page(
+        &self,
+        token: &str,
+        id: &str,
+        change: &PageChange,
+    ) -> Result<PageView, ClientError> {
+        self.call(
+            Method::PATCH,
+            &format!("v1/admin/pages/{}", seg(id)),
+            token,
+            Some(change),
+        )
+        .await
+    }
+
+    pub async fn remove_page(&self, token: &str, id: &str) -> Result<(), ClientError> {
+        self.call_empty(Method::DELETE, &format!("v1/admin/pages/{}", seg(id)), token)
             .await
+    }
+
+    /// Sets the shared page order. `ids` must name every page exactly once.
+    pub async fn reorder_pages(&self, token: &str, ids: Vec<String>) -> Result<Vec<PageView>, ClientError> {
+        self.call(Method::PUT, "v1/admin/pages/order", token, Some(&Order { ids }))
+            .await
+    }
+
+    /// Sets what a manual page shows.
+    pub async fn set_page_content(
+        &self,
+        token: &str,
+        id: &str,
+        content: &PageContentInput,
+    ) -> Result<PageView, ClientError> {
+        self.call(
+            Method::PUT,
+            &format!("v1/admin/pages/{}/content", seg(id)),
+            token,
+            Some(content),
+        )
+        .await
+    }
+
+    /// The pages a display shows, in page order.
+    pub async fn display_pages(&self, token: &str, display: &str) -> Result<Vec<String>, ClientError> {
+        let p: DisplayPages = self
+            .call(
+                Method::GET,
+                &format!("v1/admin/devices/{}/pages", seg(display)),
+                token,
+                None::<&()>,
+            )
+            .await?;
+        Ok(p.ids)
+    }
+
+    pub async fn set_display_pages(
+        &self,
+        token: &str,
+        display: &str,
+        ids: Vec<String>,
+    ) -> Result<Vec<String>, ClientError> {
+        let p: DisplayPages = self
+            .call(
+                Method::PUT,
+                &format!("v1/admin/devices/{}/pages", seg(display)),
+                token,
+                Some(&DisplayPages { ids }),
+            )
+            .await?;
+        Ok(p.ids)
+    }
+
+    // ----- usage pages, as the manager shows them -----
+
+    /// The usage pages (meter pages of a known service), in order. Other pages are left out.
+    pub async fn subscriptions(&self, token: &str) -> Result<Vec<SubscriptionView>, ClientError> {
+        Ok(self
+            .pages(token)
+            .await?
+            .iter()
+            .filter_map(SubscriptionView::from_page)
+            .collect())
     }
 
     pub async fn add_subscription(
@@ -246,8 +345,7 @@ impl HubClient {
         token: &str,
         new: &NewSubscription,
     ) -> Result<SubscriptionView, ClientError> {
-        self.call(Method::POST, "v1/admin/subscriptions", token, Some(new))
-            .await
+        usage(self.add_page(token, &new.to_new_page()).await?)
     }
 
     pub async fn change_subscription(
@@ -256,47 +354,47 @@ impl HubClient {
         id: &str,
         change: &SubscriptionChange,
     ) -> Result<SubscriptionView, ClientError> {
-        self.call(
-            Method::PATCH,
-            &format!("v1/admin/subscriptions/{}", seg(id)),
-            token,
-            Some(change),
-        )
-        .await
+        let change = PageChange {
+            title: change.title.clone(),
+            source: change.source,
+            stale_after_seconds: None,
+        };
+        usage(self.change_page(token, id, &change).await?)
     }
 
     pub async fn remove_subscription(&self, token: &str, id: &str) -> Result<(), ClientError> {
-        self.call_empty(
-            Method::DELETE,
-            &format!("v1/admin/subscriptions/{}", seg(id)),
-            token,
-        )
-        .await
+        self.remove_page(token, id).await
     }
 
+    /// Puts the usage pages in the order of `ids`. Other pages keep their places.
     pub async fn reorder(&self, token: &str, ids: Vec<String>) -> Result<Vec<SubscriptionView>, ClientError> {
-        self.call(
-            Method::PUT,
-            "v1/admin/subscriptions/order",
-            token,
-            Some(&Order { ids }),
-        )
-        .await
+        let all = self.pages(token).await?;
+        let mut wanted = ids.into_iter();
+        let mut order: Vec<String> = all
+            .iter()
+            .map(|p| match p.usage_service() {
+                Some(_) => wanted.next().unwrap_or_else(|| p.id.clone()),
+                None => p.id.clone(),
+            })
+            .collect();
+        // Anything left over makes the order wrong, and the hub says so.
+        order.extend(wanted);
+        Ok(self
+            .reorder_pages(token, order)
+            .await?
+            .iter()
+            .filter_map(SubscriptionView::from_page)
+            .collect())
     }
 
+    /// Typed-in figures for a usage page, as its meter.
     pub async fn set_manual(
         &self,
         token: &str,
         id: &str,
         figures: &ManualFigures,
     ) -> Result<SubscriptionView, ClientError> {
-        self.call(
-            Method::PUT,
-            &format!("v1/admin/subscriptions/{}/manual", seg(id)),
-            token,
-            Some(figures),
-        )
-        .await
+        usage(self.set_page_content(token, id, &figures.to_content()).await?)
     }
 
     pub async fn displays(&self, token: &str) -> Result<Vec<DisplayView>, ClientError> {
@@ -451,6 +549,12 @@ fn is_dns_failure(e: &(dyn std::error::Error + 'static)) -> bool {
         src = s.source();
     }
     false
+}
+
+/// A page the hub answered with, as a usage page.
+fn usage(page: PageView) -> Result<SubscriptionView, ClientError> {
+    SubscriptionView::from_page(&page)
+        .ok_or_else(|| ClientError::Malformed(format!("page {:?} isn't a usage page", page.id)))
 }
 
 /// A path segment, percent-encoded so an id can't change the path.

@@ -5,7 +5,7 @@
 | Path | What it is |
 |---|---|
 | `crates/hub-protocol` | Protocol v1: wire types, bounds and validation. No I/O. The contract with firmware. |
-| `crates/hub-core` | Domain: subscriptions, data quality, freshness, providers and snapshot building. No I/O. |
+| `crates/hub-core` | Domain: pages as stored, data quality, freshness, providers, admin API bodies and snapshot building. No I/O. |
 | `crates/hub-client` | Client for the hub's HTTP API, used by the simulator, the manager and the PC helper. |
 | `apps/hubd` | The hub service (library plus a command-line binary). |
 | `apps/hub-manager` | The native desktop manager (GPUI). |

@@ -4,7 +4,7 @@
 
 | Part | Runs on | Job |
 |---|---|---|
-| `hubd` | Raspberry Pi 5, always on | Keeps the subscription list, stored figures and displays. Builds each display's snapshot. Serves the device and admin APIs over HTTPS on the local network. |
+| `hubd` | Raspberry Pi 5, always on | Keeps the pages, what each shows, which pages each display shows, and the displays. Builds each display's snapshot. Serves the device and admin APIs over HTTPS on the local network. |
 | ESP32 displays (`llm-usage-display` repo) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
 | `hub-manager` | Windows PC (macOS and Linux later) | Pairs with the hub. Adds, removes and reorders pages. Enters manual figures. Adds and revokes displays. Shows diagnostics. Doesn't need to stay open. |
 | `hubctl` | The PC | Optional helper that forwards usage figures your own tools already report (Claude Code, Codex) to the hub ([providers.md](providers.md)). |
@@ -12,14 +12,52 @@
 
 ## Data flow
 
-1. The hub owns an ordered list of **subscriptions**. Each is one page on the display: a service (Claude Max, ChatGPT Plus, OpenCode Go Plus), a title and a **source** (`demo`, `manual`, `collector` or `none`).
-2. Figures for each subscription are stored with their **data quality**: `demo`, `provider_reported`, `estimated`, `manual` or `unavailable`. These are never interchangeable, and every screen says which one it is showing.
-3. When a display polls, the hub builds a **snapshot** from the list in order (`hub_core::build_snapshot`):
+1. The hub owns one ordered list of **pages**, up to 50. Each has a title, a **kind** (a ready-made shape, `meter`, `big_number`, `text` or `list`, or a custom `name/version` kind), a **source** (`demo`, `manual`, `collector` or `none`), optionally a **feed** (the named feed that fills it, such as a usage service) and how long its content stays fresh. A usage subscription (Claude Max, ChatGPT Plus, OpenCode Go Plus) is a `meter` page whose feed is the service.
+2. What each page shows is stored as its `data`, in the shape its kind names, with its **data quality**: `demo`, `provider_reported`, `estimated`, `manual` or `unavailable`. These are never interchangeable, and every screen says which one it is showing.
+3. Each display has a set of **ticked** pages. A new page is ticked on every display, and a new display gets every page; the manager can untick them.
+4. When a display polls, the hub builds its **snapshot** from its first 10 ticked pages, in the shared order (`hub_core::build_snapshot`):
    - Demo pages are generated fresh.
-   - Stored figures are checked, sanitised and bounded.
-   - A window whose reset time has passed loses its old figure: the share becomes unknown, not zero.
-4. The display draws exactly the pages in the snapshot, in that order. Adding, removing or reordering subscriptions in the manager changes the next snapshot, with no firmware change.
-5. Ages are measured on the hub's clock: `generated_at − updated_at`, plus however long the display has held the snapshot. A display without a working clock still shows correct ages and staleness.
+   - Stored content is checked, sanitised and bounded. A page that still breaks the page rules goes out as an unavailable page with a note instead, so it never blanks the others.
+   - A meter item whose reset time has passed loses its old share: it becomes unknown, not zero.
+5. The display draws exactly the pages in the snapshot, in that order. Adding, removing, reordering or ticking pages in the manager changes the next snapshot, with no firmware change.
+6. Ages are measured on the hub's clock: `generated_at − updated_at`, plus however long the display has held the snapshot. A display without a working clock still shows correct ages and staleness.
+
+## Storage
+
+The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/var/lib/display-hub` on a Pi), at schema version 3:
+
+| Table | Holds |
+|---|---|
+| `pages` | Each page: id, title, kind, source, feed, position in the shared order, stale time, and what was last stored for it (quality, `updated_at`, `data` as JSON text, note). |
+| `display_pages` | Which pages each display shows: one row per display and ticked page. |
+| `devices`, `credentials`, `one_time_codes` | Displays, the hashes of every token, and pairing and enrolment codes. |
+| `collector_scopes` | The feeds (today, usage services) each PC helper may report. |
+| `audit_log` | Security-relevant events, kept for 90 days. |
+
+Schema 3 replaced version 2's `subscriptions` and `page_data` tables. The upgrade turned each subscription into a `meter` page with the same id, title, order and source, its service as the feed, and its stored figures, typed-in ones included, as meter data, so every display showed what it did before. Every display that wasn't revoked was ticked for every page. Before upgrading an existing database, the hub saves a copy beside it (`hub-before-upgrade-schema-<old version>-<UTC time>.db`, owner-only), and the upgrade runs in one transaction ([deploy-raspberry-pi.md](deploy-raspberry-pi.md), "Upgrading").
+
+## Admin API
+
+Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, except `pair` itself. Bodies are JSON, at most 16 KiB; errors use the same body as the device API ([protocol-v1.md](protocol-v1.md), "Errors"). The types are in `crates/hub-core/src/api.rs`, and `crates/hub-client` calls them.
+
+| Route | Does |
+|---|---|
+| `POST /v1/admin/pair` | Exchanges a pairing secret for an admin token. |
+| `GET /v1/admin/status` | Version, clocks, identity, addresses, and how many pages, displays and admins. |
+| `GET /v1/admin/pages` | Every page, in order, with what was last stored for it. |
+| `POST /v1/admin/pages` | Adds a page (title, kind, source, and optionally feed, id and stale time) at the end, ticked on every display. The hub holds at most 50. |
+| `GET`, `PATCH`, `DELETE /v1/admin/pages/{id}` | One page; change its title, source or stale time (a new source drops what was stored); remove it. The kind can't change. |
+| `PUT /v1/admin/pages/order` | The new order, naming every page once. |
+| `PUT /v1/admin/pages/{id}/content` | What a manual page shows: `data` in its kind's shape, and a note. It is checked as the hub checks a page before sending it (the kind's rules and the 3072-byte page cap), and a refusal says which rule broke. |
+| `GET /v1/admin/devices` | The displays. `DELETE /v1/admin/devices/{id}` revokes one and clears its ticks. |
+| `GET`, `PUT /v1/admin/devices/{id}/pages` | The pages a display shows, as `{"ids": [...]}`. Order doesn't matter: displays share the page order. |
+| `POST /v1/admin/enrolments` | A one-time secret to set up a display. |
+| `GET /v1/admin/preview-snapshot` | The snapshot a display would get now. With `?display=<id>`, that display's; without, the first 10 of all pages. |
+| `GET`, `POST /v1/admin/collectors`, `DELETE /v1/admin/collectors/{id}` | PC helpers: list, invite (scoped to services), revoke. |
+
+The manager still works in usage subscriptions. `hub-client` maps them onto meter pages, and leaves other pages where they are when it reorders.
+
+A PC helper reports with `POST /v1/collector/usage` and its own token. The hub writes the figures to every `meter` page whose feed is that service and whose source is `collector`, and only for services the helper's invite named.
 
 ## Decisions
 

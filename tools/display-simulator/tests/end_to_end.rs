@@ -235,7 +235,7 @@ async fn an_empty_hub_says_so() {
     d.accept(clock.now(), hub.client().device_snapshot(None).await);
     let s = screen(&d, clock.now());
     assert_eq!(count_pages(&s), 0);
-    assert!(s.contains("No pages. Add subscriptions in the desktop manager."));
+    assert!(s.contains("No pages. Add some in the desktop manager."));
     hub.stop().await;
 }
 

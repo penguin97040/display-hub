@@ -327,17 +327,14 @@ mod tests {
         let clock = FakeClock::parse("2026-11-11T01:00:00Z");
         let a = config(&tmp.path().join("a"));
         let hub = crate::open_hub(a.clone(), Arc::new(clock.clone())).unwrap();
-        hub.store
-            .add_subscription(
-                &hub_core::Subscription {
-                    id: "claude-max".into(),
-                    service: Service::ClaudeMax,
-                    title: "Claude Max".into(),
-                    source: Source::Demo,
-                },
-                clock.now(),
-            )
-            .unwrap();
+        let page = hub_core::Subscription {
+            id: "claude-max".into(),
+            service: Service::ClaudeMax,
+            title: "Claude Max".into(),
+            source: Source::Demo,
+        }
+        .to_page(None);
+        hub.store.add_page(&page, clock.now()).unwrap();
         let dest = tmp.path().join("backup");
         let made = backup(&hub, &a, &dest).unwrap();
         assert_eq!(made.pages, 1);

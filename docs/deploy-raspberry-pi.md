@@ -149,6 +149,10 @@ Copy the new folder over, then run `sudo bash install.sh` in it again. It does t
 3. Keeps your `hubd.toml`.
 4. Restarts the service.
 
+When a new hubd needs a newer database layout, it upgrades the database the first time it starts. Before it changes anything, it saves a copy of the database beside it, readable by the hub's user only, named after the old layout's version and the time in UTC: for example `/var/lib/display-hub/hub-before-upgrade-schema-2-2026-11-16T05-39-17Z.db`. The upgrade then runs as one step: if it fails, the database is left exactly as it was and the hub doesn't start; `journalctl -u display-hub` says why. Either way the copy is kept, and the hub never deletes it. Once the upgraded hub has run well for a while, you may delete it yourself.
+
+To go back to the old version after an upgrade, reinstall the old release, then restore the backup the installer made in step 1 (see "Restoring" above). The old hubd refuses an upgraded database rather than guess at it.
+
 ## Removing
 
 `sudo bash install.sh --uninstall` stops and removes the service and binary. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.

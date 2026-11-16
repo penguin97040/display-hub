@@ -14,13 +14,14 @@ use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequest, Path, Query, Req
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hub_core::api::*;
 use hub_core::model::{clean_note, clean_percent, clean_title, valid_page_id};
-use hub_core::{build_snapshot, Clock, MetricValue, PageData, Source, Subscription};
+use hub_core::{build_snapshot, Clock, MetricValue, PageData, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
-use hub_protocol::{DataQuality, ErrorCode, Health, Timestamp};
+use hub_protocol::shapes::{classify_kind, KindClass};
+use hub_protocol::{CantShow, DataQuality, ErrorCode, Health, Page, Timestamp};
 use serde::de::DeserializeOwned;
 use tower::ServiceBuilder;
 
@@ -29,7 +30,7 @@ use crate::http::{check_protocol, handle_layer_error, ApiError, MAX_CONCURRENT_R
 use crate::identity::Identity;
 use crate::ratelimit::Limiter;
 use crate::secret::{hash, new_code, new_id, new_token, Role};
-use crate::store::{CodeUse, Store, StoreError};
+use crate::store::{CodeUse, Store, StoreError, MAX_STORED_PAGES};
 
 /// One-time codes (pairing and enrolment) last this long.
 pub const CODE_LIFETIME_SECONDS: i64 = 600;
@@ -299,18 +300,19 @@ pub fn router(hub: AppState) -> Router {
     let admin = Router::new()
         .route("/v1/admin/pair", post(admin_pair))
         .route("/v1/admin/status", get(admin_status))
+        .route("/v1/admin/pages", get(list_pages).post(add_page))
+        .route("/v1/admin/pages/order", put(reorder))
         .route(
-            "/v1/admin/subscriptions",
-            get(list_subscriptions).post(add_subscription),
+            "/v1/admin/pages/{id}",
+            get(get_page).patch(change_page).delete(remove_page),
         )
-        .route("/v1/admin/subscriptions/order", put(reorder))
-        .route(
-            "/v1/admin/subscriptions/{id}",
-            patch(change_subscription).delete(remove_subscription),
-        )
-        .route("/v1/admin/subscriptions/{id}/manual", put(set_manual))
+        .route("/v1/admin/pages/{id}/content", put(set_content))
         .route("/v1/admin/devices", get(list_devices))
         .route("/v1/admin/devices/{id}", delete(revoke_device))
+        .route(
+            "/v1/admin/devices/{id}/pages",
+            get(display_pages).put(set_display_pages),
+        )
         .route("/v1/admin/enrolments", post(new_enrolment))
         .route("/v1/admin/preview-snapshot", get(preview_snapshot))
         .route("/v1/admin/collectors", get(list_collectors).post(new_collector))
@@ -551,9 +553,9 @@ async fn admin_status(
     headers: HeaderMap,
 ) -> Result<Json<HubStatus>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let (subs, displays, admins) = db(&hub, |s| {
+    let (pages, displays, admins) = db(&hub, |s| {
         Ok((
-            s.subscription_ids()?.len(),
+            s.page_ids()?.len(),
             s.devices()?.len(),
             s.count_active(Role::Admin)?,
         ))
@@ -567,51 +569,93 @@ async fn admin_status(
         identity: hub.identity.info(),
         hosts: hub.config.hosts(),
         port: hub.config.listen.port(),
-        subscriptions: subs,
+        pages,
         displays,
         admins,
     }))
 }
 
-fn view((s, data): (Subscription, Option<PageData>)) -> SubscriptionView {
-    SubscriptionView {
-        id: s.id,
-        service: s.service,
-        title: s.title,
-        source: s.source,
-        data,
+async fn list_pages(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PageView>>, ApiError> {
+    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    Ok(Json(db(&hub, |s| s.pages()).await?))
+}
+
+async fn get_page(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<PageView>, ApiError> {
+    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    db(&hub, move |s| s.page(&id))
+        .await?
+        .map(Json)
+        .ok_or_else(ApiError::not_found)
+}
+
+fn clean_page_title(t: &str) -> Result<String, ApiError> {
+    clean_title(t).ok_or_else(|| ApiError::bad_request("The title needs some printable text."))
+}
+
+fn check_stale(stale: u32) -> Result<u32, ApiError> {
+    let range = hub_protocol::limits::STALE_AFTER_RANGE;
+    if range.contains(&stale) {
+        Ok(stale)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "A page goes stale after {} to {} seconds.",
+            range.start(),
+            range.end()
+        )))
     }
 }
 
-async fn list_subscriptions(
-    State(hub): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<SubscriptionView>>, ApiError> {
-    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    Ok(Json(
-        db(&hub, |s| s.subscriptions())
-            .await?
-            .into_iter()
-            .map(view)
-            .collect(),
-    ))
+/// `base` made into a page id: lower case, other characters as hyphens, at most 40 long.
+fn id_from(base: &str) -> String {
+    let mut id = String::new();
+    for c in base.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            id.push(c);
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    let id: String = id.chars().take(40).collect();
+    match id.trim_end_matches('-') {
+        "" => "page".into(),
+        id => id.into(),
+    }
 }
 
-async fn add_subscription(
+async fn add_page(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    ApiJson(req): ApiJson<NewSubscription>,
-) -> Result<(StatusCode, Json<SubscriptionView>), ApiError> {
+    ApiJson(req): ApiJson<NewPage>,
+) -> Result<(StatusCode, Json<PageView>), ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let title = match &req.title {
-        Some(t) => {
-            clean_title(t).ok_or_else(|| ApiError::bad_request("The title needs some printable text."))?
+    let title = clean_page_title(&req.title)?;
+    if classify_kind(&req.kind) == KindClass::Invalid {
+        return Err(ApiError::bad_request(
+            "A page's kind is meter, big_number, text, list or a custom kind such as nearby-flights/1.",
+        ));
+    }
+    if let Some(feed) = &req.feed {
+        if !valid_page_id(feed) {
+            return Err(ApiError::bad_request(
+                "A feed name uses a-z, 0-9 and '-', up to 48 characters.",
+            ));
         }
-        None => req.service.default_title().into(),
-    };
-    let existing = db(&hub, |s| s.subscription_ids()).await?;
+    }
+    let stale_after_seconds = check_stale(
+        req.stale_after_seconds
+            .unwrap_or_else(|| req.source.stale_after_seconds()),
+    )?;
+    let existing = db(&hub, |s| s.page_ids()).await?;
     let id = match &req.id {
         Some(id) if valid_page_id(id) => id.clone(),
         Some(_) => {
@@ -620,11 +664,11 @@ async fn add_subscription(
             ))
         }
         None => {
-            let base = req.service.slug();
+            let base = id_from(req.feed.as_deref().unwrap_or(&req.title));
             (1..)
                 .map(|n| {
                     if n == 1 {
-                        base.to_string()
+                        base.clone()
                     } else {
                         format!("{base}-{n}")
                     }
@@ -633,55 +677,49 @@ async fn add_subscription(
                 .expect("an unused id exists")
         }
     };
-    let sub = Subscription {
+    let page = StoredPage {
         id,
-        service: req.service,
         title,
+        kind: req.kind,
         source: req.source,
+        feed: req.feed,
+        stale_after_seconds,
+        content: None,
     };
-    let (s2, now) = (sub.clone(), hub.clock.now());
-    db(&hub, move |s| s.add_subscription(&s2, now)).await?;
-    Ok((StatusCode::CREATED, Json(view((sub, None)))))
+    let (p2, now) = (page.clone(), hub.clock.now());
+    db(&hub, move |s| s.add_page(&p2, now)).await?;
+    Ok((StatusCode::CREATED, Json(page)))
 }
 
-async fn change_subscription(
+async fn change_page(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    ApiJson(req): ApiJson<SubscriptionChange>,
-) -> Result<Json<SubscriptionView>, ApiError> {
+    ApiJson(req): ApiJson<PageChange>,
+) -> Result<Json<PageView>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let title = match &req.title {
-        Some(t) => Some(
-            clean_title(t).ok_or_else(|| ApiError::bad_request("The title needs some printable text."))?,
-        ),
-        None => None,
-    };
-    let id2 = id.clone();
-    let found = db(&hub, move |s| {
-        s.update_subscription(&id2, title.as_deref(), req.source)
+    let title = req.title.as_deref().map(clean_page_title).transpose()?;
+    let stale = req.stale_after_seconds.map(check_stale).transpose()?;
+    db(&hub, move |s| {
+        if !s.update_page(&id, title.as_deref(), req.source, stale)? {
+            return Ok(None);
+        }
+        s.page(&id)
     })
-    .await?;
-    if !found {
-        return Err(ApiError::not_found());
-    }
-    db(&hub, move |s| s.subscriptions())
-        .await?
-        .into_iter()
-        .find(|(s, _)| s.id == id)
-        .map(|x| Json(view(x)))
-        .ok_or_else(ApiError::not_found)
+    .await?
+    .map(Json)
+    .ok_or_else(ApiError::not_found)
 }
 
-async fn remove_subscription(
+async fn remove_page(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    if db(&hub, move |s| s.remove_subscription(&id)).await? {
+    if db(&hub, move |s| s.remove_page(&id)).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found())
@@ -693,46 +731,117 @@ async fn reorder(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     ApiJson(req): ApiJson<Order>,
-) -> Result<Json<Vec<SubscriptionView>>, ApiError> {
+) -> Result<Json<Vec<PageView>>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let list = db(&hub, move |s| {
         s.reorder(&req.ids)?;
-        s.subscriptions()
+        s.pages()
     })
     .await?;
-    Ok(Json(list.into_iter().map(view).collect()))
+    Ok(Json(list))
 }
 
-async fn set_manual(
+/// Sets what a manual page shows, after checking it as a hub checks a page before sending it.
+async fn set_content(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Path(id): Path<String>,
-    ApiJson(req): ApiJson<ManualFigures>,
-) -> Result<Json<SubscriptionView>, ApiError> {
+    ApiJson(req): ApiJson<PageContentInput>,
+) -> Result<Json<PageView>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let id2 = id.clone();
-    let sub = db(&hub, move |s| s.subscription(&id2))
+    let page = db(&hub, move |s| s.page(&id2))
         .await?
         .ok_or_else(ApiError::not_found)?;
-    if sub.source != Source::Manual {
+    if page.source != Source::Manual {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             ErrorCode::Conflict,
-            "This page doesn't take manual figures. Change its source to manual first.",
+            "This page doesn't take typed-in content. Change its source to manual first.",
         ));
     }
-    let metrics = clean_metrics(sub.service, &req.metrics)?;
     let now = hub.clock.now();
-    let data = PageData {
+    let content = StoredContent {
         quality: DataQuality::Manual,
         updated_at: Some(now),
-        metrics,
+        data: req.data.filter(|d| !d.is_null()),
         note: req.note.as_deref().and_then(clean_note),
     };
-    let (id2, d2) = (id.clone(), data.clone());
-    db(&hub, move |s| s.put_page_data(&id2, &d2, now)).await?;
-    Ok(Json(view((sub, Some(data)))))
+    if let Some(data) = &content.data {
+        let wire = Page {
+            id: page.id.clone(),
+            title: clean_title(&page.title).unwrap_or_default(),
+            kind: page.kind.clone(),
+            data_quality: content.quality,
+            updated_at: content.updated_at,
+            stale_after_seconds: page.stale_after_seconds,
+            note: content.note.clone(),
+            data: Some(data.clone()),
+        };
+        match wire.check() {
+            Ok(()) => {}
+            Err(CantShow::TooLarge) => {
+                return Err(ApiError::bad_request(format!(
+                    "This page would be {} bytes; a page may be at most {} bytes.",
+                    wire.size(),
+                    hub_protocol::limits::MAX_PAGE_BYTES
+                )))
+            }
+            Err(CantShow::BadData(why)) => {
+                return Err(ApiError::bad_request(format!(
+                    "This data doesn't fit a {} page: {why}.",
+                    page.kind
+                )))
+            }
+            Err(CantShow::UnknownKind) => {
+                return Err(ApiError::bad_request("This page's kind isn't one the hub knows."))
+            }
+        }
+    }
+    let c2 = content.clone();
+    db(&hub, move |s| s.put_content(&id, &c2, now)).await?;
+    Ok(Json(StoredPage {
+        content: Some(content),
+        ..page
+    }))
+}
+
+async fn display_pages(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DisplayPages>, ApiError> {
+    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    db(&hub, move |s| s.display_page_ids(&id))
+        .await?
+        .map(|ids| Json(DisplayPages { ids }))
+        .ok_or_else(ApiError::not_found)
+}
+
+async fn set_display_pages(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<DisplayPages>,
+) -> Result<Json<DisplayPages>, ApiError> {
+    authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
+    if req.ids.len() > MAX_STORED_PAGES {
+        return Err(ApiError::bad_request(format!(
+            "The hub holds at most {MAX_STORED_PAGES} pages."
+        )));
+    }
+    db(&hub, move |s| {
+        if !s.set_display_pages(&id, &req.ids)? {
+            return Ok(None);
+        }
+        s.display_page_ids(&id)
+    })
+    .await?
+    .map(|ids| Json(DisplayPages { ids }))
+    .ok_or_else(ApiError::not_found)
 }
 
 /// Checks figures against the service's windows and bounds. Unknown stays unknown.
@@ -892,11 +1001,11 @@ async fn collector_usage(
         metrics,
         note: None,
     };
-    let service = req.service;
+    let (feed, content) = (req.service.slug(), data.to_content());
     let updated = db(&hub, move |s| {
-        let pages = s.collector_pages(service)?;
+        let pages = s.collector_feed_pages(feed)?;
         for id in &pages {
-            s.put_page_data(id, &data, now)?;
+            s.put_content(id, &content, now)?;
         }
         Ok(pages)
     })

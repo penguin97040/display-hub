@@ -144,7 +144,7 @@ Plan first, then work in milestones:
    and factory reset.
 4. Wi-Fi, enrolment, pinned HTTPS (cert_pem plus common_name hub.display-hub.internal; no CA
    bundle; TLS 1.2 and 1.3), polling, heartbeat, and the last good snapshot in flash.
-5. LVGL screens: one page per subscription in the hub's order, swiping, quality labels, "unknown"
+5. LVGL screens: one screen per snapshot page in the hub's order, swiping, quality labels, "unknown"
    (never 0%), stale and "reset due", the unavailable note, and plain-language problems.
 
 Never log or display the device token, enrolment secret or Wi-Fi password. Never skip certificate

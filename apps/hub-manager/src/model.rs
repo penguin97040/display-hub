@@ -1090,7 +1090,7 @@ impl Model {
                     Some(false) => "NOT synchronised",
                     None => "unknown",
                 },
-                s.subscriptions,
+                s.pages,
                 s.displays,
                 s.admins
             ));
@@ -1270,7 +1270,7 @@ mod tests {
                 },
                 hosts: vec!["raspberrypi.local".into()],
                 port: 8443,
-                subscriptions: pages.len(),
+                pages: pages.len(),
                 displays: 0,
                 admins: 1,
             },
@@ -1652,7 +1652,7 @@ mod helper_string_tests {
                 identity: invite.identity.clone(),
                 hosts: vec![],
                 port: 8443,
-                subscriptions: 0,
+                pages: 0,
                 displays: 0,
                 admins: 1,
             },

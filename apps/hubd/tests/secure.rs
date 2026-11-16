@@ -758,3 +758,215 @@ async fn a_pc_helper_reports_only_its_services_to_collector_pages() {
         .any(|x| x.id == id && x.revoked));
     r.stop().await;
 }
+
+#[tokio::test]
+async fn an_upgraded_hub_serves_each_display_what_it_did_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    // A hub as the schema 2 release left it: its identity, and a database with representative data
+    // and credentials whose tokens this test knows.
+    Running::start(dir.path(), &clock).await.stop().await;
+    for f in ["hub.db", "hub.db-wal", "hub.db-shm"] {
+        let _ = std::fs::remove_file(dir.path().join(f));
+    }
+    {
+        let conn = rusqlite::Connection::open(dir.path().join("hub.db")).unwrap();
+        hubd::store::create_at_schema(&conn, 2).unwrap();
+        conn.execute_batch(include_str!("fixtures/schema-2-data.sql"))
+            .unwrap();
+        for (token, role, subject) in [
+            ("dha_test_admin", "admin", "a-test"),
+            ("dhd_test_desk", "device", "d-desk"),
+            ("dhd_test_kitchen", "device", "d-kitchen"),
+        ] {
+            conn.execute(
+                "INSERT INTO credentials (token_hash, role, subject, label, created_at) VALUES (?1, ?2, ?3, 'Test', 0)",
+                rusqlite::params![&hubd::secret::hash(token)[..], role, subject],
+            )
+            .unwrap();
+        }
+    }
+    let r = Running::start(dir.path(), &clock).await;
+    assert_eq!(r.hub.store.schema_version().unwrap(), 3);
+    let expected: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/schema-2-pages.json")).unwrap();
+    let c = r.client();
+    for token in ["dhd_test_desk", "dhd_test_kitchen"] {
+        let snap = c.device_snapshot(Some(token)).await.unwrap();
+        assert_eq!(serde_json::to_value(&snap.pages).unwrap(), expected, "{token}");
+    }
+    let preview = c.preview_snapshot("dha_test_admin").await.unwrap();
+    assert_eq!(serde_json::to_value(&preview.pages).unwrap(), expected);
+    // The manager's usage view still lists every page, in order.
+    let usage: Vec<String> = c
+        .subscriptions("dha_test_admin")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|s| s.id)
+        .collect();
+    let ids: Vec<&str> = expected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(usage, ids);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn pages_of_any_kind_through_the_admin_api() {
+    use hub_core::api::{NewPage, PageChange, PageContentInput};
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let new = |title: &str, kind: &str| NewPage {
+        title: title.into(),
+        kind: kind.into(),
+        source: Source::Manual,
+        feed: None,
+        id: None,
+        stale_after_seconds: None,
+    };
+    let usage = c
+        .add_subscription(
+            &admin,
+            &NewSubscription {
+                service: Service::ClaudeMax,
+                source: Source::Demo,
+                title: None,
+                id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let flights = c
+        .add_page(&admin, &new("Flights overhead!", "nearby-flights/1"))
+        .await
+        .unwrap();
+    assert_eq!(flights.id, "flights-overhead", "an id from the title");
+    assert_eq!(flights.stale_after_seconds, Source::Manual.stale_after_seconds());
+    let words = c.add_page(&admin, &new("Note", "text")).await.unwrap();
+    let again = c.add_page(&admin, &new("Note", "text")).await.unwrap();
+    assert_eq!(again.id, "note-2");
+
+    // Bad requests are refused with a reason.
+    for bad in [
+        new("x", "gauge"),
+        new("\u{7}", "text"),
+        NewPage {
+            feed: Some("Not A Feed".into()),
+            ..new("x", "text")
+        },
+        NewPage {
+            stale_after_seconds: Some(5),
+            ..new("x", "text")
+        },
+        NewPage {
+            id: Some("-x".into()),
+            ..new("x", "text")
+        },
+    ] {
+        let e = c.add_page(&admin, &bad).await.unwrap_err();
+        assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{bad:?}");
+    }
+
+    // Content is checked against the kind's rules and the size cap, and only manual pages take it.
+    let data = json!({"flights": [{"callsign": "ANZ1", "altitude_m": 10000}]});
+    let set = |data: serde_json::Value| PageContentInput {
+        data: Some(data),
+        note: Some("  Seen from the deck ".into()),
+    };
+    let stored = c
+        .set_page_content(&admin, &flights.id, &set(data.clone()))
+        .await
+        .unwrap();
+    let content = stored.content.unwrap();
+    assert_eq!(content.data, Some(data.clone()));
+    assert_eq!(content.quality, DataQuality::Manual);
+    assert_eq!(content.note.as_deref(), Some("Seen from the deck"));
+    assert_eq!(c.page(&admin, &flights.id).await.unwrap().content, Some(content));
+    let e = c
+        .set_page_content(&admin, &words.id, &set(json!({"text": ""})))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::BadRequest));
+    assert!(e.to_string().contains("text: must not be empty"), "{e}");
+    let e = c
+        .set_page_content(&admin, &flights.id, &set(json!({"big": "x".repeat(4000)})))
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("at most 3072 bytes"), "{e}");
+    let e = c
+        .set_page_content(&admin, &usage.id, &set(json!({"items": []})))
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::Conflict));
+    let missing = c.page(&admin, "nope").await.unwrap_err();
+    assert_eq!(code(&missing), Some(ErrorCode::NotFound));
+
+    // Titles and stale times change; the kind and stored content stay.
+    let changed = c
+        .change_page(
+            &admin,
+            &flights.id,
+            &PageChange {
+                title: Some("Planes".into()),
+                stale_after_seconds: Some(900),
+                ..PageChange::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (changed.title.as_str(), changed.stale_after_seconds),
+        ("Planes", 900)
+    );
+    assert!(changed.content.is_some());
+
+    // The manager's usage reorder leaves other pages where they are.
+    let (display, token) = enrolled(&r, &admin, "Desk").await;
+    let order = ["note-2", "claude-max", "note", "flights-overhead"].map(String::from);
+    c.reorder_pages(&admin, order.to_vec()).await.unwrap();
+    c.reorder(&admin, vec!["claude-max".into()]).await.unwrap();
+    let ids: Vec<String> = c.pages(&admin).await.unwrap().into_iter().map(|p| p.id).collect();
+    assert_eq!(ids, order);
+
+    // A display's ticks, through the API.
+    assert_eq!(c.display_pages(&admin, &display).await.unwrap(), order);
+    let ticked = c
+        .set_display_pages(&admin, &display, vec!["flights-overhead".into(), "note-2".into()])
+        .await
+        .unwrap();
+    assert_eq!(ticked, ["note-2", "flights-overhead"]);
+    let snap = c.device_snapshot(Some(&token)).await.unwrap();
+    let shown: Vec<(&str, &str)> = snap
+        .pages
+        .iter()
+        .map(|p| (p.id.as_str(), p.kind.as_str()))
+        .collect();
+    assert_eq!(
+        shown,
+        [("note-2", "text"), ("flights-overhead", "nearby-flights/1")]
+    );
+    assert_eq!(snap.pages[1].data, Some(data));
+    let e = c
+        .set_display_pages(&admin, &display, vec!["nope".into()])
+        .await
+        .unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::Conflict));
+    let e = c.display_pages(&admin, "d-nope").await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::NotFound));
+
+    c.remove_page(&admin, "note-2").await.unwrap();
+    assert_eq!(
+        c.display_pages(&admin, &display).await.unwrap(),
+        ["flights-overhead"]
+    );
+    assert_eq!(c.status(&admin).await.unwrap().pages, 3);
+    r.stop().await;
+}

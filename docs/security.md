@@ -3,7 +3,7 @@
 ## What we protect
 
 - **Provider credentials.** These are tokens for usage sources. They stay on the owner's PC or the Pi, never on a display, in logs, in Git or in URLs.
-- **Usage figures and the subscription list.** They are private to the household.
+- **What the pages show (such as usage figures) and the list of pages.** They are private to the household.
 - **Control of the hub.** Only paired admins may add, remove or reorder pages, or add and revoke displays.
 - **Honesty of figures.** Nothing invented is ever presented as real usage.
 

@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hub_core::{PageData, Service, Source, StoredContent, StoredPage, Subscription};
+use hub_core::{Service, Source, StoredContent, StoredPage};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::limits::{MAX_METER_ITEMS, MAX_TITLE_LEN};
 use hub_protocol::shapes::KIND_METER;
@@ -250,6 +250,17 @@ fn move_to_pages(conn: &Connection) -> Result<(), StoreError> {
 /// The most pages the hub holds. Each display shows at most its first
 /// [`MAX_PAGES`](hub_protocol::limits::MAX_PAGES) ticked ones.
 pub const MAX_STORED_PAGES: usize = 50;
+
+/// Lays down schema `version` as this build's migrations wrote it, in an empty database, for tests
+/// that need a database from an older release. It moves no data.
+#[doc(hidden)]
+pub fn create_at_schema(conn: &Connection, version: i64) -> Result<(), StoreError> {
+    for sql in MIGRATIONS.iter().take(version as usize) {
+        conn.execute_batch(sql)?;
+    }
+    conn.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
 
 /// Audit entries older than this are pruned.
 pub const AUDIT_RETENTION_SECONDS: i64 = 90 * 86_400;
@@ -952,13 +963,15 @@ impl Store {
         Ok(())
     }
 
-    /// Changes a page's title or source. Changing the source drops the stored content, which came
-    /// from the old source, and resets how long the page stays fresh to the new source's default.
+    /// Changes a page's title, source or stale time. Changing the source drops the stored content,
+    /// which came from the old source, and resets the stale time to the new source's default
+    /// unless `stale_after_seconds` is given too. False if there is no such page.
     pub fn update_page(
         &self,
         id: &str,
         title: Option<&str>,
         source: Option<Source>,
+        stale_after_seconds: Option<u32>,
     ) -> Result<bool, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -976,6 +989,12 @@ impl Store {
                                   data = NULL, note = NULL, stored_at = NULL
                  WHERE id = ?3 AND source != ?1",
                 params![s.slug(), s.stale_after_seconds(), id],
+            )?;
+        }
+        if let Some(stale) = stale_after_seconds {
+            tx.execute(
+                "UPDATE pages SET stale_after_seconds = ?1 WHERE id = ?2",
+                params![stale, id],
             )?;
         }
         tx.commit()?;
@@ -1045,54 +1064,6 @@ impl Store {
         )?;
         let rows = st.query_map(params![feed], |r| r.get::<_, String>(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    // ----- usage pages, as subscriptions -----
-    //
-    // The admin API still speaks of usage subscriptions: each is a meter page whose feed is the
-    // service, and whose meter items are the allowance windows.
-
-    pub fn subscriptions(&self) -> Result<Vec<(Subscription, Option<PageData>)>, StoreError> {
-        Ok(self
-            .pages()?
-            .iter()
-            .filter_map(StoredPage::to_subscription)
-            .collect())
-    }
-
-    pub fn add_subscription(&self, sub: &Subscription, now: Timestamp) -> Result<(), StoreError> {
-        self.add_page(&sub.to_page(None), now)
-    }
-
-    pub fn subscription_ids(&self) -> Result<Vec<String>, StoreError> {
-        self.page_ids()
-    }
-
-    pub fn update_subscription(
-        &self,
-        id: &str,
-        title: Option<&str>,
-        source: Option<Source>,
-    ) -> Result<bool, StoreError> {
-        self.update_page(id, title, source)
-    }
-
-    pub fn remove_subscription(&self, id: &str) -> Result<bool, StoreError> {
-        self.remove_page(id)
-    }
-
-    /// Stores figures for a usage page as meter data.
-    pub fn put_page_data(&self, id: &str, data: &PageData, now: Timestamp) -> Result<bool, StoreError> {
-        self.put_content(id, &data.to_content(), now)
-    }
-
-    pub fn subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
-        Ok(self.page(id)?.and_then(|p| p.to_subscription()).map(|(s, _)| s))
-    }
-
-    /// The pages a collector's report for `service` goes to.
-    pub fn collector_pages(&self, service: Service) -> Result<Vec<String>, StoreError> {
-        self.collector_feed_pages(service.slug())
     }
 
     // ----- collectors -----
@@ -1187,50 +1158,12 @@ mod tests {
     const NOW: i64 = 1_794_340_800;
 
     /// Representative data in the layout schema 2 used.
-    pub const SCHEMA_2_DATA: &str = r#"
-    INSERT INTO subscriptions (id, service, title, source, position, created_at) VALUES
-        ('claude-max', 'claude-max', 'Claude Max', 'collector', 2, 100),
-        ('chatgpt-plus', 'chatgpt-plus', 'ChatGPT Plus', 'none', 4, 101),
-        ('opencode-go-plus', 'opencode-go-plus', 'OpenCode Go Plus', 'demo', 0, 102),
-        ('work-claude', 'claude-max', 'Work Claude', 'manual', 1, 103),
-        ('chatgpt-plus-2', 'chatgpt-plus', 'Spare ChatGPT', 'manual', 5, 104),
-        ('opencode-go-plus-2', 'opencode-go-plus', 'Team OpenCode', 'collector', 3, 105),
-        ('chatgpt-plus-3', 'chatgpt-plus', 'Old ChatGPT', 'collector', 6, 106),
-        ('claude-max-2', 'claude-max', 'Empty manual', 'manual', 7, 107),
-        ('claude-max-3', 'claude-max', 'Demo Claude', 'demo', 8, 108);
-    INSERT INTO page_data (subscription_id, quality, updated_at, metrics, note, stored_at) VALUES
-        ('claude-max', 'provider_reported', 1794340200,
-         '[{"window":"five-hour","used_percent":80.0,"resets_at":"2026-11-10T19:00:00Z"},{"window":"weekly","used_percent":30.5,"resets_at":"2026-11-11T20:00:00Z"}]',
-         NULL, 1794340200),
-        ('work-claude', 'manual', 1794333600,
-         '[{"window":"five-hour","used_percent":12.3,"resets_at":"2026-11-10T21:00:00Z"},{"window":"weekly","used_percent":null,"resets_at":null}]',
-         'Typed in at lunch', 1794333600),
-        ('chatgpt-plus-3', 'provider_reported', 1794250800,
-         '[{"window":"five-hour","used_percent":99.9,"resets_at":"2026-11-10T20:01:40Z"},{"window":"weekly","used_percent":45.0,"resets_at":"2026-11-16T00:00:00Z"}]',
-         NULL, 1794250800),
-        ('claude-max-2', 'manual', 1794340740, '[]', NULL, 1794340740);
-    INSERT INTO devices (id, name, enrolled_at, last_seen_at, info, revoked_at) VALUES
-        ('d-desk', 'Desk', 200, 1794340000, NULL, NULL),
-        ('d-kitchen', 'Kitchen', 201, NULL, NULL, NULL),
-        ('d-old', 'Old', 150, 160, NULL, 170);
-    INSERT INTO credentials (token_hash, role, subject, label, created_at, revoked_at) VALUES
-        (x'01', 'admin', 'a-1', 'Desktop manager', 90, NULL),
-        (x'02', 'device', 'd-desk', 'Desk', 200, NULL),
-        (x'03', 'device', 'd-kitchen', 'Kitchen', 201, NULL),
-        (x'04', 'device', 'd-old', 'Old', 150, 170),
-        (x'05', 'collector', 'c-pc', 'PC helper', 210, NULL);
-    INSERT INTO one_time_codes (code_hash, purpose, label, created_at, expires_at, used_at) VALUES
-        (x'10', 'device-enrol', 'Desk', 190, 790, 200);
-    INSERT INTO collector_scopes (subject, service) VALUES ('c-pc', 'claude-max');
-    INSERT INTO audit_log (at, event, detail) VALUES (90, 'admin_paired', 'a-1 (Desktop manager)');
-    "#;
+    const SCHEMA_2_DATA: &str = include_str!("../tests/fixtures/schema-2-data.sql");
 
     /// A database exactly as version 2 left it, with [`SCHEMA_2_DATA`] in it.
     fn schema_2_database(path: &Path) {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(MIGRATIONS[0]).unwrap();
-        conn.execute_batch(MIGRATIONS[1]).unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        create_at_schema(&conn, 2).unwrap();
         conn.execute_batch(SCHEMA_2_DATA).unwrap();
     }
 
@@ -1292,9 +1225,9 @@ mod tests {
         }
         let store = Store::open(&path).unwrap();
         assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        assert_eq!(store.subscription_ids().unwrap(), vec!["claude-max".to_string()]);
+        assert_eq!(store.page_ids().unwrap(), vec!["claude-max".to_string()]);
         assert_eq!(
-            store.collector_pages(Service::ClaudeMax).unwrap(),
+            store.collector_feed_pages("claude-max").unwrap(),
             vec!["claude-max".to_string()]
         );
         store
@@ -1477,7 +1410,7 @@ mod tests {
         store.add_page(&page, now).unwrap();
         assert_eq!(store.pages().unwrap(), vec![page.clone()]);
         // A custom page is not a usage page.
-        assert!(store.subscriptions().unwrap().is_empty());
+        assert_eq!(store.pages().unwrap()[0].usage_service(), None);
         let content = page.content.clone().unwrap();
         assert!(!store.put_content("flights", &content, now).unwrap());
         let changed = StoredContent {

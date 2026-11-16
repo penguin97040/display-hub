@@ -1,6 +1,6 @@
 # Where the figures come from
 
-Each page on a display shows one subscription's allowances, labelled with where the figures came from (`docs/protocol-v1.md`, "Data quality"). This page records, for each subscription, what is documented, what Display Hub uses, and how each adapter was checked.
+Each usage page on a display (a `meter` page whose feed is the service) shows one subscription's allowances, labelled with where the figures came from (`docs/protocol-v1.md`, "Data quality"). This page records, for each subscription, what is documented, what Display Hub uses, and how each adapter was checked.
 
 **The rules:**
 

@@ -93,7 +93,7 @@ Returns the display's dashboard. It requires the display's token, and the hub ta
 |---|---|
 | `generated_at` | When the hub built the snapshot, by the hub's clock. All ages are measured from it. |
 | `refresh_after_seconds` | How long to wait before the next poll (30-3600). Add jitter of ±10%. |
-| `pages` | Exactly the pages to show, in order. There are at most 10. An empty list means "no pages yet". |
+| `pages` | Exactly the pages to show, in order. There are at most 10. An empty list means "no pages yet". Each display gets its own list: the pages ticked for it in the manager, in the hub's one shared order, up to the first 10. |
 
 ### A page
 

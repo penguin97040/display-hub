@@ -70,7 +70,7 @@ pub fn screen(device: &Device, now: Timestamp) -> String {
     }
     let snap = &held.snapshot;
     if snap.pages.is_empty() {
-        out.push("No pages. Add subscriptions in the desktop manager.".into());
+        out.push("No pages. Add some in the desktop manager.".into());
     }
     let total = snap.pages.len();
     for (i, page) in snap.pages.iter().enumerate() {

@@ -864,7 +864,7 @@ impl Manager {
             .flex()
             .flex_wrap()
             .gap(px(m.gap))
-            .child(stat_panel(s.subscriptions.to_string(), "Pages", m))
+            .child(stat_panel(s.pages.to_string(), "Pages", m))
             .child(stat_panel(s.displays.to_string(), "Displays", m))
             .child(stat_panel(
                 format!("{} min", r.preview.refresh_after_seconds / 60),

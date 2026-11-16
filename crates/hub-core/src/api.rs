@@ -3,7 +3,7 @@
 use hub_protocol::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{PageData, Service, Source, Window};
+use crate::model::{PageData, Service, Source, StoredPage, Window};
 
 /// `POST /v1/admin/pair`: exchanges the one-time secret from `hubd pair-admin` for an admin token.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -62,12 +62,75 @@ pub struct HubStatus {
     /// The port the hub listens on.
     #[serde(default)]
     pub port: u16,
-    pub subscriptions: usize,
+    /// Pages the hub holds, of every kind.
+    pub pages: usize,
     pub displays: usize,
     pub admins: usize,
 }
 
-/// One subscription as the manager sees it, with its stored figures.
+/// `GET /v1/admin/pages` lists every page as a [`StoredPage`], in the shared display order, and
+/// the other page routes answer with the page they changed.
+pub type PageView = StoredPage;
+
+/// `POST /v1/admin/pages`: a new page, added at the end of the order and ticked on every display.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct NewPage {
+    pub title: String,
+    /// A ready-made shape (`meter`, `big_number`, `text`, `list`) or a custom `name/version` kind.
+    /// It can't be changed later.
+    pub kind: String,
+    pub source: Source,
+    /// The named feed that fills the page, such as a usage service.
+    #[serde(default)]
+    pub feed: Option<String>,
+    /// Defaults to the feed, or else the title, made into an unused id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Defaults to the source's.
+    #[serde(default)]
+    pub stale_after_seconds: Option<u32>,
+}
+
+/// `PATCH /v1/admin/pages/{id}`. Changing the source drops what was stored and resets the stale
+/// time to the new source's, unless one is given too.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageChange {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub source: Option<Source>,
+    #[serde(default)]
+    pub stale_after_seconds: Option<u32>,
+}
+
+/// `PUT /v1/admin/pages/{id}/content`: what a manual page shows, checked against its kind's rules
+/// and the page size cap. It is stored as `manual`, updated now.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct PageContentInput {
+    /// The page's `data`. Absent or `null` means nothing to show yet.
+    #[serde(default)]
+    pub data: Option<serde_json::Value>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// `PUT /v1/admin/pages/order`: every page id, in the new order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Order {
+    pub ids: Vec<String>,
+}
+
+/// `GET` and `PUT /v1/admin/devices/{id}/pages`: the pages a display shows (its ticks). Displays
+/// share one page order, so this is a set; the hub answers in page order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DisplayPages {
+    pub ids: Vec<String>,
+}
+
+// Usage subscriptions, as the manager shows them: meter pages whose feed is the service. These are
+// how clients see usage pages, not bodies the hub takes.
+
+/// One usage page, with its stored figures.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionView {
     pub id: String,
@@ -77,7 +140,21 @@ pub struct SubscriptionView {
     pub data: Option<PageData>,
 }
 
-/// `POST /v1/admin/subscriptions`.
+impl SubscriptionView {
+    /// A usage page as the manager sees it; `None` for any other page.
+    pub fn from_page(page: &StoredPage) -> Option<Self> {
+        let (s, data) = page.to_subscription()?;
+        Some(Self {
+            id: s.id,
+            service: s.service,
+            title: s.title,
+            source: s.source,
+            data,
+        })
+    }
+}
+
+/// A new usage page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewSubscription {
     pub service: Service,
@@ -88,26 +165,61 @@ pub struct NewSubscription {
     pub id: Option<String>,
 }
 
-/// `PATCH /v1/admin/subscriptions/{id}`.
+impl NewSubscription {
+    pub fn to_new_page(&self) -> NewPage {
+        NewPage {
+            title: self
+                .title
+                .clone()
+                .unwrap_or_else(|| self.service.default_title().into()),
+            kind: hub_protocol::shapes::KIND_METER.into(),
+            source: self.source,
+            feed: Some(self.service.slug().into()),
+            id: self.id.clone(),
+            stale_after_seconds: None,
+        }
+    }
+}
+
+/// A change to a usage page's title or source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionChange {
     pub title: Option<String>,
     pub source: Option<Source>,
 }
 
-/// `PUT /v1/admin/subscriptions/order`: every subscription id, in the new order.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Order {
-    pub ids: Vec<String>,
-}
-
-/// `PUT /v1/admin/subscriptions/{id}/manual`: figures typed in by the owner.
+/// Figures typed in by the owner for a usage page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManualFigures {
     pub metrics: Vec<ManualMetric>,
     pub note: Option<String>,
 }
 
+impl ManualFigures {
+    /// The figures as a meter page's content. Shares are rounded to one decimal place; one out of
+    /// range is passed on as it is, for the hub to refuse with its reason.
+    pub fn to_content(&self) -> PageContentInput {
+        let items: Vec<hub_protocol::MeterItem> = self
+            .metrics
+            .iter()
+            .map(|m| {
+                hub_protocol::MeterItem::new(
+                    m.window.id(),
+                    m.window.label(),
+                    m.used_percent
+                        .map(|p| crate::model::clean_percent(p).unwrap_or(p)),
+                    m.resets_at,
+                )
+            })
+            .collect();
+        PageContentInput {
+            data: Some(serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise")),
+            note: self.note.clone(),
+        }
+    }
+}
+
+/// One allowance figure, as typed in or reported by a PC helper.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManualMetric {
     pub window: Window,
