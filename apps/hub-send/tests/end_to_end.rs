@@ -305,7 +305,7 @@ async fn two_profiles_on_one_hub_keep_their_own_tokens() {
         .unwrap()
         .admin_token;
     let mut strings = Vec::new();
-    for label in ["First", "Second"] {
+    for label in ["First", "Second", "Second again"] {
         let invite = manager
             .new_helper(
                 &admin,
@@ -362,6 +362,14 @@ async fn two_profiles_on_one_hub_keep_their_own_tokens() {
     assert_eq!(token_of(&cfg_b).as_deref(), Some(tb.as_str()));
     assert!(b.open().is_ok());
     assert!(token_of(&cfg_a).is_none());
+
+    // Logging B in again, without logging out, replaces its token rather than leaving the old one.
+    let cfg_b2 = b.login(&strings[2], now).await.unwrap();
+    assert_ne!(cfg_b2.helper_id, cfg_b.helper_id);
+    assert!(token_of(&cfg_b).is_none(), "the earlier token is gone");
+    assert!(token_of(&cfg_b2).is_some());
+    assert_eq!(store.items.lock().unwrap().len(), 1);
+    assert!(b.open().is_ok());
 
     let _ = tx.send(());
     server.await.unwrap().unwrap();

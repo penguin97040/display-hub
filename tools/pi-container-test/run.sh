@@ -275,7 +275,13 @@ check "remove: and says so without a warning" clean_removal
 check "remove: twice is gone" gone /var/lib/private/display-hub-helper-twice
 
 # A login that fails after the hub paired it (stood in for by a wrapper that fails once the real
-# login is done) leaves nothing active at the hub.
+# login is done) leaves nothing active at the hub. A look-alike helper paired elsewhere under the
+# same label beforehand must stay active: only the pairing the failed add made is revoked.
+invite=$(as_hub hubd pair-helper --local --label "Pi helper orphan" --feed orphan | grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' | head -1)
+printf '%s\n' "$invite" | docker exec -i "$name" env HUB_SEND_DIR=/root/lookalike HUB_SEND_STORE=file /usr/local/bin/hub-send login >/dev/null
+unset invite
+lookalike_id=$(box sed -n 's/^ *"helper_id": *"\([A-Za-z0-9_-]*\)".*/\1/p' /root/lookalike/connection.json | head -1)
+check "orphan: a look-alike helper is paired first" test -n "$lookalike_id"
 box mv /usr/local/bin/hub-send /usr/local/bin/hub-send.real
 box sh -c 'printf "#!/bin/sh\n/usr/local/bin/hub-send.real \"\$@\"\nexit 1\n" > /usr/local/bin/hub-send && chmod 0755 /usr/local/bin/hub-send'
 status=0
@@ -284,10 +290,14 @@ box mv -f /usr/local/bin/hub-send.real /usr/local/bin/hub-send
 check "orphan: add fails when the login does" test "$status" != 0
 check "orphan: and sets nothing up" gone /var/lib/private/display-hub-helper-orphan
 # The plain list is tab-separated: id, active or revoked, label.
-orphan_state() { as_hub hubd helper list --plain | awk -F'\t' -v s="$1" '$2 == s && $3 == "Pi helper orphan" { f = 1 } END { exit !f }'; }
+orphan_state() { as_hub hubd helper list --plain | awk -F'\t' -v s="$1" -v skip="$lookalike_id" '$1 != skip && $2 == s && $3 == "Pi helper orphan" { f = 1 } END { exit !f }'; }
 not_active() { ! orphan_state active; }
 check "orphan: the hub holds no active credential for it" not_active
 check "orphan: the hub lists it as revoked" orphan_state revoked
+lookalike_active() { as_hub hubd helper list --plain | awk -F'\t' -v id="$lookalike_id" '$1 == id && $2 == "active" { f = 1 } END { exit !f }'; }
+check "orphan: the look-alike helper is still active" lookalike_active
+as_hub hubd helper revoke "$lookalike_id" >/dev/null
+box rm -rf /root/lookalike
 
 box bash /root/display-hub/install.sh --uninstall >/dev/null
 check "uninstall: the service is gone" bash -c "! docker exec $name systemctl cat display-hub >/dev/null 2>&1"

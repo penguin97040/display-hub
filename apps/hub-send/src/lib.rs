@@ -214,6 +214,9 @@ impl Profile {
             PairingString::decode(helper_string.trim()).map_err(|e| Error::BadHelperString(e.to_string()))?;
         // Check the store first, so the hub never issues a token that can't be kept.
         self.store.check().map_err(Error::Store)?;
+        // A login over an earlier one: its token is kept under its own helper id, so it's removed
+        // once the new one is saved, rather than left behind in the store.
+        let earlier = self.config().ok();
         let client = HubClient::pinned(&pairing.host, pairing.port, vec![pairing.spki_sha256])?;
         let resp = client
             .helper_pair(&pairing.secret_text())
@@ -238,6 +241,10 @@ impl Profile {
             &self.dir.join(CONFIG),
             &serde_json::to_vec_pretty(&cfg).expect("serialises"),
         )?;
+        if let Some(old) = earlier.filter(|old| old.token_account() != cfg.token_account()) {
+            // Best effort: the new pairing works either way.
+            let _ = self.store.delete(&old.token_account());
+        }
         Ok(cfg)
     }
 

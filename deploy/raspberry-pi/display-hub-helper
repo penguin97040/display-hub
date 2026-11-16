@@ -121,20 +121,33 @@ discard() {
   systemctl reset-failed "$(service "$name")" "$(timer "$name")" 2>/dev/null || true
 }
 
-# Cuts off any active helper the hub holds under the label add gives helper $1. Used when add's login
-# fails after the hub may already have paired it (for example, the token or settings couldn't be
-# saved), which would leave a working credential that nobody holds. This is safe because the label
-# names the helper: a name can be installed once at a time, and an earlier helper of that name was
-# revoked by remove, so only the credential this add just made can still be active.
-revoke_unclaimed() {
-  local label="Pi helper $1" id state name
-  [ -x "$hubd" ] || return 0
+# The ids of the active helpers the hub holds under the label add gives helper $1, one per line.
+# Fails if the hub's list can't be read.
+labelled_helpers() {
+  local label="Pi helper $1" list id state name
+  list=$(runuser -u "$hub_user" -- "$hubd" helper list --plain) || return 1
   while IFS=$'\t' read -r id state name; do
-    if [ "$state" = active ] && [ "$name" = "$label" ]; then
-      runuser -u "$hub_user" -- "$hubd" helper revoke "$id" >/dev/null 2>&1 ||
-        warn "couldn't cut off the unused pairing $id at the hub. Do it with: sudo -u $hub_user hubd helper revoke $id"
-    fi
-  done < <(runuser -u "$hub_user" -- "$hubd" helper list --plain 2>/dev/null || true)
+    if [ "$state" = active ] && [ "$name" = "$label" ]; then printf '%s\n' "$id"; fi
+  done <<<"$list"
+}
+
+# Cuts off the credential a failed login in add may have left: one the hub paired before the login
+# failed (for example, the token or settings couldn't be saved), which works but nobody holds. Only
+# helpers with add's label that weren't active before this add began ($2, from labelled_helpers)
+# are revoked, so a helper someone else gave the same label is left alone.
+revoke_unclaimed() {
+  local name=$1 before=$2 now id
+  [ -x "$hubd" ] || return 0
+  if ! now=$(labelled_helpers "$name" 2>/dev/null); then
+    warn "couldn't check the hub for a pairing this left behind. Run: sudo -u $hub_user hubd helper list, and revoke any active \"Pi helper $name\" you don't recognise."
+    return 0
+  fi
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if grep -qxF -- "$id" <<<"$before"; then continue; fi
+    runuser -u "$hub_user" -- "$hubd" helper revoke "$id" >/dev/null 2>&1 ||
+      warn "couldn't cut off the unused pairing $id at the hub. Do it with: sudo -u $hub_user hubd helper revoke $id"
+  done <<<"$now"
 }
 
 # What the latest run of a helper printed.
@@ -202,7 +215,10 @@ cmd_add() {
 
   # A one-time invite for the helper's feeds, to the hub on this Pi (loopback, unless hubd.toml
   # says to listen on one address). The helper still pins the hub's key from the invite.
-  local out invite
+  local out invite before
+  # The helpers already holding this label, so a failed login below revokes only the new one.
+  before=$(labelled_helpers "$name") ||
+    fail "couldn't read the hub's list of helpers (its message is above)."
   out=$(runuser -u "$hub_user" -- "$hubd" pair-helper --local --label "Pi helper $name" "${feed_args[@]}") ||
     fail "the hub couldn't make an invite (its message is above)."
   invite=$(printf '%s\n' "$out" | grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' | head -1) || true
@@ -220,7 +236,7 @@ cmd_add() {
     --unit="display-hub-helper-login-$name" --description="Pair Display Hub helper $name" \
     "${run_props[@]}" "$hub_send" login; then
     unset invite
-    revoke_unclaimed "$name"
+    revoke_unclaimed "$name" "$before"
     fail "the helper couldn't pair with the hub (the reason is above)."
   fi
   unset invite
