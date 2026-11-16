@@ -1,20 +1,29 @@
 //! The `hub-send` tool against a real hub over pinned HTTPS: invited by the manager, logged in from
-//! the helper string with the token kept in a file, then pages sent to feeds.
+//! the helper string with the token kept in a file, then pages sent to feeds. The file store is for
+//! Unix only, so the tests that use it run there; the credential-store test runs everywhere.
 
+#[cfg(unix)]
 use std::io::Write;
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 
 use base64::Engine;
 use hub_client::HubClient;
-use hub_core::api::{NewHelper, NewPage};
+use hub_core::api::NewHelper;
+#[cfg(unix)]
+use hub_core::api::NewPage;
+#[cfg(unix)]
 use hub_core::Source;
 use hub_protocol::pairing::PairingString;
 
+#[cfg(unix)]
 const BIN: &str = env!("CARGO_BIN_EXE_hub-send");
 
 /// Runs `hub-send` with the file store in `dir`, feeding `stdin`.
+#[cfg(unix)]
 fn run(dir: &Path, args: &[&str], stdin: &str) -> Output {
     let mut child = Command::new(BIN)
         .arg("--config-dir")
@@ -32,6 +41,7 @@ fn run(dir: &Path, args: &[&str], stdin: &str) -> Output {
     child.wait_with_output().unwrap()
 }
 
+#[cfg(unix)]
 fn text(o: &Output) -> (String, String) {
     (
         String::from_utf8_lossy(&o.stdout).into_owned(),
@@ -39,6 +49,7 @@ fn text(o: &Output) -> (String, String) {
     )
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn login_then_pages_to_allowed_other_kind_and_forbidden_feeds() {
     let root = tempfile::tempdir().unwrap();

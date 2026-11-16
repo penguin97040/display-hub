@@ -10,7 +10,7 @@ use hub_protocol::pairing::PairingString;
 use hub_protocol::DataQuality;
 use hub_send::Profile;
 use os_secrets::{MemoryStore, TokenStore};
-use usage::{NewSubscription, Service, Window};
+use usage::{NewSubscription, Service};
 use usage_helper::commands;
 
 /// The items of a page that must be a meter.
@@ -181,7 +181,6 @@ async fn helper_figures_reach_helper_pages() {
             (Some(33.0), Some(70.0))
         );
         assert!(items(gpt).iter().all(|m| m.percent.is_some()));
-        let _ = Window::Weekly;
     }
 
     // Removed in the manager: the helper's next send is refused, and says why in its log.
