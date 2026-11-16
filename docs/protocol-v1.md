@@ -1,6 +1,6 @@
 # Display protocol, version 1
 
-**Status: frozen on 11/11/2026, at the end of milestone 2.** From now on, v1 changes only by adding things (see Compatibility). Everything here is implemented in `hubd` and tested, including against mbedTLS 3.6, the line ESP-IDF 5.x uses.
+**Status: reshaped on 16/11/2026 for general pages, and not yet frozen again.** Until it is, v1 may still change in ways that aren't just additions. Once it is frozen, it changes only by adding things (see Compatibility). Everything here is implemented in `hubd` and tested, including against mbedTLS 3.6, the line ESP-IDF 5.x uses.
 
 This document is for anyone writing display firmware. The machine-readable parts are in `protocol/v1/`: JSON Schemas for every message and examples for each. The Rust reference implementation is `crates/hub-protocol`, and `tools/display-simulator` is the reference display.
 
@@ -65,39 +65,153 @@ Returns the display's dashboard. It requires the display's token, and the hub ta
 {
   "protocol_version": 1,
   "message_type": "dashboard.snapshot",
-  "dashboard_id": "llm-usage",
   "generated_at": "2026-11-10T20:00:00Z",
   "refresh_after_seconds": 300,
   "pages": [
     {
       "id": "claude-max",
       "title": "Claude Max",
+      "kind": "meter",
       "data_quality": "provider_reported",
       "updated_at": "2026-11-10T19:55:00Z",
       "stale_after_seconds": 1800,
       "note": null,
-      "metrics": [
-        { "id": "five-hour", "label": "Five-hour allowance used", "used_percent": 42.0, "resets_at": "2026-11-10T22:00:00Z" },
-        { "id": "weekly", "label": "Weekly allowance used", "used_percent": null, "resets_at": null }
-      ]
+      "data": {
+        "items": [
+          { "id": "five-hour", "label": "Five-hour allowance used", "percent": 42.0, "resets_at": "2026-11-10T22:00:00Z" },
+          { "id": "weekly", "label": "Weekly allowance used", "percent": null }
+        ]
+      }
     }
   ]
 }
 ```
 
+### The snapshot
+
 | Field | Meaning |
 |---|---|
 | `generated_at` | When the hub built the snapshot, by the hub's clock. All ages are measured from it. |
-| `refresh_after_seconds` | How long to wait before the next poll (30–3600). Add jitter of ±10%. |
+| `refresh_after_seconds` | How long to wait before the next poll (30-3600). Add jitter of ±10%. |
 | `pages` | Exactly the pages to show, in order. There are at most 10. An empty list means "no pages yet". |
-| `page.id` | Stable across snapshots, so the display can keep its place when pages move. It uses `a-z`, `0-9` and `-`, up to 64 characters. |
-| `page.title` | Plain text, 1–48 characters. |
-| `page.data_quality` | Where the figures came from. See below. |
-| `page.updated_at` | When the figures were collected. It is `null` only for unavailable pages. |
-| `page.stale_after_seconds` | The figures are stale once they are older than this (60–604800). |
-| `page.note` | Optional plain text, up to 96 characters. For example, why a page is unavailable. Show it. |
-| `metric.used_percent` | Share of the allowance **used** (not remaining), from 0 to 100. `null` means unknown. **Never draw `null` as zero.** |
-| `metric.resets_at` | When the window resets, if known. |
+
+### A page
+
+Every page has the same common fields, and a `kind` that says what is in its `data`.
+
+| Field | Meaning |
+|---|---|
+| `id` | Stable across snapshots, so the display can keep its place when pages move. It uses `a-z`, `0-9` and `-`, up to 64 characters. Unique in the snapshot. |
+| `title` | Plain text, 1-48 characters. |
+| `kind` | What `data` holds: a ready-made shape or a custom kind. See below. |
+| `data_quality` | Where the figures came from. See below. |
+| `updated_at` | When the figures were collected. It is `null` only for unavailable pages. |
+| `stale_after_seconds` | The figures are stale once they are older than this (60-604800). |
+| `note` | Optional plain text, up to 96 characters. For example, why a page is unavailable. Show it. |
+| `data` | The page's content, an object. **Absent (or `null`) when `data_quality` is `unavailable`, and required otherwise.** |
+
+All text is plain: Unicode NFC, with no control or invisible formatting characters and no leading or trailing spaces, and never empty. Lengths count characters, not bytes.
+
+A hub never sends a field that isn't listed here. A display ignores any it doesn't know, in the page and inside `data`.
+
+### Kinds
+
+`kind` is either a **ready-made shape name** (`meter`, `big_number`, `text` or `list`) or a **custom kind**.
+
+A custom kind looks like `nearby-flights/1`:
+
+- a name in lower-case letters, digits and `-`, optionally in dot-separated parts (`org.example.board/2`);
+- a `/`;
+- a version number from 1 to 9999.
+
+The pattern is `^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)*/[1-9][0-9]{0,3}$`, and a kind is at most 64 characters. **The version is part of the kind.** `nearby-flights/2` is a different kind from `nearby-flights/1`, so a display that only knows version 1 never misreads version 2 as version 1. Shape names never contain `/`, so a shape added in future can't clash with anyone's custom kind.
+
+#### `meter`
+
+One to six bars, each a share from 0 to 100.
+
+```json
+{ "items": [
+  { "id": "five-hour", "label": "Five-hour allowance used", "percent": 42.0, "resets_at": "2026-11-10T22:00:00Z" },
+  { "id": "weekly", "label": "Weekly allowance used", "percent": null }
+] }
+```
+
+- `items`: 1-6, each with a unique `id` (same rules as a page `id`).
+- `label`: up to 48 characters.
+- `percent`: 0-100, or `null` for unknown. **Never draw `null` as zero**; say "unknown" or show a dash.
+- `resets_at`: optional, when the item's window resets. Once it has passed, show "reset due" rather than a countdown.
+
+#### `big_number`
+
+One figure, drawn large.
+
+```json
+{ "value": 1234.5, "decimals": 1, "unit": "k", "caption": "Tokens today" }
+```
+
+- `value`: a finite number, or `null` for unknown. **Draw `null` as a dash, never as 0.**
+- `decimals`: optional, 0-3, default 0. How many decimal places to draw.
+- `unit`: optional, up to 8 characters.
+- `caption`: optional, up to 48 characters.
+
+#### `text`
+
+A short paragraph.
+
+```json
+{ "text": "The monthly allowance resets on the first." }
+```
+
+- `text`: 1-280 characters.
+
+#### `list`
+
+Up to eight lines, each with an optional detail.
+
+```json
+{ "items": [ { "text": "display-hub", "detail": "passed" }, { "text": "firmware" } ] }
+```
+
+- `items`: 0-8, each with `text` (up to 48 characters) and an optional `detail` (up to 48 characters). An empty list is allowed, so a display shows "nothing listed".
+
+#### Custom kinds
+
+For anything the shapes don't cover, such as `nearby-flights/1`:
+
+- `data` is any JSON **object**, with no more than 8 levels of nesting (the `data` object itself is the first level).
+- The hub doesn't look inside it. What it means is agreed between whoever writes the hub-side source and whoever writes the firmware that draws it, and nobody else needs to know.
+- A display whose firmware doesn't know the kind shows the "can't show this" card (below). That is the normal, safe outcome. A new custom kind never breaks a display that doesn't know it.
+- Treat the version as a contract: change what `data` means, and you change the version.
+
+### Size
+
+- The whole snapshot is at most **32 KiB**.
+- Each page, counted as its compact serialised JSON, is at most **3072 bytes** (`MAX_PAGE_BYTES`). Ten pages of that size, plus the envelope, still fit in 32 KiB.
+- A full `list` with four-byte characters everywhere can be over 3072 bytes, so a hub must keep a long list within the page limit (the hub checks it and refuses to send a page that is over). The other ready-made shapes always fit.
+
+### What a display does with a page it can't show
+
+One bad page must not cost the display the rest of the snapshot. A display shows a **"can't show this" card** for a page when:
+
+- its `kind` is a shape the display doesn't know, a custom kind it doesn't support, or doesn't read as a kind at all (**unknown kind**);
+- its `data` breaks the rules for its shape: a value out of range, text too long or too many items, duplicate meter ids, a custom `data` that isn't an object or nests too deep, or `data` missing on a page that needs it (**bad data**);
+- it has `data` and its `data_quality` is `unavailable` (**bad data**);
+- it is over 3072 bytes (**too large**).
+
+The card shows the page's `title`, then this text, exactly:
+
+> This display can't show this page.
+
+For an unknown kind only, a second line follows:
+
+> It may need a firmware update.
+
+The card shows nothing else about the page (no figures, note or age). The hub-protocol crate has these two lines as constants (`CANT_SHOW_TEXT`, `CANT_SHOW_UPDATE_HINT`), and the conformance vectors give the exact lines.
+
+An unavailable page that has no `data` is not a card: show the title and `note`, as in the next section, whatever its `kind` says.
+
+Problems with the snapshot itself are different, and **do** make the display refuse it and keep the last good one: a wrong version or message type, a bad `refresh_after_seconds`, more than 10 pages, a body over 32 KiB, or a page whose common fields (`id`, `title`, `updated_at`, `stale_after_seconds`, `note`) break the rules or whose `id` repeats.
 
 ### Timestamps
 
@@ -111,7 +225,7 @@ Timestamps are always `YYYY-MM-DDTHH:MM:SSZ`: UTC, exactly 20 characters, with n
 | `provider_reported` | REPORTED | Reported by the provider through a documented interface. |
 | `estimated` | ESTIMATE | Worked out locally. Approximate. |
 | `manual` | MANUAL | Typed in by the owner. |
-| `unavailable` | UNAVAILABLE | No figures. Show the `note`. Such a page never has metrics. |
+| `unavailable` | UNAVAILABLE | No figures. Show the `note`. Such a page has no `data`. |
 
 These are not interchangeable, and the display must always show which one applies. Any value the display doesn't recognise must be treated as `unavailable`.
 
@@ -122,14 +236,14 @@ A display may not know the time. Measure everything on the hub's clock:
 ```text
 age          = (generated_at − updated_at) + (time since the snapshot arrived, by a monotonic timer)
 stale        = age > stale_after_seconds
-reset in     = resets_at − (generated_at + time since the snapshot arrived)
+reset in     = resets_at − (generated_at + time since the snapshot arrived)   (meter items)
 ```
 
-Once a reset time has passed, show "reset due" instead of a countdown. The hub clears a figure when its window has reset (the share becomes `null`, with a note), so the next snapshot corrects it.
+Once a reset time has passed, show "reset due" instead of a countdown. The hub clears a meter item when its window has reset (the share becomes `null`, with a note), so the next snapshot corrects it.
 
 ### Size and bounds
 
-A snapshot is never larger than **32 KiB**, and per-field bounds keep even the worst case (four-byte characters everywhere) under that limit. The tests check this. Text is Unicode NFC, without control or invisible formatting characters and without leading or trailing spaces.
+A snapshot is never larger than **32 KiB** and a page never larger than **3072 bytes**; see Size above. The tests check that ten largest-possible pages, with four-byte characters everywhere, fit.
 
 ## Errors
 
@@ -150,9 +264,9 @@ An error with no JSON body, such as a proxy's page, counts as `unavailable` for 
 - **Accept a response** only if:
   - it is at most 32 KiB, which you check before parsing;
   - `protocol_version` is 1 and `message_type` is `dashboard.snapshot`;
-  - it follows the rules above.
+  - its envelope and the common fields of every page follow the rules above.
 
-  Otherwise keep the last good snapshot and say the hub sent something unreadable.
+  Otherwise keep the last good snapshot and say the hub sent something unreadable. A page whose `kind` or `data` you can't use is not a reason to refuse: show the card for that page.
 - **Back off on failure:** 15 s, 30 s, 60 s and so on, up to 15 minutes, with ±20% jitter. On success, wait `refresh_after_seconds` (±10%).
 - **Explain problems in plain words:**
   - can't reach the hub;
@@ -201,7 +315,8 @@ Rules:
 ## Compatibility
 
 - Displays **ignore fields they don't know**, and treat unknown `data_quality` values as `unavailable` and unknown error codes as transient. A hub may therefore add optional fields and new quality values within v1.
-- A hub never removes or renames a field within v1, never changes a field's meaning, and never loosens a bound. The published schema stays strict, describing exactly what a v1 hub sends.
+- New shapes and new custom kinds are additions too: a display that doesn't know a kind shows the card for that page and carries on with the others.
+- A hub never removes or renames a field within v1, never changes a field's meaning, and never loosens a bound. A shape's `data` only ever gains optional fields. The published schema stays strict, describing exactly what a v1 hub sends.
 - A breaking change needs `protocol_version: 2`. A hub serves every version from `MIN_SUPPORTED_PROTOCOL_VERSION` (currently 1) up to its own. A display that sends a version the hub doesn't serve gets `incompatible_version`.
 
 ## Finding the hub
@@ -211,9 +326,10 @@ The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.l
 ## Conformance
 
 - `protocol/v1/examples/valid/*.json` must be accepted and drawn.
-- `protocol/v1/examples/invalid/*.json` must be refused, apart from these, which a display tolerates (a hub never sends them):
-  - `extra-field` is accepted, because unknown fields are ignored;
-  - `unknown-quality` and `missing-used-percent` are accepted, read as unavailable and unknown respectively.
+- `protocol/v1/examples/invalid/*.json` are things a hub never sends. A display treats each one of three ways:
+  - **Refused**, keeping the last good snapshot: a wrong version or message type, a bad envelope or common page field, too many pages and an unreadable timestamp.
+  - **Tolerated and shown:** `extra-field` and `shape-extra-field` (unknown fields are ignored), `unknown-quality` (read as unavailable) and `missing-used-percent` (a missing `percent` reads as unknown).
+  - **A card for that page, with the others still shown:** an unknown kind, bad shape data, data on an unavailable page, a custom kind with bad data and a page over 3072 bytes.
 - `crates/hub-protocol/tests/conformance.rs` shows the exact expectation for each file.
-- **`protocol/v1/vectors/`** has 40 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
+- **`protocol/v1/vectors/`** has 54 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, each shape, cards, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
 - USB messages have `usb.schema.json` and examples in `examples/usb/`.

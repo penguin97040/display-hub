@@ -10,7 +10,9 @@ use std::path::Path;
 
 use hub_core::freshness::Freshness;
 use hub_protocol::limits::MAX_SNAPSHOT_BYTES;
-use hub_protocol::{receive, ErrorAction, ErrorBody, ReceiveError, Snapshot};
+use hub_protocol::{receive, ErrorAction, ErrorBody, PageContent, ReceiveError, Snapshot};
+
+use crate::render::{big_number_text, drawable};
 use serde::{Deserialize, Serialize};
 
 pub const FORMAT: &str = "display-hub.conformance";
@@ -55,26 +57,102 @@ pub struct Expect {
 pub struct PageExpect {
     pub id: String,
     pub title: String,
+    /// `show`: draw the page. `cant_show`: draw the "can't show this" card instead, and nothing
+    /// else about the page.
+    pub show: String,
+    /// Why a page is a card: `unknown_kind` (a shape name or custom kind this display doesn't
+    /// support), `bad_data` (the data breaks its shape's rules, or is on an unavailable page, or is
+    /// missing) or `too_large` (the page is over 3072 bytes).
+    pub cant_show_reason: Option<String>,
+    /// The exact lines of the card, under the title. Empty when the page shows.
+    pub card_lines: Vec<String>,
     /// What the screen says about the figures: DEMO, REPORTED, ESTIMATE, MANUAL or UNAVAILABLE.
     pub quality_label: String,
     pub note: Option<String>,
     /// Age on the hub's clock (`generated_at - updated_at + held_seconds`); `null` if never updated.
     pub age_seconds: Option<i64>,
     pub stale: bool,
-    /// Empty for an unavailable page: its figures are never drawn.
-    pub metrics: Vec<MetricExpect>,
+    /// What to draw. `null` for an unavailable page (its figures are never drawn) and for a card.
+    pub content: Option<ContentExpect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct MetricExpect {
+#[serde(tag = "shape", rename_all = "snake_case")]
+pub enum ContentExpect {
+    Meter {
+        items: Vec<MeterExpect>,
+    },
+    BigNumber {
+        /// `null` is unknown: draw a dash, never 0.
+        value: Option<f64>,
+        /// The figure to draw: `decimals` places (0 if absent), or `-` when unknown.
+        text: String,
+        unit: Option<String>,
+        caption: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+    List {
+        items: Vec<ListExpect>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MeterExpect {
     pub id: String,
     pub label: String,
     /// `null` is unknown: draw "unknown", never 0%.
-    pub used_percent: Option<f64>,
+    pub percent: Option<f64>,
     /// Seconds until reset on the hub's clock, while it's in the future.
     pub resets_in_seconds: Option<i64>,
     /// The reset time has passed: show "reset due" instead of a countdown.
     pub reset_due: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ListExpect {
+    pub text: String,
+    pub detail: Option<String>,
+}
+
+fn content_expect(c: PageContent, now: hub_protocol::Timestamp) -> ContentExpect {
+    match c {
+        PageContent::Meter(m) => ContentExpect::Meter {
+            items: m
+                .items
+                .into_iter()
+                .map(|it| {
+                    let left = it.resets_at.map(|r| now.seconds_until(r));
+                    MeterExpect {
+                        id: it.id,
+                        label: it.label,
+                        percent: it.percent,
+                        resets_in_seconds: left.filter(|l| *l > 0),
+                        reset_due: left.is_some_and(|l| l <= 0),
+                    }
+                })
+                .collect(),
+        },
+        PageContent::BigNumber(b) => ContentExpect::BigNumber {
+            value: b.value,
+            text: big_number_text(&b),
+            unit: b.unit,
+            caption: b.caption,
+        },
+        PageContent::Text(t) => ContentExpect::Text { text: t.text },
+        PageContent::List(l) => ContentExpect::List {
+            items: l
+                .items
+                .into_iter()
+                .map(|i| ListExpect {
+                    text: i.text,
+                    detail: i.detail,
+                })
+                .collect(),
+        },
+        PageContent::Custom { .. } => unreachable!("this display draws no custom kinds"),
+    }
 }
 
 fn show(s: &Snapshot, held: i64) -> Expect {
@@ -88,31 +166,26 @@ fn show(s: &Snapshot, held: i64) -> Expect {
                 Freshness::Fresh { age_seconds } => (Some(age_seconds), false),
                 Freshness::Stale { age_seconds } => (Some(age_seconds), true),
             };
-            let metrics = if p.data_quality.shows_figures() {
-                p.metrics
-                    .iter()
-                    .map(|m| {
-                        let left = m.resets_at.map(|r| now.seconds_until(r));
-                        MetricExpect {
-                            id: m.id.clone(),
-                            label: m.label.clone(),
-                            used_percent: m.used_percent,
-                            resets_in_seconds: left.filter(|l| *l > 0),
-                            reset_due: left.is_some_and(|l| l <= 0),
-                        }
-                    })
-                    .collect()
-            } else {
-                Vec::new()
+            let (show, cant_show_reason, card_lines, content) = match drawable(p) {
+                Ok(content) => ("show", None, Vec::new(), content.map(|c| content_expect(c, now))),
+                Err(cant) => (
+                    "cant_show",
+                    Some(cant.code().to_string()),
+                    cant.card_lines().iter().map(|l| l.to_string()).collect(),
+                    None,
+                ),
             };
             PageExpect {
                 id: p.id.clone(),
                 title: p.title.clone(),
+                show: show.into(),
+                cant_show_reason,
+                card_lines,
                 quality_label: p.data_quality.label().into(),
                 note: p.note.clone(),
                 age_seconds,
                 stale,
-                metrics,
+                content,
             }
         })
         .collect();
@@ -166,15 +239,18 @@ fn error(code: &str, message: &str) -> String {
     format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#)
 }
 
-/// Every case, built from `protocol/v1/examples` and the cases below.
 /// One case: name, description, HTTP status, body and seconds held.
 pub type Case = (String, String, u16, String, i64);
 
+/// Every case, built from `protocol/v1/examples` and the cases below.
 pub fn cases(protocol_dir: &Path) -> std::io::Result<Vec<Case>> {
     let mut out = Vec::new();
     for (kind, what) in [
         ("valid", "A valid snapshot"),
-        ("invalid", "A snapshot that breaks the protocol"),
+        (
+            "invalid",
+            "A snapshot a hub must never send. A display refuses it, tolerates it or shows a card for the page, as expected here",
+        ),
     ] {
         let mut files: Vec<_> = std::fs::read_dir(protocol_dir.join("examples").join(kind))?
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -200,6 +276,14 @@ pub fn cases(protocol_dir: &Path) -> std::io::Result<Vec<Case>> {
         "The demo snapshot, held for 70 minutes without a new one: its pages are now stale.".into(),
         200,
         demo,
+        4200,
+    ));
+    let shapes = std::fs::read_to_string(protocol_dir.join("examples/valid/all-shapes.json"))?;
+    out.push((
+        "held-shapes-until-stale".into(),
+        "Every shape, held for 70 minutes without a new snapshot: all are stale, and a meter's countdown has run on.".into(),
+        200,
+        shapes,
         4200,
     ));
     out.push((

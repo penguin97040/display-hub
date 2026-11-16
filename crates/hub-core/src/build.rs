@@ -1,8 +1,9 @@
 //! Turns subscriptions and their stored figures into the snapshot a display receives.
 
-use hub_protocol::limits::MAX_PAGES;
-use hub_protocol::snapshot::{DASHBOARD_LLM_USAGE, MESSAGE_TYPE};
-use hub_protocol::{DataQuality, Metric, Page, Snapshot, Timestamp, PROTOCOL_VERSION};
+use hub_protocol::limits::{MAX_METER_ITEMS, MAX_PAGES};
+use hub_protocol::shapes::KIND_METER;
+use hub_protocol::snapshot::MESSAGE_TYPE;
+use hub_protocol::{DataQuality, Meter, MeterItem, Page, Snapshot, Timestamp, PROTOCOL_VERSION};
 
 use crate::model::{clean_note, clean_title, PageData, Source, Subscription};
 use crate::provider::generated;
@@ -10,6 +11,8 @@ use crate::provider::generated;
 pub const RESET_NOTE: &str = "Window reset since the last report";
 pub const NO_SOURCE_NOTE: &str = "No supported source connected yet";
 pub const NEVER_COLLECTED_NOTE: &str = "Waiting for the first report";
+/// A page with a source but no figures in it: a meter needs at least one item.
+pub const NO_FIGURES_NOTE: &str = "No figures yet";
 pub const DEFAULT_REFRESH_SECONDS: u32 = 300;
 
 /// Builds a snapshot. `pages` are in display order, each with its latest stored figures (if any).
@@ -22,7 +25,6 @@ pub fn build_snapshot(
     Snapshot {
         protocol_version: PROTOCOL_VERSION,
         message_type: MESSAGE_TYPE.into(),
-        dashboard_id: DASHBOARD_LLM_USAGE.into(),
         generated_at: now,
         refresh_after_seconds: refresh_after_seconds.clamp(
             *hub_protocol::limits::REFRESH_RANGE.start(),
@@ -53,7 +55,7 @@ fn page(now: Timestamp, sub: &Subscription, stored: Option<&PageData>) -> Page {
     let updated_at = data.updated_at.map(|u| u.min(now));
 
     let mut cleared = false;
-    let metrics = if shows && updated_at.is_some() {
+    let items: Vec<MeterItem> = if shows && updated_at.is_some() {
         data.metrics
             .iter()
             .map(|m| {
@@ -61,18 +63,18 @@ fn page(now: Timestamp, sub: &Subscription, stored: Option<&PageData>) -> Page {
                 // is unknown until the next report.
                 let reset = m.resets_at.is_some_and(|r| r <= now);
                 cleared |= reset && m.used_percent.is_some();
-                Metric {
-                    id: m.window.id().into(),
-                    label: m.window.label().into(),
-                    used_percent: if reset {
+                MeterItem::new(
+                    m.window.id(),
+                    m.window.label(),
+                    if reset {
                         None
                     } else {
                         m.used_percent.and_then(crate::model::clean_percent)
                     },
-                    resets_at: if reset { None } else { m.resets_at },
-                }
+                    if reset { None } else { m.resets_at },
+                )
             })
-            .take(hub_protocol::limits::MAX_METRICS)
+            .take(MAX_METER_ITEMS)
             .collect()
     } else {
         Vec::new()
@@ -80,30 +82,29 @@ fn page(now: Timestamp, sub: &Subscription, stored: Option<&PageData>) -> Page {
     if cleared && note.is_none() {
         note = Some(RESET_NOTE.into());
     }
-    let (quality, updated_at) = if shows && updated_at.is_some() {
-        (data.quality, updated_at)
-    } else {
-        if note.is_none() {
-            note = Some(NO_SOURCE_NOTE.into());
-        }
-        (DataQuality::Unavailable, None)
-    };
-
-    Page {
-        id: sub.id.clone(),
-        title,
-        data_quality: quality,
-        updated_at,
-        stale_after_seconds: sub.source.stale_after_seconds(),
-        note,
-        metrics,
+    let stale_after_seconds = sub.source.stale_after_seconds();
+    if let (true, Some(updated_at), false) = (shows, updated_at, items.is_empty()) {
+        return Page::with_content(
+            sub.id.clone(),
+            title,
+            data.quality,
+            Some(updated_at),
+            stale_after_seconds,
+            note,
+            Meter { items },
+        );
     }
+    if note.is_none() {
+        note = Some(if shows { NO_FIGURES_NOTE } else { NO_SOURCE_NOTE }.into());
+    }
+    Page::unavailable(sub.id.clone(), title, KIND_METER, stale_after_seconds, note)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{MetricValue, Service, Window};
+    use hub_protocol::PageContent;
 
     fn ts(s: &str) -> Timestamp {
         Timestamp::parse(s).unwrap()
@@ -134,7 +135,7 @@ mod tests {
         assert_eq!(ids, ["opencode-go-plus", "chatgpt-plus", "claude-max"]);
         assert_eq!(s.pages[0].data_quality, DataQuality::Demo);
         assert_eq!(s.pages[1].data_quality, DataQuality::Unavailable);
-        assert!(s.pages[1].metrics.is_empty());
+        assert!(s.pages[1].data.is_none());
         s.validate().unwrap();
     }
 
@@ -167,9 +168,12 @@ mod tests {
             )],
         );
         let p = &s.pages[0];
-        assert_eq!(p.metrics[0].used_percent, None);
-        assert_eq!(p.metrics[0].resets_at, None);
-        assert_eq!(p.metrics[1].used_percent, Some(30.0));
+        let Some(PageContent::Meter(m)) = p.content().unwrap() else {
+            panic!("not a meter")
+        };
+        assert_eq!(m.items[0].percent, None);
+        assert_eq!(m.items[0].resets_at, None);
+        assert_eq!(m.items[1].percent, Some(30.0));
         assert_eq!(p.note.as_deref(), Some(RESET_NOTE));
         s.validate().unwrap();
     }
@@ -204,7 +208,10 @@ mod tests {
         let p = &s.pages[0];
         assert_eq!(p.title, "Mine");
         assert_eq!(p.updated_at, Some(now));
-        assert_eq!(p.metrics[0].used_percent, None);
+        let Some(PageContent::Meter(m)) = p.content().unwrap() else {
+            panic!("not a meter")
+        };
+        assert_eq!(m.items[0].percent, None);
         assert_eq!(s.refresh_after_seconds, 30);
         s.validate().unwrap();
     }
@@ -226,8 +233,26 @@ mod tests {
             300,
             &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
         );
-        assert!(s.pages[0].metrics.is_empty());
+        assert!(s.pages[0].data.is_none());
         assert_eq!(s.pages[0].updated_at, None);
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn a_page_with_a_source_but_no_figures_is_unavailable() {
+        let stored = PageData {
+            quality: DataQuality::Manual,
+            updated_at: Some(ts("2026-11-10T19:00:00Z")),
+            metrics: Vec::new(),
+            note: None,
+        };
+        let s = build_snapshot(
+            ts("2026-11-10T20:00:00Z"),
+            300,
+            &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
+        );
+        assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
+        assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
         s.validate().unwrap();
     }
 }

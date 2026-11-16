@@ -1279,7 +1279,6 @@ mod tests {
             preview: Snapshot {
                 protocol_version: 1,
                 message_type: "dashboard.snapshot".into(),
-                dashboard_id: "llm-usage".into(),
                 generated_at: ts("2026-11-10T20:00:00Z"),
                 refresh_after_seconds: 300,
                 pages: vec![],
@@ -1662,7 +1661,6 @@ mod helper_string_tests {
             preview: Snapshot {
                 protocol_version: 1,
                 message_type: "dashboard.snapshot".into(),
-                dashboard_id: "llm-usage".into(),
                 generated_at: t,
                 refresh_after_seconds: 300,
                 pages: vec![],

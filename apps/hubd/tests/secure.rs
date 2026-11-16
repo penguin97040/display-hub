@@ -14,6 +14,14 @@ use hubd::api::Hub;
 use hubd::config::Config;
 use tokio::sync::oneshot;
 
+/// The items of a page that must be a meter.
+fn items(page: &hub_protocol::Page) -> Vec<hub_protocol::MeterItem> {
+    match page.content().unwrap() {
+        Some(hub_protocol::PageContent::Meter(m)) => m.items,
+        other => panic!("not a meter: {other:?}"),
+    }
+}
+
 const NOW: &str = "2026-11-10T20:00:00Z";
 
 struct Running {
@@ -267,7 +275,7 @@ async fn admin_changes_reach_the_next_snapshot() {
     assert_eq!(ids, ["opencode-go-plus", "claude-max"]);
     assert_eq!(snap.pages[1].title, "Work Claude");
     assert_eq!(snap.pages[1].data_quality, DataQuality::Manual);
-    assert_eq!(snap.pages[1].metrics[0].used_percent, Some(33.3));
+    assert_eq!(items(&snap.pages[1])[0].percent, Some(33.3));
 
     // Reorders must be complete, manual figures only on manual pages, windows must exist.
     let e = c.reorder(&admin, vec!["claude-max".into()]).await.unwrap_err();
@@ -500,7 +508,7 @@ async fn data_and_identity_survive_a_restart() {
         "same identity, so displays still trust it"
     );
     let snap = r.client().device_snapshot(Some(&token)).await.unwrap();
-    assert_eq!(snap.pages[0].metrics[0].used_percent, Some(61.0));
+    assert_eq!(items(&snap.pages[0])[0].percent, Some(61.0));
     assert_eq!(snap.pages[0].updated_at.unwrap().to_string(), NOW);
     let displays = r.client().displays(&admin).await.unwrap();
     assert_eq!(displays[0].id, id);
@@ -627,8 +635,8 @@ async fn a_pc_helper_reports_only_its_services_to_collector_pages() {
     let snap = c.preview_snapshot(&admin).await.unwrap();
     let page = snap.pages.iter().find(|p| p.id == "claude-max").unwrap();
     assert_eq!(page.data_quality, DataQuality::ProviderReported);
-    assert_eq!(page.metrics[0].used_percent, Some(42.3));
-    assert_eq!(page.metrics[1].used_percent, None, "unknown stays unknown");
+    assert_eq!(items(page)[0].percent, Some(42.3));
+    assert_eq!(items(page)[1].percent, None, "unknown stays unknown");
     assert_eq!(page.updated_at.unwrap().to_string(), "2026-11-10T19:59:00Z");
 
     // Outside its scope, from the future, malformed, or with another role's token: refused.

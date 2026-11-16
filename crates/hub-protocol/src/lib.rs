@@ -9,13 +9,18 @@ pub mod error;
 pub mod limits;
 pub mod pairing;
 pub mod provisioning;
+pub mod shapes;
 pub mod snapshot;
 pub mod text;
 pub mod timestamp;
 pub mod usb;
 
 pub use error::{ErrorAction, ErrorBody, ErrorCode, ErrorDetail};
-pub use snapshot::{receive, DataQuality, Metric, Page, ReceiveError, Snapshot, Violation};
+pub use shapes::{
+    BigNumber, CantShow, List, ListItem, Meter, MeterItem, PageContent, TextBlock, CANT_SHOW_TEXT,
+    CANT_SHOW_UPDATE_HINT,
+};
+pub use snapshot::{receive, DataQuality, Page, ReceiveError, Snapshot, Violation};
 pub use timestamp::Timestamp;
 
 /// The wire protocol version this crate speaks.

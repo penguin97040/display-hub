@@ -910,13 +910,7 @@ impl Manager {
                                     ),
                             )
                             .child(ui::h2(p.title.clone()))
-                            .children(p.metrics.iter().map(|mt| {
-                                ui::meter(
-                                    &mt.label,
-                                    mt.used_percent,
-                                    &model::resets_text(mt.resets_at, Some(r.preview.generated_at)),
-                                )
-                            }))
+                            .children(preview_body(p, r.preview.generated_at))
                             .when_some(p.note.clone(), |d, n| d.child(ui::p_muted(n)))
                             .child(ui::label(&fresh)),
                     ),
@@ -2076,4 +2070,28 @@ fn field_canvas(
     )
     .flex_1()
     .h_full()
+}
+
+/// The page's figures in the manager's preview. The manager draws meters, and says so for any
+/// other kind rather than guess how a display would draw it.
+fn preview_body(page: &hub_protocol::Page, generated_at: hub_protocol::Timestamp) -> Vec<gpui::Div> {
+    match page.content() {
+        Ok(Some(hub_protocol::PageContent::Meter(m))) => m
+            .items
+            .iter()
+            .map(|it| {
+                ui::meter(
+                    &it.label,
+                    it.percent,
+                    &model::resets_text(it.resets_at, Some(generated_at)),
+                )
+            })
+            .collect(),
+        Ok(None) => Vec::new(),
+        Ok(Some(_)) => vec![ui::p_muted(format!(
+            "A {} page. The manager previews meters only.",
+            page.kind
+        ))],
+        Err(cant) => cant.card_lines().iter().map(|l| ui::p_muted(*l)).collect(),
+    }
 }

@@ -1,0 +1,52 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "invalid-shape-extra-field",
+  "description": "A snapshot a hub must never send. A display refuses it, tolerates it or shows a card for the page, as expected here: examples/invalid/shape-extra-field.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"reminder\",\n      \"title\": \"Reminder\",\n      \"kind\": \"text\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"text\": \"Hello\",\n        \"colour\": \"red\"\n      }\n    },\n    {\n      \"id\": \"tokens-today\",\n      \"title\": \"Tokens today\",\n      \"kind\": \"big_number\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"value\": 1234.5,\n        \"decimals\": 1,\n        \"unit\": \"k\",\n        \"caption\": \"Since midnight\"\n      }\n    }\n  ]\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": [
+      {
+        "id": "reminder",
+        "title": "Reminder",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "text",
+          "text": "Hello"
+        }
+      },
+      {
+        "id": "tokens-today",
+        "title": "Tokens today",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "big_number",
+          "value": 1234.5,
+          "text": "1234.5",
+          "unit": "k",
+          "caption": "Since midnight"
+        }
+      }
+    ]
+  }
+}

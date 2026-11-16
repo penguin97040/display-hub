@@ -1,7 +1,7 @@
 //! Draws what the display would show, as text. One block per page, in the hub's order.
 
 use hub_core::{short_duration, Freshness};
-use hub_protocol::{DataQuality, Page, Timestamp};
+use hub_protocol::{BigNumber, CantShow, DataQuality, List, Meter, Page, PageContent, Timestamp};
 
 use crate::device::{Device, Link};
 
@@ -90,6 +90,11 @@ fn render_page(page: &Page, n: usize, total: usize, generated_at: Timestamp, hel
         &format!("-- Page {n}/{total}: {}", page.title),
         &format!("{tag} --"),
     ));
+    if let Err(cant) = drawable(page) {
+        // The standard card: the title above, and nothing else about the page.
+        out.extend(cant.card_lines().iter().map(|l| format!("  {l}")));
+        return out;
+    }
     if !page.data_quality.shows_figures() {
         out.push(format!(
             "  {}",
@@ -100,22 +105,17 @@ fn render_page(page: &Page, n: usize, total: usize, generated_at: Timestamp, hel
         }
         return out;
     }
+    let Ok(Some(content)) = drawable(page) else {
+        return out; // Handled above.
+    };
     // Reset countdowns run on the hub's clock, plus the time this display has held the snapshot.
     let now_on_hub = generated_at.plus_seconds(held_for);
-    for m in &page.metrics {
-        out.push(format!("  {}", m.label));
-        let value = match m.used_percent {
-            Some(p) => format!("{:>5}% {}", format_percent(p), bar(p)),
-            None => format!("{:>6} {}", "--", "unknown"),
-        };
-        let reset = match m.resets_at {
-            Some(r) if r > now_on_hub => {
-                format!("  resets in {}", short_duration(now_on_hub.seconds_until(r)))
-            }
-            Some(_) => "  reset due".into(),
-            None => String::new(),
-        };
-        out.push(format!("    {value}{reset}"));
+    match &content {
+        PageContent::Meter(m) => draw_meter(m, now_on_hub, &mut out),
+        PageContent::BigNumber(b) => draw_big_number(b, &mut out),
+        PageContent::Text(t) => out.extend(wrap(&t.text, WIDTH - 2).into_iter().map(|l| format!("  {l}"))),
+        PageContent::List(l) => draw_list(l, &mut out),
+        PageContent::Custom { .. } => unreachable!("drawable turns custom kinds into cards"),
     }
     let age = match fresh {
         Freshness::Never => "Never updated".to_string(),
@@ -127,6 +127,87 @@ fn render_page(page: &Page, n: usize, total: usize, generated_at: Timestamp, hel
         None => out.push(format!("  {age}")),
     }
     out
+}
+
+/// What this display can draw for a page. It knows the four ready-made shapes and no custom kinds,
+/// so a custom kind is a card, as it is on any display whose firmware doesn't know it.
+pub fn drawable(page: &Page) -> Result<Option<PageContent>, CantShow> {
+    match page.content()? {
+        Some(PageContent::Custom { .. }) => Err(CantShow::UnknownKind),
+        other => Ok(other),
+    }
+}
+
+fn draw_meter(m: &Meter, now_on_hub: Timestamp, out: &mut Vec<String>) {
+    for it in &m.items {
+        out.push(format!("  {}", it.label));
+        let value = match it.percent {
+            Some(p) => format!("{:>5}% {}", format_percent(p), bar(p)),
+            None => format!("{:>6} {}", "--", "unknown"),
+        };
+        let reset = match it.resets_at {
+            Some(r) if r > now_on_hub => {
+                format!("  resets in {}", short_duration(now_on_hub.seconds_until(r)))
+            }
+            Some(_) => "  reset due".into(),
+            None => String::new(),
+        };
+        out.push(format!("    {value}{reset}"));
+    }
+}
+
+/// The figure as drawn: `decimals` places, or a dash when unknown. Never 0 for unknown.
+pub fn big_number_text(b: &BigNumber) -> String {
+    match b.value {
+        Some(v) => format!("{:.*}", b.decimals.unwrap_or(0) as usize, v),
+        None => "-".into(),
+    }
+}
+
+fn draw_big_number(b: &BigNumber, out: &mut Vec<String>) {
+    if let Some(c) = &b.caption {
+        out.push(format!("  {c}"));
+    }
+    let unit = b.unit.as_deref().map(|u| format!(" {u}")).unwrap_or_default();
+    out.push(format!("    {}{unit}", big_number_text(b)));
+}
+
+fn draw_list(l: &List, out: &mut Vec<String>) {
+    if l.items.is_empty() {
+        out.push("  (nothing listed)".into());
+    }
+    for it in &l.items {
+        match &it.detail {
+            Some(d) => out.push(format!("  - {} · {d}", it.text)),
+            None => out.push(format!("  - {}", it.text)),
+        }
+    }
+}
+
+/// Breaks text into lines of at most `width` characters, at spaces where it can.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split(' ') {
+        let (have, add) = (line.chars().count(), word.chars().count());
+        if have > 0 && have + 1 + add > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+        while line.chars().count() > width {
+            let cut: String = line.chars().take(width).collect();
+            let rest: String = line.chars().skip(width).collect();
+            lines.push(cut);
+            line = rest;
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 fn format_percent(p: f64) -> String {

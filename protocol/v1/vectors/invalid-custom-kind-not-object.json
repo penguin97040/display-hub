@@ -1,0 +1,48 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "invalid-custom-kind-not-object",
+  "description": "A snapshot a hub must never send. A display refuses it, tolerates it or shows a card for the page, as expected here: examples/invalid/custom-kind-not-object.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"nearby-flights\",\n      \"title\": \"Nearby flights\",\n      \"kind\": \"nearby-flights/1\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": [\n        1,\n        2,\n        3\n      ]\n    },\n    {\n      \"id\": \"reminder\",\n      \"title\": \"Reminder\",\n      \"kind\": \"text\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"text\": \"The monthly allowance resets on the first. Plan big jobs for after that.\"\n      }\n    }\n  ]\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": [
+      {
+        "id": "nearby-flights",
+        "title": "Nearby flights",
+        "show": "cant_show",
+        "cant_show_reason": "bad_data",
+        "card_lines": [
+          "This display can't show this page."
+        ],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": null
+      },
+      {
+        "id": "reminder",
+        "title": "Reminder",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "text",
+          "text": "The monthly allowance resets on the first. Plan big jobs for after that."
+        }
+      }
+    ]
+  }
+}

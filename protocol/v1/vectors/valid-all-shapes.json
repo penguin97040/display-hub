@@ -1,0 +1,128 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "valid-all-shapes",
+  "description": "A valid snapshot: examples/valid/all-shapes.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"claude-max\",\n      \"title\": \"Claude Max\",\n      \"kind\": \"meter\",\n      \"data_quality\": \"provider_reported\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"items\": [\n          {\n            \"id\": \"five-hour\",\n            \"label\": \"Five-hour allowance used\",\n            \"percent\": 42.0,\n            \"resets_at\": \"2026-11-10T22:00:00Z\"\n          },\n          {\n            \"id\": \"weekly\",\n            \"label\": \"Weekly allowance used\",\n            \"percent\": null\n          }\n        ]\n      }\n    },\n    {\n      \"id\": \"tokens-today\",\n      \"title\": \"Tokens today\",\n      \"kind\": \"big_number\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"value\": 1234.5,\n        \"decimals\": 1,\n        \"unit\": \"k\",\n        \"caption\": \"Since midnight\"\n      }\n    },\n    {\n      \"id\": \"cost-today\",\n      \"title\": \"Cost today\",\n      \"kind\": \"big_number\",\n      \"data_quality\": \"estimated\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"value\": null,\n        \"unit\": \"NZ$\",\n        \"caption\": \"Not reported yet\"\n      }\n    },\n    {\n      \"id\": \"reminder\",\n      \"title\": \"Reminder\",\n      \"kind\": \"text\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"text\": \"The monthly allowance resets on the first. Plan big jobs for after that.\"\n      }\n    },\n    {\n      \"id\": \"queue\",\n      \"title\": \"Build queue\",\n      \"kind\": \"list\",\n      \"data_quality\": \"manual\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": null,\n      \"data\": {\n        \"items\": [\n          {\n            \"text\": \"display-hub\",\n            \"detail\": \"passed\"\n          },\n          {\n            \"text\": \"firmware\"\n          },\n          {\n            \"text\": \"docs\",\n            \"detail\": \"running\"\n          }\n        ]\n      }\n    }\n  ]\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": [
+      {
+        "id": "claude-max",
+        "title": "Claude Max",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "REPORTED",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "meter",
+          "items": [
+            {
+              "id": "five-hour",
+              "label": "Five-hour allowance used",
+              "percent": 42.0,
+              "resets_in_seconds": 7200,
+              "reset_due": false
+            },
+            {
+              "id": "weekly",
+              "label": "Weekly allowance used",
+              "percent": null,
+              "resets_in_seconds": null,
+              "reset_due": false
+            }
+          ]
+        }
+      },
+      {
+        "id": "tokens-today",
+        "title": "Tokens today",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "big_number",
+          "value": 1234.5,
+          "text": "1234.5",
+          "unit": "k",
+          "caption": "Since midnight"
+        }
+      },
+      {
+        "id": "cost-today",
+        "title": "Cost today",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "ESTIMATE",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "big_number",
+          "value": null,
+          "text": "-",
+          "unit": "NZ$",
+          "caption": "Not reported yet"
+        }
+      },
+      {
+        "id": "reminder",
+        "title": "Reminder",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "text",
+          "text": "The monthly allowance resets on the first. Plan big jobs for after that."
+        }
+      },
+      {
+        "id": "queue",
+        "title": "Build queue",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "MANUAL",
+        "note": null,
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "list",
+          "items": [
+            {
+              "text": "display-hub",
+              "detail": "passed"
+            },
+            {
+              "text": "firmware",
+              "detail": null
+            },
+            {
+              "text": "docs",
+              "detail": "running"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -11,6 +11,14 @@ use hub_protocol::DataQuality;
 use hubctl::commands;
 use os_secrets::{MemoryStore, TokenStore};
 
+/// The items of a page that must be a meter.
+fn items(page: &hub_protocol::Page) -> Vec<hub_protocol::MeterItem> {
+    match page.content().unwrap() {
+        Some(hub_protocol::PageContent::Meter(m)) => m.items,
+        other => panic!("not a meter: {other:?}"),
+    }
+}
+
 const STATUS_JSON: &str = r#"{"model":{"display_name":"Opus 4.7"},
   "rate_limits":{"five_hour":{"used_percentage":42.5,"resets_at":1900000000},
                  "seven_day":{"used_percentage":17,"resets_at":1900500000}}}"#;
@@ -128,8 +136,8 @@ async fn helper_figures_reach_collector_pages() {
     let snap = manager.preview_snapshot(&admin).await.unwrap();
     let claude = snap.pages.iter().find(|p| p.id == "claude-max").unwrap();
     assert_eq!(claude.data_quality, DataQuality::ProviderReported);
-    assert_eq!(claude.metrics[0].used_percent, Some(42.5));
-    assert_eq!(claude.metrics[1].resets_at.unwrap().unix(), 1_900_500_000);
+    assert_eq!(items(claude)[0].percent, Some(42.5));
+    assert_eq!(items(claude)[1].resets_at.unwrap().unix(), 1_900_500_000);
 
     // Codex, through a stand-in for `codex app-server` that answers as documented.
     #[cfg(unix)]
@@ -162,10 +170,10 @@ async fn helper_figures_reach_collector_pages() {
         let snap = manager.preview_snapshot(&admin).await.unwrap();
         let gpt = snap.pages.iter().find(|p| p.id == "chatgpt-plus").unwrap();
         assert_eq!(
-            (gpt.metrics[0].used_percent, gpt.metrics[1].used_percent),
+            (items(gpt)[0].percent, items(gpt)[1].percent),
             (Some(33.0), Some(70.0))
         );
-        assert!(gpt.metrics.iter().all(|m| m.used_percent.is_some()));
+        assert!(items(gpt).iter().all(|m| m.percent.is_some()));
         let _ = Window::Weekly;
     }
 

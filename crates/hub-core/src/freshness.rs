@@ -70,11 +70,12 @@ mod tests {
         Page {
             id: "p".into(),
             title: "P".into(),
+            kind: "text".into(),
             data_quality: DataQuality::Manual,
             updated_at: updated.map(|u| Timestamp::parse(u).unwrap()),
             stale_after_seconds: stale_after,
             note: None,
-            metrics: vec![],
+            data: None,
         }
     }
 

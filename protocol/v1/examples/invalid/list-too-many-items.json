@@ -1,0 +1,60 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "queue",
+      "title": "Build queue",
+      "kind": "list",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "items": [
+          {
+            "text": "item 0"
+          },
+          {
+            "text": "item 1"
+          },
+          {
+            "text": "item 2"
+          },
+          {
+            "text": "item 3"
+          },
+          {
+            "text": "item 4"
+          },
+          {
+            "text": "item 5"
+          },
+          {
+            "text": "item 6"
+          },
+          {
+            "text": "item 7"
+          },
+          {
+            "text": "item 8"
+          }
+        ]
+      }
+    },
+    {
+      "id": "reminder",
+      "title": "Reminder",
+      "kind": "text",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "text": "The monthly allowance resets on the first. Plan big jobs for after that."
+      }
+    }
+  ]
+}

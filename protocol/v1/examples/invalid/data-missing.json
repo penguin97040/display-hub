@@ -1,0 +1,32 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "reminder",
+      "title": "Reminder",
+      "kind": "text",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null
+    },
+    {
+      "id": "tokens-today",
+      "title": "Tokens today",
+      "kind": "big_number",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "value": 1234.5,
+        "decimals": 1,
+        "unit": "k",
+        "caption": "Since midnight"
+      }
+    }
+  ]
+}
