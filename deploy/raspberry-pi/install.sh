@@ -2,11 +2,13 @@
 # Installs or upgrades Display Hub on a Raspberry Pi (Raspberry Pi OS Bookworm or Trixie, 64-bit).
 #
 #   sudo bash install.sh              install, or upgrade in place
-#   sudo bash install.sh --uninstall  stop and remove the service and binary; keep data and settings
+#   sudo bash install.sh --uninstall  stop and remove the service, binaries and helper tools; keep
+#                                     data and settings
 #
-# Run it from a folder holding `hubd` (the aarch64 build) and the files next to this script.
-# Safe to run again: it never overwrites /etc/display-hub/hubd.toml, never deletes data, and backs
-# the hub up before replacing a running version. See docs/deploy-raspberry-pi.md.
+# Run it from a folder holding `hubd` and `hub-send` (the aarch64 builds) and the files next to this
+# script. Safe to run again: it never overwrites /etc/display-hub/hubd.toml, never deletes data, and
+# backs the hub up before replacing a running version. It installs what helpers need, but turns no
+# helper on: that's `sudo display-hub-helper add`. See docs/deploy-raspberry-pi.md.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -16,6 +18,11 @@ unit=/etc/systemd/system/display-hub.service
 conf_dir=/etc/display-hub
 data_dir=/var/lib/display-hub
 backups=/var/backups/display-hub
+send_bin=/usr/local/bin/hub-send
+helper_cmd=/usr/local/sbin/display-hub-helper
+helper_units=(/etc/systemd/system/display-hub-helper@.service /etc/systemd/system/display-hub-helper@.timer)
+helper_programs=/usr/local/lib/display-hub/helpers
+examples=/usr/local/share/display-hub/helpers
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -25,21 +32,42 @@ as_hub() { runuser -u "$user" -- "$@"; }
 command -v systemctl >/dev/null || fail "this needs systemd"
 command -v runuser >/dev/null || fail "this needs runuser (util-linux)"
 
+# Installs a file atomically, so a running helper never sees half of it.
+put() { install -m "$1" -o root -g root "$2" "$3.new" && mv -f "$3.new" "$3"; }
+
 if [ "${1:-}" = "--uninstall" ]; then
+  # Helpers hold tokens for this hub: removing them properly also cuts them off there.
+  set_up=$(find "$helper_programs" -mindepth 1 -maxdepth 1 -type f -printf '%f ' 2>/dev/null || true)
+  if [ -n "$set_up" ]; then
+    fail "these helpers are still set up: $set_up
+Remove each one first (it also cuts it off at the hub): sudo display-hub-helper remove <name>"
+  fi
   systemctl disable --now display-hub 2>/dev/null || true
-  rm -f "$unit" "$bin"
+  rm -f "$unit" "$bin" "$send_bin" "$helper_cmd" "${helper_units[@]}"
+  rm -rf "$examples"
+  rmdir "$helper_programs" /usr/local/lib/display-hub /usr/local/share/display-hub 2>/dev/null || true
   systemctl daemon-reload
-  say "Removed the service and $bin."
+  say "Removed the service, $bin, hub-send and the helper tools."
   say "Kept $data_dir (the hub's identity and data), $conf_dir and $backups."
   say "Delete them yourself only if you'll never use this hub again: every display and PC trusts its key."
   exit 0
 fi
 [ $# -eq 0 ] || fail "unknown argument: $1"
 
-for f in hubd display-hub.service hubd.toml; do
+for f in hubd hub-send display-hub.service hubd.toml display-hub-helper@.service \
+  display-hub-helper@.timer display-hub-helper helpers/pi-status; do
   [ -f "$here/$f" ] || fail "$f is missing from $here"
 done
-new_version=$("$here/hubd" --version) || fail "$here/hubd doesn't run on this machine (is it the aarch64 build?)"
+# The binaries are staged beside where they go and tried there first, so a copy that lost its
+# execute bits on the way (from Windows, or a CI download) still works, and a wrong build is
+# refused before anything changes.
+trap 'rm -f "$bin.new" "$send_bin.new"' EXIT
+install -m 0755 "$here/hubd" "$bin.new"
+install -m 0755 "$here/hub-send" "$send_bin.new"
+for b in "$bin" "$send_bin"; do
+  "$b.new" --version >/dev/null 2>&1 || fail "$here/${b##*/} doesn't run on this machine (is it the aarch64 build?)"
+done
+new_version=$("$bin.new" --version)
 
 # The service user: no login, no home of its own beyond the data folder.
 if ! id "$user" >/dev/null 2>&1; then
@@ -56,7 +84,6 @@ if [ -f "$data_dir/hub.db" ] && [ -x "$bin" ]; then
   say "Backed up the current hub to $backups/before-upgrade-$stamp."
 fi
 
-install -m 0755 "$here/hubd" "$bin.new"
 mv -f "$bin.new" "$bin"
 install -d -m 0755 "$conf_dir"
 if [ ! -f "$conf_dir/hubd.toml" ]; then
@@ -66,6 +93,15 @@ else
   say "Kept your $conf_dir/hubd.toml."
 fi
 install -m 0644 "$here/display-hub.service" "$unit"
+
+# Helpers: hub-send, the helper units and the command that sets helpers up, and the example. Helpers
+# already set up keep running, with the new units from the next run.
+mv -f "$send_bin.new" "$send_bin"
+put 0755 "$here/display-hub-helper" "$helper_cmd"
+put 0644 "$here/display-hub-helper@.service" "${helper_units[0]}"
+put 0644 "$here/display-hub-helper@.timer" "${helper_units[1]}"
+install -d -m 0755 -o root -g root "$helper_programs" "$examples"
+put 0755 "$here/helpers/pi-status" "$examples/pi-status"
 
 systemctl daemon-reload
 systemctl enable display-hub >/dev/null 2>&1
@@ -86,3 +122,4 @@ as_hub "$bin" check || say "(Problems above are worth a look. An unsynchronised 
 say ""
 say "Next, pair the desktop manager:"
 say "  sudo -u $user hubd pair-admin"
+say "To send your own data to the hub from this Pi, see: sudo display-hub-helper help"

@@ -2,7 +2,7 @@
 
 `hubd` runs on a Raspberry Pi 5 (a Pi 4 works too) as a systemd service, around the clock. Displays and the desktop manager reach it over HTTPS on port 8443 on your local network.
 
-**What has been tested:** the installer, the service, restarts, a crash, a network cut, a reboot, a bad setting, backup and restore, an upgrade and an uninstall. They ran in a Debian Bookworm container with systemd (`tools/pi-container-test/run.sh`, also in CI). The ARM64 binary was also run under emulation against Bookworm's and Trixie's own C libraries. **Nobody has run it on a real Pi yet.** The steps below are written for that, and the last section lists what to watch for.
+**What has been tested:** the installer, the service, restarts, a crash, a network cut, a reboot, a bad setting, backup and restore, helpers in their sandboxes, an upgrade and an uninstall. They ran in Debian Bookworm and Trixie containers with systemd (`tools/pi-container-test/run.sh`, also in CI). The ARM64 binaries were also run under emulation against Bookworm's and Trixie's own C libraries. **Nobody has run it on a real Pi yet.** The steps below are written for that, and the last section lists what to watch for.
 
 ## What you need
 
@@ -12,18 +12,19 @@
 
 ## 1. Get the files
 
-You need a folder holding the ARM64 `hubd` and the four files from `deploy/raspberry-pi/`: `install.sh`, `display-hub.service`, `hubd.toml` and `nftables-display-hub.conf`.
+You need a folder holding the two ARM64 programs, `hubd` (the hub) and `hub-send` (for helpers), and everything in `deploy/raspberry-pi/`: `install.sh`, `display-hub.service`, `hubd.toml`, `nftables-display-hub.conf`, the helper tools `display-hub-helper`, `display-hub-helper@.service` and `display-hub-helper@.timer`, and the `helpers` folder.
 
-- **Ready-made:** if `dist\display-hub-pi\` exists in your checkout, that's the folder. Alternatively, CI builds `hubd` for every push: the `hubd-raspberry-pi-arm64` artefact on the run's page on GitHub. Copy the four files next to it.
+- **Ready-made:** if `dist\display-hub-pi\` exists in your checkout, that's the folder. Alternatively, CI makes the whole folder for every push: the `display-hub-raspberry-pi-arm64` artefact on the run's page on GitHub. Unzip it; it doesn't matter that the download loses the programs' "executable" marks, because the installer sets them.
 - **Or build it** on Linux, with [zig](https://ziglang.org) and `cargo install cargo-zigbuild`:
 
   ```sh
-  cargo zigbuild --release --locked -p hubd --target aarch64-unknown-linux-gnu.2.36
+  cargo zigbuild --release --locked -p hubd -p hub-send --target aarch64-unknown-linux-gnu.2.36
   mkdir display-hub-pi
-  cp target/aarch64-unknown-linux-gnu/release/hubd deploy/raspberry-pi/* display-hub-pi/
+  cp -r deploy/raspberry-pi/. display-hub-pi/
+  cp target/aarch64-unknown-linux-gnu/release/hubd target/aarch64-unknown-linux-gnu/release/hub-send display-hub-pi/
   ```
 
-  The `.2.36` suffix builds against the C library of Raspberry Pi OS Bookworm, so one binary runs on Bookworm and Trixie. A binary built on the Pi itself, or by a newer distribution, may not run on Bookworm.
+  The `.2.36` suffix builds against the C library of Raspberry Pi OS Bookworm, so one build runs on Bookworm and Trixie. A program built on the Pi itself, or by a newer distribution, may not run on Bookworm.
 
 ## 2. Connect over SSH, and check the Pi's key
 
@@ -56,8 +57,9 @@ The installer does the following:
 1. Creates a `display-hub` system user with no login.
 2. Installs `/usr/local/bin/hubd`, plus `/etc/display-hub/hubd.toml` if you don't have one.
 3. Installs the hardened `display-hub.service` (systemd rates its exposure 1.0, "OK"), then enables and starts it.
-4. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
-5. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
+4. Installs what helpers need: `hub-send`, the `display-hub-helper` command and the example helper. It turns no helper on (see [Helpers on the Pi](#helpers-on-the-pi)).
+5. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
+6. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
 
 ## 4. Pair the desktop manager
 
@@ -84,6 +86,63 @@ Some PCs can't look up `.local` names, especially Windows with a VPN connected, 
   This rule is lost on reboot unless you include it from `/etc/nftables.conf` and run `sudo systemctl enable nftables`.
 - **No port forwarding.** The hub is for your local network only. Never forward 8443 on your router.
 
+## Helpers on the Pi
+
+A **helper** is a small program that fetches something, such as the weather or flights overhead, and sends it to a page on the hub ([helpers.md](helpers.md)). The Pi can run helpers too, next to the hub. The `display-hub-helper` command sets each one up to run every few minutes, kept well apart from the hub:
+
+- Each helper runs as its own throwaway user, made up by systemd for each run, with its own private folder.
+- It can reach the internet and the hub, but it can't see the hub's key, data, settings or backups, another helper's folder, your home folder, or the hub's process. It can't change its own program, or anything else on the Pi.
+- Its pass to the hub only lets it send to its own feeds. If a helper goes wrong, the worst it can do is put wrong figures on its own pages.
+
+### Try the example
+
+The example helper sends the Pi's CPU temperature as a "big number" page. On the Pi:
+
+```sh
+sudo display-hub-helper add pi-status --run /usr/local/share/display-hub/helpers/pi-status
+```
+
+It pairs the helper with the hub, runs it once and shows what happened. From then on it runs every 5 minutes, and after every restart.
+
+The hub shows what a helper sends on pages of the same kind whose figures come from a helper ("PC helper" in the manager) and whose feed is the helper's, here `pi-status`. "Updated 1 page: pi-status" means such a page exists and now has the temperature.
+
+**The desktop manager can't make such a page yet:** it adds usage pages only. Until it can, the helper still runs and the hub accepts what it sends, but it says that no page uses the feed. (For developers: `POST /v1/admin/pages` with `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}` makes one; `tools/pi-container-test/run.sh` does this.)
+
+### Your own helper
+
+A helper can be any program that runs on its own, without anyone typing at it: a shell script or a Python script, for instance. It sends a page with `hub-send`, for example:
+
+```sh
+echo '{"value": 21.5, "unit": "°C"}' | hub-send page garden-weather --kind big_number --data -
+```
+
+The example in `/usr/local/share/display-hub/helpers/pi-status` is a good start. Copy it, change it, then set it up:
+
+```sh
+sudo display-hub-helper add garden-weather --run /home/<user>/garden-weather --every 15min
+```
+
+- **The name** (here `garden-weather`) is lower case, with letters, digits and single hyphens, 20 characters at most. It is also the feed the helper sends to. To send to other feeds, add `--feed <feed>` for each.
+- **`--every`** is how often it runs: 5 minutes unless you say, between once a minute and once a day (`1min`, `15min`, `2h`, `1d`).
+- **The program is copied**, so changing your file later changes nothing until you run `sudo display-hub-helper update garden-weather --run /home/<user>/garden-weather`. It keeps its pairing.
+- **What it gets:** `DISPLAY_HUB_HELPER` (its name), `DISPLAY_HUB_FEEDS` (its feeds, separated by spaces) and its own folder, `HUB_SEND_DIR`, where it may keep files between runs.
+- **Limits:** each run has 2 minutes, 128 MB of memory and half of one processor. It can't read `/home`, and most of `/proc` is hidden (for example `/proc/loadavg`). It may reach other devices on your network as well as the internet.
+- **A program that needs a password or key of its own**, such as a weather service's API key, isn't covered by `display-hub-helper` yet.
+- **Tighter still:** a helper that is a shell or plain Python script can also be stopped from making code at run time. Run `sudo systemctl edit display-hub-helper@garden-weather.service`, add the two lines `[Service]` and `MemoryDenyWriteExecute=yes`, save, then `sudo display-hub-helper run-now garden-weather` to check it still works. It's off by default because it breaks Node.js, Java and some Python packages.
+
+### Looking after helpers
+
+| To | Run on the Pi |
+|---|---|
+| See every helper and how its last run went | `sudo display-hub-helper list` |
+| Run one now and see what it said | `sudo display-hub-helper run-now pi-status` |
+| Read its log | `sudo display-hub-helper logs pi-status` (add `--follow` to keep watching; Ctrl+C stops) |
+| Replace its program | `sudo display-hub-helper update pi-status --run <program>` |
+| Remove it | `sudo display-hub-helper remove pi-status` |
+| See every helper the hub knows, including PCs | `sudo -u display-hub hubd helper list` |
+
+`remove` stops the helper, cuts it off at the hub (its token stops working at once) and deletes its program, folder and token. Its pages keep their last figures until they go stale. To pause a helper instead: `sudo systemctl disable --now display-hub-helper@pi-status.timer`, and `enable --now` to carry on.
+
 ## Day to day
 
 | To | Run on the Pi |
@@ -93,6 +152,7 @@ Some PCs can't look up `.local` names, especially Windows with a VPN connected, 
 | Check the setup | `sudo -u display-hub hubd check` |
 | See the key fingerprint, to compare with the manager's Settings | `sudo -u display-hub hubd fingerprint` |
 | List or cut off paired PCs | `sudo -u display-hub hubd admin list`, then `sudo -u display-hub hubd admin revoke <id>` |
+| Check on helpers | `sudo display-hub-helper list` (see [Helpers on the Pi](#helpers-on-the-pi)) |
 | Restart | `sudo systemctl restart display-hub` |
 
 ## Backups
@@ -138,14 +198,16 @@ The installer also backs up automatically before every upgrade, into `/var/backu
    sudo systemctl start display-hub
    ```
 
-`--replace` moves the empty hub aside into `/var/lib/display-hub/replaced-<time>/` rather than deleting it. Displays and the manager carry on as before, because the key is the same. If the Pi's address changed, they find it through the other addresses they know, or you can pair the manager again.
+`--replace` moves the empty hub aside into `/var/lib/display-hub/replaced-<time>/` rather than deleting it.
+
+Helpers on the Pi aren't in the backup. On a new SD card or Pi, set them up again with `display-hub-helper add`. The old ones are still listed by `sudo -u display-hub hubd helper list`; cut them off with `sudo -u display-hub hubd helper revoke <id>`. Displays and the manager carry on as before, because the key is the same. If the Pi's address changed, they find it through the other addresses they know, or you can pair the manager again.
 
 ## Upgrading
 
 Copy the new folder over, then run `sudo bash install.sh` in it again. It does the following:
 
 1. Backs up the hub.
-2. Replaces the binary and the unit.
+2. Replaces the programs and the units. Helpers you've set up keep running, and use the new versions from their next run.
 3. Keeps your `hubd.toml`.
 4. Restarts the service.
 
@@ -155,7 +217,9 @@ To go back to the old version after an upgrade, reinstall the old release, then 
 
 ## Removing
 
-`sudo bash install.sh --uninstall` stops and removes the service and binary. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.
+`sudo bash install.sh --uninstall` stops and removes the service, the programs and the helper tools. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.
+
+It refuses while helpers are set up: remove each one first with `sudo display-hub-helper remove <name>`, which also cuts it off at the hub.
 
 ## On a real Pi: what to watch
 
@@ -163,6 +227,7 @@ These couldn't be tested without one. They're also in `USER_INSTRUCTIONS.md`.
 
 - `install.sh` finishes with "Display Hub is running", and `hubd check` shows no problems except perhaps the clock in the first minute.
 - `systemd-analyze security display-hub` reports about 1.0 ("OK").
+- The example helper (see [Try the example](#try-the-example)): `sudo display-hub-helper run-now pi-status` succeeds, and `sudo cat /sys/class/thermal/thermal_zone0/temp` shows a number (the temperature in thousandths of a degree), so its page shows a real temperature rather than "No temperature sensor". `systemd-analyze security display-hub-helper@pi-status` reports about 1.1 ("OK").
 - `hubd check` says the clock is synchronised once the Pi is online. The service can't make the system call it prefers for this, so it relies on systemd-timesyncd, which Raspberry Pi OS uses by default. If you've swapped in chrony or ntpd, the manager shows the clock as "Unknown". That's harmless.
 - After `sudo reboot`, the service is back within a minute, and the manager reconnects.
 - Pull the power while it runs, then power it back on. It starts again with its data intact. SQLite runs with full synchronous writes and the identity is written atomically, but only a real power cut proves it.

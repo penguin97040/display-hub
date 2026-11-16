@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+# display-hub-helper: sets up, lists, runs and removes Display Hub helpers on this Pi. Each helper
+# runs on a timer as its own throwaway user, in a sandbox that can't reach the hub's data (see
+# display-hub-helper@.service). Installed by install.sh as /usr/local/sbin/display-hub-helper.
+#
+#   sudo display-hub-helper help
+#
+# See "Helpers on the Pi" in docs/deploy-raspberry-pi.md.
+set -euo pipefail
+
+me=display-hub-helper
+hub_user=display-hub
+hubd=/usr/local/bin/hubd
+hub_send=/usr/local/bin/hub-send
+programs=/usr/local/lib/display-hub/helpers
+units=/etc/systemd/system
+template=$units/display-hub-helper@.service
+default_every=5min
+# Helper names become part of a user name (dh-helper-<name>), which can be 31 characters at most.
+max_name=20
+
+say() { printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$me" "$*" >&2; }
+fail() { warn "$*"; exit 1; }
+
+usage() {
+  cat <<EOF
+Sets up helpers on this Pi: small programs that fetch data and send pages to the hub.
+Each one runs on a timer as its own user, and can't reach the hub's keys or data.
+
+  sudo $me add <name> --run <program> [--feed <feed>]... [--every <interval>]
+      Set up a helper and start it. <name> is lower case, like pi-status (letters, digits and
+      single hyphens, $max_name characters at most). It is also the feed it sends to, unless you
+      give --feed (repeat for more feeds). --every is how often it runs, like 15min or 1h:
+      5min unless you say, once a minute at most and once a day at least.
+  sudo $me update <name> --run <program>
+                             Replace a helper's program with a new version, keeping its pairing.
+  sudo $me list              Show the helpers, how often they run and how their last run went.
+  sudo $me run-now <name>    Run a helper now and show what it said.
+  sudo $me logs <name> [--follow]
+                             Show a helper's recent log (--follow keeps watching; Ctrl+C stops).
+  sudo $me remove <name>     Stop a helper, cut it off at the hub and delete its files.
+
+Example, the helper that comes with Display Hub (it sends the Pi's CPU temperature):
+
+  sudo $me add pi-status --run /usr/local/share/display-hub/helpers/pi-status
+EOF
+}
+
+slug() { [[ $1 =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; }
+
+check_name() {
+  local name=${1:-}
+  [ -n "$name" ] || fail "give the helper's name, for example: sudo $me $2 pi-status"
+  if ! slug "$name" || [ "${#name}" -gt "$max_name" ]; then
+    fail "\"$name\" can't be a helper's name. Use lower-case letters, digits and single hyphens, like pi-status, $max_name characters at most."
+  fi
+}
+
+state_dir() { printf '/var/lib/private/display-hub-helper-%s' "$1"; }
+service() { printf 'display-hub-helper@%s.service' "$1"; }
+timer() { printf 'display-hub-helper@%s.timer' "$1"; }
+
+is_set_up() {
+  [ -e "$programs/$1" ] || [ -d "$(state_dir "$1")" ] ||
+    [ -d "$units/$(service "$1").d" ] || [ -d "$units/$(timer "$1").d" ]
+}
+
+need_set_up() {
+  is_set_up "$1" || fail "no helper called $1 is set up. See them with: sudo $me list"
+}
+
+# An interval like 90s, 10min, 2h or 1d, between a minute and a day, written the way systemd reads it.
+interval() {
+  local n unit secs
+  [[ $1 =~ ^([0-9]{1,6})(s|sec|m|min|h|hr|d)$ ]] ||
+    fail "\"$1\" isn't an interval this understands. Write it like 1min, 15min, 2h or 1d."
+  n=$((10#${BASH_REMATCH[1]}))
+  case ${BASH_REMATCH[2]} in
+    s | sec) unit=s secs=$n ;;
+    m | min) unit=min secs=$((n * 60)) ;;
+    h | hr) unit=h secs=$((n * 3600)) ;;
+    d) unit=d secs=$((n * 86400)) ;;
+  esac
+  [ "$secs" -ge 60 ] || fail "every $1 is too often for a helper: once a minute at most, please."
+  [ "$secs" -le 86400 ] || fail "every $1 is longer than a day. Choose 1d or less."
+  printf '%s%s' "$n" "$unit"
+}
+
+# The [Service] settings of the helper template that make its sandbox, for this helper: everything
+# except how it starts and what it runs. The login runs with exactly these.
+sandbox_properties() {
+  local props
+  props=$(sed -n '/^\[Service\]/,/^\[/p' "$template" | grep -E '^[A-Za-z]+=' |
+    grep -vE '^(Type|ExecStart|TimeoutStartSec)=' | sed "s/%i/$1/g")
+  if [[ $props =~ %[A-Za-z%] ]] || ! grep -qx 'DynamicUser=yes' <<<"$props"; then
+    fail "$template isn't as install.sh put it; run install.sh again"
+  fi
+  printf '%s\n' "$props"
+}
+
+# The id the hub gave the helper, from its folder. Empty if it never paired.
+helper_id() {
+  local f
+  f=$(state_dir "$1")/connection.json
+  [ -f "$f" ] || return 0
+  sed -n 's/^ *"helper_id": *"\([A-Za-z0-9_-]*\)".*/\1/p' "$f" | head -1
+}
+
+# Removes a helper's program, settings and folder. Used by remove, and by add when it fails.
+discard() {
+  local name=$1
+  rm -f "$programs/$name" "$programs/$name.new"
+  rm -rf "$units/$(service "$name").d" "$units/$(timer "$name").d"
+  systemctl daemon-reload
+  if [ -d "$(state_dir "$name")" ]; then
+    systemctl clean --what=state "$(service "$name")" 2>/dev/null || true
+    rm -rf "$(state_dir "$name")"
+  fi
+  rm -f "/var/lib/display-hub-helper-$name"
+  systemctl reset-failed "$(service "$name")" "$(timer "$name")" 2>/dev/null || true
+}
+
+# What the latest run of a helper printed.
+last_output() {
+  local id
+  id=$(systemctl show -p InvocationID --value "$(service "$1")")
+  [ -n "$id" ] || return 0
+  journalctl --no-pager -o cat "_SYSTEMD_INVOCATION_ID=$id" 2>/dev/null | sed 's/^/  /' | tail -n 15
+}
+
+# For add's clean-up if it fails part-way.
+adding=""
+added=0
+
+cmd_add() {
+  local name=${1:-} run="" every=$default_every
+  local -a feeds=() feed_args=() props=() run_props=()
+  check_name "$name" add
+  shift
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --run | --feed | --every) [ $# -ge 2 ] || fail "$1 needs a value (see: $me help)" ;;
+    esac
+    case $1 in
+      --run) run=$2; shift 2 ;;
+      --feed) feeds+=("$2"); shift 2 ;;
+      --every) every=$2; shift 2 ;;
+      *) fail "$1 isn't something add understands (see: $me help)" ;;
+    esac
+  done
+  [ -n "$run" ] || fail "say which program the helper runs, for example: sudo $me add $name --run /usr/local/share/display-hub/helpers/pi-status"
+  [ "${#feeds[@]}" -gt 0 ] || feeds=("$name")
+  local f
+  for f in "${feeds[@]}"; do
+    if ! slug "$f" || [ "${#f}" -gt 48 ]; then
+      fail "\"$f\" can't be a feed's name. Use lower-case letters, digits and single hyphens, like garden-weather."
+    fi
+    feed_args+=(--feed "$f")
+  done
+  every=$(interval "$every")
+  { [ -f "$run" ] && [ -r "$run" ]; } || fail "can't find the program $run. Give the whole path to a file."
+  for f in "$hubd" "$hub_send" "$template" "$units/display-hub-helper@.timer"; do
+    [ -e "$f" ] || fail "$f is missing. Install Display Hub first: sudo bash install.sh"
+  done
+  if is_set_up "$name"; then
+    fail "a helper called $name is already set up. To set it up again, remove it first: sudo $me remove $name"
+  fi
+  systemctl is-active --quiet display-hub ||
+    fail "the hub isn't running, so the helper can't pair with it. Start it with: sudo systemctl start display-hub"
+
+  # From here on, a failure undoes what was done.
+  adding=$name
+  trap '[ "$added" = 1 ] || { discard "$adding"; warn "nothing was set up for $adding."; }' EXIT
+
+  # The program, owned by root and read-only to the helper.
+  install -d -m 0755 -o root -g root "$programs"
+  install -m 0755 -o root -g root "$run" "$programs/$name.new"
+  mv -f "$programs/$name.new" "$programs/$name"
+  install -d -m 0755 "$units/$(service "$name").d" "$units/$(timer "$name").d"
+  printf '# Written by display-hub-helper add.\n[Service]\nEnvironment="DISPLAY_HUB_FEEDS=%s"\n' \
+    "${feeds[*]}" >"$units/$(service "$name").d/feeds.conf"
+  printf '# Written by display-hub-helper add.\n[Timer]\nOnUnitActiveSec=\nOnUnitActiveSec=%s\n' \
+    "$every" >"$units/$(timer "$name").d/every.conf"
+  systemctl daemon-reload
+
+  # A one-time invite for the helper's feeds, to the hub on this Pi (loopback, unless hubd.toml
+  # says to listen on one address). The helper still pins the hub's key from the invite.
+  local out invite
+  out=$(runuser -u "$hub_user" -- "$hubd" pair-helper --local --label "Pi helper $name" "${feed_args[@]}") ||
+    fail "the hub couldn't make an invite (its message is above)."
+  invite=$(printf '%s\n' "$out" | grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' | head -1) || true
+  unset out
+  [ -n "$invite" ] || fail "the hub's invite wasn't in the form this expects. Is hubd the same version as this command?"
+
+  # The login runs inside the helper's own sandbox, as its own user, so the token file is made by
+  # and belongs to that user. The invite goes in on standard input only: never in a command line,
+  # the environment, a file or the journal.
+  local sandbox
+  sandbox=$(sandbox_properties "$name")
+  mapfile -t props <<<"$sandbox"
+  for f in "${props[@]}"; do run_props+=(-p "$f"); done
+  if ! printf '%s\n' "$invite" | systemd-run --quiet --wait --pipe --collect \
+    --unit="display-hub-helper-login-$name" --description="Pair Display Hub helper $name" \
+    "${run_props[@]}" "$hub_send" login; then
+    unset invite
+    fail "the helper couldn't pair with the hub (the reason is above)."
+  fi
+  unset invite
+  added=1
+  trap - EXIT
+
+  say "Set up $name. On the hub it is helper $(helper_id "$name"), sending to: ${feeds[*]}."
+  # The timer first: it then counts the interval from this first run.
+  systemctl enable --now "$(timer "$name")" >/dev/null 2>&1
+  say "Running it once now..."
+  local first=0
+  systemctl start "$(service "$name")" || first=$?
+  last_output "$name"
+  say ""
+  if [ "$first" = 0 ]; then
+    say "It ran without errors. From now on it runs every $every, and after every restart."
+  else
+    say "It's set up and will run every $every, but this first run failed (its log is above)."
+    say "Fix the program, then try it with: sudo $me run-now $name"
+  fi
+  say "The hub shows what it sends on pages of that kind whose figures come from a helper"
+  say "(\"PC helper\" in the manager) and whose feed is ${feeds[0]}. Check on it with: sudo $me list"
+}
+
+cmd_list() {
+  local f name every feeds result when timer_state
+  local -a names=()
+  shopt -s nullglob
+  for f in "$programs"/*; do
+    name=${f##*/}
+    [ -f "$f" ] && slug "$name" && names+=("$name")
+  done
+  if [ "${#names[@]}" = 0 ]; then
+    say "No helpers are set up yet. Add one with: sudo $me add <name> --run <program>"
+    say "($me help explains, and has an example.)"
+    return 0
+  fi
+  printf '%-20s  %-7s  %-24s  %s\n' HELPER EVERY FEEDS "LAST RUN"
+  for name in "${names[@]}"; do
+    every=$(sed -n 's/^OnUnitActiveSec=\(..*\)$/\1/p' "$units/$(timer "$name").d/every.conf" 2>/dev/null | tail -1)
+    feeds=$(sed -n 's/^Environment="DISPLAY_HUB_FEEDS=\(.*\)"$/\1/p' "$units/$(service "$name").d/feeds.conf" 2>/dev/null)
+    result=$(systemctl show -p Result --value "$(service "$name")")
+    when=$(systemctl show -p ExecMainExitTimestamp --value "$(service "$name")")
+    timer_state=$(systemctl is-active "$(timer "$name")" 2>/dev/null || true)
+    if [ -z "$when" ]; then
+      result="not run since the Pi started"
+    elif [ "$result" = success ]; then
+      result="worked, $when"
+    else
+      result="FAILED ($result), $when: see sudo $me logs $name"
+    fi
+    [ "$timer_state" = active ] || result="TURNED OFF (timer $timer_state). $result"
+    printf '%-20s  %-7s  %-24s  %s\n' "$name" "${every:-$default_every}" "${feeds:-$name}" "$result"
+  done
+}
+
+cmd_update() {
+  local name=${1:-} run=""
+  check_name "$name" update
+  shift
+  case ${1:-} in
+    --run) [ $# -ge 2 ] || fail "--run needs a value (see: $me help)"; run=$2 ;;
+    *) fail "say which program the helper now runs: sudo $me update $name --run <program>" ;;
+  esac
+  [ $# -le 2 ] || fail "$3 isn't something update understands (see: $me help)"
+  { [ -f "$run" ] && [ -r "$run" ]; } || fail "can't find the program $run. Give the whole path to a file."
+  [ -f "$programs/$name" ] || fail "no helper called $name is set up. Set it up with: sudo $me add $name --run $run"
+  install -m 0755 -o root -g root "$run" "$programs/$name.new"
+  mv -f "$programs/$name.new" "$programs/$name"
+  say "Updated $name. Its next run uses the new program; to try it now: sudo $me run-now $name"
+}
+
+cmd_run_now() {
+  check_name "${1:-}" run-now
+  need_set_up "$1"
+  say "Running $1..."
+  if systemctl start "$(service "$1")"; then
+    last_output "$1"
+    say "Done."
+  else
+    last_output "$1"
+    fail "$1 failed. Its log is above; more with: sudo $me logs $1"
+  fi
+}
+
+cmd_logs() {
+  check_name "${1:-}" logs
+  local name=$1 follow=()
+  shift
+  case ${1:-} in
+    "") ;;
+    --follow | -f) follow=(--follow) ;;
+    *) fail "$1 isn't something logs understands (see: $me help)" ;;
+  esac
+  journalctl --no-pager -n 50 -u "$(service "$name")" "${follow[@]}"
+}
+
+cmd_remove() {
+  check_name "${1:-}" remove
+  local name=$1 id status=0
+  need_set_up "$name"
+  systemctl disable --now "$(timer "$name")" >/dev/null 2>&1 || true
+  systemctl stop "$(service "$name")" 2>/dev/null || true
+  id=$(helper_id "$name")
+  if [ -z "$id" ]; then
+    say "$name never paired with the hub, so there was nothing to cut off there."
+  elif [ ! -x "$hubd" ]; then
+    warn "hubd isn't installed, so $name (helper $id) wasn't cut off at the hub."
+    status=1
+  elif runuser -u "$hub_user" -- "$hubd" helper revoke "$id" >/dev/null; then
+    say "Cut $name off at the hub (helper $id): its token no longer works."
+  else
+    warn "the hub didn't revoke $name (the reason is above). Once it's fixed, run: sudo -u $hub_user hubd helper revoke $id"
+    status=1
+  fi
+  discard "$name"
+  say "Removed $name: its timer, program, folder and token are gone."
+  [ "$status" = 0 ] && say "Pages fed by it keep their last figures until they go stale."
+  return "$status"
+}
+
+main() {
+  local cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case $cmd in
+    help | -h | --help) usage; return 0 ;;
+  esac
+  [ "$(id -u)" = 0 ] || fail "run it with sudo: sudo $me $cmd $*"
+  command -v systemd-run >/dev/null || fail "this needs systemd"
+  cd /
+  case $cmd in
+    add) cmd_add "$@" ;;
+    list) cmd_list ;;
+    update) cmd_update "$@" ;;
+    run-now) cmd_run_now "$@" ;;
+    logs) cmd_logs "$@" ;;
+    remove) cmd_remove "$@" ;;
+    *) warn "\"$cmd\" isn't a command."; usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"

@@ -71,6 +71,24 @@
 - **Backups contain the private key.** `hubd backup` writes them 0700/0600 and says so. Keep copies off the Pi somewhere private.
 - `hubd restore` refuses while the hub runs, and moves whatever it replaces aside instead of deleting it.
 - `hubd display-bundle` writes a setup file, owner-only, for adding a display from the Pi itself. It works once, within 10 minutes.
+- **Helpers on the Pi** run apart from the hub (next section).
+
+## Helpers on the Pi
+
+A helper fetches data from the internet, so it is the part most likely to meet something hostile, and it may be someone else's code. The hub never touches the internet and holds the key every display and PC trusts, so a helper on the same Pi must never be able to reach it. `display-hub-helper` (installed by `install.sh`) runs each helper through `display-hub-helper@.service` and its timer:
+
+- **Its own user, made up for it.** systemd's `DynamicUser=` gives each helper its own throwaway user (`dh-helper-<name>`), never the hub's and never another helper's. Its only writable place is its own folder, `/var/lib/private/display-hub-helper-<name>` (0700), which holds the hub's address and key hash and the token (0600). systemd shows each helper only its own folder.
+- **The hub out of sight.** `/var/lib/display-hub`, `/etc/display-hub` and `/var/backups/display-hub` are made inaccessible, on top of their own permissions. The hub's process is hidden (`ProtectProc=invisible`), and so is most of `/proc`.
+- **No way up.** No capabilities, no new privileges, no set-user-ID programs, a system-call filter, a read-only system (`ProtectSystem=strict`), no `/home`, private `/tmp`, devices and IPC, its own user namespace, and no changes to the kernel, clock, host name or control groups. Its program is a root-owned copy it can't change. Limits: 2 minutes a run, 128 MB, half a processor, 32 tasks.
+- **Network:** IPv4, IPv6 and local sockets (for name lookups) only. It may reach the internet, which is its job, and the hub, on loopback when the hub listens on every address (the default; `hubd pair-helper --local` picks the address). It still pins the hub's key, so the address only says where to look.
+- **`MemoryDenyWriteExecute=` is off by default**, because it breaks programs that compile code as they run (Node.js, Java, PyPy, LuaJIT) and some Python packages. A shell or plain Python helper can have it with a drop-in ([deploy-raspberry-pi.md](deploy-raspberry-pi.md#your-own-helper)).
+- **The invite never rests anywhere.** `display-hub-helper add` makes it with `hubd pair-helper` and passes it on standard input to `hub-send login`, which runs inside the helper's own sandbox (`systemd-run --pipe`, with every sandbox setting of the helper's unit), so the token is created by and belongs to the helper's user. The invite is never in a command line, an environment variable, a file or the journal. The container test checks the journal and the helper's folder for it.
+- **`systemd-analyze security`** rates the helper's unit 1.1 ("OK"), against 1.0 for the hub. The difference is the internet access a helper needs.
+- **Cutting one off:** `display-hub-helper remove <name>` stops it, revokes it on the hub with `hubd helper revoke`, and deletes its program, folder and token.
+
+The container test (`tools/pi-container-test/run.sh`) runs a probe helper that tries each of these: it can't read the hub's key, data, settings or backups, another helper's token, change its own program or `hub-send`, write outside its folder, see the hub's process, or send to another helper's feed.
+
+What it doesn't stop: a helper can reach other devices on your network, as any program on the Pi can, and whatever it sends to its own feeds is shown. Someone with root on the Pi can do anything, as before.
 
 ## The desktop manager
 
@@ -87,7 +105,7 @@
 - **What it holds:** a helper token (`dhc_`), in the OS credential store by default. `connection.json` has only the hub's address and key hash. The helper string is read from stdin, never the command line, so it stays out of shell history and process lists.
 - **The file store:** a headless Linux service with no keyring (a Raspberry Pi helper under systemd) can ask `hub-send` for `--store file` (or `HUB_SEND_STORE=file`) instead. The token is then the file `token` in the helper's folder, created owner-only (0600) in an owner-only folder (0700), by writing a new file and renaming it into place. `hub-send` refuses to use it if it is a link, belongs to another user, or can be read by its group or anyone else. It is Unix only, and never chosen unless asked for.
 - **What its token can do:** send page content to the feeds it was invited for (for the PC helper, Claude Max's, ChatGPT Plus's or both), and only to pages of those feeds whose figures come from "PC helper" and whose kind matches. The hub refuses other feeds (403), content dated more than five minutes ahead, and content that breaks the page rules, such as shares outside 0–100 or a page over 3072 bytes. It can't read anything, change pages, or act as an admin or a display. `usage-helper` also checks the figures against the service's windows before sending them.
-- **Cutting it off:** **Settings**, **PC helper**, **Remove** in the manager. Its token stops working at once. `logout` (`usage-helper logout` or `hub-send logout`) deletes it from that computer.
+- **Cutting it off:** **Settings**, **PC helper**, **Remove** in the manager, or `hubd helper revoke <id>` on the Pi (`hubd helper list` shows the ids). Its token stops working at once. `logout` (`usage-helper logout` or `hub-send logout`) deletes it from that computer.
 - **Invites** work once, within 10 minutes. A reused invite is recorded as an `ALARM_` audit event, as pairing codes are.
 
 ## Credentials
@@ -122,6 +140,7 @@
 | The Pi's address changed | Nothing. Displays try every address in their bundle, and the key, not the address, identifies the hub. A fixed DHCP lease is still recommended. |
 | The SD card failed or the Pi was replaced | Install, then `hubd restore` the latest backup, which includes the identity ([deploy-raspberry-pi.md](deploy-raspberry-pi.md#backups)). Without the identity, every display and admin must be set up again. |
 | The key must change (suspected compromise) | Not automated in v0. Stop the hub, move `identity/` and the database aside, start fresh, then pair the manager and re-provision every display. Bundles already have room for two trust anchors, so a later version can roll keys over without re-provisioning. |
+| A helper on the Pi misbehaves | `sudo display-hub-helper remove <name>`: it stops, its token is revoked and its files are deleted. |
 | A pairing or enrolment code appears in the audit log as `ALARM_` | Someone tried a code that had already been used. Check `hubd admin list` and the manager's list of displays, and revoke anything you don't recognise. |
 
 ## Limitations (stated plainly)

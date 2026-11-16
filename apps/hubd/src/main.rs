@@ -69,13 +69,17 @@ enum Command {
         #[arg(long, default_value = "Desktop manager")]
         label: String,
     },
-    /// Print a one-time string for `usage-helper login` on a PC (valid 10 minutes), without the manager.
+    /// Print a one-time helper string for `hub-send login` or `usage-helper login` (valid 10 minutes),
+    /// without the manager.
     PairHelper {
         #[command(flatten)]
         settings: Settings,
         /// Host name or address the helper should use, if not this machine's `.local` name.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "local")]
         host: Option<String>,
+        /// For a helper on this machine: use the address the hub listens on, loopback by default.
+        #[arg(long)]
+        local: bool,
         /// A feed the helper may send to, such as garden-weather. Repeat for more than one.
         #[arg(long = "feed", required = true)]
         feeds: Vec<String>,
@@ -87,6 +91,13 @@ enum Command {
     Admin {
         #[command(subcommand)]
         action: AdminAction,
+        #[command(flatten)]
+        settings: Settings,
+    },
+    /// List or revoke helpers.
+    Helper {
+        #[command(subcommand)]
+        action: HelperAction,
         #[command(flatten)]
         settings: Settings,
     },
@@ -159,6 +170,14 @@ enum AdminAction {
     Revoke { id: String },
     /// Revoke every admin. Pair again afterwards with `pair-admin`.
     RevokeAll,
+}
+
+#[derive(Subcommand)]
+enum HelperAction {
+    /// List every helper that has paired, its feeds, and whether it is still allowed.
+    List,
+    /// Revoke one helper, by the id `list` shows. Its token stops working at once.
+    Revoke { id: String },
 }
 
 fn init_logging() {
@@ -234,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
         Command::PairHelper {
             settings,
             host,
+            local,
             feeds,
             label,
         } => {
@@ -242,7 +262,11 @@ async fn main() -> anyhow::Result<()> {
             }
             let config = settings.load()?;
             let port = config.listen.port();
-            let host = host.unwrap_or_else(|| config.hosts().remove(0));
+            let host = match host {
+                Some(h) => h,
+                None if local => config.local_host(),
+                None => config.hosts().remove(0),
+            };
             let hub = hubd::open_hub(config, clock)?;
             let invite = hub.new_helper_invite(&label, &feeds, "command line")?;
             let mut secret = [0u8; 16];
@@ -256,10 +280,10 @@ async fn main() -> anyhow::Result<()> {
                 secret,
             };
             println!(
-                "Helper string for `usage-helper login` on your PC. It works once, within 10 minutes:\n"
+                "Helper string for `hub-send login` (or `usage-helper login` on a PC). It works once, within 10 minutes:\n"
             );
             println!("  {}\n", pairing.encode());
-            println!("Paste it when `usage-helper login` asks. Don't share it or save it anywhere.");
+            println!("Paste it when the login asks. Don't share it or save it anywhere.");
         }
         Command::Admin { action, settings } => {
             let hub = hubd::open_hub(settings.load()?, clock.clone())?;
@@ -293,6 +317,34 @@ async fn main() -> anyhow::Result<()> {
                     hub.store
                         .audit(clock.now(), "admin_revoked_all", &format!("{n} (command line)"))?;
                     println!("Revoked {n} admin(s). Run `hubd pair-admin` to pair the manager again.");
+                }
+            }
+        }
+        Command::Helper { action, settings } => {
+            let hub = hubd::open_hub(settings.load()?, clock.clone())?;
+            match action {
+                HelperAction::List => {
+                    let helpers = hub.store.helpers()?;
+                    if helpers.is_empty() {
+                        println!("No helpers have paired yet. Run `hubd pair-helper`.");
+                    }
+                    for (id, label, created_at, revoked) in helpers {
+                        let feeds = hub.store.helper_feeds(&id)?;
+                        println!(
+                            "{id}  {}  paired {created_at}  {label}  feeds: {}",
+                            if revoked { "REVOKED" } else { "active " },
+                            feeds.join(", ")
+                        );
+                    }
+                }
+                HelperAction::Revoke { id } => {
+                    let n = hub.store.revoke(Role::Helper, &id, clock.now())?;
+                    if n == 0 {
+                        anyhow::bail!("no active helper with id {id}; see `hubd helper list`");
+                    }
+                    hub.store
+                        .audit(clock.now(), "helper_revoked", &format!("{id} (command line)"))?;
+                    println!("Revoked {id}. Its token no longer works.");
                 }
             }
         }

@@ -93,6 +93,23 @@ impl Config {
         self.data_dir.join("identity")
     }
 
+    /// The address a helper on this machine should use to reach the hub: loopback when the hub
+    /// listens on every interface, otherwise the one address it listens on. The helper still pins
+    /// the hub's key, so the address only says where to look.
+    pub fn local_host(&self) -> String {
+        let ip = self.listen.ip();
+        if !ip.is_unspecified() {
+            return ip.to_string();
+        }
+        // On `[::]` Linux also accepts IPv4 (as mapped addresses, which the hub allows), whereas
+        // `::1` is refused unless IPv6 sources are allowed.
+        if ip.is_ipv6() && self.allow_ipv6 {
+            "::1".into()
+        } else {
+            "127.0.0.1".into()
+        }
+    }
+
     /// Where displays and the manager should look for the hub.
     pub fn hosts(&self) -> Vec<String> {
         if !self.advertise_hosts.is_empty() {
@@ -155,6 +172,24 @@ mod tests {
         assert_eq!(pairing_hint(Some("192.168.1.20"), &hosts), None);
         assert_eq!(pairing_hint(None, &["raspberrypi.local".to_string()]), None);
         assert_eq!(pairing_hint(None, &["192.168.1.20".to_string()]), None);
+    }
+
+    #[test]
+    fn local_host_is_loopback_unless_the_hub_listens_on_one_address() {
+        let with = |listen: &str, allow_ipv6: bool| {
+            Config {
+                listen: listen.parse().unwrap(),
+                allow_ipv6,
+                ..Config::default()
+            }
+            .local_host()
+        };
+        assert_eq!(Config::default().local_host(), "127.0.0.1");
+        assert_eq!(with("[::]:8443", false), "127.0.0.1");
+        assert_eq!(with("[::]:8443", true), "::1");
+        assert_eq!(with("127.0.0.1:9443", false), "127.0.0.1");
+        assert_eq!(with("192.168.1.20:8443", false), "192.168.1.20");
+        assert_eq!(with("[fd12::5]:8443", true), "fd12::5");
     }
 
     #[test]

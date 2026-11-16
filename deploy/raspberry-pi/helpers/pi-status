@@ -1,0 +1,36 @@
+#!/bin/sh
+# Display Hub example helper: sends the Pi's CPU temperature as a big number page.
+#
+#   sudo display-hub-helper add pi-status --run /usr/local/share/display-hub/helpers/pi-status
+#
+# The hub shows it on big number pages whose figures come from a helper with the feed pi-status. It
+# runs as its own user in a sandbox (display-hub-helper@.service), so it can read /sys but nothing
+# of the hub's. A copy of this is a good start for a helper of your own.
+set -eu
+
+# The first feed this helper was invited for (set by display-hub-helper add).
+feed=${DISPLAY_HUB_FEEDS:-${DISPLAY_HUB_HELPER:-pi-status}}
+feed=${feed%% *}
+
+# The kernel gives the temperature in thousandths of a degree. Without a sensor (or in a container),
+# the page shows a dash, never a made-up number.
+value=null
+caption="No temperature sensor"
+zone=/sys/class/thermal/thermal_zone0/temp
+milli=$(cat "$zone" 2>/dev/null || true)
+case $milli in
+  '' | - | *[!0-9-]* | ?*-* | ????????*) ;;
+  *)
+    sign=
+    if [ "$milli" -lt 0 ]; then
+      sign=-
+      milli=$((-milli))
+    fi
+    tenths=$(((milli + 50) / 100))
+    value="$sign$((tenths / 10)).$((tenths % 10))"
+    caption="CPU temperature"
+    ;;
+esac
+
+printf '{"value": %s, "decimals": 1, "unit": "°C", "caption": "%s"}\n' "$value" "$caption" |
+  hub-send page "$feed" --kind big_number --data -

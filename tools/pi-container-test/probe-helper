@@ -1,0 +1,42 @@
+#!/bin/sh
+# A test helper for run.sh: from inside a helper's sandbox, tries to reach what a helper must never
+# reach, and writes one line per attempt to probe.txt in its own folder ("blocked ..." or
+# "OPEN ..."). It also counts its runs, so the test can see the timer working. Never install it on
+# a real hub.
+set -u
+out=$HUB_SEND_DIR/probe.txt
+: >"$out.new"
+note() { printf '%s %s\n' "$1" "$2" >>"$out.new"; }
+try() {
+  what=$1
+  shift
+  if "$@" >/dev/null 2>&1; then note OPEN "$what"; else note blocked "$what"; fi
+}
+
+try "read the hub's key" cat /var/lib/display-hub/identity/hub-key.pem
+try "list the hub's data folder" ls /var/lib/display-hub
+try "read the hub's database" cat /var/lib/display-hub/hub.db
+try "list the hub's settings" ls /etc/display-hub
+try "list the hub's backups" ls /var/backups/display-hub
+try "read another helper's token" cat /var/lib/display-hub-helper-pi-status/token
+try "read another helper's folder" ls /var/lib/private/display-hub-helper-pi-status
+try "change its own program" sh -c 'echo x >>/usr/local/lib/display-hub/helpers/probe'
+try "change hub-send" sh -c 'echo x >>/usr/local/bin/hub-send'
+try "write outside its folder" touch /var/lib/probe-was-here
+sees_hubd() {
+  for c in /proc/[0-9]*/comm; do
+    [ "$(cat "$c" 2>/dev/null)" = hubd ] && return 0
+  done
+  return 1
+}
+try "see the hub's process" sees_hubd
+try "send to another helper's feed" sh -c 'echo "{\"value\": 1}" | hub-send page pi-status --kind big_number --data -'
+try "send to its own feed" sh -c 'echo "{\"text\": \"probe\"}" | hub-send page probe --kind text --data -'
+
+# The token must be readable to this helper (hub-send just used it), and owner-only.
+note mode "$(stat -c '%a %u' "$HUB_SEND_DIR/token")"
+note uid "$(id -u)"
+mv -f "$out.new" "$out"
+runs=$(cat "$HUB_SEND_DIR/runs" 2>/dev/null || echo 0)
+echo $((runs + 1)) >"$HUB_SEND_DIR/runs"
+echo "probe ran"

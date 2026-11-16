@@ -26,7 +26,7 @@ This is under active development. See [docs/architecture.md](docs/architecture.m
 | `hubd serve`: HTTPS with a pinned identity, SQLite, admin pairing, display enrolment and revocation | Working, tested on Linux (including an mbedTLS client). Not yet on a Pi. |
 | `hub-send` (`apps/hub-send`): the general "send data" tool and library for helpers, with an owner-only file store for headless Linux services: [docs/helpers.md](docs/helpers.md) | Working, tested against a real hub on Linux. |
 | PC helper (`apps/usage-helper`): Claude Code status line and Codex limits, forwarded as provider-reported | Tested against stand-ins for both tools. Not yet with a live Claude Code or Codex: [docs/providers.md](docs/providers.md). |
-| Raspberry Pi install (`deploy/raspberry-pi`): hardened systemd service, backups, upgrades | Tested in a systemd container and under ARM64 emulation. Not yet on a real Pi: [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md). |
+| Raspberry Pi install (`deploy/raspberry-pi`): hardened systemd service, backups, upgrades, and helpers on timers, each in its own sandbox | Tested in Bookworm and Trixie systemd containers and under ARM64 emulation. Not yet on a real Pi: [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md). |
 | Desktop manager (`apps/hub-manager`): pairing, pages, manual figures, displays, USB setup | Working, tested on Linux (including screenshots) and built for Windows. Not yet tried on a Windows desktop: [docs/windows-testing.md](docs/windows-testing.md). |
 
 The ESP32 firmware lives in a separate repository, `llm-usage-display`. This repository defines the protocol it follows, with schemas, examples and conformance vectors: [docs/firmware-handoff.md](docs/firmware-handoff.md) is the brief.

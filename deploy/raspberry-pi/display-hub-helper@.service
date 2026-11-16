@@ -1,0 +1,83 @@
+# One Display Hub helper, run by its timer: display-hub-helper@<name>.service runs
+# /usr/local/lib/display-hub/helpers/<name> once and stops. Installed by install.sh as
+# /etc/systemd/system/display-hub-helper@.service; set helpers up with `sudo display-hub-helper add`.
+#
+# A helper fetches data (often from the internet) and sends pages to the hub with hub-send. It is
+# not trusted: each one runs as its own throwaway user, in its own sandbox, and can't reach the
+# hub's data, its identity or another helper's folder.
+#
+# `display-hub-helper add` logs the helper in with every setting of the [Service] section below
+# except Type=, ExecStart= and TimeoutStartSec=, so the token is made inside this same sandbox.
+# Keep one setting per line, with no line continuations, and use only the %i specifier.
+[Unit]
+Description=Display Hub helper %i
+Documentation=https://github.com/penguin97040/display-hub/blob/main/docs/deploy-raspberry-pi.md
+After=network-online.target display-hub.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/display-hub/helpers/%i
+# A helper that hangs is stopped, and runs again next time.
+TimeoutStartSec=2min
+
+# Its own throwaway user, and its own folder (/var/lib/private/display-hub-helper-<name>, 0700),
+# where hub-send keeps the hub's details and the token (0600).
+DynamicUser=yes
+User=dh-helper-%i
+StateDirectory=display-hub-helper-%i
+StateDirectoryMode=0700
+UMask=0077
+Environment=HUB_SEND_DIR=/var/lib/display-hub-helper-%i HUB_SEND_STORE=file DISPLAY_HUB_HELPER=%i
+
+# The hub's data, identity, settings and backups are hidden, not just unreadable. Other helpers'
+# folders are out of reach too: systemd shows each helper only its own.
+InaccessiblePaths=-/var/lib/display-hub -/etc/display-hub -/var/backups/display-hub
+
+# No privileges at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+
+# Filesystem: read-only everywhere except its own folder; private /tmp and devices.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+DevicePolicy=closed
+PrivateIPC=yes
+PrivateUsers=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Kernel and system.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A refused system call fails instead of killing the helper.
+SystemCallErrorNumber=EPERM
+# MemoryDenyWriteExecute= is left off: it breaks programs that compile code as they run (Node.js,
+# Java, PyPy, LuaJIT) and some Python packages. A helper that is a shell script or plain Python can
+# have it: see "Helpers on the Pi" in docs/deploy-raspberry-pi.md.
+
+# Network: the internet (that's a helper's job) and the hub. AF_UNIX is for looking up names.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resources: enough for a script or a small program, and a ceiling if one goes wrong.
+MemoryMax=128M
+CPUQuota=50%
+TasksMax=32
+LimitNOFILE=512
+Nice=10
+IOSchedulingClass=idle

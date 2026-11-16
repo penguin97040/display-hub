@@ -1,0 +1,15 @@
+# Runs Display Hub helper <name> every 5 minutes, starting 2 minutes after boot. Installed by
+# install.sh as /etc/systemd/system/display-hub-helper@.timer and turned on per helper by
+# `sudo display-hub-helper add`; `--every` changes the interval with a drop-in in
+# /etc/systemd/system/display-hub-helper@<name>.timer.d/.
+[Unit]
+Description=Run Display Hub helper %i regularly
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=15s
+RandomizedDelaySec=15s
+
+[Install]
+WantedBy=timers.target

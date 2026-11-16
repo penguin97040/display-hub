@@ -240,7 +240,7 @@ fn page(
     }
     if lines.is_empty() {
         lines.push(format!(
-            "The hub accepted it, but no page uses the {feed} feed from a helper yet: in the manager, set a page's figures to \"PC helper\"."
+            "The hub accepted it, but no page takes the {feed} feed from a helper yet. See \"Pages for a helper\" in docs/helpers.md."
         ));
     }
     Ok(lines.join("\n"))

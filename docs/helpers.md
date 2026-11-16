@@ -2,14 +2,20 @@
 
 A **helper** is anything that collects a number or a line of text somewhere and sends it to your hub: a script on a Raspberry Pi reading a soil sensor, a weather job, a build checker. The hub keeps the page and the displays show it. The hub doesn't care where the data came from.
 
-A helper is invited to one or more **feeds**. A feed is just a name, such as `garden-weather`. Each page in the manager can be fed by a feed: set the page's figures to a helper and give it the feed name. Whatever a helper sends to a feed goes to every page of that feed whose kind matches.
+A helper is invited to one or more **feeds**. A feed is just a name, such as `garden-weather`. A page is fed by a feed when its source is a helper and it names the feed. Whatever a helper sends to a feed goes to every page of that feed whose kind matches.
+
+### Pages for a helper
+
+For now the manager makes helper pages for usage limits only (as "PC helper"). Any other page is made with the hub's admin API until templates arrive in the manager: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
 
 ## Pairing
 
-1. Make a helper string. For a helper that isn't the PC helper, run `hubd pair-helper --feed garden-weather` on the hub (repeat `--feed` for more feeds).
+1. Make a helper string: on the hub, run `hubd pair-helper --feed garden-weather` (repeat `--feed` for more feeds). For the usage helper on a PC, the manager's Settings makes one too.
 2. On the helper's computer, run `hub-send login` and paste the string when asked. It is read from standard input, never from the command line, and works once, within 10 minutes.
 
-`hub-send status` shows the hub, the feeds this helper may send to and recent activity. `hub-send logout` forgets the hub. Remove the helper in the manager's Settings to cut it off at the hub.
+`hub-send status` shows the hub, the feeds this helper may send to and recent activity. `hub-send logout` forgets the hub. Remove the helper in the manager's Settings to cut it off at the hub, or on the hub run `hubd helper list`, then `hubd helper revoke <id>`.
+
+**A helper on the hub's own Raspberry Pi** needs none of these steps: `sudo display-hub-helper add <name> --run <program>` pairs it, runs it on a timer and keeps it in a sandbox of its own, away from the hub's keys and data. See [Helpers on the Pi](deploy-raspberry-pi.md#helpers-on-the-pi).
 
 ## Sending
 
