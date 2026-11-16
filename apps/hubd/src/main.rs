@@ -212,7 +212,9 @@ async fn main() -> anyhow::Result<()> {
         } => {
             let config = settings.load()?;
             let port = config.listen.port();
-            let host = host.unwrap_or_else(|| config.hosts().remove(0));
+            let hosts = config.hosts();
+            let hint = hubd::config::pairing_hint(host.as_deref(), &hosts);
+            let host = host.unwrap_or_else(|| hosts[0].clone());
             let hub = hubd::open_hub(config, clock)?;
             let secret = hub.new_admin_pairing(&label)?;
             let pairing = PairingString {
@@ -225,6 +227,9 @@ async fn main() -> anyhow::Result<()> {
             println!("  {}\n", pairing.encode());
             println!("Hub fingerprint: {}", fingerprint(&hub.identity.spki_sha256));
             println!("Paste the whole string into the desktop manager. Don't share it or save it anywhere.");
+            if let Some(hint) = hint {
+                println!("{hint}");
+            }
         }
         Command::PairHelper {
             settings,

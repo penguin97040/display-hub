@@ -60,7 +60,9 @@ impl Problem {
     pub fn from_error(e: &ClientError) -> Problem {
         match e {
             ClientError::AddressRefused(d) => Problem::Configuration(d.clone()),
-            ClientError::Unreachable(_) | ClientError::Timeout => Problem::Unreachable,
+            ClientError::Unreachable(_) | ClientError::NameNotFound { .. } | ClientError::Timeout => {
+                Problem::Unreachable
+            }
             ClientError::IdentityMismatch => Problem::WrongHub,
             ClientError::TooLarge(_) => Problem::BadResponse("The hub's answer was too large".into()),
             ClientError::Snapshot(r) => match r {

@@ -82,6 +82,16 @@ fn hub_message(e: &ClientError) -> String {
     }
 }
 
+/// The host part of a `host:port` address.
+fn host_of(address: &str) -> &str {
+    address.rsplit_once(':').map_or(address, |(h, _)| h)
+}
+
+/// Technical detail for showing: control characters dropped and length capped.
+fn one_line(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).take(300).collect()
+}
+
 pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
     use ErrorCode::*;
     match e {
@@ -93,6 +103,26 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
                  backup, forget it in Settings and pair again. Otherwise, check your network."
             ),
             Next::None,
+        ),
+        ClientError::NameNotFound { host, detail } => Guidance::problem(
+            "This PC can't find the hub's name",
+            format!(
+                "This PC couldn't find {host}. Some Windows setups, and VPNs, can't look up .local names. On the Pi, \
+                 make a pairing string with its address instead: sudo -u display-hub hubd pair-admin --host <the Pi's \
+                 address>. Running hostname -I on the Pi shows its address. Details: {}",
+                one_line(detail)
+            ),
+            Next::Retry,
+        ),
+        ClientError::Timeout if host_of(address).to_ascii_lowercase().ends_with(".local") => Guidance::problem(
+            "Can't reach the hub",
+            format!(
+                "Nothing answered at {address}. Check the Raspberry Pi is switched on and on the same network as this \
+                 PC. If it is, this PC may be slow to look up .local names (some Windows setups and VPNs are): on the \
+                 Pi, make a pairing string with its address instead: sudo -u display-hub hubd pair-admin --host <the \
+                 Pi's address>. Running hostname -I on the Pi shows its address."
+            ),
+            Next::Retry,
         ),
         ClientError::Unreachable(_) | ClientError::Timeout => Guidance::problem(
             "Can't reach the hub",
@@ -206,6 +236,29 @@ pub fn from_usb(e: &UsbError) -> Guidance {
 mod tests {
     use super::*;
     use hub_protocol::ErrorBody;
+
+    #[test]
+    fn a_failed_name_lookup_names_the_host_and_offers_the_address_instead() {
+        let e = ClientError::NameNotFound {
+            host: "raspberrypi.local".into(),
+            detail: "dns error\u{1b}".into(),
+        };
+        let g = from_client(&e, Doing::Pairing, "raspberrypi.local:8443");
+        assert_eq!(g.title, "This PC can't find the hub's name");
+        assert!(g.detail.contains("couldn't find raspberrypi.local"));
+        assert!(g.detail.contains("hubd pair-admin --host <the Pi's address>"));
+        assert!(g.detail.contains("Details: dns error"));
+        assert!(!g.detail.contains('\u{1b}'));
+        assert_eq!(g.next, Next::Retry);
+    }
+
+    #[test]
+    fn a_timeout_on_a_local_name_suggests_the_address_but_an_ip_does_not() {
+        let local = from_client(&ClientError::Timeout, Doing::Pairing, "pi.local:8443");
+        assert!(local.detail.contains("hubd pair-admin --host"));
+        let ip = from_client(&ClientError::Timeout, Doing::Pairing, "192.168.1.20:8443");
+        assert!(!ip.detail.contains("pair-admin"));
+    }
 
     fn status(code: ErrorCode) -> ClientError {
         ClientError::Status {

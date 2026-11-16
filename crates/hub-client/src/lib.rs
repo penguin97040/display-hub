@@ -30,6 +30,9 @@ pub enum ClientError {
     AddressRefused(String),
     #[error("can't reach the hub: {0}")]
     Unreachable(String),
+    /// The host name couldn't be looked up at all (as opposed to a hub that didn't answer).
+    #[error("can't find {host} on the network: {detail}")]
+    NameNotFound { host: String, detail: String },
     #[error(
         "the server at this address isn't the hub you paired with: its key is different. Someone may \
          be impersonating the hub, so nothing was sent. If you reinstalled the hub, pair again."
@@ -52,7 +55,10 @@ impl ClientError {
     pub fn is_connection(&self) -> bool {
         matches!(
             self,
-            ClientError::Unreachable(_) | ClientError::Timeout | ClientError::IdentityMismatch
+            ClientError::Unreachable(_)
+                | ClientError::NameNotFound { .. }
+                | ClientError::Timeout
+                | ClientError::IdentityMismatch
         )
     }
 
@@ -396,6 +402,7 @@ fn classify(e: reqwest::Error) -> ClientError {
     } else {
         // reqwest's messages name the URL, which holds no credentials here (they go in headers).
         let mut msg = e.to_string();
+        let dns = is_dns_failure(&e);
         let mut src = std::error::Error::source(&e);
         while let Some(s) = src {
             msg = format!("{msg}: {s}");
@@ -403,10 +410,31 @@ fn classify(e: reqwest::Error) -> ClientError {
         }
         if msg.contains(pin::MISMATCH) {
             ClientError::IdentityMismatch
+        } else if dns {
+            let host = e
+                .url()
+                .and_then(|u| u.host_str())
+                .unwrap_or("the hub")
+                .to_string();
+            ClientError::NameNotFound { host, detail: msg }
         } else {
             ClientError::Unreachable(msg)
         }
     }
+}
+
+/// Whether a failed lookup is in the error's chain. hyper-util wraps one as a connect error whose own
+/// message is "dns error"; the cause under it is worded differently on Windows and Unix, so only that
+/// wrapper is matched.
+fn is_dns_failure(e: &(dyn std::error::Error + 'static)) -> bool {
+    let mut src = e.source();
+    while let Some(s) = src {
+        if s.to_string() == "dns error" {
+            return true;
+        }
+        src = s.source();
+    }
+    false
 }
 
 /// A path segment, percent-encoded so an id can't change the path.
@@ -419,6 +447,44 @@ fn seg(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stands in for hyper-util's connect error, which wraps a failed lookup.
+    #[derive(Debug)]
+    struct Wrapper(&'static str, Option<Box<dyn std::error::Error + 'static>>);
+    impl std::fmt::Display for Wrapper {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrapper {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref()
+        }
+    }
+
+    #[test]
+    fn a_failed_name_lookup_is_told_apart_from_other_connection_failures() {
+        let io = |m: &str| Box::new(std::io::Error::other(m.to_string())) as Box<dyn std::error::Error>;
+        // Unix and Windows word the cause differently; the wrapper is what counts.
+        for cause in [
+            "failed to lookup address information: Name or service not known",
+            "No such host is known. (os error 11001)",
+        ] {
+            let chain = Wrapper(
+                "client error (Connect)",
+                Some(Box::new(Wrapper("dns error", Some(io(cause))))),
+            );
+            assert!(is_dns_failure(&chain), "{cause}");
+        }
+        let refused = Wrapper(
+            "client error (Connect)",
+            Some(Box::new(Wrapper(
+                "tcp connect error",
+                Some(io("Connection refused")),
+            ))),
+        );
+        assert!(!is_dns_failure(&refused));
+    }
 
     #[test]
     fn dev_mode_refuses_anything_but_loopback_http() {

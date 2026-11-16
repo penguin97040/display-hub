@@ -39,6 +39,8 @@ It prints a line starting with `dh1.`. Select it and copy it (Ctrl+C in Windows 
 
 ## 2. The manager
 
+Some Windows PCs can't look up `.local` names, especially with a VPN connected or on two networks at once (Ethernet and Wi-Fi). If the manager says it can't find the hub's name, pair with the Pi's address instead (`hostname -I` on the Pi shows it).
+
 Start `dist\hub-manager.exe`. Check each of these, and note anything that differs:
 
 | | Do | Expect |

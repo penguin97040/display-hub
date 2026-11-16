@@ -69,7 +69,7 @@ sudo -u display-hub hubd pair-admin
 
 Copy the `dh1.…` line, paste it into the desktop manager and choose **Pair**. It works once, within 10 minutes. The manager then remembers the hub, and connects to it by the address in the string (`raspberrypi.local` by default).
 
-If your PC can't resolve `raspberrypi.local`, give the address instead: `sudo -u display-hub hubd pair-admin --host 192.168.1.20`.
+Some PCs can't look up `.local` names, especially Windows with a VPN connected, or a PC on two networks at once (for example Ethernet and Wi-Fi). If the manager says it can't find the hub's name, make a string with the Pi's address instead (`hostname -I` on the Pi shows it): `sudo -u display-hub hubd pair-admin --host 192.168.1.20`. `pair-admin` prints this command for you when the hub knows its address (see `advertise_hosts` below).
 
 ## 5. Optional: settings and firewall
 

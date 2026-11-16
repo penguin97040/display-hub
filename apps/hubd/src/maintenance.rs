@@ -77,6 +77,11 @@ fn private_dir(path: &Path) -> Result<(), MaintenanceError> {
 
 fn private_copy(from: &Path, to: &Path) -> Result<(), MaintenanceError> {
     let bytes = std::fs::read(from).map_err(io(format!("reading {}", from.display())))?;
+    private_write(to, &bytes)
+}
+
+/// Writes a new file that only its owner can read, whatever the umask.
+fn private_write(to: &Path, bytes: &[u8]) -> Result<(), MaintenanceError> {
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -85,7 +90,7 @@ fn private_copy(from: &Path, to: &Path) -> Result<(), MaintenanceError> {
         opts.mode(0o600);
     }
     let mut f = opts.open(to).map_err(io(format!("writing {}", to.display())))?;
-    f.write_all(&bytes)
+    f.write_all(bytes)
         .map_err(io(format!("writing {}", to.display())))?;
     f.sync_all().map_err(io(format!("writing {}", to.display())))
 }
@@ -160,9 +165,7 @@ pub fn backup(hub: &Hub, config: &Config, dest: &Path) -> Result<BackupSummary, 
         summary.displays
     );
     let path = dest.join(MARKER);
-    let mut f = File::create_new(&path).map_err(io(format!("writing {}", path.display())))?;
-    f.write_all(marker.as_bytes())
-        .map_err(io(format!("writing {}", path.display())))?;
+    private_write(&path, marker.as_bytes())?;
     hub.store
         .audit(hub.clock.now(), "backup_written", &dest.display().to_string())?;
     Ok(summary)
@@ -359,6 +362,7 @@ mod tests {
             assert_eq!(mode(&dest), 0o700);
             assert_eq!(mode(&dest.join("identity/hub-key.pem")), 0o600);
             assert_eq!(mode(&dest.join("hub.db")), 0o600);
+            assert_eq!(mode(&dest.join(MARKER)), 0o600);
         }
 
         // Into an empty folder: the same key comes back.

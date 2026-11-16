@@ -105,6 +105,20 @@ impl Config {
     }
 }
 
+/// A hint for `pair-admin` when the string uses a `.local` name but the hub also knows an IP address:
+/// some PCs (Windows with a VPN, for instance) can't look `.local` names up. Never a second string,
+/// because each one is a live invite.
+pub fn pairing_hint(chosen: Option<&str>, hosts: &[String]) -> Option<String> {
+    let used = chosen.or(hosts.first().map(String::as_str))?;
+    if !used.to_ascii_lowercase().ends_with(".local") {
+        return None;
+    }
+    let ip = hosts.iter().find(|h| h.parse::<std::net::IpAddr>().is_ok())?;
+    Some(format!(
+        "If your PC can't find {used}, run: sudo -u display-hub hubd pair-admin --host {ip}"
+    ))
+}
+
 /// This machine's host name, from the kernel (works where `/proc/sys` is hidden, as in the service).
 #[cfg(target_os = "linux")]
 fn hostname() -> Option<String> {
@@ -130,6 +144,18 @@ fn hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pairing_hint_offers_an_address_only_for_a_local_name() {
+        let hosts = vec!["raspberrypi.local".to_string(), "192.168.1.20".to_string()];
+        assert_eq!(
+            pairing_hint(None, &hosts).as_deref(),
+            Some("If your PC can't find raspberrypi.local, run: sudo -u display-hub hubd pair-admin --host 192.168.1.20")
+        );
+        assert_eq!(pairing_hint(Some("192.168.1.20"), &hosts), None);
+        assert_eq!(pairing_hint(None, &["raspberrypi.local".to_string()]), None);
+        assert_eq!(pairing_hint(None, &["192.168.1.20".to_string()]), None);
+    }
 
     #[test]
     fn empty_means_defaults_and_mistakes_are_refused() {
