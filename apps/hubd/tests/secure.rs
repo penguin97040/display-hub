@@ -610,6 +610,18 @@ async fn a_helper_sends_only_to_its_feeds_and_only_pages_of_the_same_kind() {
         let e = c.new_helper(&admin, &bad).await.unwrap_err();
         assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{bad:?}");
     }
+    // Too many feeds is said plainly, not blamed on the names.
+    let many = NewHelper {
+        label: "x".into(),
+        feeds: (0..300).map(|i| format!("feed-{i}")).collect(),
+    };
+    let e = c.new_helper(&admin, &many).await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::BadRequest));
+    assert!(
+        e.to_string().contains("at most") && e.to_string().contains("feeds"),
+        "{e}"
+    );
+    assert!(!e.to_string().contains("lower-case"), "{e}");
     let invite = c
         .new_helper(
             &admin,
@@ -759,6 +771,77 @@ async fn a_helper_sends_only_to_its_feeds_and_only_pages_of_the_same_kind() {
         .unwrap()
         .iter()
         .any(|x| x.id == id && x.revoked));
+    r.stop().await;
+}
+
+/// The page-by-page check happens inside the write: content that fits the feed's stand-in but is too
+/// big for one page (its id and title count) is refused, and no page of the feed is changed.
+#[tokio::test]
+async fn a_feed_write_is_all_or_nothing_across_its_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let c = r.client();
+    let admin = r.admin().await;
+    let text_page = |id: &str, title: &str| NewPage {
+        title: title.into(),
+        kind: "nearby-flights/1".into(),
+        source: Source::Helper,
+        feed: Some("t".into()),
+        id: Some(id.into()),
+        stale_after_seconds: None,
+    };
+    c.add_page(&admin, &text_page("s", "S")).await.unwrap();
+    c.add_page(
+        &admin,
+        &text_page(
+            "a-page-with-a-rather-long-id",
+            "A page with a rather long title indeed",
+        ),
+    )
+    .await
+    .unwrap();
+    let invite = c
+        .new_helper(
+            &admin,
+            &NewHelper {
+                label: "Tight".into(),
+                feeds: vec!["t".into(), "u".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let token = c.helper_pair(&invite.secret).await.unwrap().helper_token;
+    let body = |n: usize| FeedContent {
+        kind: "nearby-flights/1".into(),
+        data: json!({"big": "x".repeat(n)}),
+        collected_at: None,
+        note: None,
+    };
+    // Feed `u` has no pages, so only the stand-in is checked there. Find a size that passes that but
+    // not the long page of `t`.
+    let before = c.pages(&admin).await.unwrap();
+    let mut found = false;
+    for n in (2500..3072).rev() {
+        if c.put_feed(&token, "u", &body(n)).await.is_err() {
+            continue;
+        }
+        let e = c.put_feed(&token, "t", &body(n)).await;
+        if let Err(e) = e {
+            assert_eq!(e.code(), Some(ErrorCode::BadRequest), "{e}");
+            assert!(e.to_string().contains("at most 3072 bytes"), "{e}");
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "a size that fits the stand-in but not the long page");
+    let after = c.pages(&admin).await.unwrap();
+    let content_of = |pages: &[PageView], id: &str| pages.iter().find(|p| p.id == id).unwrap().clone();
+    assert_eq!(
+        content_of(&after, "s"),
+        content_of(&before, "s"),
+        "the short page wasn't written"
+    );
     r.stop().await;
 }
 

@@ -97,7 +97,7 @@ The manager opens the port with DTR set and RTS clear, so an ESP32 board shouldn
 
 ## 6. The PC helper (optional)
 
-Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) has the full set-up.
+Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) has the full set-up. If this PC was paired with the old `hubctl`, first remove that helper in **Settings**, then log in with `usage-helper` as below ([providers.md](providers.md), "Upgrading from `hubctl`").
 
 1. In the manager, open **Settings**, then **PC helper**. Choose **Create helper string**, then **Copy helper string**.
 2. Run `.\dist\usage-helper.exe login` and paste it. Expect "Paired with the hub at 127.0.0.1:8443 …".

@@ -111,9 +111,10 @@ impl Config {
         bytes.try_into().ok()
     }
 
-    /// The credential store's account for the token: one per hub.
+    /// The credential store's account for the token: one per helper, so two profiles paired with the
+    /// same hub never share an entry.
     fn token_account(&self) -> String {
-        format!("token-{}", &self.spki_sha256[..16.min(self.spki_sha256.len())])
+        format!("token-{}", self.helper_id)
     }
 }
 

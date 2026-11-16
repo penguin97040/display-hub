@@ -175,8 +175,13 @@ enum AdminAction {
 #[derive(Subcommand)]
 enum HelperAction {
     /// List every helper that has paired, its feeds, and whether it is still allowed.
-    List,
-    /// Revoke one helper, by the id `list` shows. Its token stops working at once.
+    List {
+        /// One helper per line for scripts: id, `active` or `revoked`, then the label, separated by tabs.
+        #[arg(long)]
+        plain: bool,
+    },
+    /// Revoke one helper, by the id `list` shows. Its token stops working at once. Revoking one that
+    /// is already revoked is fine.
     Revoke { id: String },
 }
 
@@ -323,7 +328,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Helper { action, settings } => {
             let hub = hubd::open_hub(settings.load()?, clock.clone())?;
             match action {
-                HelperAction::List => {
+                HelperAction::List { plain: true } => {
+                    for (id, label, _, revoked) in hub.store.helpers()? {
+                        let label: String = label.chars().filter(|c| !c.is_control()).collect();
+                        println!("{id}\t{}\t{label}", if revoked { "revoked" } else { "active" });
+                    }
+                }
+                HelperAction::List { plain: false } => {
                     let helpers = hub.store.helpers()?;
                     if helpers.is_empty() {
                         println!("No helpers have paired yet. Run `hubd pair-helper`.");
@@ -340,11 +351,16 @@ async fn main() -> anyhow::Result<()> {
                 HelperAction::Revoke { id } => {
                     let n = hub.store.revoke(Role::Helper, &id, clock.now())?;
                     if n == 0 {
-                        anyhow::bail!("no active helper with id {id}; see `hubd helper list`");
+                        if hub.store.helpers()?.iter().any(|(h, ..)| *h == id) {
+                            println!("{id} was already cut off. Its token doesn't work.");
+                        } else {
+                            anyhow::bail!("no helper with id {id}; see `hubd helper list`");
+                        }
+                    } else {
+                        hub.store
+                            .audit(clock.now(), "helper_revoked", &format!("{id} (command line)"))?;
+                        println!("Revoked {id}. Its token no longer works.");
                     }
-                    hub.store
-                        .audit(clock.now(), "helper_revoked", &format!("{id} (command line)"))?;
-                    println!("Revoked {id}. Its token no longer works.");
                 }
             }
         }

@@ -93,12 +93,14 @@ async fn a_local_invite_pairs_over_loopback_and_revoking_cuts_the_helper_off() {
         .unwrap();
 
     let (d, id) = (data.clone(), paired.helper_id.clone());
-    let (listed, revoked, again, relisted) = tokio::task::spawn_blocking(move || {
+    let (listed, revoked, again, relisted, plain, unknown) = tokio::task::spawn_blocking(move || {
         let listed = stdout(&hubd(&d, &["helper", "list"]));
         let revoked = stdout(&hubd(&d, &["helper", "revoke", &id]));
         let again = hubd(&d, &["helper", "revoke", &id]);
         let relisted = stdout(&hubd(&d, &["helper", "list"]));
-        (listed, revoked, again, relisted)
+        let plain = stdout(&hubd(&d, &["helper", "list", "--plain"]));
+        let unknown = hubd(&d, &["helper", "revoke", "no-such-helper"]);
+        (listed, revoked, again, relisted, plain, unknown)
     })
     .await
     .unwrap();
@@ -106,10 +108,20 @@ async fn a_local_invite_pairs_over_loopback_and_revoking_cuts_the_helper_off() {
     assert!(listed.contains("active"), "{listed}");
     assert!(listed.contains("feeds: pi-status"), "{listed}");
     assert!(revoked.contains("Revoked"), "{revoked}");
-    assert!(!again.status.success(), "revoking twice is refused");
+    assert!(again.status.success(), "revoking twice is fine: {again:?}");
     assert!(
-        String::from_utf8_lossy(&again.stderr).contains("no active helper"),
+        String::from_utf8_lossy(&again.stdout).contains("already cut off"),
         "{again:?}"
+    );
+    assert!(!unknown.status.success(), "an unknown id is still refused");
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no helper with id"),
+        "{unknown:?}"
+    );
+    assert_eq!(
+        plain,
+        format!("{}\trevoked\tPi helper pi-status\n", paired.helper_id),
+        "tab-separated for scripts"
     );
     assert!(relisted.contains("REVOKED"), "{relisted}");
 

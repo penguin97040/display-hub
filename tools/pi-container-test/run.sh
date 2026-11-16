@@ -263,6 +263,32 @@ check "remove: the other helper is untouched" listed '^probe +1min'
 check "uninstall: refused while a helper is set up" refused bash /root/display-hub/install.sh --uninstall
 box display-hub-helper remove probe >/dev/null
 
+# Remove on a helper the hub has already cut off is still a success, with no warning.
+box display-hub-helper add twice --run /usr/local/share/display-hub/helpers/pi-status >/dev/null 2>&1 || bad "helper: add twice"
+twice_id=$(box sed -n 's/^ *"helper_id": *"\([A-Za-z0-9_-]*\)".*/\1/p' /var/lib/private/display-hub-helper-twice/connection.json | head -1)
+check "remove: the hub revokes it first" as_hub hubd helper revoke "$twice_id"
+status=0
+out=$(box display-hub-helper remove twice 2>&1) || status=$?
+check "remove: an already revoked helper is removed with exit 0" test "$status" = 0
+clean_removal() { ! grep -q "display-hub-helper:" <<<"$out" && grep -q "Removed twice" <<<"$out"; }
+check "remove: and says so without a warning" clean_removal
+check "remove: twice is gone" gone /var/lib/private/display-hub-helper-twice
+
+# A login that fails after the hub paired it (stood in for by a wrapper that fails once the real
+# login is done) leaves nothing active at the hub.
+box mv /usr/local/bin/hub-send /usr/local/bin/hub-send.real
+box sh -c 'printf "#!/bin/sh\n/usr/local/bin/hub-send.real \"\$@\"\nexit 1\n" > /usr/local/bin/hub-send && chmod 0755 /usr/local/bin/hub-send'
+status=0
+out=$(box display-hub-helper add orphan --run /usr/local/share/display-hub/helpers/pi-status 2>&1) || status=$?
+box mv -f /usr/local/bin/hub-send.real /usr/local/bin/hub-send
+check "orphan: add fails when the login does" test "$status" != 0
+check "orphan: and sets nothing up" gone /var/lib/private/display-hub-helper-orphan
+# The plain list is tab-separated: id, active or revoked, label.
+orphan_state() { as_hub hubd helper list --plain | awk -F'\t' -v s="$1" '$2 == s && $3 == "Pi helper orphan" { f = 1 } END { exit !f }'; }
+not_active() { ! orphan_state active; }
+check "orphan: the hub holds no active credential for it" not_active
+check "orphan: the hub lists it as revoked" orphan_state revoked
+
 box bash /root/display-hub/install.sh --uninstall >/dev/null
 check "uninstall: the service is gone" bash -c "! docker exec $name systemctl cat display-hub >/dev/null 2>&1"
 check "uninstall: the data is kept" box test -f /var/lib/display-hub/identity/hub-key.pem

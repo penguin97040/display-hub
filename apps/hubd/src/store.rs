@@ -1175,22 +1175,36 @@ impl Store {
     }
 
     /// Writes a helper's content to every page of `feed` whose source is `helper` and whose kind is
-    /// `kind`, in one transaction. Pages it wouldn't change are not rewritten.
-    pub fn put_feed_content(
+    /// `kind`, in one transaction. Pages it wouldn't change are not rewritten. `check` runs on each page
+    /// that would be written, inside the transaction; if it fails for any of them nothing is written and
+    /// its error is returned.
+    pub fn put_feed_content<E: From<StoreError>>(
         &self,
         feed: &str,
         kind: &str,
         content: &StoredContent,
         now: Timestamp,
-    ) -> Result<FeedWrite, StoreError> {
+        mut check: impl FnMut(&StoredPage) -> Result<(), E>,
+    ) -> Result<FeedWrite, E> {
         let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)?;
         let mut out = FeedWrite::default();
-        for (id, page_kind) in feed_pages(&tx, feed)? {
-            if page_kind == kind {
-                out.updated.push(id);
+        let pages = read_pages(
+            &tx,
+            &format!(
+                "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.feed = ?1 AND p.source = 'helper' \
+                 ORDER BY p.position, p.created_at"
+            ),
+            params![feed],
+        )?;
+        for page in pages {
+            if page.kind == kind {
+                check(&page)?;
+                out.updated.push(page.id);
             } else {
-                out.skipped.push(id);
+                out.skipped.push(page.id);
             }
         }
         let (quality, updated_at, data, note) = content_columns(content);
@@ -1199,9 +1213,10 @@ impl Store {
                 "UPDATE pages SET quality = ?2, updated_at = ?3, data = ?4, note = ?5, stored_at = ?6
                  WHERE id = ?1 AND NOT (quality IS ?2 AND updated_at IS ?3 AND data IS ?4 AND note IS ?5)",
                 params![id, quality, updated_at, data, note, now.unix()],
-            )?;
+            )
+            .map_err(StoreError::from)?;
         }
-        tx.commit()?;
+        tx.commit().map_err(StoreError::from)?;
         Ok(out)
     }
 
@@ -1275,15 +1290,6 @@ static DISPLAY_PAGES_SQL: LazyLock<String> = LazyLock::new(|| {
          ORDER BY p.position, p.created_at LIMIT ?2"
     )
 });
-
-/// The pages of `feed` whose source is `helper`, with their kinds, in order.
-fn feed_pages(conn: &Connection, feed: &str) -> Result<Vec<(String, String)>, StoreError> {
-    let mut st = conn.prepare(
-        "SELECT id, kind FROM pages WHERE feed = ?1 AND source = 'helper' ORDER BY position, created_at",
-    )?;
-    let rows = st.query_map(params![feed], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    Ok(rows.collect::<Result<_, _>>()?)
-}
 
 /// Runs a query selecting [`PAGE_COLUMNS`] and reads each row as a page.
 fn read_pages(
@@ -1498,7 +1504,9 @@ mod tests {
         };
         assert_eq!(
             store
-                .put_feed_content("claude-max", "meter", &report, ts(NOW))
+                .put_feed_content("claude-max", "meter", &report, ts(NOW), |_| Ok::<(), StoreError>(
+                    ()
+                ))
                 .unwrap()
                 .updated,
             vec!["claude-max".to_string()]
@@ -1872,8 +1880,38 @@ mod tests {
             data: Some(json!({"items": [{"id": "soil", "label": "Soil moisture", "percent": 5.0}]})),
             note: None,
         };
+        let ok = |_: &StoredPage| Ok::<(), StoreError>(());
+        // A check that fails for the last page it sees stops the whole write: nothing is changed.
+        let mut seen = Vec::new();
+        #[derive(Debug)]
+        struct Refused;
+        impl From<StoreError> for Refused {
+            fn from(_: StoreError) -> Self {
+                Refused
+            }
+        }
+        let refused = store.put_feed_content("garden", "meter", &content, now, |p| {
+            seen.push(p.id.clone());
+            if p.id == "later" {
+                Err(Refused)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(refused.is_err());
         assert_eq!(
-            store.put_feed_content("garden", "meter", &content, now).unwrap(),
+            seen,
+            ["meter", "later"],
+            "only helper pages of the feed and kind are checked"
+        );
+        assert!(
+            store.page("meter").unwrap().unwrap().content.is_none(),
+            "rolled back"
+        );
+        assert_eq!(
+            store
+                .put_feed_content("garden", "meter", &content, now, ok)
+                .unwrap(),
             FeedWrite {
                 updated: vec!["meter".into(), "later".into()],
                 skipped: vec!["text".into()],
@@ -1896,7 +1934,9 @@ mod tests {
             ]
         );
         assert_eq!(
-            store.put_feed_content("nobody", "meter", &content, now).unwrap(),
+            store
+                .put_feed_content("nobody", "meter", &content, now, ok)
+                .unwrap(),
             FeedWrite::default()
         );
     }
@@ -2022,7 +2062,13 @@ mod tests {
         };
         assert_eq!(
             store
-                .put_feed_content("claude-max", "meter", &content, ts(NOW))
+                .put_feed_content(
+                    "claude-max",
+                    "meter",
+                    &content,
+                    ts(NOW),
+                    |_| Ok::<(), StoreError>(())
+                )
                 .unwrap()
                 .updated,
             ["claude-max"]

@@ -125,6 +125,15 @@ OpenCode documents the Go plan's limits as dollar amounts per model:
 
 You track usage in its web console. Each API response carries a per-request `opencode.allowance` figure. But nothing documented reports the running totals, and no local file has them. So the page takes figures typed into the manager (**Pages**, **Edit**), shown as MANUAL, and stale after a day. The manager doesn't offer "PC helper" for it.
 
+## Upgrading from `hubctl`
+
+`usage-helper` replaces the old `hubctl` tool and doesn't read the pairing `hubctl` kept, so a PC paired with `hubctl` needs a fresh pairing:
+
+1. In the manager, open **Settings** and remove the old helper.
+2. Make a new helper string (**Settings**, **PC helper**, **Create helper string**).
+3. Run `usage-helper login` and paste it.
+4. Point Claude Code's `statusLine` and the Codex schedule at `usage-helper` instead of `hubctl`.
+
 ## Typed in, for any subscription
 
 Any page can take figures typed in from the provider's own usage page. Leave a share empty if you don't know it, and the display shows "unknown", never 0 %. Reset times are entered as "3 h 20 min" and measured on the hub's clock.

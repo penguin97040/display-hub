@@ -121,6 +121,22 @@ discard() {
   systemctl reset-failed "$(service "$name")" "$(timer "$name")" 2>/dev/null || true
 }
 
+# Cuts off any active helper the hub holds under the label add gives helper $1. Used when add's login
+# fails after the hub may already have paired it (for example, the token or settings couldn't be
+# saved), which would leave a working credential that nobody holds. This is safe because the label
+# names the helper: a name can be installed once at a time, and an earlier helper of that name was
+# revoked by remove, so only the credential this add just made can still be active.
+revoke_unclaimed() {
+  local label="Pi helper $1" id state name
+  [ -x "$hubd" ] || return 0
+  while IFS=$'\t' read -r id state name; do
+    if [ "$state" = active ] && [ "$name" = "$label" ]; then
+      runuser -u "$hub_user" -- "$hubd" helper revoke "$id" >/dev/null 2>&1 ||
+        warn "couldn't cut off the unused pairing $id at the hub. Do it with: sudo -u $hub_user hubd helper revoke $id"
+    fi
+  done < <(runuser -u "$hub_user" -- "$hubd" helper list --plain 2>/dev/null || true)
+}
+
 # What the latest run of a helper printed.
 last_output() {
   local id
@@ -204,6 +220,7 @@ cmd_add() {
     --unit="display-hub-helper-login-$name" --description="Pair Display Hub helper $name" \
     "${run_props[@]}" "$hub_send" login; then
     unset invite
+    revoke_unclaimed "$name"
     fail "the helper couldn't pair with the hub (the reason is above)."
   fi
   unset invite

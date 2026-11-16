@@ -208,6 +208,17 @@ async fn db<T: Send + 'static>(
         .map_err(ApiError::from)
 }
 
+/// Like [`db`], for work that can fail with an [`ApiError`] of its own.
+async fn db_api<T: Send + 'static>(
+    hub: &AppState,
+    f: impl FnOnce(&Store) -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let store = hub.store.clone();
+    tokio::task::spawn_blocking(move || f(&store))
+        .await
+        .map_err(|_| ApiError::unavailable("The hub hit an internal fault."))?
+}
+
 /// JSON bodies with structured errors instead of axum's plain-text ones.
 pub struct ApiJson<T>(pub T);
 
@@ -643,7 +654,12 @@ pub fn check_feeds(feeds: &[String]) -> Result<(), ApiError> {
             "Choose at least one feed for the helper to send to.",
         ));
     }
-    if feeds.len() > MAX_STORED_PAGES || !feeds.iter().all(|f| valid_feed(f)) {
+    if feeds.len() > MAX_STORED_PAGES {
+        return Err(ApiError::bad_request(format!(
+            "A helper can send to at most {MAX_STORED_PAGES} feeds. Choose fewer."
+        )));
+    }
+    if !feeds.iter().all(|f| valid_feed(f)) {
         return Err(bad_feed());
     }
     Ok(())
@@ -1037,13 +1053,6 @@ async fn put_feed(
         content: None,
     };
     check_content(&stand_in, &req.data, &note, quality, now)?;
-    let pages = db(&hub, |s| s.pages()).await?;
-    for page in pages
-        .iter()
-        .filter(|p| p.source == Source::Helper && p.feed.as_deref() == Some(&feed) && p.kind == req.kind)
-    {
-        check_content(page, &req.data, &note, quality, now)?;
-    }
     let content = StoredContent {
         quality,
         // Never later than the hub's own clock, so ages are never negative.
@@ -1052,7 +1061,15 @@ async fn put_feed(
         note,
     };
     let kind = req.kind;
-    let written = db(&hub, move |s| s.put_feed_content(&feed, &kind, &content, now)).await?;
+    // The per-page check runs inside the write, so what was checked is what is replaced.
+    let written = db_api(&hub, move |s| {
+        let data = content.data.clone().unwrap_or_default();
+        let note = content.note.clone();
+        s.put_feed_content(&feed, &kind, &content, now, |page| {
+            check_content(page, &data, &note, quality, now)
+        })
+    })
+    .await?;
     Ok(Json(FeedAccepted {
         updated: written.updated,
         skipped: written.skipped,

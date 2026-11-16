@@ -264,3 +264,105 @@ fn a_token_file_others_can_read_stops_the_tool_with_a_clear_message() {
         assert!(!out.contains("dhc_") && !err.contains("dhc_"));
     }
 }
+
+/// Two profiles paired with the same hub, sharing one credential store, keep separate tokens: logging
+/// in the second doesn't overwrite the first, and logging out of one leaves the other working.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_profiles_on_one_hub_keep_their_own_tokens() {
+    use hub_send::Profile;
+    use os_secrets::{MemoryStore, TokenStore};
+
+    let root = tempfile::tempdir().unwrap();
+    let hub = hubd::open_hub(
+        hubd::config::Config {
+            data_dir: root.path().join("hub"),
+            ..Default::default()
+        },
+        Arc::new(hub_core::SystemClock),
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(hubd::serve_https(hub.clone(), listener, async {
+        let _ = rx.await;
+    }));
+    let pin = hub.identity.spki_sha256;
+    let manager = HubClient::pinned("127.0.0.1", port, vec![pin]).unwrap();
+    let raw = hub.new_admin_pairing("PC").unwrap();
+    let admin = manager
+        .pair(
+            &PairingString {
+                host: "127.0.0.1".into(),
+                port,
+                spki_sha256: pin,
+                secret: raw,
+            }
+            .secret_text(),
+            "PC",
+        )
+        .await
+        .unwrap()
+        .admin_token;
+    let mut strings = Vec::new();
+    for label in ["First", "Second"] {
+        let invite = manager
+            .new_helper(
+                &admin,
+                &NewHelper {
+                    label: label.into(),
+                    feeds: vec!["garden".into()],
+                },
+            )
+            .await
+            .unwrap();
+        let mut secret = [0u8; 16];
+        secret.copy_from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&invite.secret)
+                .unwrap(),
+        );
+        strings.push(
+            PairingString {
+                host: "127.0.0.1".into(),
+                port,
+                spki_sha256: pin,
+                secret,
+            }
+            .encode(),
+        );
+    }
+
+    let store = MemoryStore::default();
+    let profile = |name: &str| {
+        Profile::new(
+            "hub-send",
+            root.path().join(name),
+            Box::new(store.clone()) as Box<dyn TokenStore>,
+        )
+    };
+    let (a, b) = (profile("a"), profile("b"));
+    let now = hub_protocol::Timestamp::from_unix(1_900_000_000).unwrap();
+    let cfg_a = a.login(&strings[0], now).await.unwrap();
+    let cfg_b = b.login(&strings[1], now).await.unwrap();
+    assert_ne!(cfg_a.helper_id, cfg_b.helper_id);
+    assert_eq!(store.items.lock().unwrap().len(), 2, "one entry each");
+    let token_of = |cfg: &hub_send::Config| {
+        store
+            .load(&format!("token-{}", cfg.helper_id))
+            .unwrap()
+            .map(|t| t.to_string())
+    };
+    let (ta, tb) = (token_of(&cfg_a).unwrap(), token_of(&cfg_b).unwrap());
+    assert_ne!(ta, tb, "logging in B left A's token alone");
+    assert!(a.open().is_ok() && b.open().is_ok());
+
+    // Logging out of A leaves B's token in place.
+    a.logout().unwrap();
+    assert_eq!(token_of(&cfg_b).as_deref(), Some(tb.as_str()));
+    assert!(b.open().is_ok());
+    assert!(token_of(&cfg_a).is_none());
+
+    let _ = tx.send(());
+    server.await.unwrap().unwrap();
+}
