@@ -1,3 +1,5 @@
+> **Out of date for now.** This brief describes the old page format (`dashboard_id` and per-page `metrics`). The protocol now has page kinds and shapes: see `docs/protocol-v1.md`. This file will be updated in a later release step. Don't use its prompt until then.
+
 # Firmware handoff: `llm-usage-display`
 
 The display firmware lives in its own repository, `penguin97040/llm-usage-display`, which is empty as of 11/11/2026. This repository defines what the firmware must do and supplies everything to test it against. It contains no firmware, and the firmware repository should not depend on this one as a submodule: copy the files below at a pinned commit instead.

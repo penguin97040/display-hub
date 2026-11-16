@@ -121,6 +121,7 @@ fn displays_refuse_tolerate_or_card_invalid_examples_as_documented() {
             | "custom-data-too-deep"
             | "shape-bad-data"
             | "big-number-decimals"
+            | "big-number-too-big"
             | "list-too-many-items"
             | "meter-duplicate-ids"
             | "data-missing"
@@ -163,6 +164,89 @@ fn every_shape_and_a_custom_kind_are_covered_by_valid_examples() {
     for k in ["meter", "big_number", "text", "list", "nearby-flights/1"] {
         assert!(kinds.contains(k), "no valid example of {k}");
     }
+}
+
+/// Wraps one `data` object in a snapshot with a second, plain page.
+fn snapshot_with(kind: &str, data: serde_json::Value) -> serde_json::Value {
+    let page = |id: &str, kind: &str, data: serde_json::Value| {
+        serde_json::json!({"id": id, "title": "T", "kind": kind, "data_quality": "manual",
+            "updated_at": "2026-11-10T20:00:00Z", "stale_after_seconds": 1800, "note": null, "data": data})
+    };
+    serde_json::json!({"protocol_version": 1, "message_type": "dashboard.snapshot",
+        "generated_at": "2026-11-10T20:00:00Z", "refresh_after_seconds": 300,
+        "pages": [page("a", kind, data)]})
+}
+
+/// Optional fields inside a shape can be omitted or null, and the schema and the code agree on
+/// that, and on `decimals` written as a whole-number float.
+#[test]
+fn the_schema_and_the_code_agree_on_null_optionals_and_whole_decimals() {
+    use serde_json::json;
+    let schema = schema();
+    let cases = [
+        (
+            true,
+            "meter",
+            json!({"items":[{"id":"a","label":"A","percent":1.0,"resets_at":null}]}),
+        ),
+        (
+            true,
+            "big_number",
+            json!({"value":1,"decimals":null,"unit":null,"caption":null}),
+        ),
+        (true, "big_number", json!({"value":1,"decimals":2.0})),
+        (true, "list", json!({"items":[{"text":"x","detail":null}]})),
+        (true, "big_number", json!({"value":1e15})),
+        (false, "big_number", json!({"value":1.5e15})),
+        (false, "big_number", json!({"value":1,"decimals":2.5})),
+        (false, "big_number", json!({"value":1,"decimals":-1})),
+        (
+            false,
+            "meter",
+            json!({"items":[{"id":"a","label":"A","percent":1.0,"resets_at":5}]}),
+        ),
+        (false, "list", json!({"items":[{"text":"x","detail":5}]})),
+    ];
+    for (ok, kind, data) in cases {
+        let body = snapshot_with(kind, data.clone());
+        assert_eq!(schema.is_valid(&body), ok, "schema: {kind} {data}");
+        let snap: Snapshot = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(snap.validate().is_ok(), ok, "hub: {kind} {data}");
+        let shown = receive(&serde_json::to_vec(&body).unwrap()).unwrap().pages[0]
+            .content()
+            .is_ok();
+        assert_eq!(shown, ok, "display: {kind} {data}");
+    }
+}
+
+/// The JSON parser has limits of its own. A display may refuse, as malformed, a body nested more
+/// than about 100 levels or with a number outside the double range; a hub never sends either.
+#[test]
+fn a_display_may_refuse_absurdly_deep_or_huge_input_as_malformed() {
+    let mut deep = String::from("1");
+    for _ in 0..200 {
+        deep = format!("{{\"n\":{deep}}}");
+    }
+    let body = format!(
+        r#"{{"protocol_version":1,"message_type":"dashboard.snapshot","generated_at":"2026-11-10T20:00:00Z","refresh_after_seconds":300,"pages":[{{"id":"a","title":"T","kind":"deep/1","data_quality":"manual","updated_at":"2026-11-10T20:00:00Z","stale_after_seconds":1800,"note":null,"data":{deep}}}]}}"#
+    );
+    assert!(matches!(
+        receive(body.as_bytes()),
+        Err(ReceiveError::Malformed(_))
+    ));
+    let huge = serde_json::to_string(&snapshot_with("big_number", serde_json::json!({"value": 1}))).unwrap();
+    let huge = huge.replace("\"value\":1", "\"value\":1e400");
+    assert!(matches!(
+        receive(huge.as_bytes()),
+        Err(ReceiveError::Malformed(_))
+    ));
+    // Within the limits, deep custom data is a card, not a refusal.
+    let mut ok = serde_json::json!({"x": 1});
+    for _ in 0..20 {
+        ok = serde_json::json!({ "n": ok });
+    }
+    let snap = receive(&serde_json::to_vec(&snapshot_with("deep/1", ok)).unwrap()).unwrap();
+    assert!(snap.pages[0].content().is_err());
 }
 
 #[test]
@@ -252,7 +336,7 @@ fn the_largest_meter_big_number_and_text_pages_fit_a_page() {
             .collect(),
     };
     let big = BigNumber {
-        value: Some(-1.7976931348623157e308),
+        value: Some(-MAX_BIG_NUMBER_ABS),
         decimals: Some(MAX_DECIMALS),
         unit: Some(wide(MAX_UNIT_LEN)),
         caption: Some(wide(MAX_CAPTION_LEN)),

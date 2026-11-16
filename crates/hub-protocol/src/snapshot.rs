@@ -115,19 +115,15 @@ impl Page {
         }
     }
 
+    /// Whether a hub may send this page: the page-level rules (size, kind and data), checked
+    /// strictly. The common fields are checked by [`Snapshot::violations`].
+    pub fn check(&self) -> Result<(), CantShow> {
+        self.read(true).map(|_| ())
+    }
+
     /// The serialised size of the page object.
     pub fn size(&self) -> usize {
-        // A quality from a newer revision can't be written back out, so measure it as the longest
-        // name this revision knows.
-        let bytes = if self.data_quality == DataQuality::Unrecognised {
-            serde_json::to_vec(&Page {
-                data_quality: DataQuality::ProviderReported,
-                ..self.clone()
-            })
-        } else {
-            serde_json::to_vec(self)
-        };
-        bytes.map_or(usize::MAX, |b| b.len())
+        serde_json::to_vec(self).map_or(usize::MAX, |b| b.len())
     }
 }
 
@@ -146,8 +142,10 @@ pub enum DataQuality {
     Manual,
     /// No supported source. The page shows why, not numbers.
     Unavailable,
-    /// A value from a newer protocol revision. Displays treat it as unavailable. Never sent.
-    #[serde(other, skip_serializing)]
+    /// A value from a newer protocol revision. Displays treat it as unavailable.
+    /// A hub never sends it (validation refuses it). It serialises as `"unrecognised"` only so a
+    /// display can save what it received and read it back the same way.
+    #[serde(other)]
     Unrecognised,
 }
 

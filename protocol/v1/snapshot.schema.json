@@ -104,7 +104,7 @@
             ]
           },
           "data": {
-            "description": "Absent (or null) when the page is unavailable, an object otherwise. Its shape follows kind. A custom kind's data is any object, nested at most 8 levels deep; the schema can't express the depth or the 3072-byte page limit, which the hub also checks.",
+            "description": "Absent (or null) when the page is unavailable, an object otherwise. Its shape follows kind. A custom kind's data is any object, nested at most 8 levels deep; the schema can't express the depth or the 3072-byte page limit, which the hub also checks. Optional fields inside a shape may be omitted or null.",
             "type": [
               "object",
               "null"
@@ -279,7 +279,14 @@
                 ]
               },
               "resets_at": {
-                "$ref": "#/$defs/timestamp"
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/timestamp"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             }
           }
@@ -296,7 +303,9 @@
         "value": {
           "oneOf": [
             {
-              "type": "number"
+              "type": "number",
+              "minimum": -1000000000000000.0,
+              "maximum": 1000000000000000.0
             },
             {
               "type": "null"
@@ -304,17 +313,38 @@
           ]
         },
         "decimals": {
-          "type": "integer",
-          "minimum": 0,
-          "maximum": 3
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 3
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "unit": {
-          "$ref": "#/$defs/text",
-          "maxLength": 8
+          "oneOf": [
+            {
+              "$ref": "#/$defs/text",
+              "maxLength": 8
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "caption": {
-          "$ref": "#/$defs/text",
-          "maxLength": 48
+          "oneOf": [
+            {
+              "$ref": "#/$defs/text",
+              "maxLength": 48
+            },
+            {
+              "type": "null"
+            }
+          ]
         }
       }
     },
@@ -353,8 +383,15 @@
                 "maxLength": 48
               },
               "detail": {
-                "$ref": "#/$defs/text",
-                "maxLength": 48
+                "oneOf": [
+                  {
+                    "$ref": "#/$defs/text",
+                    "maxLength": 48
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               }
             }
           }

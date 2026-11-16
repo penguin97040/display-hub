@@ -3,7 +3,7 @@
 use hub_protocol::limits::{MAX_METER_ITEMS, MAX_PAGES};
 use hub_protocol::shapes::KIND_METER;
 use hub_protocol::snapshot::MESSAGE_TYPE;
-use hub_protocol::{DataQuality, Meter, MeterItem, Page, Snapshot, Timestamp, PROTOCOL_VERSION};
+use hub_protocol::{CantShow, DataQuality, Meter, MeterItem, Page, Snapshot, Timestamp, PROTOCOL_VERSION};
 
 use crate::model::{clean_note, clean_title, PageData, Source, Subscription};
 use crate::provider::generated;
@@ -13,6 +13,11 @@ pub const NO_SOURCE_NOTE: &str = "No supported source connected yet";
 pub const NEVER_COLLECTED_NOTE: &str = "Waiting for the first report";
 /// A page with a source but no figures in it: a meter needs at least one item.
 pub const NO_FIGURES_NOTE: &str = "No figures yet";
+/// Stand-ins for a page that breaks the page-level rules, so one bad page never blanks the rest.
+pub const TOO_BIG_NOTE: &str = "This page is too big to show";
+pub const INVALID_DATA_NOTE: &str = "This page's data isn't valid";
+/// The stand-in's title when the original can't be cleaned into one.
+pub const UNTITLED: &str = "Untitled page";
 pub const DEFAULT_REFRESH_SECONDS: u32 = 300;
 
 /// Builds a snapshot. `pages` are in display order, each with its latest stored figures (if any).
@@ -33,9 +38,29 @@ pub fn build_snapshot(
         pages: pages
             .iter()
             .take(MAX_PAGES)
-            .map(|(sub, data)| page(now, sub, data.as_ref()))
+            .map(|(sub, data)| guard(page(now, sub, data.as_ref())))
             .collect(),
     }
+}
+
+/// A page a hub may not send (over its size cap, or with data that breaks its shape) becomes an
+/// unavailable page with the same id and title, so the rest of the snapshot still goes out.
+fn guard(page: Page) -> Page {
+    let note = match page.check() {
+        Ok(()) => return page,
+        Err(CantShow::TooLarge) => TOO_BIG_NOTE,
+        Err(_) => INVALID_DATA_NOTE,
+    };
+    // The title may be what broke the page, so the stand-in gets a cleaned one. The kind doesn't
+    // matter on an unavailable page: a display shows only the title and the note.
+    let title = clean_title(&page.title).unwrap_or_else(|| UNTITLED.to_string());
+    Page::unavailable(
+        page.id,
+        title,
+        KIND_METER,
+        page.stale_after_seconds,
+        Some(note.into()),
+    )
 }
 
 fn page(now: Timestamp, sub: &Subscription, stored: Option<&PageData>) -> Page {
@@ -254,5 +279,80 @@ mod tests {
         assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
         assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn a_page_with_no_update_time_but_a_figure_showing_source_says_no_figures() {
+        let stored = PageData {
+            quality: DataQuality::Manual,
+            updated_at: None,
+            metrics: vec![MetricValue {
+                window: Window::FiveHour,
+                used_percent: Some(50.0),
+                resets_at: None,
+            }],
+            note: None,
+        };
+        let s = build_snapshot(
+            ts("2026-11-10T20:00:00Z"),
+            300,
+            &[(sub("a", Service::ClaudeMax, Source::Manual), Some(stored))],
+        );
+        assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
+        assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
+        s.validate().unwrap();
+    }
+
+    #[test]
+    fn one_bad_page_is_replaced_and_the_rest_still_go_out() {
+        let t = ts("2026-11-10T20:00:00Z");
+        let item = |i: usize| MeterItem::new(format!("m{i}"), "M", Some(1.0), None);
+        let meter = |items| Meter { items };
+        // Over the page cap (here through a huge title) and with data that breaks its shape
+        // (seven meter items).
+        let big = Page::with_content(
+            "big",
+            "x".repeat(4000),
+            DataQuality::Manual,
+            Some(t),
+            1800,
+            None,
+            meter(vec![item(0)]),
+        );
+        let bad = Page::with_content(
+            "bad",
+            "Bad",
+            DataQuality::Manual,
+            Some(t),
+            1800,
+            None,
+            meter((0..7).map(item).collect()),
+        );
+        let fine = guard(page(
+            t,
+            &sub("claude-max", Service::ClaudeMax, Source::Demo),
+            None,
+        ));
+        let (big, bad) = (guard(big), guard(bad));
+        assert_eq!(big.note.as_deref(), Some(TOO_BIG_NOTE));
+        assert_eq!(bad.note.as_deref(), Some(INVALID_DATA_NOTE));
+        for p in [&big, &bad] {
+            assert_eq!(p.data_quality, DataQuality::Unavailable);
+            assert!(p.data.is_none());
+        }
+        assert_eq!(big.id, "big");
+        assert_eq!(
+            big.title,
+            format!("{}…", "x".repeat(hub_protocol::limits::MAX_TITLE_LEN - 1))
+        );
+        assert_eq!(fine.data_quality, DataQuality::Demo);
+        let snap = Snapshot {
+            protocol_version: PROTOCOL_VERSION,
+            message_type: MESSAGE_TYPE.into(),
+            generated_at: t,
+            refresh_after_seconds: 300,
+            pages: vec![big, fine, bad],
+        };
+        snap.to_wire().unwrap();
     }
 }

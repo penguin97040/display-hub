@@ -19,6 +19,8 @@ pub const MAX_LIST_TEXT_LEN: usize = 48;
 /// Characters in a `big_number` unit and caption.
 pub const MAX_UNIT_LEN: usize = 8;
 pub const MAX_CAPTION_LEN: usize = 48;
+/// The largest magnitude a `big_number` value may have, so any display can draw it.
+pub const MAX_BIG_NUMBER_ABS: f64 = 1e15;
 /// The most decimal places a `big_number` shows.
 pub const MAX_DECIMALS: u8 = 3;
 /// How deeply a custom page's `data` may nest (the `data` object itself counts as one level).

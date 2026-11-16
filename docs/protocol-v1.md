@@ -112,7 +112,7 @@ Every page has the same common fields, and a `kind` that says what is in its `da
 
 All text is plain: Unicode NFC, with no control or invisible formatting characters and no leading or trailing spaces, and never empty. Lengths count characters, not bytes.
 
-A hub never sends a field that isn't listed here. A display ignores any it doesn't know, in the page and inside `data`.
+A hub never sends a field that isn't listed here. A display ignores any it doesn't know, in the page and inside `data`. Where a field inside `data` is optional, omit it or use `null`: a display treats the two the same.
 
 ### Kinds
 
@@ -150,8 +150,8 @@ One figure, drawn large.
 { "value": 1234.5, "decimals": 1, "unit": "k", "caption": "Tokens today" }
 ```
 
-- `value`: a finite number, or `null` for unknown. **Draw `null` as a dash, never as 0.**
-- `decimals`: optional, 0-3, default 0. How many decimal places to draw.
+- `value`: a number from -1e15 to 1e15 (`MAX_BIG_NUMBER_ABS`), or `null` for unknown. **Draw `null` as a dash, never as 0.** A value outside that range is bad data (a card).
+- `decimals`: optional, 0-3, default 0. How many decimal places to draw. A whole number written as a float (`2.0`) counts.
 - `unit`: optional, up to 8 characters.
 - `caption`: optional, up to 48 characters.
 
@@ -188,7 +188,8 @@ For anything the shapes don't cover, such as `nearby-flights/1`:
 
 - The whole snapshot is at most **32 KiB**.
 - Each page, counted as its compact serialised JSON, is at most **3072 bytes** (`MAX_PAGE_BYTES`). Ten pages of that size, plus the envelope, still fit in 32 KiB.
-- A full `list` with four-byte characters everywhere can be over 3072 bytes, so a hub must keep a long list within the page limit (the hub checks it and refuses to send a page that is over). The other ready-made shapes always fit.
+- A full `list` with four-byte characters everywhere can be over 3072 bytes, so a hub must keep a long list within the page limit. The other ready-made shapes always fit.
+- A hub never sends an over-size or invalid page. `hubd` checks every page it builds, and swaps one that breaks the page rules for an unavailable page with the same `id` and `title` and a note (for example "This page is too big to show"), so one bad page never stops the others being sent.
 
 ### What a display does with a page it can't show
 
@@ -210,6 +211,8 @@ For an unknown kind only, a second line follows:
 The card shows nothing else about the page (no figures, note or age). The hub-protocol crate has these two lines as constants (`CANT_SHOW_TEXT`, `CANT_SHOW_UPDATE_HINT`), and the conformance vectors give the exact lines.
 
 An unavailable page that has no `data` is not a card: show the title and `note`, as in the next section, whatever its `kind` says.
+
+**Limits of the JSON parser.** A display may refuse a whole body as malformed if it is nested deeper than about 100 levels, or has a number outside the range of a double (such as `1e400`). A hub never sends either, so this is not a card case. Custom `data` nested within the limit above but deeper than 8 levels is a card.
 
 Problems with the snapshot itself are different, and **do** make the display refuse it and keep the last good one: a wrong version or message type, a bad `refresh_after_seconds`, more than 10 pages, a body over 32 KiB, or a page whose common fields (`id`, `title`, `updated_at`, `stale_after_seconds`, `note`) break the rules or whose `id` repeats.
 
@@ -331,5 +334,5 @@ The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.l
   - **Tolerated and shown:** `extra-field` and `shape-extra-field` (unknown fields are ignored), `unknown-quality` (read as unavailable) and `missing-used-percent` (a missing `percent` reads as unknown).
   - **A card for that page, with the others still shown:** an unknown kind, bad shape data, data on an unavailable page, a custom kind with bad data and a page over 3072 bytes.
 - `crates/hub-protocol/tests/conformance.rs` shows the exact expectation for each file.
-- **`protocol/v1/vectors/`** has 54 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, each shape, cards, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
+- **`protocol/v1/vectors/`** has 55 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, each shape, cards, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
 - USB messages have `usb.schema.json` and examples in `examples/usb/`.

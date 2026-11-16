@@ -78,6 +78,7 @@ fn key_behaviours_hold() {
         ("invalid-unavailable-with-data", "bad_data", 1),
         ("invalid-data-missing", "bad_data", 1),
         ("invalid-custom-data-too-deep", "bad_data", 1),
+        ("invalid-big-number-too-big", "bad_data", 1),
         ("invalid-page-too-large", "too_large", 1),
     ] {
         let e = get(name);

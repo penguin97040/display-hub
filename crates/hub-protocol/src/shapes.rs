@@ -102,12 +102,29 @@ pub struct BigNumber {
     #[serde(default)]
     pub value: Option<f64>,
     /// Decimal places to show, 0 to 3. Absent means 0.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "whole_number",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub decimals: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub caption: Option<String>,
+}
+
+/// Reads `decimals`, accepting a whole number written as a float (`2.0`), as JSON Schema's
+/// `integer` does.
+fn whole_number<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u8>, D::Error> {
+    let Some(x) = Option::<f64>::deserialize(d)? else {
+        return Ok(None);
+    };
+    if x.fract() == 0.0 && (0.0..=255.0).contains(&x) {
+        Ok(Some(x as u8))
+    } else {
+        Err(serde::de::Error::custom("must be a whole number from 0 to 255"))
+    }
 }
 
 /// `text`: a short paragraph.
@@ -377,8 +394,12 @@ pub(crate) fn read(kind: &str, data: Option<&Value>, strict: bool) -> Result<Pag
                 strict,
             )?;
             let b: BigNumber = field(data)?;
-            if b.value.is_some_and(|x| !x.is_finite()) {
-                return Err(bad("value: must be a finite number or null"));
+            if b.value
+                .is_some_and(|x| !(x.is_finite() && x.abs() <= MAX_BIG_NUMBER_ABS))
+            {
+                return Err(bad(format!(
+                    "value: must be a number from -{MAX_BIG_NUMBER_ABS:e} to {MAX_BIG_NUMBER_ABS:e}, or null"
+                )));
             }
             if b.decimals.is_some_and(|d| d > MAX_DECIMALS) {
                 return Err(bad(format!("decimals: must be 0-{MAX_DECIMALS}")));
@@ -478,6 +499,14 @@ mod tests {
         .is_err());
         assert!(ok(KIND_BIG_NUMBER, json!({"value":null}), true).is_ok());
         assert!(ok(KIND_BIG_NUMBER, json!({"value":1,"decimals":4}), false).is_err());
+        for strict in [true, false] {
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":1,"decimals":2.0}), strict).is_ok());
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":1,"decimals":2.5}), strict).is_err());
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":1,"decimals":-1}), strict).is_err());
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":1e15}), strict).is_ok());
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":-1e15}), strict).is_ok());
+            assert!(ok(KIND_BIG_NUMBER, json!({"value":1.0000001e15}), strict).is_err());
+        }
         assert!(ok(KIND_BIG_NUMBER, json!({"value":1,"unit":"123456789"}), false).is_err());
         assert!(ok(KIND_TEXT, json!({"text":""}), false).is_err());
         assert!(ok(KIND_LIST, json!({"items":[]}), true).is_ok());

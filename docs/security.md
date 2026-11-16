@@ -28,7 +28,7 @@
 3. No `danger_accept_invalid_certs` or equivalent, anywhere.
 4. No provider credentials or admin tokens in firmware, logs, fixtures, URLs, command-line flags or Git.
 5. No browser cookies or session tokens copied from another app, and no undocumented endpoints.
-6. `used_percent` is `null` when unknown, never zero. Every page carries its data quality. Demo figures say so on screen.
+6. A meter item's `percent` (and a big number's `value`) is `null` when unknown, never zero. Every page carries its data quality. Demo figures say so on screen.
 7. Text from users and providers is normalised, stripped of control and invisible characters, and bounded before it reaches a display.
 
 ## The hub's identity
