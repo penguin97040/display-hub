@@ -8,7 +8,7 @@ You don't need the Raspberry Pi for this. `hubd` also runs on Windows, on your o
 
 From a checkout of this repository, either:
 
-- **The ready-made executables** in `dist\`, if someone has built them there (they're ignored by Git): `hub-manager.exe`, `hubd.exe` and `display-simulator.exe`. They come from `cargo build --release --target x86_64-pc-windows-gnu` on Linux, and compile their shaders the first time the manager starts.
+- **The ready-made executables** in `dist\`, if someone has built them there (they're ignored by Git): `hub-manager.exe`, `hubd.exe`, `display-simulator.exe`, `hub-send.exe`, `usage-helper.exe` and `usage-helper-sync.exe`. They come from `cargo build --release --target x86_64-pc-windows-gnu` on Linux, and compile their shaders the first time the manager starts.
 - **Or build them yourself**, with Rust and the Visual Studio Build Tools ("Desktop development with C++") installed:
 
   ```powershell
@@ -100,17 +100,17 @@ The manager opens the port with DTR set and RTS clear, so an ESP32 board shouldn
 Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) has the full set-up.
 
 1. In the manager, open **Settings**, then **PC helper**. Choose **Create helper string**, then **Copy helper string**.
-2. Run `.\dist\hubctl.exe login` and paste it. Expect "Paired with the hub at 127.0.0.1:8443 …".
+2. Run `.\dist\usage-helper.exe login` and paste it. Expect "Paired with the hub at 127.0.0.1:8443 …".
 3. In **Pages**, set a Claude Max page's figures to **PC helper**.
-4. **Claude Code:** add `{"statusLine": {"type": "command", "command": "C:/path/to/dist/hubctl.exe claude-statusline"}}` to `%USERPROFILE%\.claude\settings.json`, and send Claude a message. Use forward slashes: Claude Code runs the command through Git Bash, where backslashes are escape characters.
+4. **Claude Code:** add `{"statusLine": {"type": "command", "command": "C:/path/to/dist/usage-helper.exe claude-statusline"}}` to `%USERPROFILE%\.claude\settings.json`, and send Claude a message. Use forward slashes: Claude Code runs the command through Git Bash, where backslashes are escape characters.
    - Expect a status line like `Opus 4.7 · 5h 42% · 7d 18%`.
    - Within a minute, the page shows those figures as REPORTED.
-   - `.\dist\hubctl.exe status` shows the send.
-5. **Codex:** run `.\dist\hubctl.exe codex-sync --dry-run`.
+   - `.\dist\usage-helper.exe status` shows the send.
+5. **Codex:** run `.\dist\usage-helper.exe codex-sync --dry-run`.
    - Expect "Codex reports five-hour …, weekly …".
    - Without `--dry-run`, it sends them to a ChatGPT Plus page set to **PC helper**.
-   - In Task Scheduler, `dist\hubctl-sync.exe` should run with no window.
-6. Remove the helper in **Settings**. The next send is refused, and `hubctl status` says why.
+   - In Task Scheduler, `dist\usage-helper-sync.exe` should run with no window.
+6. Remove the helper in **Settings**. The next send is refused, and `usage-helper status` says why.
 
 Also check, anywhere in the manager: a hover highlight follows the pointer and never stays lit after the pointer leaves.
 

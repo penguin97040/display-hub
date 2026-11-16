@@ -1,5 +1,5 @@
-//! `hubctl-sync`: `hubctl codex-sync` without a console window, for Windows Task Scheduler. It takes
-//! the same `--codex <path>`, and writes what happened to the helper's log (`hubctl status` shows it).
+//! `usage-helper-sync`: `usage-helper codex-sync` without a console window, for Windows Task Scheduler. It takes
+//! the same `--codex <path>`, and writes what happened to the helper's log (`usage-helper status` shows it).
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::path::PathBuf;
@@ -16,8 +16,8 @@ fn main() -> ExitCode {
             _ => return ExitCode::from(2),
         }
     }
-    let dir = hubctl::commands::dir(dir);
-    match hubctl::commands::codex_sync(&dir, &hubctl::commands::store(), codex.as_deref(), false) {
+    let profile = usage_helper::commands::profile(dir);
+    match usage_helper::commands::codex_sync(&profile, codex.as_deref(), false) {
         Ok(_) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
     }

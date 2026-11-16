@@ -1,11 +1,11 @@
-//! `hubctl`: the Display Hub PC helper. See `docs/providers.md`.
+//! `usage-helper`: forwards the usage figures that Claude Code and Codex report on this PC. See `docs/providers.md`.
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use hubctl::commands;
+use usage_helper::commands;
 
 /// Forwards usage figures that Claude Code and Codex already report on this PC to your Display Hub.
 #[derive(Parser)]
@@ -27,7 +27,7 @@ enum Cmd {
     Status,
     /// Forget the hub on this PC.
     Logout,
-    /// Claude Code status line: set `"statusLine": {"type": "command", "command": "hubctl claude-statusline"}`
+    /// Claude Code status line: set `"statusLine": {"type": "command", "command": "usage-helper claude-statusline"}`
     /// in Claude Code's settings. Prints a short line and forwards the plan limits in the background.
     ClaudeStatusline {
         /// Print nothing; only forward. For piping from a status line script you already have.
@@ -55,7 +55,7 @@ fn finish(r: Result<String, String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("hubctl: {e}");
+            eprintln!("usage-helper: {e}");
             ExitCode::FAILURE
         }
     }
@@ -63,8 +63,7 @@ fn finish(r: Result<String, String>) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let dir = commands::dir(cli.config_dir);
-    let store = commands::store();
+    let p = commands::profile(cli.config_dir);
     match cli.command {
         Cmd::Login => {
             if std::io::stdin().is_terminal() {
@@ -73,19 +72,19 @@ fn main() -> ExitCode {
             }
             let mut line = String::new();
             if std::io::stdin().read_line(&mut line).is_err() || line.trim().is_empty() {
-                eprintln!("hubctl: no helper string given");
+                eprintln!("usage-helper: no helper string given");
                 return ExitCode::from(2);
             }
-            let r = commands::login(&dir, &store, &line);
+            let r = commands::login(&p, &line);
             zeroize::Zeroize::zeroize(&mut line);
             finish(r)
         }
-        Cmd::Status => finish(commands::status(&dir, &store)),
-        Cmd::Logout => finish(commands::logout(&dir, &store)),
+        Cmd::Status => finish(commands::status(&p)),
+        Cmd::Logout => finish(commands::logout(&p)),
         Cmd::ClaudeStatusline { quiet } => {
             // Always exits 0 with a line: Claude Code blanks the status line otherwise.
             commands::claude_statusline(
-                &dir,
+                &p,
                 &mut std::io::stdin().lock(),
                 &mut std::io::stdout().lock(),
                 quiet,
@@ -93,10 +92,8 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Cmd::CodexSync { codex, dry_run } => {
-            finish(commands::codex_sync(&dir, &store, codex.as_deref(), dry_run))
-        }
-        Cmd::SendPending => match commands::send_pending(&dir, &store) {
+        Cmd::CodexSync { codex, dry_run } => finish(commands::codex_sync(&p, codex.as_deref(), dry_run)),
+        Cmd::SendPending => match commands::send_pending(&p) {
             Ok(_) => ExitCode::SUCCESS,
             Err(_) => ExitCode::FAILURE,
         },

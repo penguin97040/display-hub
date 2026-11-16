@@ -192,7 +192,7 @@ impl Confirm {
             Confirm::RevokeHelper { label, .. } => (
                 format!("Remove the helper on {label}?"),
                 "Its credential stops working straight away. Pages it fed keep their last figures, and go stale. On \
-                 that PC, hubctl logout tidies up."
+                 that PC, usage-helper logout tidies up."
                     .into(),
                 "Remove helper",
             ),
@@ -327,12 +327,12 @@ pub struct MetricRow {
     pub resets: String,
 }
 
-/// Setting up a PC helper (`hubctl`).
+/// Setting up a PC helper (`usage-helper`).
 #[derive(Default)]
 pub struct HelperForm {
     pub claude: bool,
     pub chatgpt: bool,
-    /// The `dh1.` string for `hubctl login`, once made. A secret until used or expired.
+    /// The `dh1.` string for `usage-helper login`, once made. A secret until used or expired.
     pub string: Option<Zeroizing<String>>,
     pub expires_at: Option<Timestamp>,
 }

@@ -172,7 +172,7 @@ pub struct NewHelper {
     pub feeds: Vec<String>,
 }
 
-/// The one-time secret for pairing a helper (`hubctl login`), valid for 10 minutes.
+/// The one-time secret for pairing a helper (`usage-helper login`), valid for 10 minutes.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct HelperInvite {
     pub secret: String,

@@ -1,0 +1,37 @@
+[package]
+name = "hub-send"
+version = "0.1.0"
+description = "Display Hub: pairs a helper with the hub and sends it page content for the feeds it was invited for"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hub_send"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hub-send"
+path = "src/main.rs"
+
+[dependencies]
+hub-protocol.workspace = true
+hub-core.workspace = true
+hub-client.workspace = true
+os-secrets.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+dirs.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+hubd = { path = "../hubd" }
+tempfile.workspace = true
+base64.workspace = true

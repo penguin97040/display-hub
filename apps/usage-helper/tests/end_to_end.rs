@@ -8,9 +8,10 @@ use hub_core::api::NewHelper;
 use hub_core::{FakeClock, Source};
 use hub_protocol::pairing::PairingString;
 use hub_protocol::DataQuality;
-use hubctl::commands;
+use hub_send::Profile;
 use os_secrets::{MemoryStore, TokenStore};
 use usage::{NewSubscription, Service, Window};
+use usage_helper::commands;
 
 /// The items of a page that must be a meter.
 fn items(page: &hub_protocol::Page) -> Vec<hub_protocol::MeterItem> {
@@ -101,16 +102,21 @@ async fn helper_figures_reach_helper_pages() {
     // The helper's side, on its own thread (the commands run their own runtime, as the binary does).
     let hdir = dir.path().join("helper");
     let store = MemoryStore::default();
-    let (d, s) = (hdir.clone(), store.clone());
+    let p = Arc::new(Profile::new(
+        commands::TOOL,
+        hdir.clone(),
+        Box::new(store.clone()),
+    ));
+    let d = p.clone();
     let out = tokio::task::spawn_blocking(move || {
-        let login = commands::login(&d, &s, &format!("  {helper_string}\n"));
+        let login = commands::login(&d, &format!("  {helper_string}\n"));
         let mut line = Vec::new();
         commands::claude_statusline(&d, &mut STATUS_JSON.as_bytes(), &mut line, false, false);
-        let first = commands::send_pending(&d, &s);
+        let first = commands::send_pending(&d);
         // A second update within the minute queues nothing.
         let mut ignored = Vec::new();
         commands::claude_statusline(&d, &mut STATUS_JSON.as_bytes(), &mut ignored, true, false);
-        let second = commands::send_pending(&d, &s);
+        let second = commands::send_pending(&d);
         (login, String::from_utf8(line).unwrap(), first, second, ignored)
     })
     .await
@@ -122,7 +128,7 @@ async fn helper_figures_reach_helper_pages() {
     assert_eq!(first.unwrap(), "sent to claude-max");
     assert_eq!(second.unwrap(), "nothing to send", "throttled to once a minute");
     assert!(
-        !std::fs::read_to_string(hdir.join("hubctl.json"))
+        !std::fs::read_to_string(hdir.join("connection.json"))
             .unwrap()
             .contains("dhc_"),
         "no token in files"
@@ -153,15 +159,15 @@ async fn helper_figures_reach_helper_pages() {
         )
         .unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let (d, s) = (hdir.clone(), store.clone());
+        let d = p.clone();
         let dry = tokio::task::spawn_blocking({
-            let (d, s, f) = (d.clone(), s.clone(), fake.clone());
-            move || commands::codex_sync(&d, &s, Some(&f), true)
+            let (d, f) = (d.clone(), fake.clone());
+            move || commands::codex_sync(&d, Some(&f), true)
         })
         .await
         .unwrap();
         assert_eq!(dry.unwrap(), "Codex reports five-hour 33%, weekly 70% (not sent)");
-        let sent = tokio::task::spawn_blocking(move || commands::codex_sync(&d, &s, Some(&fake), false))
+        let sent = tokio::task::spawn_blocking(move || commands::codex_sync(&d, Some(&fake), false))
             .await
             .unwrap();
         assert_eq!(
@@ -182,21 +188,21 @@ async fn helper_figures_reach_helper_pages() {
     let id = manager.helpers(&admin).await.unwrap()[0].id.clone();
     manager.revoke_helper(&admin, &id).await.unwrap();
     std::fs::remove_file(hdir.join("claude-sent.json")).unwrap();
-    let (d, s) = (hdir.clone(), store.clone());
+    let d = p.clone();
     let after = tokio::task::spawn_blocking(move || {
         commands::claude_statusline(&d, &mut STATUS_JSON.as_bytes(), &mut Vec::new(), true, false);
-        commands::send_pending(&d, &s)
+        commands::send_pending(&d)
     })
     .await
     .unwrap();
     assert!(after.unwrap_err().contains("revoked"));
-    assert!(std::fs::read_to_string(hdir.join("hubctl.log"))
+    assert!(std::fs::read_to_string(hdir.join("helper.log"))
         .unwrap()
         .contains("revoked"));
 
     // Logging out forgets the token.
     let account = store.items.lock().unwrap().keys().next().cloned().unwrap();
-    commands::logout(&hdir, &store).unwrap();
+    commands::logout(&p).unwrap();
     assert!(store.load(&account).unwrap().is_none());
     let _ = tx.send(());
     server.await.unwrap().unwrap();

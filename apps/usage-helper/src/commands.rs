@@ -1,27 +1,32 @@
-//! What each `hubctl` command does. Both binaries call these.
+//! What each `usage-helper` command does. Both binaries call these.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use hub_core::{Clock, SystemClock};
-use hub_protocol::pairing::PairingString;
-use os_secrets::{OsStore, TokenStore};
+use hub_send::{write_private, Config, Error, Profile};
+use os_secrets::OsStore;
 use usage::{Service, UsageReport};
 
 use crate::claude::{self, Sent};
 use crate::codex;
-use crate::helper::{self, Helper, HelperError};
+
+/// The name the helper's messages use for its command.
+pub const TOOL: &str = "usage-helper";
+/// The credential store's service name for the helper's token.
+pub const SERVICE: &str = "display-hub-usage-helper";
 
 const PENDING: &str = "claude-pending.json";
 const SENT: &str = "claude-sent.json";
 /// A queued Claude report older than this isn't sent: newer figures will come.
 const PENDING_MAX_AGE_SECONDS: i64 = 600;
 
-pub fn store() -> OsStore {
-    OsStore {
-        service: helper::SERVICE,
-    }
+/// This helper's place on the computer: its folder (`dir`, or the user's configuration folder) and
+/// the system's credential store.
+pub fn profile(dir: Option<PathBuf>) -> Profile {
+    let dir = dir.unwrap_or_else(|| hub_send::default_dir(TOOL));
+    Profile::new(TOOL, dir, Box::new(OsStore { service: SERVICE }))
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -32,7 +37,7 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 /// What the helper reports, by service name where its feed is a service's.
-fn service_names(cfg: &helper::HelperConfig) -> String {
+fn service_names(cfg: &Config) -> String {
     cfg.feeds
         .iter()
         .map(|f| Service::from_slug(f).map_or(f.as_str(), |s| s.default_title()))
@@ -40,21 +45,12 @@ fn service_names(cfg: &helper::HelperConfig) -> String {
         .join(" and ")
 }
 
-/// `hubctl login`: the helper string comes on stdin, never as an argument, so it stays out of shell
-/// history and process lists.
-pub fn login(dir: &Path, store: &dyn TokenStore, input: &str) -> Result<String, String> {
-    let pairing = PairingString::decode(input.trim()).map_err(|e| e.to_string())?;
+/// `usage-helper login`: the helper string comes on stdin, never as an argument, so it stays out of
+/// shell history and process lists.
+pub fn login(p: &Profile, input: &str) -> Result<String, String> {
     let cfg = runtime()
-        .block_on(helper::login(dir, store, &pairing, SystemClock.now()))
-        .map_err(|e| match e {
-            HelperError::Hub(c) if c.code() == Some(hub_protocol::ErrorCode::EnrolmentUsed) => {
-                "this helper string was already used. Make a new one in the manager's Settings.".into()
-            }
-            HelperError::Hub(c) if c.code() == Some(hub_protocol::ErrorCode::EnrolmentExpired) => {
-                "this helper string has expired (they last 10 minutes). Make a new one in the manager's Settings.".into()
-            }
-            other => other.to_string(),
-        })?;
+        .block_on(p.login(input, SystemClock.now()))
+        .map_err(|e| e.to_string())?;
     Ok(format!(
         "Paired with the hub at {}:{}. This PC can now report {}.",
         cfg.host,
@@ -63,8 +59,8 @@ pub fn login(dir: &Path, store: &dyn TokenStore, input: &str) -> Result<String, 
     ))
 }
 
-pub fn logout(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
-    match helper::logout(dir, store).map_err(|e| e.to_string())? {
+pub fn logout(p: &Profile) -> Result<String, String> {
+    match p.logout().map_err(|e| e.to_string())? {
         Some(_) => Ok(
             "Forgot the hub on this PC. Remove the helper in the manager's Settings too, to cut it off."
                 .into(),
@@ -73,8 +69,8 @@ pub fn logout(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
     }
 }
 
-pub fn status(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
-    let h = Helper::open(dir, store).map_err(|e| e.to_string())?;
+pub fn status(p: &Profile) -> Result<String, String> {
+    let h = p.open().map_err(|e| e.to_string())?;
     let mut out = vec![
         format!("Hub: {}:{}", h.config.host, h.config.port),
         format!("Reports: {}", service_names(&h.config)),
@@ -83,7 +79,7 @@ pub fn status(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
         Ok(()) => "Reachable: yes".into(),
         Err(e) => format!("Reachable: no ({e})"),
     });
-    let tail = helper::log_tail(dir, 5);
+    let tail = p.log_tail(5);
     if !tail.is_empty() {
         out.push("Recent activity:".into());
         out.extend(tail.into_iter().map(|l| format!("  {l}")));
@@ -91,10 +87,10 @@ pub fn status(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
     Ok(out.join("\n"))
 }
 
-/// `hubctl claude-statusline`: prints the status line straight away, then, at most once a minute,
+/// `usage-helper claude-statusline`: prints the status line straight away, then, at most once a minute,
 /// starts a separate `send-pending` so Claude Code never waits on the network.
 pub fn claude_statusline(
-    dir: &Path,
+    p: &Profile,
     stdin: &mut impl Read,
     stdout: &mut impl Write,
     quiet: bool,
@@ -112,9 +108,10 @@ pub fn claude_statusline(
         return;
     };
     // Only a PC that has been set up sends anything.
-    if helper::load_config(dir).is_err() {
+    if p.config().is_err() {
         return;
     }
+    let dir = p.dir();
     let digest = claude::digest(&report);
     let last: Option<Sent> = std::fs::read(dir.join(SENT))
         .ok()
@@ -128,19 +125,18 @@ pub fn claude_statusline(
         digest,
     })
     .expect("serialises");
-    if helper::write_private(&dir.join(PENDING), &pending).is_err()
-        || helper::write_private(&dir.join(SENT), &sent).is_err()
+    if write_private(&dir.join(PENDING), &pending).is_err() || write_private(&dir.join(SENT), &sent).is_err()
     {
         return;
     }
     if spawn {
         if let Err(e) = spawn_sender(dir) {
-            helper::log(dir, now, &format!("couldn't start the sender: {e}"));
+            p.log(now, &format!("couldn't start the sender: {e}"));
         }
     }
 }
 
-/// Starts `hubctl send-pending` on its own, detached, with no window and no inherited streams.
+/// Starts `usage-helper send-pending` on its own, detached, with no window and no inherited streams.
 fn spawn_sender(dir: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let make = || {
@@ -172,10 +168,10 @@ fn spawn_sender(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// `hubctl send-pending`: sends the queued Claude Code figures.
-pub fn send_pending(dir: &Path, store: &dyn TokenStore) -> Result<String, String> {
+/// `usage-helper send-pending`: sends the queued Claude Code figures.
+pub fn send_pending(p: &Profile) -> Result<String, String> {
     let now = SystemClock.now();
-    let path = dir.join(PENDING);
+    let path = p.dir().join(PENDING);
     let Some(report) = std::fs::read(&path)
         .ok()
         .and_then(|b| serde_json::from_slice::<UsageReport>(&b).ok())
@@ -186,18 +182,23 @@ pub fn send_pending(dir: &Path, store: &dyn TokenStore) -> Result<String, String
     if report.collected_at.seconds_until(now) > PENDING_MAX_AGE_SECONDS {
         return Ok("the queued figures were too old to send".into());
     }
-    let result = send(dir, store, &report);
-    helper::log(
-        dir,
+    let result = send(p, &report);
+    p.log(
         now,
         &format!("Claude Code: {}", result.as_ref().unwrap_or_else(|e| e)),
     );
     result
 }
 
-fn send(dir: &Path, store: &dyn TokenStore, report: &UsageReport) -> Result<String, String> {
-    let h = Helper::open(dir, store).map_err(|e| e.to_string())?;
-    let accepted = runtime().block_on(h.send(report)).map_err(|e| e.to_string())?;
+fn send(p: &Profile, report: &UsageReport) -> Result<String, String> {
+    let h = p.open().map_err(|e| e.to_string())?;
+    // Only figures that pass the usage checks are sent, as a meter page to the service's feed.
+    let (feed, body) = report
+        .to_feed_content()
+        .map_err(|e| Error::Hub(hub_send::ClientError::Invalid(e)).to_string())?;
+    let accepted = runtime()
+        .block_on(h.send_page(feed, &body))
+        .map_err(|e| e.to_string())?;
     Ok(if accepted.updated.is_empty() {
         format!(
             "sent, but no page uses it yet: in the manager, set a {} page's figures to \"PC helper\"",
@@ -208,17 +209,12 @@ fn send(dir: &Path, store: &dyn TokenStore, report: &UsageReport) -> Result<Stri
     })
 }
 
-/// `hubctl codex-sync`: asks Codex for its plan limits and sends them. For Task Scheduler.
-pub fn codex_sync(
-    dir: &Path,
-    store: &dyn TokenStore,
-    codex_path: Option<&Path>,
-    dry_run: bool,
-) -> Result<String, String> {
+/// `usage-helper codex-sync`: asks Codex for its plan limits and sends them. For Task Scheduler.
+pub fn codex_sync(p: &Profile, codex_path: Option<&Path>, dry_run: bool) -> Result<String, String> {
     let now = SystemClock.now();
     if !dry_run {
         // Fail early, before starting Codex, if there's nowhere to send.
-        Helper::open(dir, store).map_err(|e| e.to_string())?;
+        p.open().map_err(|e| e.to_string())?;
     }
     let result = codex::run(codex_path)
         .map_err(|e| e.to_string())
@@ -240,18 +236,10 @@ pub fn codex_sync(
             if dry_run {
                 return Ok(format!("Codex reports {shown} (not sent)"));
             }
-            send(dir, store, &report).map(|s| format!("Codex reports {shown}: {s}"))
+            send(p, &report).map(|s| format!("Codex reports {shown}: {s}"))
         });
     if !dry_run {
-        helper::log(
-            dir,
-            now,
-            &format!("Codex: {}", result.as_ref().unwrap_or_else(|e| e)),
-        );
+        p.log(now, &format!("Codex: {}", result.as_ref().unwrap_or_else(|e| e)));
     }
     result
-}
-
-pub fn dir(arg: Option<PathBuf>) -> PathBuf {
-    helper::folder(arg.as_deref())
 }

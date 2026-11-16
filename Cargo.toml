@@ -8,7 +8,8 @@ members = [
     "crates/usage",
     "apps/hubd",
     "apps/hub-manager",
-    "apps/hubctl",
+    "apps/hub-send",
+    "apps/usage-helper",
     "tools/display-simulator",
 ]
 

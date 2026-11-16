@@ -69,7 +69,7 @@ enum Command {
         #[arg(long, default_value = "Desktop manager")]
         label: String,
     },
-    /// Print a one-time string for `hubctl login` on a PC (valid 10 minutes), without the manager.
+    /// Print a one-time string for `usage-helper login` on a PC (valid 10 minutes), without the manager.
     PairHelper {
         #[command(flatten)]
         settings: Settings,
@@ -255,9 +255,11 @@ async fn main() -> anyhow::Result<()> {
                 spki_sha256: hub.identity.spki_sha256,
                 secret,
             };
-            println!("Helper string for `hubctl login` on your PC. It works once, within 10 minutes:\n");
+            println!(
+                "Helper string for `usage-helper login` on your PC. It works once, within 10 minutes:\n"
+            );
             println!("  {}\n", pairing.encode());
-            println!("Paste it when `hubctl login` asks. Don't share it or save it anywhere.");
+            println!("Paste it when `usage-helper login` asks. Don't share it or save it anywhere.");
         }
         Command::Admin { action, settings } => {
             let hub = hubd::open_hub(settings.load()?, clock.clone())?;

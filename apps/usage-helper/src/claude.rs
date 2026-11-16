@@ -4,7 +4,7 @@
 //! claude.ai Pro and Max subscribers, after the first response in a session, that JSON includes
 //! `rate_limits.five_hour` and `rate_limits.seven_day`, each with `used_percentage` (0-100) and
 //! `resets_at` (Unix seconds). Either window may be missing. Claude Code cancels a status line command
-//! that is still running when the next update comes, so `hubctl claude-statusline` prints at once and
+//! that is still running when the next update comes, so `usage-helper claude-statusline` prints at once and
 //! leaves sending to a separate process (`send-pending`), at most once a minute.
 
 use hub_protocol::Timestamp;

@@ -2858,10 +2858,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "hubctl"
+name = "hub-send"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "base64 0.23.1",
  "clap",
  "dirs 6.0.0",
@@ -2869,13 +2868,13 @@ dependencies = [
  "hub-core",
  "hub-protocol",
  "hubd",
+ "libc",
  "os-secrets",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "usage",
  "zeroize",
 ]
 
@@ -6706,6 +6705,28 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+]
+
+[[package]]
+name = "usage-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "clap",
+ "hub-client",
+ "hub-core",
+ "hub-protocol",
+ "hub-send",
+ "hubd",
+ "os-secrets",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "usage",
+ "zeroize",
 ]
 
 [[package]]

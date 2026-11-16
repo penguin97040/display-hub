@@ -1740,7 +1740,7 @@ impl Manager {
         );
         let mut body = ui::body(m)
             .child(ui::p_muted(
-                "hubctl runs on a PC where Claude Code or Codex is signed in, and forwards the plan limits they \
+                "usage-helper runs on a PC where Claude Code or Codex is signed in, and forwards the plan limits they \
                  report there. Pages whose figures are set to PC helper show them, marked REPORTED. It reads \
                  nothing else: no browser data, passwords or other apps' tokens.",
             ))
@@ -1764,7 +1764,7 @@ impl Manager {
                     cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
                     this.model.notice = Some(Guidance::done(
                         "Copied the helper string",
-                        "Paste it where hubctl login asks. It works once, within 10 minutes.",
+                        "Paste it where usage-helper login asks. It works once, within 10 minutes.",
                     ));
                 },
             );
@@ -1783,8 +1783,8 @@ impl Manager {
                     .child(ui::data(shown))
                     .child(div().flex().child(copy))
                     .child(ui::p_muted(
-                        "On that PC, run hubctl login and paste it. Then add hubctl claude-statusline as Claude \
-                         Code's status line, or schedule hubctl-sync for Codex: docs/providers.md has the steps.",
+                        "On that PC, run usage-helper login and paste it. Then add usage-helper claude-statusline as Claude \
+                         Code's status line, or schedule usage-helper-sync for Codex: docs/providers.md has the steps.",
                     )),
             );
         }

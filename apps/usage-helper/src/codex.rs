@@ -173,7 +173,7 @@ pub fn read_limits<R: Read + Send + 'static, W: Write>(
     send(
         to,
         &json!({"method": "initialize", "id": 0, "params": {"clientInfo": {
-            "name": "display_hub_hubctl", "title": "Display Hub PC helper", "version": env!("CARGO_PKG_VERSION")
+            "name": "display_hub_usage_helper", "title": "Display Hub PC helper", "version": env!("CARGO_PKG_VERSION")
         }}}),
     )?;
     response(&rx, 0, deadline)?;
