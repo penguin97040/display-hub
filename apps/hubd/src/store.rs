@@ -483,7 +483,7 @@ impl Store {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs() as i64);
-        let stamp = ts(now).to_string().replace(':', "-");
+        let stamp = file_stamp(ts(now));
         let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("hub");
         let mut opts = std::fs::OpenOptions::new();
         opts.write(true).create_new(true);
@@ -815,19 +815,34 @@ impl Store {
 
     /// The pages a display's snapshot is built from: its first
     /// [`MAX_PAGES`](hub_protocol::limits::MAX_PAGES) ticked pages, in order. `None` if there is
-    /// no such active display.
+    /// no such active display. One query, since every poll asks.
     pub fn display_pages(&self, device: &str) -> Result<Option<Vec<StoredPage>>, StoreError> {
-        let Some(ids) = self.display_page_ids(device)? else {
-            return Ok(None);
-        };
-        let ticked: std::collections::HashSet<String> = ids.into_iter().collect();
-        Ok(Some(
-            self.pages()?
-                .into_iter()
-                .filter(|p| ticked.contains(&p.id))
-                .take(hub_protocol::limits::MAX_PAGES)
-                .collect(),
-        ))
+        let conn = self.conn();
+        let sql = format!(
+            "SELECT {PAGE_COLUMNS} FROM display_pages t
+             JOIN devices d ON d.id = t.device_id AND d.revoked_at IS NULL
+             JOIN pages p ON p.id = t.page_id AND p.source IN ({})
+             WHERE t.device_id = ?1
+             ORDER BY p.position, p.created_at LIMIT ?2",
+            known_sources()
+        );
+        let pages = read_pages(
+            &conn,
+            &sql,
+            params![device, hub_protocol::limits::MAX_PAGES as i64],
+        )?;
+        if pages.is_empty() {
+            // No ticked pages, or no such display: only the second needs another look.
+            let active: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM devices WHERE id = ?1 AND revoked_at IS NULL)",
+                params![device],
+                |r| r.get(0),
+            )?;
+            if !active {
+                return Ok(None);
+            }
+        }
+        Ok(Some(pages))
     }
 
     /// Writes buffered last-seen times and heartbeat details in one transaction.
@@ -849,61 +864,17 @@ impl Store {
     /// Every page, in display order, with what was last stored for it.
     pub fn pages(&self) -> Result<Vec<StoredPage>, StoreError> {
         let conn = self.conn();
-        let mut st = conn.prepare(
-            "SELECT id, title, kind, source, feed, stale_after_seconds, quality, updated_at, data, note
-             FROM pages ORDER BY position, created_at",
-        )?;
-        let rows = st.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, i64>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, Option<i64>>(7)?,
-                r.get::<_, Option<String>>(8)?,
-                r.get::<_, Option<String>>(9)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (id, title, kind, source, feed, stale, quality, updated, data, note) = row?;
-            // A row this build can't interpret is skipped and logged, rather than breaking every snapshot.
-            let Some(source) = Source::from_slug(&source) else {
-                tracing::warn!(%id, "skipping a page with an unknown source");
-                continue;
-            };
-            let content = quality.map(|q| StoredContent {
-                quality: serde_json::from_value(serde_json::Value::String(q))
-                    .unwrap_or(DataQuality::Unavailable),
-                updated_at: updated.map(ts),
-                data: data.and_then(|d| match serde_json::from_str(&d) {
-                    Ok(v) => Some(v),
-                    Err(_) => {
-                        tracing::warn!(%id, "ignoring a page's stored data, which isn't valid JSON");
-                        None
-                    }
-                }),
-                note,
-            });
-            out.push(StoredPage {
-                id,
-                title,
-                kind,
-                source,
-                feed,
-                // Out of range is left for snapshot checks to catch, which leave the page off.
-                stale_after_seconds: u32::try_from(stale).unwrap_or(0),
-                content,
-            });
-        }
-        Ok(out)
+        read_pages(
+            &conn,
+            &format!("SELECT {PAGE_COLUMNS} FROM pages p ORDER BY p.position, p.created_at"),
+            [],
+        )
     }
 
     pub fn page(&self, id: &str) -> Result<Option<StoredPage>, StoreError> {
-        Ok(self.pages()?.into_iter().find(|p| p.id == id))
+        let conn = self.conn();
+        let sql = format!("SELECT {PAGE_COLUMNS} FROM pages p WHERE p.id = ?1");
+        Ok(read_pages(&conn, &sql, params![id])?.into_iter().next())
     }
 
     pub fn page_ids(&self) -> Result<Vec<String>, StoreError> {
@@ -1035,35 +1006,70 @@ impl Store {
         Ok(())
     }
 
-    /// Stores a page's content, replacing what was there. A write that changes nothing is skipped,
-    /// to spare the SD card.
-    pub fn put_content(&self, id: &str, content: &StoredContent, now: Timestamp) -> Result<bool, StoreError> {
-        let conn = self.conn();
-        let row: Option<ContentColumns> = conn
+    /// Stores a page's content, replacing what was there, but only while its source is `source`:
+    /// a page that has since changed source is refused, in the same transaction as the write. A
+    /// write that changes nothing is skipped, to spare the SD card.
+    pub fn put_content(
+        &self,
+        id: &str,
+        source: Source,
+        content: &StoredContent,
+        now: Timestamp,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, ContentColumns)> = tx
             .query_row(
-                "SELECT quality, updated_at, data, note FROM pages WHERE id = ?1",
+                "SELECT source, quality, updated_at, data, note FROM pages WHERE id = ?1",
                 params![id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))),
             )
             .optional()?;
-        let Some(row) = row else {
+        let Some((stored_source, stored)) = row else {
             return Err(StoreError::Invalid(format!("no page with id {id:?}")));
         };
-        if row == content_columns(content) {
+        if stored_source != source.slug() {
+            return Err(StoreError::Invalid(format!(
+                "page {id:?} no longer takes content from {}: its source has changed",
+                source.slug()
+            )));
+        }
+        if stored == content_columns(content) {
             return Ok(false);
         }
-        write_content(&conn, id, content, now)?;
+        write_content(&tx, id, content, now)?;
+        tx.commit()?;
         Ok(true)
     }
 
-    /// The pages a collector's report for `feed` goes to: that feed, with source `collector`.
+    /// The pages a collector's report for `feed` goes to: meter pages of that feed, with source
+    /// `collector`.
     pub fn collector_feed_pages(&self, feed: &str) -> Result<Vec<String>, StoreError> {
         let conn = self.conn();
-        let mut st = conn.prepare(
-            "SELECT id FROM pages WHERE feed = ?1 AND source = 'collector' ORDER BY position, created_at",
-        )?;
-        let rows = st.query_map(params![feed], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        feed_page_ids(&conn, feed)
+    }
+
+    /// Writes a collector's report to every page [`collector_feed_pages`](Self::collector_feed_pages)
+    /// names, in one transaction, and returns their ids. Pages it wouldn't change are not rewritten.
+    pub fn put_feed_content(
+        &self,
+        feed: &str,
+        content: &StoredContent,
+        now: Timestamp,
+    ) -> Result<Vec<String>, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let ids = feed_page_ids(&tx, feed)?;
+        let (quality, updated_at, data, note) = content_columns(content);
+        for id in &ids {
+            tx.execute(
+                "UPDATE pages SET quality = ?2, updated_at = ?3, data = ?4, note = ?5, stored_at = ?6
+                 WHERE id = ?1 AND NOT (quality IS ?2 AND updated_at IS ?3 AND data IS ?4 AND note IS ?5)",
+                params![id, quality, updated_at, data, note, now.unix()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
     }
 
     // ----- collectors -----
@@ -1114,6 +1120,84 @@ impl Store {
     pub fn backup_to(&self, dest: &Path) -> Result<(), StoreError> {
         Ok(online_copy(&self.conn(), dest)?)
     }
+}
+
+/// The columns [`read_pages`] reads, from `pages` aliased as `p`.
+const PAGE_COLUMNS: &str =
+    "p.id, p.title, p.kind, p.source, p.feed, p.stale_after_seconds, p.quality, p.updated_at, p.data, p.note";
+
+/// Every source this build knows, as an SQL list.
+fn known_sources() -> String {
+    Source::ALL.map(|s| format!("'{}'", s.slug())).join(", ")
+}
+
+fn feed_page_ids(conn: &Connection, feed: &str) -> Result<Vec<String>, StoreError> {
+    let mut st = conn.prepare(
+        "SELECT id FROM pages WHERE feed = ?1 AND source = 'collector' AND kind = 'meter'
+         ORDER BY position, created_at",
+    )?;
+    let rows = st.query_map(params![feed], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Runs a query selecting [`PAGE_COLUMNS`] and reads each row as a page.
+fn read_pages(
+    conn: &Connection,
+    sql: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<StoredPage>, StoreError> {
+    let mut st = conn.prepare(sql)?;
+    let rows = st.query_map(args, |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<i64>>(7)?,
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<String>>(9)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, title, kind, source, feed, stale, quality, updated, data, note) = row?;
+        // A row this build can't interpret is skipped and logged, rather than breaking every snapshot.
+        let Some(source) = Source::from_slug(&source) else {
+            tracing::warn!(%id, "skipping a page with an unknown source");
+            continue;
+        };
+        let content = quality.map(|q| StoredContent {
+            quality: serde_json::from_value(serde_json::Value::String(q)).unwrap_or(DataQuality::Unavailable),
+            updated_at: updated.map(ts),
+            data: data.and_then(|d| match serde_json::from_str(&d) {
+                Ok(v) => Some(v),
+                Err(_) => {
+                    tracing::warn!(%id, "ignoring a page's stored data, which isn't valid JSON");
+                    None
+                }
+            }),
+            note,
+        });
+        out.push(StoredPage {
+            id,
+            title,
+            kind,
+            source,
+            feed,
+            // Out of range is left for snapshot checks to catch, which leave the page off.
+            stale_after_seconds: u32::try_from(stale).unwrap_or(0),
+            content,
+        });
+    }
+    Ok(out)
+}
+
+/// `2026-11-11T01-02-03Z`: a timestamp that is also a valid file name everywhere.
+pub(crate) fn file_stamp(t: Timestamp) -> String {
+    t.to_string().replace(':', "-")
 }
 
 /// A page's content as its database columns: quality, updated_at, data and note.
@@ -1412,15 +1496,19 @@ mod tests {
         // A custom page is not a usage page.
         assert_eq!(store.pages().unwrap()[0].usage_service(), None);
         let content = page.content.clone().unwrap();
-        assert!(!store.put_content("flights", &content, now).unwrap());
+        assert!(!store
+            .put_content("flights", Source::Manual, &content, now)
+            .unwrap());
         let changed = StoredContent {
             data: Some(json!({"flights": []})),
             ..content
         };
-        assert!(store.put_content("flights", &changed, now).unwrap());
+        assert!(store
+            .put_content("flights", Source::Manual, &changed, now)
+            .unwrap());
         assert_eq!(store.page("flights").unwrap().unwrap().content, Some(changed));
         assert!(matches!(
-            store.put_content("nope", &page.content.unwrap(), now),
+            store.put_content("nope", Source::Manual, &page.content.clone().unwrap(), now),
             Err(StoreError::Invalid(_))
         ));
     }
@@ -1539,5 +1627,76 @@ mod tests {
         assert_eq!(shown(&store), odd[..10]);
         let snap = hub_core::build_snapshot(ts(NOW), 300, &store.display_pages("d-1").unwrap().unwrap());
         assert_eq!(snap.pages.len(), hub_protocol::limits::MAX_PAGES);
+    }
+
+    #[test]
+    fn content_is_written_only_while_the_page_keeps_its_source() {
+        let store = Store::in_memory().unwrap();
+        let now = ts(NOW);
+        store.add_page(&text_page("a"), now).unwrap();
+        let content = StoredContent {
+            quality: DataQuality::Manual,
+            updated_at: Some(now),
+            data: Some(json!({"text": "Hello"})),
+            note: None,
+        };
+        assert!(store.put_content("a", Source::Manual, &content, now).unwrap());
+        // Its source changed since the caller looked: the write is refused, and nothing changes.
+        store.update_page("a", None, Some(Source::Demo), None).unwrap();
+        let e = store.put_content("a", Source::Manual, &content, now).unwrap_err();
+        assert!(matches!(e, StoreError::Invalid(_)), "{e}");
+        assert_eq!(store.page("a").unwrap().unwrap().content, None);
+        assert_eq!(store.page("nope").unwrap(), None);
+    }
+
+    #[test]
+    fn collector_reports_reach_only_collector_meter_pages_of_their_feed() {
+        let store = Store::in_memory().unwrap();
+        let now = ts(NOW);
+        let page = |id: &str, kind: &str, source: Source, feed: Option<&str>| StoredPage {
+            kind: kind.into(),
+            source,
+            feed: feed.map(String::from),
+            ..text_page(id)
+        };
+        for p in [
+            page("meter", "meter", Source::Collector, Some("claude-max")),
+            page("text", "text", Source::Collector, Some("claude-max")),
+            page("manual", "meter", Source::Manual, Some("claude-max")),
+            page("other", "meter", Source::Collector, Some("chatgpt-plus")),
+            page("later", "meter", Source::Collector, Some("claude-max")),
+        ] {
+            store.add_page(&p, now).unwrap();
+        }
+        assert_eq!(
+            store.collector_feed_pages("claude-max").unwrap(),
+            ["meter", "later"]
+        );
+        let content = StoredContent {
+            quality: DataQuality::ProviderReported,
+            updated_at: Some(now),
+            data: Some(json!({"items": [{"id": "weekly", "label": "Weekly", "percent": 5.0}]})),
+            note: None,
+        };
+        assert_eq!(
+            store.put_feed_content("claude-max", &content, now).unwrap(),
+            ["meter", "later"]
+        );
+        let stored: Vec<(String, bool)> = store
+            .pages()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.content.is_some()))
+            .collect();
+        assert_eq!(
+            stored,
+            [
+                ("meter".into(), true),
+                ("text".into(), false),
+                ("manual".into(), false),
+                ("other".into(), false),
+                ("later".into(), true),
+            ]
+        );
     }
 }

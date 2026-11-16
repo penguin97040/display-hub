@@ -48,6 +48,9 @@ pub enum ClientError {
     Snapshot(#[from] ReceiveError),
     #[error("the hub's answer was not understood: {0}")]
     Malformed(String),
+    /// Checked before sending: the hub would refuse it. A sentence for the owner.
+    #[error("{0}")]
+    Refused(String),
 }
 
 impl ClientError {
@@ -387,14 +390,20 @@ impl HubClient {
             .collect())
     }
 
-    /// Typed-in figures for a usage page, as its meter.
+    /// Typed-in figures for a usage page, as its meter. Figures for a window the service doesn't
+    /// have, or a window listed twice, are refused here, before anything is sent.
     pub async fn set_manual(
         &self,
         token: &str,
         id: &str,
         figures: &ManualFigures,
     ) -> Result<SubscriptionView, ClientError> {
-        usage(self.set_page_content(token, id, &figures.to_content()).await?)
+        let page = self.page(token, id).await?;
+        let service = page.usage_service().ok_or_else(|| {
+            ClientError::Refused("This page doesn't show a usage service's figures.".into())
+        })?;
+        let content = figures.to_content(service).map_err(ClientError::Refused)?;
+        usage(self.set_page_content(token, id, &content).await?)
     }
 
     pub async fn displays(&self, token: &str) -> Result<Vec<DisplayView>, ClientError> {

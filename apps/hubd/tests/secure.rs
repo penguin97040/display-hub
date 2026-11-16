@@ -371,7 +371,11 @@ async fn admin_changes_reach_the_next_snapshot() {
         )
         .await
         .unwrap_err();
-    assert_eq!(code(&e), Some(ErrorCode::BadRequest));
+    // Checked before sending, with the hub's old wording.
+    assert!(
+        matches!(&e, ClientError::Refused(m) if m == "Percentages must be 0 to 100."),
+        "{e}"
+    );
     r.stop().await;
 }
 
@@ -968,5 +972,150 @@ async fn pages_of_any_kind_through_the_admin_api() {
         ["flights-overhead"]
     );
     assert_eq!(c.status(&admin).await.unwrap().pages, 3);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn the_admin_api_keeps_its_page_rules() {
+    use hub_core::api::{NewPage, PageChange, PageContentInput};
+    use serde_json::json;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let new = |title: &str, kind: &str, source, feed: Option<&str>| NewPage {
+        title: title.into(),
+        kind: kind.into(),
+        source,
+        feed: feed.map(String::from),
+        id: None,
+        stale_after_seconds: None,
+    };
+    let refused = |e: ClientError, words: &str| {
+        assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{e}");
+        assert!(e.to_string().contains(words), "{e}");
+    };
+
+    // Collector pages are meters with a feed, until collectors can fill other kinds.
+    let e = c
+        .add_page(&admin, &new("T", "text", Source::Collector, Some("claude-max")))
+        .await
+        .unwrap_err();
+    refused(e, "Only a meter page with a feed");
+    let e = c
+        .add_page(&admin, &new("M", "meter", Source::Collector, None))
+        .await
+        .unwrap_err();
+    refused(e, "Only a meter page with a feed");
+    c.add_page(&admin, &new("M", "meter", Source::Collector, Some("claude-max")))
+        .await
+        .unwrap();
+    let words = c
+        .add_page(&admin, &new("Words", "text", Source::Manual, None))
+        .await
+        .unwrap();
+    let to_collector = PageChange {
+        source: Some(Source::Collector),
+        ..PageChange::default()
+    };
+    let e = c.change_page(&admin, &words.id, &to_collector).await.unwrap_err();
+    refused(e, "Only a meter page with a feed");
+    assert_eq!(c.page(&admin, &words.id).await.unwrap().source, Source::Manual);
+    let usage = c
+        .add_subscription(
+            &admin,
+            &NewSubscription {
+                service: Service::ClaudeMax,
+                source: Source::Manual,
+                title: Some("Mine".into()),
+                id: Some("mine".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let e = c.change_page(&admin, "nope", &to_collector).await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::NotFound));
+
+    // `order` is the reorder route's, never a page's.
+    let e = c
+        .add_page(
+            &admin,
+            &NewPage {
+                id: Some("order".into()),
+                ..new("x", "text", Source::Manual, None)
+            },
+        )
+        .await
+        .unwrap_err();
+    refused(e, "reserved");
+    let order = c
+        .add_page(&admin, &new("Order", "text", Source::Manual, None))
+        .await
+        .unwrap();
+    assert_eq!(order.id, "order-2");
+
+    // Typed-in usage figures are checked against the service before anything is sent.
+    let figures = |windows: &[Window]| ManualFigures {
+        metrics: windows
+            .iter()
+            .map(|&window| ManualMetric {
+                window,
+                used_percent: Some(10.0),
+                resets_at: None,
+            })
+            .collect(),
+        note: None,
+    };
+    let e = c
+        .set_manual(&admin, &usage.id, &figures(&[Window::Monthly]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, ClientError::Refused(m) if m == "Claude Max has no monthly window."),
+        "{e}"
+    );
+    let e = c
+        .set_manual(&admin, &usage.id, &figures(&[Window::FiveHour, Window::FiveHour]))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, ClientError::Refused(m) if m == "The five-hour window is listed twice."),
+        "{e}"
+    );
+    assert_eq!(
+        c.page(&admin, &usage.id).await.unwrap().content,
+        None,
+        "nothing was sent"
+    );
+
+    // No figures at all is "no figures yet", as it always was; other meter rules stay strict.
+    let saved = c.set_manual(&admin, &usage.id, &figures(&[])).await.unwrap();
+    let data = saved.data.unwrap();
+    assert_eq!((data.quality, data.metrics.len()), (DataQuality::Manual, 0));
+    let preview = c.preview_snapshot(&admin).await.unwrap();
+    let page = preview.pages.iter().find(|p| p.id == usage.id).unwrap();
+    assert_eq!(page.data_quality, DataQuality::Unavailable);
+    assert_eq!(page.note.as_deref(), Some(hub_core::build::NO_FIGURES_NOTE));
+    let e = c
+        .set_page_content(
+            &admin,
+            &usage.id,
+            &PageContentInput {
+                data: Some(json!({"items": [], "extra": 1})),
+                note: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    refused(e, "unknown field");
+
+    // Ticks are a set, so repeats don't count towards the limit.
+    let display = enrolled(&r, &admin, "Desk").await.0;
+    let many = vec![words.id.clone(); 60];
+    assert_eq!(
+        c.set_display_pages(&admin, &display, many).await.unwrap(),
+        std::slice::from_ref(&words.id)
+    );
     r.stop().await;
 }

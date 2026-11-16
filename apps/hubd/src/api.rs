@@ -17,10 +17,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hub_core::api::*;
-use hub_core::model::{clean_note, clean_percent, clean_title, valid_page_id};
+use hub_core::model::{clean_note, clean_title, valid_page_id};
 use hub_core::{build_snapshot, Clock, MetricValue, PageData, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
-use hub_protocol::shapes::{classify_kind, KindClass};
+use hub_protocol::shapes::{classify_kind, KindClass, KIND_METER};
 use hub_protocol::{CantShow, DataQuality, ErrorCode, Health, Page, Timestamp};
 use serde::de::DeserializeOwned;
 use tower::ServiceBuilder;
@@ -614,6 +614,20 @@ fn check_stale(stale: u32) -> Result<u32, ApiError> {
     }
 }
 
+/// Ids the admin routes use for themselves (`/v1/admin/pages/order`), so no page may have them.
+const RESERVED_PAGE_IDS: &[&str] = &["order"];
+
+/// Until collectors can fill other kinds, a collector page is a meter with a feed to match a
+/// helper's scope against.
+fn check_collector(source: Source, kind: &str, feed: Option<&str>) -> Result<(), ApiError> {
+    if source == Source::Collector && (kind != KIND_METER || feed.is_none()) {
+        return Err(ApiError::bad_request(
+            "Only a meter page with a feed can take figures from a PC helper, for now.",
+        ));
+    }
+    Ok(())
+}
+
 /// `base` made into a page id: lower case, other characters as hyphens, at most 40 long.
 fn id_from(base: &str) -> String {
     let mut id = String::new();
@@ -651,12 +665,18 @@ async fn add_page(
             ));
         }
     }
+    check_collector(req.source, &req.kind, req.feed.as_deref())?;
     let stale_after_seconds = check_stale(
         req.stale_after_seconds
             .unwrap_or_else(|| req.source.stale_after_seconds()),
     )?;
     let existing = db(&hub, |s| s.page_ids()).await?;
     let id = match &req.id {
+        Some(id) if RESERVED_PAGE_IDS.contains(&id.as_str()) => {
+            return Err(ApiError::bad_request(format!(
+                "The page id {id:?} is reserved. Choose another."
+            )))
+        }
         Some(id) if valid_page_id(id) => id.clone(),
         Some(_) => {
             return Err(ApiError::bad_request(
@@ -673,7 +693,7 @@ async fn add_page(
                         format!("{base}-{n}")
                     }
                 })
-                .find(|c| !existing.contains(c))
+                .find(|c| !existing.contains(c) && !RESERVED_PAGE_IDS.contains(&c.as_str()))
                 .expect("an unused id exists")
         }
     };
@@ -701,6 +721,13 @@ async fn change_page(
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let title = req.title.as_deref().map(clean_page_title).transpose()?;
     let stale = req.stale_after_seconds.map(check_stale).transpose()?;
+    if let Some(source) = req.source {
+        let id2 = id.clone();
+        let page = db(&hub, move |s| s.page(&id2))
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+        check_collector(source, &page.kind, page.feed.as_deref())?;
+    }
     db(&hub, move |s| {
         if !s.update_page(&id, title.as_deref(), req.source, stale)? {
             return Ok(None);
@@ -768,7 +795,10 @@ async fn set_content(
         data: req.data.filter(|d| !d.is_null()),
         note: req.note.as_deref().and_then(clean_note),
     };
-    if let Some(data) = &content.data {
+    // A meter with no items is how a usage page says "no figures yet", as typed-in usage pages
+    // always could. Every other meter rule still applies.
+    let empty_meter = page.kind == KIND_METER && content.data == Some(serde_json::json!({ "items": [] }));
+    if let Some(data) = content.data.as_ref().filter(|_| !empty_meter) {
         let wire = Page {
             id: page.id.clone(),
             title: clean_title(&page.title).unwrap_or_default(),
@@ -800,7 +830,8 @@ async fn set_content(
         }
     }
     let c2 = content.clone();
-    db(&hub, move |s| s.put_content(&id, &c2, now)).await?;
+    // Written only while the page is still manual, in case it changed since it was read.
+    db(&hub, move |s| s.put_content(&id, Source::Manual, &c2, now)).await?;
     Ok(Json(StoredPage {
         content: Some(content),
         ..page
@@ -828,7 +859,8 @@ async fn set_display_pages(
     ApiJson(req): ApiJson<DisplayPages>,
 ) -> Result<Json<DisplayPages>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    if req.ids.len() > MAX_STORED_PAGES {
+    let distinct: std::collections::HashSet<&String> = req.ids.iter().collect();
+    if distinct.len() > MAX_STORED_PAGES {
         return Err(ApiError::bad_request(format!(
             "The hub holds at most {MAX_STORED_PAGES} pages."
         )));
@@ -844,36 +876,9 @@ async fn set_display_pages(
     .ok_or_else(ApiError::not_found)
 }
 
-/// Checks figures against the service's windows and bounds. Unknown stays unknown.
+/// Checks a PC helper's figures against the service's windows and bounds.
 fn clean_metrics(service: hub_core::Service, input: &[ManualMetric]) -> Result<Vec<MetricValue>, ApiError> {
-    let mut metrics = Vec::new();
-    for m in input {
-        if !service.windows().contains(&m.window) {
-            return Err(ApiError::bad_request(format!(
-                "{} has no {} window.",
-                service.default_title(),
-                m.window.id()
-            )));
-        }
-        if metrics.iter().any(|x: &MetricValue| x.window == m.window) {
-            return Err(ApiError::bad_request(format!(
-                "The {} window is listed twice.",
-                m.window.id()
-            )));
-        }
-        let used_percent = match m.used_percent {
-            Some(p) => {
-                Some(clean_percent(p).ok_or_else(|| ApiError::bad_request("Percentages must be 0 to 100."))?)
-            }
-            None => None,
-        };
-        metrics.push(MetricValue {
-            window: m.window,
-            used_percent,
-            resets_at: m.resets_at,
-        });
-    }
-    Ok(metrics)
+    clean_figures(service, input).map_err(ApiError::bad_request)
 }
 
 // ----- collectors (PC helpers) -----
@@ -1002,14 +1007,7 @@ async fn collector_usage(
         note: None,
     };
     let (feed, content) = (req.service.slug(), data.to_content());
-    let updated = db(&hub, move |s| {
-        let pages = s.collector_feed_pages(feed)?;
-        for id in &pages {
-            s.put_content(id, &content, now)?;
-        }
-        Ok(pages)
-    })
-    .await?;
+    let updated = db(&hub, move |s| s.put_feed_content(feed, &content, now)).await?;
     Ok(Json(UsageAccepted { updated }))
 }
 

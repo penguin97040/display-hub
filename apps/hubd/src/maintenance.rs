@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 
 use hub_core::Clock;
 use hub_protocol::pairing::fingerprint;
-use hub_protocol::Timestamp;
 
 use crate::api::Hub;
 use crate::config::Config;
@@ -229,10 +228,7 @@ pub fn restore(
     Ok((restored, moved_to))
 }
 
-/// `2026-11-11T01-02-03Z`: a timestamp that is also a valid file name everywhere.
-fn stamp(t: Timestamp) -> String {
-    t.to_string().replace(':', "-")
-}
+use crate::store::file_stamp as stamp;
 
 /// One line of `hubd check`.
 #[derive(Debug, PartialEq, Eq)]

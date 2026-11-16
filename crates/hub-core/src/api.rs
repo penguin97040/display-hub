@@ -3,7 +3,7 @@
 use hub_protocol::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{PageData, Service, Source, StoredPage, Window};
+use crate::model::{MetricValue, PageData, Service, Source, StoredPage, Window};
 
 /// `POST /v1/admin/pair`: exchanges the one-time secret from `hubd pair-admin` for an admin token.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -196,27 +196,47 @@ pub struct ManualFigures {
 }
 
 impl ManualFigures {
-    /// The figures as a meter page's content. Shares are rounded to one decimal place; one out of
-    /// range is passed on as it is, for the hub to refuse with its reason.
-    pub fn to_content(&self) -> PageContentInput {
-        let items: Vec<hub_protocol::MeterItem> = self
-            .metrics
+    /// The figures as a usage page's meter content, once they pass [`clean_figures`].
+    pub fn to_content(&self, service: Service) -> Result<PageContentInput, String> {
+        let items: Vec<hub_protocol::MeterItem> = clean_figures(service, &self.metrics)?
             .iter()
             .map(|m| {
-                hub_protocol::MeterItem::new(
-                    m.window.id(),
-                    m.window.label(),
-                    m.used_percent
-                        .map(|p| crate::model::clean_percent(p).unwrap_or(p)),
-                    m.resets_at,
-                )
+                hub_protocol::MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at)
             })
             .collect();
-        PageContentInput {
+        Ok(PageContentInput {
             data: Some(serde_json::to_value(hub_protocol::Meter { items }).expect("meters always serialise")),
             note: self.note.clone(),
-        }
+        })
     }
+}
+
+/// Checks typed-in or reported figures against the service's windows and bounds, and rounds shares
+/// to one decimal place. Unknown stays unknown. The error is a sentence for the owner.
+pub fn clean_figures(service: Service, input: &[ManualMetric]) -> Result<Vec<MetricValue>, String> {
+    let mut metrics: Vec<MetricValue> = Vec::new();
+    for m in input {
+        if !service.windows().contains(&m.window) {
+            return Err(format!(
+                "{} has no {} window.",
+                service.default_title(),
+                m.window.id()
+            ));
+        }
+        if metrics.iter().any(|x| x.window == m.window) {
+            return Err(format!("The {} window is listed twice.", m.window.id()));
+        }
+        let used_percent = match m.used_percent {
+            Some(p) => Some(crate::model::clean_percent(p).ok_or("Percentages must be 0 to 100.")?),
+            None => None,
+        };
+        metrics.push(MetricValue {
+            window: m.window,
+            used_percent,
+            resets_at: m.resets_at,
+        });
+    }
+    Ok(metrics)
 }
 
 /// One allowance figure, as typed in or reported by a PC helper.
