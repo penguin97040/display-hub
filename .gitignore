@@ -69,6 +69,9 @@ desktop.ini
 /target/
 /dist/
 /dev-data/
+# Local plans for the owner to review (agent working notes, never publish)
+/PLAN.md
+/PLAN-*.md
 # Test hubs and simulator state from USER_TESTS.md (they hold keys and tokens)
 /hub-test/
 /sim-test/
