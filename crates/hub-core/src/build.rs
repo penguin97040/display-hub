@@ -27,7 +27,7 @@ pub fn build_snapshot(
     refresh_after_seconds: u32,
     pages: &[(Subscription, Option<PageData>)],
 ) -> Snapshot {
-    Snapshot {
+    let mut snap = Snapshot {
         protocol_version: PROTOCOL_VERSION,
         message_type: MESSAGE_TYPE.into(),
         generated_at: now,
@@ -35,12 +35,27 @@ pub fn build_snapshot(
             *hub_protocol::limits::REFRESH_RANGE.start(),
             *hub_protocol::limits::REFRESH_RANGE.end(),
         ),
-        pages: pages
-            .iter()
-            .take(MAX_PAGES)
-            .map(|(sub, data)| guard(page(now, sub, data.as_ref())))
-            .collect(),
-    }
+        pages: Vec::new(),
+    };
+    let guarded: Vec<Page> = pages
+        .iter()
+        .take(MAX_PAGES)
+        .map(|(sub, data)| guard(page(now, sub, data.as_ref())))
+        .collect();
+    // A page that is still unsendable has a bad id or other common field, which only a damaged
+    // database can give. Leaving it off keeps every other page on the displays.
+    snap.pages = guarded
+        .into_iter()
+        .filter(|p| {
+            Snapshot {
+                pages: vec![p.clone()],
+                ..snap.clone()
+            }
+            .violations()
+            .is_empty()
+        })
+        .collect();
+    snap
 }
 
 /// A page a hub may not send (over its size cap, or with data that breaks its shape) becomes an
@@ -301,6 +316,22 @@ mod tests {
         assert_eq!(s.pages[0].data_quality, DataQuality::Unavailable);
         assert_eq!(s.pages[0].note.as_deref(), Some(NO_FIGURES_NOTE));
         s.validate().unwrap();
+    }
+
+    #[test]
+    fn a_page_with_a_bad_id_is_left_off_and_the_rest_still_go_out() {
+        // Only a damaged database can give these: the API checks ids when a page is made.
+        let t = ts("2026-11-10T20:00:00Z");
+        let long = "x".repeat(4000);
+        let pages = vec![
+            (sub("Bad ID", Service::ClaudeMax, Source::Demo), None),
+            (sub(&long, Service::ClaudeMax, Source::Demo), None),
+            (sub("good", Service::ClaudeMax, Source::Demo), None),
+        ];
+        let snap = build_snapshot(t, 300, &pages);
+        let ids: Vec<&str> = snap.pages.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["good"]);
+        snap.to_wire().unwrap();
     }
 
     #[test]

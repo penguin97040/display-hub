@@ -354,6 +354,13 @@ pub fn receive(body: &[u8]) -> Result<Snapshot, ReceiveError> {
     if body.len() > MAX_SNAPSHOT_BYTES {
         return Err(ReceiveError::TooLarge);
     }
+    reread(body)
+}
+
+/// [`receive`] without the size cap, for a display reading back its own saved copy of a snapshot
+/// it already accepted. Writing a parsed snapshot out again can make it a little longer (an absent
+/// `note` becomes `null`, `1E5` becomes `100000.0`), and that must not cost the display its copy.
+pub fn reread(body: &[u8]) -> Result<Snapshot, ReceiveError> {
     #[derive(Deserialize)]
     struct Head {
         protocol_version: u32,

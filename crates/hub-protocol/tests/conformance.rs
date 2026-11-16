@@ -354,3 +354,22 @@ fn the_largest_meter_big_number_and_text_pages_fit_a_page() {
         envelope(vec![page]).validate().unwrap();
     }
 }
+
+#[test]
+fn a_saved_copy_reads_back_even_when_rewriting_made_it_longer() {
+    let (_, bytes) = examples("valid")
+        .into_iter()
+        .find(|(name, _)| name.starts_with("demo-three-pages"))
+        .expect("the demo example");
+    // Whitespace stands in for the few bytes a rewrite can add (`null` notes, `1E5` as `100000.0`).
+    let mut long = bytes.clone();
+    long.extend(std::iter::repeat_n(b' ', MAX_SNAPSHOT_BYTES));
+    assert!(matches!(
+        hub_protocol::receive(&long),
+        Err(hub_protocol::ReceiveError::TooLarge)
+    ));
+    assert_eq!(
+        hub_protocol::snapshot::reread(&long).unwrap(),
+        hub_protocol::receive(&bytes).unwrap()
+    );
+}

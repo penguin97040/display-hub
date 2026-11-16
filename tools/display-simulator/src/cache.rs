@@ -4,7 +4,8 @@
 use std::io::Write;
 use std::path::Path;
 
-use hub_protocol::{receive, Snapshot, Timestamp};
+use hub_protocol::snapshot::reread;
+use hub_protocol::{Snapshot, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -26,7 +27,7 @@ struct Saved {
 pub fn load(path: &Path) -> Option<Held> {
     let bytes = std::fs::read(path).ok()?;
     let saved: Saved = serde_json::from_slice(&bytes).ok()?;
-    let snapshot = receive(&serde_json::to_vec(&saved.snapshot).ok()?).ok()?;
+    let snapshot = reread(&serde_json::to_vec(&saved.snapshot).ok()?).ok()?;
     Some(Held {
         snapshot,
         received_at: saved.received_at,
