@@ -11,4 +11,4 @@ pub mod provider;
 pub use build::build_snapshot;
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use freshness::{short_duration, Freshness};
-pub use model::{MetricValue, PageData, Service, Source, Subscription, Window};
+pub use model::{MetricValue, PageData, Service, Source, StoredContent, StoredPage, Subscription, Window};

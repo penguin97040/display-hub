@@ -159,6 +159,33 @@ impl PageData {
     }
 }
 
+/// One page as the hub stores it: any kind, with whatever was last stored for it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredPage {
+    /// The page id: lower-case letters, digits and hyphens.
+    pub id: String,
+    pub title: String,
+    /// A ready-made shape (`meter`, `big_number`, `text`, `list`) or a custom `name/version` kind.
+    pub kind: String,
+    pub source: Source,
+    /// The named feed that fills the page, such as a usage service. A collector may write only to
+    /// pages whose feed it is scoped to and whose source is `collector`.
+    pub feed: Option<String>,
+    pub stale_after_seconds: u32,
+    /// What was last stored for the page. `None` until something is.
+    pub content: Option<StoredContent>,
+}
+
+/// What was last stored for a page.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StoredContent {
+    pub quality: DataQuality,
+    pub updated_at: Option<Timestamp>,
+    /// The page's `data`, in the shape its kind names. `None` when there is nothing to show.
+    pub data: Option<serde_json::Value>,
+    pub note: Option<String>,
+}
+
 /// Owner-supplied page titles and notes, made safe for the wire.
 pub fn clean_title(s: &str) -> Option<String> {
     sanitise_text(s, MAX_TITLE_LEN)

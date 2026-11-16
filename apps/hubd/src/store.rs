@@ -1,17 +1,22 @@
-//! SQLite storage: subscriptions and their order, stored figures, displays, credentials, one-time
+//! SQLite storage: pages and their order, what each display shows, displays, credentials, one-time
 //! codes and the audit log.
 //!
 //! The Pi stores everything on an SD card that can lose power at any moment. So the database runs in
 //! WAL mode with `synchronous=FULL` (a commit is on disk when it returns), checks itself at start-up,
-//! and never deletes or recreates itself when something is wrong. Frequent, unimportant writes
-//! (display last-seen times) are kept in memory and flushed now and then, to spare the card.
+//! and never deletes or recreates itself when something is wrong. Before an upgrade changes an
+//! existing database, a copy of it is saved beside it, and the upgrade runs in one transaction.
+//! Frequent, unimportant writes (display last-seen times) are kept in memory and flushed now and
+//! then, to spare the card.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use hub_core::{MetricValue, PageData, Service, Source, Subscription};
+use hub_core::{MetricValue, PageData, Service, Source, StoredContent, StoredPage, Subscription, Window};
 use hub_protocol::device::DeviceInfo;
-use hub_protocol::{DataQuality, Timestamp};
+use hub_protocol::limits::{MAX_METER_ITEMS, MAX_TITLE_LEN};
+use hub_protocol::shapes::KIND_METER;
+use hub_protocol::text::sanitise_text;
+use hub_protocol::{DataQuality, Meter, MeterItem, Timestamp};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::secret::Role;
@@ -80,7 +85,167 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (subject, service)
     );
     "#,
+    // 3: pages of any kind, replacing subscriptions and their figures (moved by `move_to_pages`),
+    // and the pages each display shows. A page's content is what was last stored for it: `quality`
+    // is null until something is, and `data` is its JSON in the shape `kind` names.
+    r#"
+    CREATE TABLE pages (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        feed TEXT,
+        position INTEGER NOT NULL,
+        stale_after_seconds INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        quality TEXT,
+        updated_at INTEGER,
+        data TEXT,
+        note TEXT,
+        stored_at INTEGER
+    );
+    CREATE TABLE display_pages (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        page_id TEXT NOT NULL REFERENCES pages(id) ON DELETE CASCADE,
+        PRIMARY KEY (device_id, page_id)
+    );
+    "#,
 ];
+
+/// Data an upgrade moves with code rather than SQL: run straight after that version's SQL, in the
+/// same transaction. Never edit one that has shipped either.
+const DATA_MOVES: &[(i64, DataMove)] = &[(3, move_to_pages)];
+
+type DataMove = fn(&Connection) -> Result<(), StoreError>;
+
+/// Version 3: each usage subscription becomes a `meter` page with the same id, title, order and
+/// source, its service as the page's feed, and its stored figures (typed-in ones included) as meter
+/// data, so displays show what they did before. Every active display shows every page.
+///
+/// This reads what version 2 wrote, so it keeps its own copy of the names and rules of that time
+/// rather than using today's usage types. A row version 2 couldn't read either (an unknown service
+/// or source) was never shown, and is left behind in the pre-upgrade copy.
+fn move_to_pages(conn: &Connection) -> Result<(), StoreError> {
+    const SERVICES: [(&str, &str); 3] = [
+        ("claude-max", "Claude Max"),
+        ("chatgpt-plus", "ChatGPT Plus"),
+        ("opencode-go-plus", "OpenCode Go Plus"),
+    ];
+    // Each source and how long its figures stayed fresh.
+    const SOURCES: [(&str, i64); 4] = [
+        ("demo", 3600),
+        ("manual", 86_400),
+        ("collector", 1800),
+        ("none", 3600),
+    ];
+    const WINDOWS: [(&str, &str); 3] = [
+        ("five-hour", "Five-hour allowance used"),
+        ("weekly", "Weekly allowance used"),
+        ("monthly", "Monthly allowance used"),
+    ];
+    #[derive(serde::Deserialize)]
+    struct Figure {
+        window: String,
+        used_percent: Option<f64>,
+        resets_at: Option<Timestamp>,
+    }
+    type Row = (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+    );
+    let rows: Vec<Row> = {
+        let mut st = conn.prepare(
+            "SELECT s.id, s.service, s.title, s.source, s.created_at,
+                    d.quality, d.updated_at, d.metrics, d.note, d.stored_at
+             FROM subscriptions s LEFT JOIN page_data d ON d.subscription_id = s.id
+             ORDER BY s.position, s.created_at",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+                r.get(7)?,
+                r.get(8)?,
+                r.get(9)?,
+            ))
+        })?;
+        rows.collect::<Result<_, _>>()?
+    };
+    let mut position = 0i64;
+    for (id, service, title, source, created_at, quality, updated_at, metrics, note, stored_at) in rows {
+        let (Some(&(_, default_title)), Some(&(_, stale_after))) = (
+            SERVICES.iter().find(|(s, _)| *s == service),
+            SOURCES.iter().find(|(s, _)| *s == source),
+        ) else {
+            tracing::warn!(%id, "not moving a subscription with an unknown service or source");
+            continue;
+        };
+        let title = sanitise_text(&title, MAX_TITLE_LEN).unwrap_or_else(|| default_title.into());
+        // Version 2 read figures it couldn't parse, or with a window it didn't know, as none at all,
+        // and showed shares rounded to one decimal place, or unknown when out of range.
+        let data = metrics.map(|m| {
+            let figures: Vec<Figure> = serde_json::from_str(&m).unwrap_or_default();
+            let known = figures
+                .iter()
+                .all(|f| WINDOWS.iter().any(|(w, _)| *w == f.window));
+            let items = figures
+                .iter()
+                .filter(|_| known)
+                .take(MAX_METER_ITEMS)
+                .map(|f| {
+                    let label = WINDOWS.iter().find(|(w, _)| *w == f.window).expect("known").1;
+                    let percent = f
+                        .used_percent
+                        .filter(|p| p.is_finite() && (0.0..=100.0).contains(p))
+                        .map(|p| (p * 10.0).round() / 10.0);
+                    MeterItem::new(f.window.clone(), label, percent, f.resets_at)
+                })
+                .collect();
+            serde_json::to_string(&Meter { items }).expect("serialises")
+        });
+        conn.execute(
+            "INSERT INTO pages (id, title, kind, source, feed, position, stale_after_seconds, created_at,
+                                quality, updated_at, data, note, stored_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                id,
+                title,
+                KIND_METER,
+                source,
+                service,
+                position,
+                stale_after,
+                created_at,
+                quality,
+                updated_at,
+                data,
+                note,
+                stored_at
+            ],
+        )?;
+        position += 1;
+    }
+    conn.execute(
+        "INSERT INTO display_pages (device_id, page_id)
+         SELECT d.id, p.id FROM devices d CROSS JOIN pages p WHERE d.revoked_at IS NULL",
+        [],
+    )?;
+    conn.execute_batch("DROP TABLE page_data; DROP TABLE subscriptions;")?;
+    Ok(())
+}
 
 /// Audit entries older than this are pruned.
 pub const AUDIT_RETENTION_SECONDS: i64 = 90 * 86_400;
@@ -97,6 +262,21 @@ pub enum StoreError {
          {known}). Install the newer hubd again, or restore a backup made by this version."
     )]
     TooNew { path: PathBuf, found: i64, known: i64 },
+    #[error(
+        "couldn't save a copy of the database at {path} before upgrading it ({detail}), so it has not \
+         been upgraded or changed. Check the data folder has free space and that the hub may write to it."
+    )]
+    UpgradeCopy { path: PathBuf, detail: String },
+    #[error(
+        "upgrading the database at {path} from schema {from} failed ({detail}). It has not been \
+         changed, and the copy saved beside it before the upgrade is kept. Install the previous hubd \
+         again to keep using it."
+    )]
+    UpgradeFailed {
+        path: PathBuf,
+        from: i64,
+        detail: String,
+    },
     #[error("database error: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("{0}")]
@@ -175,14 +355,21 @@ impl Store {
             });
         }
         let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let count = |table: &str| -> Result<usize, StoreError> {
-            let sql = match table {
-                "subscriptions" => "SELECT COUNT(*) FROM subscriptions",
-                _ => "SELECT COUNT(*) FROM devices",
-            };
+        let count = |sql: &str| -> Result<usize, StoreError> {
             Ok(conn.query_row(sql, [], |r| r.get::<_, i64>(0))? as usize)
         };
-        Ok((version, count("subscriptions")?, count("devices")?))
+        // Before version 3, pages were subscriptions.
+        let has_pages: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pages')",
+            [],
+            |r| r.get(0),
+        )?;
+        let pages = if has_pages {
+            "SELECT COUNT(*) FROM pages"
+        } else {
+            "SELECT COUNT(*) FROM subscriptions"
+        };
+        Ok((version, count(pages)?, count("SELECT COUNT(*) FROM devices")?))
     }
 
     /// An in-memory database, for tests.
@@ -234,14 +421,93 @@ impl Store {
                 known,
             });
         }
-        for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-            tx.commit()?;
-            tracing::info!(version = i + 1, "database schema upgraded");
+        if current == known {
+            return Ok(());
         }
+        // A new database (version 0) has nothing to lose. An existing one is copied first.
+        if current > 0 {
+            let copy = self.copy_before_upgrade(&conn, current)?;
+            tracing::info!(path = %copy.display(), from = current, "saved a copy of the database before upgrading it");
+        }
+        // Every step in one transaction: a failure part-way leaves the database as it was.
+        let upgrade = |conn: &mut Connection| -> Result<(), StoreError> {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+                let version = (i + 1) as i64;
+                tx.execute_batch(sql)?;
+                if let Some((_, data_move)) = DATA_MOVES.iter().find(|(v, _)| *v == version) {
+                    data_move(&tx)?;
+                }
+            }
+            tx.pragma_update(None, "user_version", known)?;
+            tx.commit()?;
+            Ok(())
+        };
+        match upgrade(&mut conn) {
+            Ok(()) => {}
+            Err(e) if current > 0 => {
+                return Err(StoreError::UpgradeFailed {
+                    path: self.path.clone(),
+                    from: current,
+                    detail: e.to_string(),
+                })
+            }
+            Err(e) => return Err(e),
+        }
+        tracing::info!(from = current, to = known, "database schema upgraded");
         Ok(())
+    }
+
+    /// Saves an online copy of the database beside it, owner-only, named after its schema version
+    /// and the time: `hub-before-upgrade-schema-2-2026-11-16T05-39-17Z.db`. Never replaces a file.
+    fn copy_before_upgrade(&self, conn: &Connection, version: i64) -> Result<PathBuf, StoreError> {
+        let fail = |path: &Path, detail: String| StoreError::UpgradeCopy {
+            path: path.into(),
+            detail,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        let stamp = ts(now).to_string().replace(':', "-");
+        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("hub");
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut attempt = 1;
+        let dest = loop {
+            let suffix = if attempt == 1 {
+                String::new()
+            } else {
+                format!("-{attempt}")
+            };
+            let dest = self.path.with_file_name(format!(
+                "{stem}-before-upgrade-schema-{version}-{stamp}{suffix}.db"
+            ));
+            match opts.open(&dest) {
+                Ok(_) => break dest,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => attempt += 1,
+                Err(e) => return Err(fail(&dest, e.to_string())),
+            }
+        };
+        let copied = online_copy(conn, &dest).and_then(|()| {
+            Connection::open(&dest)?.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+        });
+        match copied {
+            Ok(v) if v == version => Ok(dest),
+            outcome => {
+                // Only the incomplete copy, which this call just created, is removed.
+                let _ = std::fs::remove_file(&dest);
+                let detail = match outcome {
+                    Ok(v) => format!("the copy reads as schema {v}"),
+                    Err(e) => e.to_string(),
+                };
+                Err(fail(&dest, detail))
+            }
+        }
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -479,72 +745,80 @@ impl Store {
         Ok(())
     }
 
-    // ----- subscriptions -----
+    // ----- pages -----
 
-    pub fn subscriptions(&self) -> Result<Vec<(Subscription, Option<PageData>)>, StoreError> {
+    /// Every page, in display order, with what was last stored for it.
+    pub fn pages(&self) -> Result<Vec<StoredPage>, StoreError> {
         let conn = self.conn();
         let mut st = conn.prepare(
-            "SELECT s.id, s.service, s.title, s.source, d.quality, d.updated_at, d.metrics, d.note
-             FROM subscriptions s LEFT JOIN page_data d ON d.subscription_id = s.id
-             ORDER BY s.position, s.created_at",
+            "SELECT id, title, kind, source, feed, stale_after_seconds, quality, updated_at, data, note
+             FROM pages ORDER BY position, created_at",
         )?;
         let rows = st.query_map([], |r| {
-            let id: String = r.get(0)?;
-            let service: String = r.get(1)?;
-            let source: String = r.get(3)?;
-            let quality: Option<String> = r.get(4)?;
-            let metrics: Option<String> = r.get(6)?;
             Ok((
-                id,
-                service,
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
                 r.get::<_, String>(2)?,
-                source,
-                quality,
-                r.get::<_, Option<i64>>(5)?,
-                metrics,
-                r.get::<_, Option<String>>(7)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, Option<String>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<String>>(8)?,
+                r.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, service, title, source, quality, updated, metrics, note) = row?;
+            let (id, title, kind, source, feed, stale, quality, updated, data, note) = row?;
             // A row this build can't interpret is skipped and logged, rather than breaking every snapshot.
-            let (Some(service), Some(source)) = (Service::from_slug(&service), Source::from_slug(&source))
-            else {
-                tracing::warn!(%id, "skipping a subscription with an unknown service or source");
+            let Some(source) = Source::from_slug(&source) else {
+                tracing::warn!(%id, "skipping a page with an unknown source");
                 continue;
             };
-            let data = match (quality, metrics) {
-                (Some(q), Some(m)) => {
-                    let quality = serde_json::from_value::<DataQuality>(serde_json::Value::String(q))
-                        .unwrap_or(DataQuality::Unavailable);
-                    let metrics: Vec<MetricValue> = serde_json::from_str(&m).unwrap_or_default();
-                    Some(PageData {
-                        quality,
-                        updated_at: updated.map(ts),
-                        metrics,
-                        note,
-                    })
-                }
-                _ => None,
-            };
-            out.push((
-                Subscription {
-                    id,
-                    service,
-                    title,
-                    source,
-                },
-                data,
-            ));
+            let content = quality.map(|q| StoredContent {
+                quality: serde_json::from_value(serde_json::Value::String(q))
+                    .unwrap_or(DataQuality::Unavailable),
+                updated_at: updated.map(ts),
+                data: data.and_then(|d| match serde_json::from_str(&d) {
+                    Ok(v) => Some(v),
+                    Err(_) => {
+                        tracing::warn!(%id, "ignoring a page's stored data, which isn't valid JSON");
+                        None
+                    }
+                }),
+                note,
+            });
+            out.push(StoredPage {
+                id,
+                title,
+                kind,
+                source,
+                feed,
+                // Out of range is left for snapshot checks to catch, which leave the page off.
+                stale_after_seconds: u32::try_from(stale).unwrap_or(0),
+                content,
+            });
         }
         Ok(out)
     }
 
-    pub fn add_subscription(&self, sub: &Subscription, now: Timestamp) -> Result<(), StoreError> {
+    pub fn page(&self, id: &str) -> Result<Option<StoredPage>, StoreError> {
+        Ok(self.pages()?.into_iter().find(|p| p.id == id))
+    }
+
+    pub fn page_ids(&self) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut st = conn.prepare("SELECT id FROM pages ORDER BY position, created_at")?;
+        let rows = st.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Adds a page at the end of the order, with its content if it has any.
+    pub fn add_page(&self, page: &StoredPage, now: Timestamp) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let count: i64 = tx.query_row("SELECT COUNT(*) FROM subscriptions", [], |r| r.get(0))?;
+        let count: i64 = tx.query_row("SELECT COUNT(*) FROM pages", [], |r| r.get(0))?;
         if count as usize >= hub_protocol::limits::MAX_PAGES {
             return Err(StoreError::Invalid(format!(
                 "a display shows at most {} pages; remove one first",
@@ -552,39 +826,43 @@ impl Store {
             )));
         }
         let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE id = ?1)",
-            params![sub.id],
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE id = ?1)",
+            params![page.id],
             |r| r.get(0),
         )?;
         if exists {
             return Err(StoreError::Invalid(format!(
                 "a page with id {:?} already exists",
-                sub.id
+                page.id
             )));
         }
-        let next: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position), -1) + 1 FROM subscriptions",
-            [],
-            |r| r.get(0),
-        )?;
+        let next: i64 = tx.query_row("SELECT COALESCE(MAX(position), -1) + 1 FROM pages", [], |r| {
+            r.get(0)
+        })?;
         tx.execute(
-            "INSERT INTO subscriptions (id, service, title, source, position, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![sub.id, sub.service.slug(), sub.title, sub.source.slug(), next, now.unix()],
+            "INSERT INTO pages (id, title, kind, source, feed, position, stale_after_seconds, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                page.id,
+                page.title,
+                page.kind,
+                page.source.slug(),
+                page.feed,
+                next,
+                page.stale_after_seconds,
+                now.unix()
+            ],
         )?;
+        if let Some(content) = &page.content {
+            write_content(&tx, &page.id, content, now)?;
+        }
         tx.commit()?;
         Ok(())
     }
 
-    pub fn subscription_ids(&self) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        let mut st = conn.prepare("SELECT id FROM subscriptions ORDER BY position, created_at")?;
-        let rows = st.query_map([], |r| r.get(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
-    /// Changes a subscription's title or source. Changing the source drops stored figures, which
-    /// came from the old source.
-    pub fn update_subscription(
+    /// Changes a page's title or source. Changing the source drops the stored content, which came
+    /// from the old source, and resets how long the page stays fresh to the new source's default.
+    pub fn update_page(
         &self,
         id: &str,
         title: Option<&str>,
@@ -592,44 +870,39 @@ impl Store {
     ) -> Result<bool, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let mut found = false;
+        let found: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE id = ?1)",
+            params![id],
+            |r| r.get(0),
+        )?;
         if let Some(t) = title {
-            found |= tx.execute(
-                "UPDATE subscriptions SET title = ?1 WHERE id = ?2",
-                params![t, id],
-            )? > 0;
+            tx.execute("UPDATE pages SET title = ?1 WHERE id = ?2", params![t, id])?;
         }
         if let Some(s) = source {
-            let changed = tx.execute(
-                "UPDATE subscriptions SET source = ?1 WHERE id = ?2 AND source != ?1",
-                params![s.slug(), id],
-            )?;
-            if changed > 0 {
-                tx.execute("DELETE FROM page_data WHERE subscription_id = ?1", params![id])?;
-            }
-            found |= tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE id = ?1)",
-                params![id],
-                |r| r.get::<_, bool>(0),
+            tx.execute(
+                "UPDATE pages SET source = ?1, stale_after_seconds = ?2, quality = NULL, updated_at = NULL,
+                                  data = NULL, note = NULL, stored_at = NULL
+                 WHERE id = ?3 AND source != ?1",
+                params![s.slug(), s.stale_after_seconds(), id],
             )?;
         }
         tx.commit()?;
         Ok(found)
     }
 
-    pub fn remove_subscription(&self, id: &str) -> Result<bool, StoreError> {
+    pub fn remove_page(&self, id: &str) -> Result<bool, StoreError> {
         Ok(self
             .conn()
-            .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?
+            .execute("DELETE FROM pages WHERE id = ?1", params![id])?
             > 0)
     }
 
-    /// Sets the display order. `ids` must name every subscription exactly once.
+    /// Sets the display order. `ids` must name every page exactly once.
     pub fn reorder(&self, ids: &[String]) -> Result<(), StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let mut current: Vec<String> = {
-            let mut st = tx.prepare("SELECT id FROM subscriptions")?;
+            let mut st = tx.prepare("SELECT id FROM pages")?;
             let rows = st.query_map([], |r| r.get(0))?;
             rows.collect::<Result<_, _>>()?
         };
@@ -643,7 +916,7 @@ impl Store {
         }
         for (pos, id) in ids.iter().enumerate() {
             tx.execute(
-                "UPDATE subscriptions SET position = ?1 WHERE id = ?2",
+                "UPDATE pages SET position = ?1 WHERE id = ?2",
                 params![pos as i64, id],
             )?;
         }
@@ -651,46 +924,101 @@ impl Store {
         Ok(())
     }
 
-    /// Stores figures for a subscription, replacing what was there. A write that changes nothing is
-    /// skipped, to spare the SD card.
-    pub fn put_page_data(&self, id: &str, data: &PageData, now: Timestamp) -> Result<bool, StoreError> {
-        let metrics = serde_json::to_string(&data.metrics).expect("serialises");
-        let quality = data.quality.as_str();
+    /// Stores a page's content, replacing what was there. A write that changes nothing is skipped,
+    /// to spare the SD card.
+    pub fn put_content(&self, id: &str, content: &StoredContent, now: Timestamp) -> Result<bool, StoreError> {
         let conn = self.conn();
-        let unchanged: bool = conn
+        let row: Option<ContentColumns> = conn
             .query_row(
-                "SELECT quality = ?2 AND updated_at IS ?3 AND metrics = ?4 AND note IS ?5 FROM page_data WHERE subscription_id = ?1",
-                params![id, quality, data.updated_at.map(|t| t.unix()), metrics, data.note],
-                |r| r.get(0),
+                "SELECT quality, updated_at, data, note FROM pages WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
-            .optional()?
-            .unwrap_or(false);
-        if unchanged {
+            .optional()?;
+        let Some(row) = row else {
+            return Err(StoreError::Invalid(format!("no page with id {id:?}")));
+        };
+        if row == content_columns(content) {
             return Ok(false);
         }
-        let n = conn.execute(
-            "INSERT INTO page_data (subscription_id, quality, updated_at, metrics, note, stored_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(subscription_id) DO UPDATE SET quality = ?2, updated_at = ?3, metrics = ?4, note = ?5, stored_at = ?6",
-            params![id, quality, data.updated_at.map(|t| t.unix()), metrics, data.note, now.unix()],
-        );
-        match n {
-            Ok(_) => Ok(true),
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                Err(StoreError::Invalid(format!("no page with id {id:?}")))
-            }
-            Err(e) => Err(e.into()),
-        }
+        write_content(&conn, id, content, now)?;
+        Ok(true)
+    }
+
+    /// The pages a collector's report for `feed` goes to: that feed, with source `collector`.
+    pub fn collector_feed_pages(&self, feed: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn();
+        let mut st = conn.prepare(
+            "SELECT id FROM pages WHERE feed = ?1 AND source = 'collector' ORDER BY position, created_at",
+        )?;
+        let rows = st.query_map(params![feed], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    // ----- usage pages, as subscriptions -----
+    //
+    // The admin API still speaks of usage subscriptions: each is a meter page whose feed is the
+    // service, and whose meter items are the allowance windows.
+
+    pub fn subscriptions(&self) -> Result<Vec<(Subscription, Option<PageData>)>, StoreError> {
+        Ok(self.pages()?.into_iter().filter_map(as_subscription).collect())
+    }
+
+    pub fn add_subscription(&self, sub: &Subscription, now: Timestamp) -> Result<(), StoreError> {
+        self.add_page(
+            &StoredPage {
+                id: sub.id.clone(),
+                title: sub.title.clone(),
+                kind: KIND_METER.into(),
+                source: sub.source,
+                feed: Some(sub.service.slug().into()),
+                stale_after_seconds: sub.source.stale_after_seconds(),
+                content: None,
+            },
+            now,
+        )
+    }
+
+    pub fn subscription_ids(&self) -> Result<Vec<String>, StoreError> {
+        self.page_ids()
+    }
+
+    pub fn update_subscription(
+        &self,
+        id: &str,
+        title: Option<&str>,
+        source: Option<Source>,
+    ) -> Result<bool, StoreError> {
+        self.update_page(id, title, source)
+    }
+
+    pub fn remove_subscription(&self, id: &str) -> Result<bool, StoreError> {
+        self.remove_page(id)
+    }
+
+    /// Stores figures for a usage page as meter data.
+    pub fn put_page_data(&self, id: &str, data: &PageData, now: Timestamp) -> Result<bool, StoreError> {
+        let items = data
+            .metrics
+            .iter()
+            .map(|m| MeterItem::new(m.window.id(), m.window.label(), m.used_percent, m.resets_at))
+            .collect();
+        let content = StoredContent {
+            quality: data.quality,
+            updated_at: data.updated_at,
+            data: Some(serde_json::to_value(Meter { items }).expect("serialises")),
+            note: data.note.clone(),
+        };
+        self.put_content(id, &content, now)
     }
 
     pub fn subscription(&self, id: &str) -> Result<Option<Subscription>, StoreError> {
-        Ok(self
-            .subscriptions()?
-            .into_iter()
-            .map(|(s, _)| s)
-            .find(|s| s.id == id))
+        Ok(self.page(id)?.and_then(as_subscription).map(|(s, _)| s))
+    }
+
+    /// The pages a collector's report for `service` goes to.
+    pub fn collector_pages(&self, service: Service) -> Result<Vec<String>, StoreError> {
+        self.collector_feed_pages(service.slug())
     }
 
     // ----- collectors -----
@@ -735,34 +1063,180 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// The pages a collector's report for `service` goes to: that service, with source `collector`.
-    pub fn collector_pages(&self, service: Service) -> Result<Vec<String>, StoreError> {
-        let conn = self.conn();
-        let mut st = conn.prepare(
-            "SELECT id FROM subscriptions WHERE service = ?1 AND source = 'collector' ORDER BY position",
-        )?;
-        let rows = st.query_map(params![service.slug()], |r| r.get::<_, String>(0))?;
-        Ok(rows.collect::<Result<_, _>>()?)
-    }
-
     // ----- backup -----
 
     /// Copies the live database to `dest` with SQLite's online backup, safe while the hub runs.
     pub fn backup_to(&self, dest: &Path) -> Result<(), StoreError> {
-        let conn = self.conn();
-        let mut out = Connection::open(dest)?;
-        let backup = rusqlite::backup::Backup::new(&conn, &mut out)?;
-        backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
-        drop(backup);
-        // One self-contained file: no write-ahead log beside it.
-        out.pragma_update(None, "journal_mode", "DELETE")?;
-        Ok(())
+        Ok(online_copy(&self.conn(), dest)?)
     }
+}
+
+/// A page's content as its database columns: quality, updated_at, data and note.
+type ContentColumns = (Option<String>, Option<i64>, Option<String>, Option<String>);
+
+fn content_columns(c: &StoredContent) -> ContentColumns {
+    (
+        Some(c.quality.as_str().to_string()),
+        c.updated_at.map(|t| t.unix()),
+        c.data
+            .as_ref()
+            .map(|d| serde_json::to_string(d).expect("serialises")),
+        c.note.clone(),
+    )
+}
+
+fn write_content(conn: &Connection, id: &str, c: &StoredContent, now: Timestamp) -> rusqlite::Result<usize> {
+    let (quality, updated_at, data, note) = content_columns(c);
+    conn.execute(
+        "UPDATE pages SET quality = ?2, updated_at = ?3, data = ?4, note = ?5, stored_at = ?6 WHERE id = ?1",
+        params![id, quality, updated_at, data, note, now.unix()],
+    )
+}
+
+/// A meter page of a known usage service, as a subscription with its figures.
+fn as_subscription(p: StoredPage) -> Option<(Subscription, Option<PageData>)> {
+    let service = Service::from_slug(p.feed.as_deref()?)?;
+    if p.kind != KIND_METER {
+        return None;
+    }
+    let data = p.content.map(|c| PageData {
+        quality: c.quality,
+        updated_at: c.updated_at,
+        metrics: c
+            .data
+            .and_then(|d| serde_json::from_value::<Meter>(d).ok())
+            .map(|m| {
+                m.items
+                    .into_iter()
+                    .filter_map(|i| {
+                        Some(MetricValue {
+                            window: Window::from_id(&i.id)?,
+                            used_percent: i.percent,
+                            resets_at: i.resets_at,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        note: c.note,
+    });
+    Some((
+        Subscription {
+            id: p.id,
+            service,
+            title: p.title,
+            source: p.source,
+        },
+        data,
+    ))
+}
+
+/// Copies `conn`'s database to `dest` with SQLite's online backup, as one self-contained file.
+fn online_copy(conn: &Connection, dest: &Path) -> rusqlite::Result<()> {
+    let mut out = Connection::open(dest)?;
+    let backup = rusqlite::backup::Backup::new(conn, &mut out)?;
+    backup.run_to_completion(256, std::time::Duration::from_millis(10), None)?;
+    drop(backup);
+    // No write-ahead log beside it.
+    out.pragma_update(None, "journal_mode", "DELETE")?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    /// The time the parity fixture was built at: 2026-11-10T20:00:00Z.
+    const NOW: i64 = 1_794_340_800;
+
+    /// Representative data in the layout schema 2 used.
+    pub const SCHEMA_2_DATA: &str = r#"
+    INSERT INTO subscriptions (id, service, title, source, position, created_at) VALUES
+        ('claude-max', 'claude-max', 'Claude Max', 'collector', 2, 100),
+        ('chatgpt-plus', 'chatgpt-plus', 'ChatGPT Plus', 'none', 4, 101),
+        ('opencode-go-plus', 'opencode-go-plus', 'OpenCode Go Plus', 'demo', 0, 102),
+        ('work-claude', 'claude-max', 'Work Claude', 'manual', 1, 103),
+        ('chatgpt-plus-2', 'chatgpt-plus', 'Spare ChatGPT', 'manual', 5, 104),
+        ('opencode-go-plus-2', 'opencode-go-plus', 'Team OpenCode', 'collector', 3, 105),
+        ('chatgpt-plus-3', 'chatgpt-plus', 'Old ChatGPT', 'collector', 6, 106),
+        ('claude-max-2', 'claude-max', 'Empty manual', 'manual', 7, 107),
+        ('claude-max-3', 'claude-max', 'Demo Claude', 'demo', 8, 108);
+    INSERT INTO page_data (subscription_id, quality, updated_at, metrics, note, stored_at) VALUES
+        ('claude-max', 'provider_reported', 1794340200,
+         '[{"window":"five-hour","used_percent":80.0,"resets_at":"2026-11-10T19:00:00Z"},{"window":"weekly","used_percent":30.5,"resets_at":"2026-11-11T20:00:00Z"}]',
+         NULL, 1794340200),
+        ('work-claude', 'manual', 1794333600,
+         '[{"window":"five-hour","used_percent":12.3,"resets_at":"2026-11-10T21:00:00Z"},{"window":"weekly","used_percent":null,"resets_at":null}]',
+         'Typed in at lunch', 1794333600),
+        ('chatgpt-plus-3', 'provider_reported', 1794250800,
+         '[{"window":"five-hour","used_percent":99.9,"resets_at":"2026-11-10T20:01:40Z"},{"window":"weekly","used_percent":45.0,"resets_at":"2026-11-16T00:00:00Z"}]',
+         NULL, 1794250800),
+        ('claude-max-2', 'manual', 1794340740, '[]', NULL, 1794340740);
+    INSERT INTO devices (id, name, enrolled_at, last_seen_at, info, revoked_at) VALUES
+        ('d-desk', 'Desk', 200, 1794340000, NULL, NULL),
+        ('d-kitchen', 'Kitchen', 201, NULL, NULL, NULL),
+        ('d-old', 'Old', 150, 160, NULL, 170);
+    INSERT INTO credentials (token_hash, role, subject, label, created_at, revoked_at) VALUES
+        (x'01', 'admin', 'a-1', 'Desktop manager', 90, NULL),
+        (x'02', 'device', 'd-desk', 'Desk', 200, NULL),
+        (x'03', 'device', 'd-kitchen', 'Kitchen', 201, NULL),
+        (x'04', 'device', 'd-old', 'Old', 150, 170),
+        (x'05', 'collector', 'c-pc', 'PC helper', 210, NULL);
+    INSERT INTO one_time_codes (code_hash, purpose, label, created_at, expires_at, used_at) VALUES
+        (x'10', 'device-enrol', 'Desk', 190, 790, 200);
+    INSERT INTO collector_scopes (subject, service) VALUES ('c-pc', 'claude-max');
+    INSERT INTO audit_log (at, event, detail) VALUES (90, 'admin_paired', 'a-1 (Desktop manager)');
+    "#;
+
+    /// A database exactly as version 2 left it, with [`SCHEMA_2_DATA`] in it.
+    fn schema_2_database(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(MIGRATIONS[1]).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute_batch(SCHEMA_2_DATA).unwrap();
+    }
+
+    /// Every row of the tables an upgrade must not touch, as text.
+    fn untouched_tables(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for (table, order) in [
+            ("devices", "id"),
+            ("credentials", "token_hash"),
+            ("one_time_codes", "code_hash"),
+            ("collector_scopes", "subject, service"),
+            ("audit_log", "id"),
+        ] {
+            let mut st = conn
+                .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+                .unwrap();
+            let n = st.column_count();
+            let rows = st
+                .query_map([], |r| {
+                    let cols: Vec<String> = (0..n).map(|i| format!("{:?}", r.get_ref(i).unwrap())).collect();
+                    Ok(format!("{table}: {}", cols.join(", ")))
+                })
+                .unwrap();
+            out.extend(rows.map(Result::unwrap));
+        }
+        out
+    }
+
+    /// Files beside `path` that an upgrade saved.
+    fn copies(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("hub-before-upgrade-"))
+            })
+            .collect();
+        out.sort();
+        out
+    }
 
     #[test]
     fn a_version_1_database_upgrades_and_keeps_its_data() {
@@ -791,5 +1265,186 @@ mod tests {
             .add_collector_scope("c-1", &[Service::ClaudeMax, Service::ClaudeMax])
             .unwrap();
         assert_eq!(store.collector_services("c-1").unwrap(), vec![Service::ClaudeMax]);
+        let saved = copies(dir.path());
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hub-before-upgrade-schema-1-"), "{name}");
+    }
+
+    #[test]
+    fn upgrading_schema_2_shows_every_display_the_same_pages_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        schema_2_database(&path);
+        let before = untouched_tables(&Connection::open(&path).unwrap());
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 3);
+        // What the schema 2 code built from the same data, captured before it was replaced.
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/schema-2-pages.json")).unwrap();
+        let snap = hub_core::build_snapshot(ts(NOW), 300, &store.subscriptions().unwrap());
+        snap.validate().unwrap();
+        assert_eq!(serde_json::to_value(&snap.pages).unwrap(), expected);
+
+        let conn = store.conn();
+        assert_eq!(untouched_tables(&conn), before);
+        let ticks: Vec<(String, i64)> = conn
+            .prepare("SELECT device_id, COUNT(*) FROM display_pages GROUP BY device_id ORDER BY device_id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        // Both active displays show all nine pages; the revoked one shows none.
+        assert_eq!(ticks, [("d-desk".into(), 9), ("d-kitchen".into(), 9)]);
+        let old_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('subscriptions', 'page_data')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_tables, 0);
+        let manual: (String, String, i64) = conn
+            .query_row(
+                "SELECT kind, feed, stale_after_seconds FROM pages WHERE id = 'work-claude'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(manual, ("meter".into(), "claude-max".into(), 86_400));
+    }
+
+    #[test]
+    fn a_copy_at_the_old_schema_is_saved_before_upgrading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        schema_2_database(&path);
+        drop(Store::open(&path).unwrap());
+        let saved = copies(dir.path());
+        assert_eq!(saved.len(), 1, "{saved:?}");
+        let name = saved[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hub-before-upgrade-schema-2-20"), "{name}");
+        assert!(name.ends_with("Z.db") && !name.contains(':'), "{name}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&saved[0]).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The copy is a whole database at schema 2, with nothing beside it.
+        let (version, pages, displays) = Store::inspect(&saved[0]).unwrap();
+        assert_eq!((version, pages, displays), (2, 9, 3));
+        assert!(!dir.path().join(format!("{name}-wal")).exists());
+
+        // Opening it again upgrades nothing, so saves nothing; nor does a new database.
+        drop(Store::open(&path).unwrap());
+        drop(Store::open(&dir.path().join("new.db")).unwrap());
+        assert_eq!(copies(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_upgrade_leaves_the_database_at_schema_2() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        schema_2_database(&path);
+        // Something already called `pages` makes version 3's first statement fail.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE pages (x TEXT);")
+            .unwrap();
+        let Err(e) = Store::open(&path) else {
+            panic!("upgraded anyway")
+        };
+        assert!(matches!(e, StoreError::UpgradeFailed { from: 2, .. }), "{e}");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+        let count = |sql: &str| conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("SELECT COUNT(*) FROM subscriptions"), 9);
+        assert_eq!(count("SELECT COUNT(*) FROM page_data"), 4);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM sqlite_master WHERE name = 'display_pages'"),
+            0
+        );
+        // The copy was made first, and is kept.
+        assert_eq!(copies(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_failed_data_move_rolls_back_the_new_tables_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        schema_2_database(&path);
+        // A NOT NULL title gone null can only come from damage, and stops the move part-way.
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "PRAGMA writable_schema = ON;
+                 UPDATE sqlite_master SET sql = replace(sql, 'title TEXT NOT NULL', 'title TEXT')
+                     WHERE name = 'subscriptions';",
+            )
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE subscriptions SET title = NULL WHERE id = 'chatgpt-plus-3'",
+                [],
+            )
+            .unwrap();
+        let Err(e) = Store::open(&path) else {
+            panic!("upgraded anyway")
+        };
+        assert!(e.to_string().contains("Invalid column type"), "{e}");
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(version, 2);
+        let new_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('pages', 'display_pages')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_tables, 0);
+    }
+
+    #[test]
+    fn custom_kind_pages_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let now = ts(NOW);
+        let page = StoredPage {
+            id: "flights".into(),
+            title: "Overhead".into(),
+            kind: "nearby-flights/1".into(),
+            source: Source::Manual,
+            feed: None,
+            stale_after_seconds: 600,
+            content: Some(StoredContent {
+                quality: DataQuality::Manual,
+                updated_at: Some(now),
+                data: Some(
+                    json!({"flights": [{"callsign": "ANZ1", "altitude_m": 10_000}], "n": {"deep": [1, 2.5, null]}}),
+                ),
+                note: Some("Hand-made".into()),
+            }),
+        };
+        store.add_page(&page, now).unwrap();
+        assert_eq!(store.pages().unwrap(), vec![page.clone()]);
+        // A custom page is not a usage page.
+        assert!(store.subscriptions().unwrap().is_empty());
+        let content = page.content.clone().unwrap();
+        assert!(!store.put_content("flights", &content, now).unwrap());
+        let changed = StoredContent {
+            data: Some(json!({"flights": []})),
+            ..content
+        };
+        assert!(store.put_content("flights", &changed, now).unwrap());
+        assert_eq!(store.page("flights").unwrap().unwrap().content, Some(changed));
+        assert!(matches!(
+            store.put_content("nope", &page.content.unwrap(), now),
+            Err(StoreError::Invalid(_))
+        ));
     }
 }

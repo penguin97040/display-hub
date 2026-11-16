@@ -1,0 +1,167 @@
+[
+  {
+    "id": "opencode-go-plus",
+    "title": "OpenCode Go Plus",
+    "kind": "meter",
+    "data_quality": "demo",
+    "updated_at": "2026-11-10T20:00:00Z",
+    "stale_after_seconds": 3600,
+    "note": "Sample figures, not real usage",
+    "data": {
+      "items": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "percent": 17.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "percent": 31.0,
+          "resets_at": "2026-11-16T00:00:00Z"
+        },
+        {
+          "id": "monthly",
+          "label": "Monthly allowance used",
+          "percent": 9.0,
+          "resets_at": "2026-12-01T00:00:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "work-claude",
+    "title": "Work Claude",
+    "kind": "meter",
+    "data_quality": "manual",
+    "updated_at": "2026-11-10T18:00:00Z",
+    "stale_after_seconds": 86400,
+    "note": "Typed in at lunch",
+    "data": {
+      "items": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "percent": 12.3,
+          "resets_at": "2026-11-10T21:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "percent": null
+        }
+      ]
+    }
+  },
+  {
+    "id": "claude-max",
+    "title": "Claude Max",
+    "kind": "meter",
+    "data_quality": "provider_reported",
+    "updated_at": "2026-11-10T19:50:00Z",
+    "stale_after_seconds": 1800,
+    "note": "Window reset since the last report",
+    "data": {
+      "items": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "percent": null
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "percent": 30.5,
+          "resets_at": "2026-11-11T20:00:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "opencode-go-plus-2",
+    "title": "Team OpenCode",
+    "kind": "meter",
+    "data_quality": "unavailable",
+    "updated_at": null,
+    "stale_after_seconds": 1800,
+    "note": "Waiting for the first report"
+  },
+  {
+    "id": "chatgpt-plus",
+    "title": "ChatGPT Plus",
+    "kind": "meter",
+    "data_quality": "unavailable",
+    "updated_at": null,
+    "stale_after_seconds": 3600,
+    "note": "No supported source connected yet"
+  },
+  {
+    "id": "chatgpt-plus-2",
+    "title": "Spare ChatGPT",
+    "kind": "meter",
+    "data_quality": "unavailable",
+    "updated_at": null,
+    "stale_after_seconds": 86400,
+    "note": "No supported source connected yet"
+  },
+  {
+    "id": "chatgpt-plus-3",
+    "title": "Old ChatGPT",
+    "kind": "meter",
+    "data_quality": "provider_reported",
+    "updated_at": "2026-11-09T19:00:00Z",
+    "stale_after_seconds": 1800,
+    "note": null,
+    "data": {
+      "items": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "percent": 99.9,
+          "resets_at": "2026-11-10T20:01:40Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "percent": 45.0,
+          "resets_at": "2026-11-16T00:00:00Z"
+        }
+      ]
+    }
+  },
+  {
+    "id": "claude-max-2",
+    "title": "Empty manual",
+    "kind": "meter",
+    "data_quality": "unavailable",
+    "updated_at": null,
+    "stale_after_seconds": 86400,
+    "note": "No figures yet"
+  },
+  {
+    "id": "claude-max-3",
+    "title": "Demo Claude",
+    "kind": "meter",
+    "data_quality": "demo",
+    "updated_at": "2026-11-10T20:00:00Z",
+    "stale_after_seconds": 3600,
+    "note": "Sample figures, not real usage",
+    "data": {
+      "items": [
+        {
+          "id": "five-hour",
+          "label": "Five-hour allowance used",
+          "percent": 42.0,
+          "resets_at": "2026-11-10T22:00:00Z"
+        },
+        {
+          "id": "weekly",
+          "label": "Weekly allowance used",
+          "percent": 24.0,
+          "resets_at": "2026-11-16T00:00:00Z"
+        }
+      ]
+    }
+  }
+]
