@@ -96,7 +96,9 @@ impl Display<'_> {
     }
 
     /// Steps 5 to 7: the signature, verified with the stored key before the manifest is parsed; then
-    /// the manifest; then whether it is for this display, not a downgrade, and fits.
+    /// the manifest; then whether it is for this display, not a downgrade, and fits. A `key_set`
+    /// that leaves out any key the display trusts now counts as a downgrade unless its security
+    /// counter is above the display's floor.
     /// `manifest` is the `manifest_len` bytes after the header, and `content_length` the response's.
     pub fn check_manifest(
         &self,
@@ -126,6 +128,15 @@ impl Display<'_> {
         }
         if m.security_counter < self.security_floor {
             return Err(Refusal::Downgrade);
+        }
+        // A key_set that drops a key this display trusts retires that key, and a maker must raise
+        // the counter to do it. Without that rule, a replay of an older release at the same counter
+        // could bring back a key a later release removed.
+        if let Some(set) = &m.key_set {
+            let drops_a_key = self.trusted_keys.iter().any(|k| !set.contains(k));
+            if drops_a_key && m.security_counter <= self.security_floor {
+                return Err(Refusal::Downgrade);
+            }
         }
         if m.image_size > self.slot_bytes {
             return Err(Refusal::TooLarge);

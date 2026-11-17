@@ -238,6 +238,44 @@ fn downgrade() {
 }
 
 #[test]
+fn a_key_set_that_drops_a_trusted_key_needs_a_higher_counter() {
+    let (maker, recovery, new) = (key(), key(), key());
+    let hex = |k: &SigningKey| json!(k.public_key().to_hex());
+    // After a release that retired `new` with counter 3, the display trusts maker and recovery.
+    let keys = [maker.public_key(), recovery.public_key()];
+    let d = display(&keys);
+
+    // A same-counter replay of an older release whose key_set names `new` again (and so leaves
+    // out recovery) is refused.
+    let mut replay = manifest_value();
+    replay["security_counter"] = json!(3);
+    replay["firmware_version"] = json!("1.1.0");
+    replay["key_set"] = json!([hex(&maker), hex(&new)]);
+    assert_eq!(
+        on_form(&d, &form_for(&maker, &replay)).unwrap_err(),
+        Refusal::Downgrade
+    );
+
+    // A release that removes a key, with the counter raised, is accepted.
+    let mut retire = manifest_value();
+    retire["security_counter"] = json!(4);
+    retire["key_set"] = json!([hex(&recovery), hex(&new)]);
+    assert!(on_form(&d, &form_for(&maker, &retire)).is_ok());
+
+    // A key_set that only adds keys, or names the same ones in another order, at the same counter.
+    let mut adds = manifest_value();
+    adds["security_counter"] = json!(3);
+    adds["key_set"] = json!([hex(&recovery), hex(&maker), hex(&new)]);
+    assert!(on_form(&d, &form_for(&maker, &adds)).is_ok());
+    adds["key_set"] = json!([hex(&recovery), hex(&maker)]);
+    assert!(on_form(&d, &form_for(&maker, &adds)).is_ok());
+    // And no key_set at all changes nothing.
+    let mut plain = manifest_value();
+    plain["security_counter"] = json!(3);
+    assert!(on_form(&d, &form_for(&maker, &plain)).is_ok());
+}
+
+#[test]
 fn too_large_and_length_mismatch() {
     let k = key();
     let keys = [k.public_key()];

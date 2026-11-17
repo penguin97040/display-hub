@@ -65,5 +65,7 @@ pub const FIRMWARE_DOWNLOAD_STALL_SECONDS: u64 = 30;
 pub const FIRMWARE_RETRY_WAIT_SECONDS: u64 = 10 * 60;
 pub const FIRMWARE_FAILURES_BEFORE_LONG_WAIT: u32 = 3;
 pub const FIRMWARE_LONG_WAIT_SECONDS: u64 = 6 * 3600;
+/// The largest `attempts_left` a display reports in its `firmware` member.
+pub const MAX_FIRMWARE_ATTEMPTS_LEFT: u32 = 5;
 /// New firmware rolls back unless it reaches the hub within this long of its trial boot.
 pub const FIRMWARE_TRIAL_SECONDS: u64 = 5 * 60;

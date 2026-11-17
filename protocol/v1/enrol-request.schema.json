@@ -72,6 +72,12 @@
             "slot_bytes": {
               "type": "integer",
               "minimum": 0
+            },
+            "attempts_left": {
+              "description": "Download attempts the display has left before it must wait. It refills by itself within hours, so a hub never refuses an offer because it is 0.",
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5
             }
           }
         }

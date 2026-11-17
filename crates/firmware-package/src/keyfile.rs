@@ -40,8 +40,9 @@
 //! changing the public key, the rounds or the salt in the file makes it fail to open, just as a wrong
 //! passphrase does. After opening, the private key's own public half must equal `public_key`.
 //!
-//! The file is created new (never over an existing file) and, on Unix, readable and writable by its
-//! owner only (`0600`).
+//! The file is created new (never over an existing file) and readable and writable by its owner
+//! only: mode `0600` on Unix, and on Windows a protected access list (one that inherits nothing from
+//! its folder) granting the current user alone.
 
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -198,17 +199,9 @@ pub fn decrypt(file: &[u8], passphrase: &str) -> Result<SigningKey, KeyFileError
     Ok(key)
 }
 
-/// Writes a new key file: never over an existing file, and on Unix owner-only (`0600`) from the
-/// moment it exists.
+/// Writes a new key file: never over an existing file, and owner-only from the moment it exists.
 pub fn write_new(path: &Path, contents: &[u8]) -> Result<(), KeyFileError> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path).map_err(|e| {
+    let mut f = create_owner_only(path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             KeyFileError::Exists(path.display().to_string())
         } else {
@@ -225,6 +218,110 @@ pub fn write_new(path: &Path, contents: &[u8]) -> Result<(), KeyFileError> {
         )));
     }
     Ok(())
+}
+
+/// Creates `path`, failing if it exists, readable and writable by its owner only (`0600`).
+#[cfg(not(windows))]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Creates `path`, failing if it exists, with a protected access list that grants the current user
+/// full access and nobody else any. The list is part of the call that creates the file, so there is
+/// no moment when the file exists with its folder's inherited permissions.
+#[cfg(windows)]
+fn create_owner_only(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr::null_mut;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let last = std::io::Error::last_os_error;
+    // SAFETY: each call gets valid pointers to buffers of the sizes it is told, every handle and
+    // allocation is released on every path, and the SID is read only while `buf` holds it.
+    unsafe {
+        // The current user's SID, as text.
+        let mut token: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(last());
+        }
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+        // u64s, so the TOKEN_USER at the front is suitably aligned.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        let got = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+        let err = last();
+        CloseHandle(token);
+        if got == 0 {
+            return Err(err);
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_text: *mut u16 = null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut sid_text) == 0 {
+            return Err(last());
+        }
+        let mut n = 0;
+        while *sid_text.add(n) != 0 {
+            n += 1;
+        }
+        let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, n));
+        LocalFree(sid_text.cast());
+
+        // "P" protects the list from inheriting; the one entry gives this user full access.
+        let sddl: Vec<u16> = format!("D:P(A;;FA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            null_mut(),
+        ) == 0
+        {
+            return Err(last());
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        );
+        let err = last();
+        LocalFree(descriptor);
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(err);
+        }
+        Ok(std::fs::File::from_raw_handle(handle))
+    }
 }
 
 /// Reads a key file's contents, refusing anything far larger than a key file.

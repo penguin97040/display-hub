@@ -8,6 +8,7 @@
 //!   for the reference simulator. It verifies with the display's stored keys, never the header's.
 //! - [`keyfile`] makes and opens a maker's passphrase-protected signing key file. Its module
 //!   documentation describes the file layout.
+//! - [`version`] compares firmware versions, as the hub and the app show them.
 //!
 //! Nothing here decides whether a key should be trusted. Passing [`check`] means a package is well
 //! formed and consistent with the key inside it; only a display's own stored keys say more.
@@ -22,6 +23,7 @@ pub mod key;
 pub mod keyfile;
 pub mod limits;
 pub mod manifest;
+pub mod version;
 
 pub use build::{build_and_sign, BuildError, Built, Release, UsbLayout, UsbPartFile};
 pub use check::{

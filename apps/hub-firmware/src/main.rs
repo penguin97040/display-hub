@@ -317,7 +317,8 @@ fn login(p: &hub::Profile) -> Result<String, String> {
     line.zeroize();
     let conn = r?;
     Ok(format!(
-        "Paired with the hub at {}:{} as a publisher. This computer can now add firmware packages to it          with `hub-firmware add` or `hub-firmware publish`, and nothing else.",
+        "Paired with the hub at {}:{} as a publisher. This computer can now add firmware packages to it \
+         with `hub-firmware add` or `hub-firmware publish`, and nothing else.",
         conn.host, conn.port
     ))
 }
@@ -356,7 +357,14 @@ fn sign(a: &SignArgs) -> Result<String, String> {
     let signer = keyfile::public_key(&key_file).map_err(|e| format!("{}: {e}", a.key.display()))?;
     if let Some(ks) = &key_set {
         if !ks.contains(&signer) {
-            warn("the key set doesn't include the signing key, so displays that install this release will stop trusting it.");
+            warn(&format!(
+                "the key set leaves out the signing key ({}), so displays that install this release will stop \
+                 trusting it. Retiring a key needs a security counter above every display's floor, or displays \
+                 refuse the release as a downgrade: this tool can't know their floors, so make sure \
+                 --security-counter ({}) is higher than in any release you have published.",
+                signer.fingerprint(),
+                a.security_counter
+            ));
         }
     }
     let pass = passphrase::ask(&format!(
@@ -383,6 +391,7 @@ fn sign(a: &SignArgs) -> Result<String, String> {
         "Signed {} {} for {} and checked it.\n\
          File: {} ({} bytes; {} bytes go to a display)\n\
          Signer fingerprint: {}\n\
+         {}\n\
          Package id: {}",
         c.manifest.device_type,
         c.manifest.firmware_version,
@@ -391,8 +400,25 @@ fn sign(a: &SignArgs) -> Result<String, String> {
         c.len,
         c.update_form_len(),
         c.signer().fingerprint(),
+        key_set_lines(c.manifest.key_set.as_deref()),
         c.package_id.to_hex()
     ))
+}
+
+/// What `sign` and `inspect` say about a package's `key_set`: the fingerprint of each key displays
+/// will trust once they have installed it.
+fn key_set_lines(key_set: Option<&[PublicKey]>) -> String {
+    match key_set {
+        None => "Key set: none, so displays keep trusting the keys they trust now.".into(),
+        Some(keys) => {
+            let mut out = String::from("Keys displays will trust after this release (key_set):");
+            for k in keys {
+                out.push_str("\n  ");
+                out.push_str(&k.fingerprint());
+            }
+            out
+        }
+    }
 }
 
 fn inspect(path: &Path) -> Result<String, String> {
@@ -406,12 +432,14 @@ fn inspect(path: &Path) -> Result<String, String> {
         "{pretty}\n\
          Signer fingerprint: {}\n\
          Signer key id: {}\n\
+         {}\n\
          Package id: {}\n\
          Size: {} bytes ({} bytes go to a display)\n\
          The package is well formed and signed by the key above. Compare the fingerprint with the one \
          the firmware's maker publishes: that is what says who made it.",
         c.signer().fingerprint(),
         c.signer_key_id().to_hex(),
+        key_set_lines(c.manifest.key_set.as_deref()),
         c.package_id.to_hex(),
         c.len,
         c.update_form_len()

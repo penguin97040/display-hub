@@ -732,6 +732,7 @@ pub(crate) mod tests {
             uploaded_by: "a".into(),
             uploaded_by_label: None,
             offered_to: vec![],
+            evicted: None,
         }
     }
 
@@ -750,6 +751,7 @@ pub(crate) mod tests {
                     key_ids: k.iter().map(|k| k.repeat(64)).collect(),
                     security_floor: 2,
                     slot_bytes: 1 << 20,
+                    attempts_left: None,
                 }),
             }),
             pages: None,

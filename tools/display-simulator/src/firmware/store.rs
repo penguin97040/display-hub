@@ -342,6 +342,7 @@ pub fn device_info(state: &Path) -> std::io::Result<DeviceInfo> {
             key_ids: keys.key_ids(),
             security_floor: keys.security_floor,
             slot_bytes: board(state)?.slot_bytes,
+            attempts_left: None,
         }),
     })
 }

@@ -20,6 +20,7 @@ use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 use tower::ServiceExt;
 
+use crate::http::CloseConnection;
 use crate::identity::Identity;
 use crate::netpolicy;
 
@@ -94,9 +95,12 @@ pub async fn serve(
                 }
                 Err(_) => return,
             };
+            let close = CloseConnection::default();
+            let closer = close.clone();
             let service =
                 hyper::service::service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
                     req.extensions_mut().insert(ConnectInfo::<SocketAddr>(peer));
+                    req.extensions_mut().insert(closer.clone());
                     router.clone().oneshot(req.map(axum::body::Body::new))
                 });
             let conn = hyper::server::conn::http1::Builder::new()
@@ -105,8 +109,15 @@ pub async fn serve(
                 .max_buf_size(64 * 1024)
                 .serve_connection(TokioIo::new(tls), service);
             let conn = watcher.watch(conn);
-            if let Err(e) = conn.await {
-                tracing::debug!(peer = %peer.ip(), error = %e, "connection ended with an error");
+            // A route that gives up on its request (a stalled download) drops the whole connection,
+            // and with it the socket and whatever the response body held.
+            tokio::select! {
+                r = conn => if let Err(e) = r {
+                    tracing::debug!(peer = %peer.ip(), error = %e, "connection ended with an error");
+                },
+                () = close.closed() => {
+                    tracing::debug!(peer = %peer.ip(), "closed a connection a route gave up on");
+                }
             }
         });
     }

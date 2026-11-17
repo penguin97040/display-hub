@@ -75,6 +75,25 @@ pub fn check_protocol(headers: &HeaderMap) -> Result<(), ApiError> {
     }
 }
 
+/// Lets a route close the connection its request came on. A firmware download that runs past its
+/// time limit while the display has stopped reading needs it: its body is then never asked for more,
+/// so nothing else would notice, and only dropping the connection frees the socket and the file.
+/// The HTTPS server puts one in every request's extensions; other servers may not.
+#[derive(Clone, Debug, Default)]
+pub struct CloseConnection(std::sync::Arc<tokio::sync::Notify>);
+
+impl CloseConnection {
+    /// Asks for the connection to be dropped, now or as soon as its server looks.
+    pub fn close(&self) {
+        self.0.notify_one();
+    }
+
+    /// Resolves once [`close`](Self::close) has been called.
+    pub async fn closed(&self) {
+        self.0.notified().await;
+    }
+}
+
 /// Turns tower's timeout and overload errors into structured responses.
 pub async fn handle_layer_error(err: tower::BoxError) -> ApiError {
     if err.is::<tower::timeout::error::Elapsed>() {

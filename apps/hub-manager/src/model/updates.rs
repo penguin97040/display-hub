@@ -890,6 +890,7 @@ mod tests {
             uploaded_by: "a".into(),
             uploaded_by_label: None,
             offered_to: vec![],
+            evicted: None,
         }
     }
 
@@ -908,6 +909,7 @@ mod tests {
                     key_ids: keys.iter().map(|k| k.repeat(64)).collect(),
                     security_floor: 1,
                     slot_bytes: 1 << 21,
+                    attempts_left: None,
                 }),
             }),
             pages: Some(vec![]),

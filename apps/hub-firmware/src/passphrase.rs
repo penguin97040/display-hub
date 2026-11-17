@@ -37,10 +37,14 @@ pub fn ask_new(prompt: &str) -> Result<Zeroizing<String>, String> {
 }
 
 /// One line, without its line ending.
+///
+/// The buffer is made at its full size first, so it never moves and leaves no copy behind to be
+/// zeroed. Standard input's own buffer, inside the standard library, may still hold the line until
+/// it is overwritten: there is no portable way to clear it.
 fn read_line() -> Result<Zeroizing<String>, String> {
-    let mut buf = Zeroizing::new(Vec::new());
     // Room for the longest passphrase, a CR LF, and one byte to notice anything longer.
     let limit = (MAX_PASSPHRASE_BYTES + 3) as u64;
+    let mut buf = Zeroizing::new(Vec::with_capacity(limit as usize));
     std::io::stdin()
         .lock()
         .take(limit)

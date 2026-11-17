@@ -429,7 +429,10 @@ impl Store {
     /// Records a display's report about one of its offers. A final result settles an open offer;
     /// it is also recorded on one that was cancelled or expired meanwhile, since the display may
     /// have acted on it first. A result for an offer already settled, or progress on one that has
-    /// ended, changes nothing.
+    /// ended, changes nothing, with one exception: an offer counted as installed only because a
+    /// heartbeat named its version is overruled by a later `rolled_back` or `failed` report (the
+    /// heartbeat may have come from the trial boot, before it rolled back), and confirmed by a later
+    /// `installed` one. A reported `installed` is never overruled.
     pub fn record_report(
         &self,
         device: &str,
@@ -453,6 +456,7 @@ impl Store {
             return Ok(ReportOutcome::NoOffer);
         };
         let settled = !matches!(row.state.as_str(), OFFERED | CANCELLED | EXPIRED | "downloading");
+        let by_heartbeat = row.state == "installed" && row.reason.as_deref() == Some(INSTALLED_BY_HEARTBEAT);
         // A state or reason this build doesn't know is recorded as a failure.
         let (state, reason) = match (state, reason) {
             (ReportState::Unrecognised, _) => ("failed", Some(ReportReason::Unrecognised.as_str())),
@@ -464,7 +468,8 @@ impl Store {
             }
             (s, _) => (s.as_str(), None),
         };
-        let outcome = if settled || (state == "downloading" && row.ended_at.is_some()) {
+        let overrules = by_heartbeat && matches!(state, "rolled_back" | "failed" | "installed");
+        let outcome = if (settled && !overrules) || (state == "downloading" && row.ended_at.is_some()) {
             ReportOutcome::Unchanged
         } else if state == "downloading" {
             tx.execute(
@@ -524,6 +529,36 @@ impl Store {
         };
         tx.commit()?;
         Ok(row)
+    }
+
+    /// Records the version a display reported running in a final report, in its stored details, so
+    /// the app shows it before the next heartbeat. False if the display has no stored
+    /// details (it never enrolled with them) or is gone.
+    pub fn set_reported_firmware_version(&self, device: &str, version: &str) -> Result<bool, StoreError> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let info: Option<Option<String>> = tx
+            .query_row(
+                "SELECT info FROM devices WHERE id = ?1 AND revoked_at IS NULL",
+                params![device],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(Ok(mut info)) = info
+            .flatten()
+            .map(|i| serde_json::from_str::<hub_protocol::device::DeviceInfo>(&i))
+        else {
+            return Ok(false);
+        };
+        if info.firmware_version != version {
+            info.firmware_version = version.to_string();
+            tx.execute(
+                "UPDATE devices SET info = ?2 WHERE id = ?1",
+                params![device, serde_json::to_string(&info).expect("serialises")],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Whether a display's open offer is worth a look at its heartbeat: one exists for `version`.

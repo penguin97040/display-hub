@@ -46,9 +46,25 @@ fn firmware_additions_match_their_schemas_and_types() {
     use hub_protocol::firmware::{FirmwareReport, ReportReason, ReportState};
     let h: Heartbeat = round_trip(check("heartbeat.schema.json", "heartbeat-with-firmware.json"));
     assert!(h.problems().is_empty());
-    let fw = h.firmware.unwrap();
+    let fw = h.firmware.clone().unwrap();
     assert!(fw.problems().is_empty());
-    assert_eq!((fw.key_ids.len(), fw.security_floor), (2, 3));
+    assert_eq!(
+        (fw.key_ids.len(), fw.security_floor, fw.attempts_left),
+        (2, 3, Some(4))
+    );
+    // attempts_left is optional, and 0 to 5.
+    let schema: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir().join("heartbeat.schema.json")).unwrap()).unwrap();
+    let hv = jsonschema::validator_for(&schema).unwrap();
+    let mut beat = serde_json::to_value(&h).unwrap();
+    for (n, ok) in [(0, true), (5, true), (6, false), (-1, false)] {
+        beat["firmware"]["attempts_left"] = serde_json::json!(n);
+        assert_eq!(hv.is_valid(&beat), ok, "{n}");
+    }
+    beat["firmware"].as_object_mut().unwrap().remove("attempts_left");
+    assert!(hv.is_valid(&beat));
+    let without: Heartbeat = serde_json::from_value(beat).unwrap();
+    assert_eq!(without.firmware.as_ref().unwrap().attempts_left, None);
     // An enrolment carries the same `device` object.
     let mut enrol: serde_json::Value =
         serde_json::from_slice(&std::fs::read(dir().join("examples/device/enrol-request.json")).unwrap())
@@ -177,5 +193,6 @@ fn usb_messages_match_their_schema_and_types() {
     let FromDisplay::Hello { device, .. } = hello else {
         panic!("hello")
     };
-    assert_eq!(device.firmware.unwrap().slot_bytes, 3_145_728);
+    let fw = device.firmware.unwrap();
+    assert_eq!((fw.slot_bytes, fw.attempts_left), (3_145_728, Some(5)));
 }

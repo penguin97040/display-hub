@@ -42,7 +42,8 @@
           "properties": {
             "key_ids": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } },
             "security_floor": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
-            "slot_bytes": { "type": "integer", "minimum": 0 }
+            "slot_bytes": { "type": "integer", "minimum": 0 },
+            "attempts_left": { "type": "integer", "minimum": 0, "maximum": 5, "description": "Download attempts left before the display must wait. It refills by itself within hours." }
           }
         }
       }

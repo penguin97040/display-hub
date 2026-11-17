@@ -2775,6 +2775,72 @@ mod tests {
             ("o5", Some(INSTALLED_BY_HEARTBEAT))
         );
         assert!(store.open_offer("d-a", ts(NOW + 12)).unwrap().is_none());
+        // That heartbeat may have come from the trial boot: a later rollback or failure report
+        // overrules it, keeping when the offer ended.
+        let ReportOutcome::Recorded {
+            offer: o,
+            settled: true,
+        } = store
+            .record_report(
+                "d-a",
+                "o5",
+                ReportState::RolledBack,
+                None,
+                Some("0.0.0-test"),
+                ts(NOW + 13),
+            )
+            .unwrap()
+        else {
+            panic!("a rollback overrules a heartbeat")
+        };
+        assert_eq!(
+            (
+                o.state.as_str(),
+                o.reason.as_deref(),
+                o.reported_version.as_deref(),
+                o.ended_at
+            ),
+            ("rolled_back", None, Some("0.0.0-test"), Some(ts(NOW + 12)))
+        );
+        // Once a report has settled it, a later report changes nothing.
+        assert_eq!(
+            store
+                .record_report("d-a", "o5", ReportState::Installed, None, None, ts(NOW + 13))
+                .unwrap(),
+            ReportOutcome::Unchanged
+        );
+        for (id, state, reason, shown) in [
+            (
+                "o5f",
+                ReportState::Failed,
+                Some(ReportReason::Flash),
+                ("failed", Some("flash")),
+            ),
+            ("o5i", ReportState::Installed, None, ("installed", None)),
+        ] {
+            store.make_offer(&offer(id, "d-a", "p1", NOW + 13)).unwrap();
+            store
+                .installed_by_heartbeat("d-a", "1.0.0", ts(NOW + 13))
+                .unwrap()
+                .unwrap();
+            let ReportOutcome::Recorded {
+                offer: o,
+                settled: true,
+            } = store
+                .record_report("d-a", id, state, reason, Some("1.0.0"), ts(NOW + 13))
+                .unwrap()
+            else {
+                panic!("{id}")
+            };
+            assert_eq!((o.state.as_str(), o.reason.as_deref()), shown, "{id}");
+        }
+        // A reported installed is never overruled.
+        assert_eq!(
+            store
+                .record_report("d-a", "o5i", ReportState::RolledBack, None, None, ts(NOW + 13))
+                .unwrap(),
+            ReportOutcome::Unchanged
+        );
         let same = firmware::NewOffer {
             from_version: Some("1.0.0"),
             ..offer("o6", "d-a", "p1", NOW + 13)
@@ -2801,6 +2867,24 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n as usize, MAX_OFFER_HISTORY_PER_DISPLAY + 1);
+    }
+
+    #[test]
+    fn an_installed_report_updates_the_stored_version() {
+        let store = Store::in_memory().unwrap();
+        device(&store, "d-a");
+        assert!(store.set_reported_firmware_version("d-a", "1.2.0").unwrap());
+        assert_eq!(
+            store
+                .device("d-a")
+                .unwrap()
+                .unwrap()
+                .info
+                .unwrap()
+                .firmware_version,
+            "1.2.0"
+        );
+        assert!(!store.set_reported_firmware_version("d-none", "1.2.0").unwrap());
     }
 
     #[test]

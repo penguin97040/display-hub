@@ -118,6 +118,7 @@ fn keygen_sign_and_inspect() {
     let (stdout, stderr) = text(&o);
     assert!(o.status.success(), "{stderr}");
     assert!(stdout.contains(&format!("Signer fingerprint: {fp}")), "{stdout}");
+    assert!(stdout.contains("Key set: none"), "{stdout}");
     assert!(stdout.contains(&format!("Package id: {}", checked.package_id.to_hex())));
     assert!(
         stdout.contains("\"device_type\": \"llm-usage-display\""),
@@ -209,6 +210,53 @@ fn sign_with_usb_parts_and_a_key_set() {
     assert_eq!(usb.parts[0].size, 21072);
     assert!(
         stdout.contains(&format!("{} bytes go to a display", c.len - 21072 - 3072)),
+        "{stdout}"
+    );
+    // Every key displays will trust afterwards is shown, by sign and by inspect, and as the set
+    // includes the signing key there is no warning.
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let listed = format!(
+        "Keys displays will trust after this release (key_set):\n  {}\n  {}\n  {}",
+        ks[0], ks[1], ks[2]
+    );
+    assert!(stdout.contains(&listed), "{stdout}");
+    let o = run(&["inspect", p(&out)], "");
+    assert!(o.status.success());
+    assert!(text(&o).0.contains(&listed), "{}", text(&o).0);
+
+    // A key set that leaves out the signing key is signed, with a warning to raise the counter.
+    let retired = dir.path().join("retired.dhfw");
+    let o = run(
+        &[
+            "sign",
+            "--key",
+            p(&key),
+            "--image",
+            p(&image),
+            "--device-type",
+            "llm-usage-display",
+            "--hardware",
+            "waveshare-amoled-1.8-v2",
+            "--version",
+            "2.0.0",
+            "--security-counter",
+            "5",
+            "--key-set",
+            p(&recovery),
+            "--out",
+            p(&retired),
+        ],
+        &format!("{PASSPHRASE}\n"),
+    );
+    let (stdout, stderr) = text(&o);
+    assert!(o.status.success(), "{stderr}");
+    assert!(stderr.contains("leaves out the signing key"), "{stderr}");
+    assert!(stderr.contains("--security-counter (5)"), "{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Keys displays will trust after this release (key_set):\n  {}\n",
+            ks[1]
+        )),
         "{stdout}"
     );
 }

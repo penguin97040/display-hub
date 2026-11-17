@@ -9,6 +9,7 @@
       "65ea7f4b63fea26954712bf24a4722036822edb24317607d323ee92716a0cd8c"
     ],
     "security_floor": 3,
-    "slot_bytes": 3145728
+    "slot_bytes": 3145728,
+    "attempts_left": 4
   }
 }

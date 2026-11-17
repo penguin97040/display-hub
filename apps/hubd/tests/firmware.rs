@@ -138,6 +138,7 @@ fn trusting(key: &SigningKey, floor: u32, slot: u64) -> FirmwareInfo {
         key_ids: vec![key.public_key().key_id().to_hex()],
         security_floor: floor,
         slot_bytes: slot,
+        attempts_left: None,
     }
 }
 
@@ -392,6 +393,7 @@ async fn offers_are_refused_when_the_display_would_refuse_them() {
                 key_ids: vec![],
                 security_floor: 0,
                 slot_bytes: 1 << 20,
+                attempts_left: None,
             }),
             "trusts no firmware keys",
         ),
@@ -816,16 +818,25 @@ async fn reports_settle_offers_and_a_heartbeat_with_the_new_version_counts_as_in
     .unwrap();
     assert_eq!(state(c.clone(), admin.clone()).await.0, "failed");
 
-    // Installed and rolled back, by report.
-    for (s, shown) in [
-        (ReportState::RolledBack, "rolled_back"),
-        (ReportState::Installed, "installed"),
+    // Installed and rolled back, by report. An installed report's version is the display's
+    // version at once, without waiting for its next heartbeat.
+    let running = |c: HubClient, admin: String| async move {
+        c.displays(&admin).await.unwrap()[0]
+            .device
+            .clone()
+            .unwrap()
+            .firmware_version
+    };
+    for (s, reported, shown, now_running) in [
+        (ReportState::RolledBack, "1.0.0", "rolled_back", "1.0.0"),
+        (ReportState::Installed, "1.2.0", "installed", "1.2.0"),
     ] {
         let offer = c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
-        c.firmware_report(&token, &report(&offer.offer_id, s, None, "1.2.0"))
+        c.firmware_report(&token, &report(&offer.offer_id, s, None, reported))
             .await
             .unwrap();
         assert_eq!(state(c.clone(), admin.clone()).await.0, shown);
+        assert_eq!(running(c.clone(), admin.clone()).await, now_running);
     }
 
     // A heartbeat naming the offered version, when the report was lost.
@@ -873,6 +884,44 @@ async fn reports_settle_offers_and_a_heartbeat_with_the_new_version_counts_as_in
         (offer.offer_id.as_str(), "installed", Some("seen_in_heartbeat"))
     );
     assert!(audit(&r.hub).iter().any(|l| l.contains("seen in a heartbeat")));
+    // That heartbeat came from the trial boot: the rollback reported afterwards overrules it.
+    c.firmware_report(
+        &shelf_token,
+        &report(&offer.offer_id, ReportState::RolledBack, None, "1.0.0"),
+    )
+    .await
+    .unwrap();
+    let o = c
+        .displays(&admin)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == shelf_desk)
+        .unwrap()
+        .firmware
+        .unwrap()
+        .offer
+        .unwrap();
+    assert_eq!(
+        (
+            o.state.as_str(),
+            o.reason.as_deref(),
+            o.reported_version.as_deref()
+        ),
+        ("rolled_back", None, Some("1.0.0"))
+    );
+    let shown = c
+        .displays(&admin)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.id == shelf_desk)
+        .unwrap();
+    assert_eq!(
+        shown.device.unwrap().firmware_version,
+        "1.0.0",
+        "back to the old version"
+    );
 
     // A heartbeat whose firmware member breaks the rules is still a heartbeat.
     let mut odd = beat("1.2.0");
@@ -1104,5 +1153,423 @@ async fn pair_publisher_prints_a_string_that_pairs_once() {
         (listed[0].id.as_str(), listed[0].label.as_str()),
         (paired.publisher_id.as_str(), "CI machine")
     );
+    r.stop().await;
+}
+
+/// Pairs a publisher and returns its id and token.
+async fn publisher(r: &Running, admin: &str, label: &str) -> (String, String) {
+    let c = r.client();
+    let invite = c.new_publisher(admin, label).await.unwrap();
+    let paired = c.publisher_pair(&invite.secret).await.unwrap();
+    (paired.publisher_id, paired.publisher_token)
+}
+
+#[tokio::test]
+async fn a_publisher_makes_room_only_with_its_own_packages_and_uploaders_hear_what_was_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let (_, mine) = publisher(&r, &admin, "Maker").await;
+    let (_, other) = publisher(&r, &admin, "Another maker").await;
+    let k = key();
+
+    let first = c
+        .upload_firmware(&admin, package(&k, "1.0.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(first.evicted, None);
+    let own_low = c
+        .publisher_upload(&mine, package(&k, "1.1.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    c.publisher_upload(&mine, package(&k, "1.2.0", 1).bytes)
+        .await
+        .unwrap();
+    // The shelf for this device type is full. The publisher's upload removes its own lowest version,
+    // not the admin's lower one, and says so.
+    let (view, created) = c
+        .publisher_upload(&mine, package(&k, "1.3.0", 1).bytes)
+        .await
+        .unwrap();
+    assert!(created);
+    let gone = view.evicted.unwrap();
+    assert_eq!(
+        (
+            gone.package_id.as_str(),
+            gone.device_type.as_str(),
+            gone.firmware_version.as_str()
+        ),
+        (own_low.package_id.as_str(), TYPE, "1.1.0")
+    );
+    assert!(audit(&r.hub)
+        .iter()
+        .any(|l| l.starts_with(&format!("firmware_evicted {} {TYPE} 1.1.0", own_low.package_id))));
+    // Another publisher, with nothing of its own there, can't make room.
+    let e = c
+        .publisher_upload(&other, package(&k, "2.0.0", 1).bytes)
+        .await
+        .unwrap_err();
+    assert_eq!((status(&e), code(&e)), (409, Some(ErrorCode::Conflict)));
+    assert!(e.to_string().contains("someone else uploaded"), "{e}");
+    assert_eq!(files(dir.path()).len(), 3);
+    // An admin's upload still removes the lowest version, whoever uploaded it.
+    let view = c
+        .upload_firmware(&admin, package(&k, "1.4.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    assert_eq!(view.evicted.unwrap().package_id, first.package_id);
+    // The lists never carry `evicted`.
+    assert!(c
+        .firmware_packages(&admin)
+        .await
+        .unwrap()
+        .iter()
+        .all(|p| p.evicted.is_none()));
+    r.stop().await;
+}
+
+/// The P-256 group order, big-endian.
+const P256_N: [u8; 32] = [
+    0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xbc,
+    0xe6, 0xfa, 0xad, 0xa7, 0x17, 0x9e, 0x84, 0xf3, 0xb9, 0xca, 0xc2, 0xfc, 0x63, 0x25, 0x51,
+];
+
+/// The same package with its signature's `s` replaced by `n - s`: another valid signature over the
+/// same bytes.
+fn malleated(package: &[u8]) -> Vec<u8> {
+    let mut out = package.to_vec();
+    let s = &mut out[73 + 32..73 + 64];
+    let mut borrow = 0i16;
+    for i in (0..32).rev() {
+        let mut d = i16::from(P256_N[i]) - i16::from(s[i]) - borrow;
+        borrow = i16::from(d < 0);
+        if d < 0 {
+            d += 256;
+        }
+        s[i] = d as u8;
+    }
+    out
+}
+
+#[tokio::test]
+async fn the_same_release_signed_again_is_the_release_already_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let (_, p) = publisher(&r, &admin, "Maker").await;
+    let k = key();
+    let original = package(&k, "1.2.0", 1);
+    let twin = malleated(&original.bytes);
+    assert_ne!(twin, original.bytes);
+    // Still a valid package, with another package id.
+    let checked = firmware_package::check(&twin[..], twin.len() as u64).unwrap();
+    assert_ne!(checked.package_id, original.checked.package_id);
+
+    let (kept, created) = c.upload_firmware(&admin, original.bytes.clone()).await.unwrap();
+    assert!(created);
+    for token in [&admin, &p] {
+        let (view, created) = if token == &admin {
+            c.upload_firmware(token, twin.clone()).await.unwrap()
+        } else {
+            c.publisher_upload(token, twin.clone()).await.unwrap()
+        };
+        assert!(!created, "answered 200");
+        assert_eq!(view.package_id, kept.package_id);
+    }
+    assert_eq!(files(dir.path()), [format!("{}.dhfw", kept.package_id)]);
+    assert_eq!(c.firmware_packages(&admin).await.unwrap().len(), 1);
+    // A release signed again from scratch is the same release too.
+    let resigned = build_and_sign(&k, &release("1.2.0", 1), &image(5000, "1.2.0".len() as u8 + 1)).unwrap();
+    assert_ne!(resigned.checked.package_id, original.checked.package_id);
+    assert!(!c.upload_firmware(&admin, resigned.bytes).await.unwrap().1);
+    // But another key's signature over the same manifest is another release.
+    let other = package(&key(), "1.2.0", 1);
+    assert!(c.upload_firmware(&admin, other.bytes).await.unwrap().1);
+    r.stop().await;
+}
+
+/// A raw HTTPS connection to the hub, for what the client library won't do: stop reading a
+/// download, or stop sending an upload. `recv_buffer` shrinks the socket's receive buffer, so
+/// little of a download can sit unread on this side.
+async fn raw(
+    r: &Running,
+    recv_buffer: Option<u32>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(b) = recv_buffer {
+        socket.set_recv_buffer_size(b).unwrap();
+    }
+    let tcp = socket
+        .connect(std::net::SocketAddr::from(([127, 0, 0, 1], r.port)))
+        .await
+        .unwrap();
+    let config = hub_client::pin::client_config(vec![r.hub.identity.spki_sha256]);
+    let name = rustls::pki_types::ServerName::from(std::net::IpAddr::from([127, 0, 0, 1]));
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
+        .unwrap()
+}
+
+/// Reads up to the end of a response's headers, and returns them.
+async fn read_head<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        assert_eq!(s.read(&mut byte).await.unwrap(), 1, "the headers ended early");
+        head.push(byte[0]);
+    }
+    String::from_utf8(head).unwrap()
+}
+
+#[tokio::test]
+async fn one_download_at_a_time_for_each_display() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let k = key();
+    let pkg = c
+        .upload_firmware(&admin, package(&k, "1.2.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    let (desk, token) = r
+        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 1 << 20)))
+        .await;
+    let (other, other_token) = r
+        .display(&admin, "Other", REV, Some(trusting(&k, 0, 1 << 20)))
+        .await;
+    c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
+    c.offer_firmware(&admin, &other, &pkg.package_id).await.unwrap();
+    // While Desk's download is being sent, Desk can't start another; Other can.
+    r.hub.downloading.lock().unwrap().insert(desk.clone());
+    let e = c.firmware_download(&token, &pkg.package_id).await.unwrap_err();
+    assert_eq!((status(&e), code(&e)), (503, Some(ErrorCode::Unavailable)));
+    assert!(e.to_string().contains("already downloading"), "{e}");
+    c.firmware_download(&other_token, &pkg.package_id).await.unwrap();
+    r.hub.downloading.lock().unwrap().remove(&desk);
+    c.firmware_download(&token, &pkg.package_id).await.unwrap();
+    assert!(r.hub.downloading.lock().unwrap().is_empty());
+    assert_eq!(
+        r.hub.download_slots.available_permits(),
+        hub_protocol::limits::MAX_CONCURRENT_FIRMWARE_DOWNLOADS
+    );
+    r.stop().await;
+}
+
+/// How many of this process's open files are `path`.
+#[cfg(target_os = "linux")]
+fn open_handles_to(path: &Path) -> usize {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| target == path)
+        .count()
+}
+
+#[tokio::test]
+async fn a_display_that_stops_reading_loses_its_connection_at_the_time_limit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    r.hub
+        .set_firmware_time_limits(hubd::firmware::FirmwareTimeLimits {
+            download: std::time::Duration::from_secs(2),
+            ..Default::default()
+        });
+    let admin = r.admin().await;
+    let c = r.client();
+    let k = key();
+    // The largest image: far more than the sockets between the hub and this test can hold.
+    let big = build_and_sign(
+        &k,
+        &release("2.0.0", 1),
+        &image(firmware_package::limits::MAX_IMAGE_SIZE as usize, 7),
+    )
+    .unwrap();
+    let form = big.checked.update_form_len();
+    let pkg = c.upload_firmware(&admin, big.bytes).await.unwrap().0;
+    let (desk, token) = r
+        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 16 << 20)))
+        .await;
+    c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
+
+    let mut s = raw(&r, Some(8192)).await;
+    s.write_all(
+        format!(
+            "GET /v1/device/firmware/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\r\n",
+            pkg.package_id
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    // The display stops reading. Its download is under way, holding a slot, its turn and the file.
+    let file = dir
+        .path()
+        .join("firmware")
+        .join(format!("{}.dhfw", pkg.package_id))
+        .canonicalize()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(r.hub.downloading.lock().unwrap().contains(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 1);
+    #[cfg(target_os = "linux")]
+    assert_eq!(open_handles_to(&file), 1);
+    // Past the limit, the hub has let go of all three while the display still isn't reading: the
+    // connection was dropped, since the body was never asked for more.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(r.hub.downloading.lock().unwrap().is_empty());
+    assert_eq!(r.hub.download_slots.available_permits(), 2);
+    #[cfg(target_os = "linux")]
+    assert_eq!(open_handles_to(&file), 0, "the file is still open");
+    let _ = &file;
+    // What was already sent arrives, then the stream ends early.
+    let mut got = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n as u64,
+            }
+        }
+    })
+    .await;
+    assert!(ended.is_ok(), "the connection was left open");
+    assert!(got < form, "{got} of {form} bytes: the download wasn't cut off");
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn an_upload_that_sends_nothing_is_dropped_before_the_overall_limit() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    assert_eq!(
+        r.hub.firmware_time_limits().upload_idle,
+        std::time::Duration::from_secs(60)
+    );
+    r.hub
+        .set_firmware_time_limits(hubd::firmware::FirmwareTimeLimits {
+            upload_idle: std::time::Duration::from_secs(1),
+            ..Default::default()
+        });
+    let admin = r.admin().await;
+    let k = key();
+    let built = package(&k, "1.2.0", 1);
+    let mut s = raw(&r, None).await;
+    s.write_all(
+        format!(
+            "POST /v1/admin/firmware HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {admin}\r\n\
+             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            built.bytes.len()
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    s.write_all(&built.bytes[..1000]).await.unwrap();
+    s.flush().await.unwrap();
+    let head = tokio::time::timeout(std::time::Duration::from_secs(10), read_head(&mut s))
+        .await
+        .expect("answered well within the overall limit");
+    assert!(head.starts_with("HTTP/1.1 408"), "{head}");
+    // The slot is free, and nothing was kept.
+    assert_eq!(r.hub.upload_slots.available_permits(), 1);
+    assert!(files(dir.path()).is_empty(), "{:?}", files(dir.path()));
+    assert!(r.client().upload_firmware(&admin, built.bytes).await.unwrap().1);
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn a_label_cant_claim_to_be_the_official_firmware() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let key_id = key().public_key().key_id().to_hex();
+    for bad in [
+        "Official Display Hub firmware",
+        "official display-hub FIRMWARE!",
+        "Display Hub (Official)",
+    ] {
+        let e = c.set_signer_label(&admin, &key_id, bad).await.unwrap_err();
+        assert_eq!(
+            (status(&e), code(&e)),
+            (400, Some(ErrorCode::BadRequest)),
+            "{bad}"
+        );
+        assert!(e.to_string().contains("built into the app"), "{e}");
+    }
+    assert!(c.firmware_signers(&admin).await.unwrap().is_empty());
+    c.set_signer_label(&admin, &key_id, "Kiwi Displays")
+        .await
+        .unwrap();
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn attempts_left_is_shown_and_never_blocks_an_offer() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let k = key();
+    let pkg = c
+        .upload_firmware(&admin, package(&k, "1.2.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    let none_left = FirmwareInfo {
+        attempts_left: Some(0),
+        ..trusting(&k, 0, 1 << 20)
+    };
+    let (desk, _) = r.display(&admin, "Desk", REV, Some(none_left)).await;
+    let shown = c.displays(&admin).await.unwrap()[0].firmware.clone().unwrap();
+    assert_eq!(shown.reported.unwrap().attempts_left, Some(0));
+    // The display refills within hours, and the offer lasts a day.
+    c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
+    // Out of range, the firmware member is dropped and the rest kept, as for any bad report.
+    let grant = c.new_enrolment(&admin, "Odd").await.unwrap();
+    c.enrol(
+        &grant.secret,
+        DeviceInfo {
+            device_type: TYPE.into(),
+            firmware_version: "1.0.0".into(),
+            hardware_revision: REV.into(),
+            protocol_version: 1,
+            firmware: Some(FirmwareInfo {
+                attempts_left: Some(6),
+                ..trusting(&k, 0, 1 << 20)
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let odd = c
+        .displays(&admin)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "Odd")
+        .unwrap();
+    assert_eq!(odd.firmware.unwrap().reported, None);
     r.stop().await;
 }

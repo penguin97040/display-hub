@@ -63,6 +63,10 @@ pub struct Hub {
     pub download_starts: Limiter<String>,
     /// Firmware uploads being received now.
     pub upload_slots: Arc<tokio::sync::Semaphore>,
+    /// Displays being sent a firmware download now: one download at a time each.
+    pub downloading: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// The time limits of firmware downloads and uploads.
+    firmware_limits: Mutex<crate::firmware::FirmwareTimeLimits>,
 }
 
 #[derive(Clone)]
@@ -94,7 +98,20 @@ impl Hub {
             upload_slots: Arc::new(tokio::sync::Semaphore::new(
                 crate::firmware::MAX_CONCURRENT_UPLOADS,
             )),
+            downloading: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            firmware_limits: Mutex::new(crate::firmware::FirmwareTimeLimits::default()),
         })
+    }
+
+    /// The time limits of firmware downloads and uploads.
+    pub fn firmware_time_limits(&self) -> crate::firmware::FirmwareTimeLimits {
+        *self.firmware_limits.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Changes the time limits of firmware downloads and uploads started from now on. The service
+    /// never calls this; tests do, so they needn't wait 15 minutes.
+    pub fn set_firmware_time_limits(&self, limits: crate::firmware::FirmwareTimeLimits) {
+        *self.firmware_limits.lock().unwrap_or_else(|e| e.into_inner()) = limits;
     }
 
     fn seen(&self) -> std::sync::MutexGuard<'_, HashMap<String, Seen>> {

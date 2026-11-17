@@ -31,6 +31,8 @@ const UPLOAD_SUFFIX: &str = ".tmp";
 pub const MAX_PACKAGES_PER_DEVICE_TYPE: usize = 3;
 /// All packages together.
 pub const MAX_FIRMWARE_STORE_BYTES: u64 = 256 * 1024 * 1024;
+/// All packages one publisher uploaded, together, so one publisher token can't fill the shelf.
+pub const MAX_PUBLISHER_STORE_BYTES: u64 = 64 * 1024 * 1024;
 /// An upload is refused if it would leave less than this free on the disk.
 pub const MIN_FREE_DISK_BYTES: u64 = 64 * 1024 * 1024;
 /// The largest upload: the largest package there is.
@@ -40,6 +42,27 @@ pub const MAX_CONCURRENT_UPLOADS: usize = 1;
 /// The time limit of an upload or a download, in place of the hub's usual 10 seconds.
 pub const FIRMWARE_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(hub_protocol::limits::FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS);
+/// An upload that sends nothing for this long is dropped, well before the overall limit.
+pub const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long firmware transfers may take. Always [`FirmwareTimeLimits::default`] in service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FirmwareTimeLimits {
+    /// A download, from its answer to its last byte. A display that stops reading loses its
+    /// connection at this point, and the slot and file it held.
+    pub download: Duration,
+    /// The longest an upload may send nothing.
+    pub upload_idle: Duration,
+}
+
+impl Default for FirmwareTimeLimits {
+    fn default() -> Self {
+        Self {
+            download: FIRMWARE_REQUEST_TIMEOUT,
+            upload_idle: UPLOAD_IDLE_TIMEOUT,
+        }
+    }
+}
+
 /// The size of each piece a package is streamed in, to disk and to a display.
 pub const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -162,100 +185,161 @@ pub fn write_chunk(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()
 
 // ----- versions -----
 
-/// A `MAJOR.MINOR.PATCH[-pre]` version, as the manifest rules allow.
-#[derive(Debug, PartialEq, Eq)]
-struct Version<'a> {
-    numbers: [u64; 3],
-    pre: Option<&'a str>,
-}
-
-fn parse_version(s: &str) -> Option<Version<'_>> {
-    let (core, pre) = match s.split_once('-') {
-        Some((c, p)) if !p.is_empty() => (c, Some(p)),
-        Some(_) => return None,
-        None => (s, None),
-    };
-    let mut parts = core.split('.');
-    let mut numbers = [0u64; 3];
-    for n in &mut numbers {
-        let p = parts.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        *n = p.parse().ok()?;
-    }
-    parts.next().is_none().then_some(Version { numbers, pre })
-}
-
-/// Compares two versions as the app does: three numbers, and with those equal, a version with a
-/// pre-release tag is older than one without. Two tags compare part by part (split at `.`), numbers
-/// as numbers and anything else as text. `None` if either isn't a version.
-pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
-    let (a, b) = (parse_version(a)?, parse_version(b)?);
-    Some(a.numbers.cmp(&b.numbers).then_with(|| match (a.pre, b.pre) {
-        (None, None) => Ordering::Equal,
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(x), Some(y)) => {
-            let mut xs = x.split('.');
-            let mut ys = y.split('.');
-            loop {
-                match (xs.next(), ys.next()) {
-                    (None, None) => break Ordering::Equal,
-                    (None, Some(_)) => break Ordering::Less,
-                    (Some(_), None) => break Ordering::Greater,
-                    (Some(p), Some(q)) => {
-                        let o = match (p.parse::<u64>(), q.parse::<u64>()) {
-                            (Ok(m), Ok(n)) => m.cmp(&n),
-                            (Ok(_), Err(_)) => Ordering::Less,
-                            (Err(_), Ok(_)) => Ordering::Greater,
-                            _ => p.cmp(q),
-                        };
-                        if o != Ordering::Equal {
-                            break o;
-                        }
-                    }
-                }
-            }
-        }
-    }))
-}
-
-/// Orders versions for choosing the lowest: real versions by [`compare_versions`], anything
-/// unreadable first.
-fn version_order(a: &str, b: &str) -> Ordering {
-    match (parse_version(a).is_some(), parse_version(b).is_some()) {
-        (true, true) => compare_versions(a, b).unwrap_or(Ordering::Equal),
-        (false, true) => Ordering::Less,
-        (true, false) => Ordering::Greater,
-        (false, false) => a.cmp(b),
-    }
-}
+/// Versions compare as the app compares them (`firmware_package::version`).
+pub use firmware_package::version::compare as compare_versions;
+use firmware_package::version::order as version_order;
 
 // ----- the shelf -----
 
-/// Every package that could make room is on offer to a display.
+/// Why there is no room for a new package.
 #[derive(Debug, PartialEq, Eq)]
-pub struct AllOnOffer;
+pub enum NoRoom {
+    /// Its device type has a full shelf, and every package that could make room is on offer.
+    AllOnOffer,
+    /// Its device type has a full shelf, and making room would remove a package someone other than
+    /// this publisher uploaded.
+    OthersPackages,
+    /// This publisher's packages would pass [`MAX_PUBLISHER_STORE_BYTES`].
+    PublisherFull,
+    /// All packages together would pass [`MAX_FIRMWARE_STORE_BYTES`].
+    StoreFull,
+}
 
-/// Which stored package to remove to make room for a new one of `device_type`: `Ok(None)` when there
-/// is room already. The new package itself is always kept.
-pub fn pick_eviction(
-    stored: &[PackageRow],
-    device_type: &str,
-    on_offer: &std::collections::HashSet<String>,
-) -> Result<Option<String>, AllOnOffer> {
-    let same: Vec<&PackageRow> = stored.iter().filter(|p| p.device_type == device_type).collect();
-    if same.len() < MAX_PACKAGES_PER_DEVICE_TYPE {
-        return Ok(None);
+impl NoRoom {
+    /// A plain sentence for the uploader.
+    pub fn message(&self, device_type: &str) -> String {
+        match self {
+            NoRoom::AllOnOffer => format!(
+                "The hub already holds {MAX_PACKAGES_PER_DEVICE_TYPE} packages for {device_type} displays, and \
+                 every one is on offer to a display. Wait for those updates to finish, or cancel one, then \
+                 upload again."
+            ),
+            NoRoom::OthersPackages => format!(
+                "The hub already holds {MAX_PACKAGES_PER_DEVICE_TYPE} packages for {device_type} displays, and \
+                 making room would remove one that someone else uploaded. Ask the hub's owner to remove a \
+                 package first."
+            ),
+            NoRoom::PublisherFull => format!(
+                "The hub keeps at most {} MiB of firmware from each publisher, and this package would take \
+                 yours past that. Ask the hub's owner to remove one of your packages first.",
+                MAX_PUBLISHER_STORE_BYTES / (1024 * 1024)
+            ),
+            NoRoom::StoreFull => format!(
+                "The hub keeps at most {} MiB of firmware, and this package would take it past that. Remove a \
+                 package first.",
+                MAX_FIRMWARE_STORE_BYTES / (1024 * 1024)
+            ),
+        }
     }
-    same.into_iter()
-        .filter(|p| !on_offer.contains(&p.id))
-        .min_by(|a, b| {
-            version_order(&a.firmware_version, &b.firmware_version).then(a.uploaded_at.cmp(&b.uploaded_at))
+}
+
+/// Which stored package to remove to make room for `new`, after the per-device-type, per-publisher
+/// and overall limits: `Ok(None)` when there is room already. The new package itself is always
+/// kept. `publisher` is the uploader's id when a publisher uploads: it may only make room by
+/// removing its own packages. An admin may remove anyone's.
+pub fn plan_room(
+    stored: &[PackageRow],
+    new: &PackageRow,
+    on_offer: &std::collections::HashSet<String>,
+    publisher: Option<&str>,
+) -> Result<Option<String>, NoRoom> {
+    let same: Vec<&PackageRow> = stored
+        .iter()
+        .filter(|p| p.device_type == new.device_type)
+        .collect();
+    let evict = if same.len() < MAX_PACKAGES_PER_DEVICE_TYPE {
+        None
+    } else {
+        let free: Vec<&PackageRow> = same.into_iter().filter(|p| !on_offer.contains(&p.id)).collect();
+        if free.is_empty() {
+            return Err(NoRoom::AllOnOffer);
+        }
+        let lowest = |c: &[&PackageRow]| {
+            c.iter()
+                .min_by(|a, b| {
+                    version_order(&a.firmware_version, &b.firmware_version)
+                        .then(a.uploaded_at.cmp(&b.uploaded_at))
+                })
+                .map(|p| (*p).clone())
+        };
+        let pick = match publisher {
+            None => lowest(&free),
+            Some(me) => {
+                let mine: Vec<&PackageRow> = free.into_iter().filter(|p| is_by(p, me)).collect();
+                lowest(&mine)
+            }
+        };
+        Some(pick.ok_or(NoRoom::OthersPackages)?)
+    };
+    let freed = evict.as_ref().map_or(0, |p| p.size);
+    if let Some(me) = publisher {
+        let freed_mine = evict.as_ref().filter(|p| is_by(p, me)).map_or(0, |p| p.size);
+        let mine: u64 = stored.iter().filter(|p| is_by(p, me)).map(|p| p.size).sum();
+        if mine - freed_mine + new.size > MAX_PUBLISHER_STORE_BYTES {
+            return Err(NoRoom::PublisherFull);
+        }
+    }
+    let total: u64 = stored.iter().map(|p| p.size).sum();
+    if total - freed + new.size > MAX_FIRMWARE_STORE_BYTES {
+        return Err(NoRoom::StoreFull);
+    }
+    Ok(evict.map(|p| p.id))
+}
+
+/// Whether publisher `id` uploaded `p`.
+fn is_by(p: &PackageRow, id: &str) -> bool {
+    p.uploaded_by_role == Role::Publisher && p.uploaded_by == id
+}
+
+/// The header and manifest at the start of a stored package's file, exactly as signed: the signer's
+/// key and the manifest bytes. `None` if the file can't be read or doesn't start with a header.
+pub fn signed_part(path: &Path) -> Option<(firmware_package::PublicKey, Vec<u8>)> {
+    use firmware_package::limits::HEADER_LEN;
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut header = [0u8; HEADER_LEN];
+    f.read_exact(&mut header).ok()?;
+    let header = firmware_package::Header::parse(&header).ok()?;
+    let mut manifest = vec![0u8; usize::from(header.manifest_len)];
+    f.read_exact(&mut manifest).ok()?;
+    Some((header.public_key, manifest))
+}
+
+/// A stored package that is the same release as `checked`, signed again: the same signer and the
+/// same manifest bytes, so the same image and parts, with only the signature different (an ECDSA
+/// signature can be re-made, or have its `s` replaced by `n - s`, and still verify). Such a copy is
+/// the same release, and must not sit beside the original or push it off the shelf.
+pub fn same_release<'a>(
+    dir: &Path,
+    stored: &'a [PackageRow],
+    checked: &CheckedPackage,
+) -> Option<&'a PackageRow> {
+    let signer = checked.signer().to_hex();
+    let m = &checked.manifest;
+    stored
+        .iter()
+        .filter(|p| {
+            p.signer_public_key == signer
+                && p.device_type == m.device_type
+                && p.firmware_version == m.firmware_version
+                && p.security_counter == m.security_counter
+                && p.image_size == m.image_size
         })
-        .map(|p| Some(p.id.clone()))
-        .ok_or(AllOnOffer)
+        .find(|p| {
+            signed_part(&package_path(dir, &p.id))
+                .is_some_and(|(key, manifest)| key == checked.signer() && manifest == checked.manifest_bytes)
+        })
+}
+
+/// What the owner may not call a signing key: the name the app keeps for keys built into it.
+/// Compared ignoring case, spacing and punctuation.
+pub fn reserved_label(label: &str) -> bool {
+    let plain: String = label
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    plain == "officialdisplayhubfirmware" || (plain.contains("official") && plain.contains("displayhub"))
 }
 
 /// A row for a package that passed `firmware_package::check`.
@@ -312,6 +396,7 @@ pub fn package_view(
         uploaded_by: p.uploaded_by.clone(),
         uploaded_by_label: p.uploaded_by_label.clone(),
         offered_to,
+        evicted: None,
     }
 }
 
@@ -409,23 +494,150 @@ pub fn best_package<'a>(info: Option<&DeviceInfo>, packages: &'a [PackageRow]) -
 mod tests {
     use super::*;
 
-    #[test]
-    fn versions_compare_as_three_numbers_with_pre_releases_older() {
-        use Ordering::*;
-        for (a, b, o) in [
-            ("1.2.0", "1.10.0", Less),
-            ("1.2.0", "1.2.0", Equal),
-            ("2.0.0", "1.99.99", Greater),
-            ("1.3.0-beta.1", "1.3.0", Less),
-            ("1.3.0-beta.2", "1.3.0-beta.10", Less),
-            ("1.3.0-beta", "1.3.0-beta.1", Less),
-            ("1.3.0-1", "1.3.0-alpha", Less),
-            ("0.0.0-simulator", "0.0.1", Less),
-        ] {
-            assert_eq!(compare_versions(a, b), Some(o), "{a} {b}");
+    fn row(id: &str, device_type: &str, version: &str, size: u64, by: Option<&str>) -> PackageRow {
+        PackageRow {
+            id: id.into(),
+            device_type: device_type.into(),
+            hardware_revisions: vec!["rev".into()],
+            firmware_version: version.into(),
+            security_counter: 0,
+            summary: None,
+            signer_key_id: "a".repeat(64),
+            signer_public_key: format!("04{}", "b".repeat(128)),
+            image_size: size,
+            size,
+            update_size: size,
+            usb_install: false,
+            uploaded_at: Timestamp::from_unix(1_800_000_000).unwrap(),
+            uploaded_by_role: if by.is_some() {
+                Role::Publisher
+            } else {
+                Role::Admin
+            },
+            uploaded_by: by.unwrap_or("admin").into(),
+            uploaded_by_label: None,
         }
-        for bad in ["1.2", "1.2.3.4", "v1.2.3", "1.2.3-", "", "1..2"] {
-            assert_eq!(compare_versions(bad, "1.0.0"), None, "{bad}");
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    #[test]
+    fn a_full_shelf_makes_room_by_the_lowest_version_and_a_publisher_only_with_its_own() {
+        let none = std::collections::HashSet::new();
+        let stored = vec![
+            row("a", "t", "1.0.0", MIB, None),
+            row("b", "t", "1.1.0", MIB, Some("p-me")),
+            row("c", "t", "1.2.0", MIB, Some("p-other")),
+        ];
+        let new = row("n", "t", "2.0.0", MIB, Some("p-me"));
+        // An admin's upload removes the lowest version, whoever uploaded it.
+        let admin_new = row("n", "t", "2.0.0", MIB, None);
+        assert_eq!(plan_room(&stored, &admin_new, &none, None), Ok(Some("a".into())));
+        // A publisher's removes its own lowest, even when someone else's is lower.
+        assert_eq!(
+            plan_room(&stored, &new, &none, Some("p-me")),
+            Ok(Some("b".into()))
+        );
+        // And is refused when only others' packages could go.
+        let on_offer: std::collections::HashSet<String> = ["b".to_string()].into();
+        assert_eq!(
+            plan_room(&stored, &new, &on_offer, Some("p-me")),
+            Err(NoRoom::OthersPackages)
+        );
+        assert_eq!(
+            plan_room(&stored, &new, &on_offer, Some("p-nobody")),
+            Err(NoRoom::OthersPackages)
+        );
+        let all: std::collections::HashSet<String> = ["a", "b", "c"].map(String::from).into();
+        assert_eq!(
+            plan_room(&stored, &new, &all, Some("p-me")),
+            Err(NoRoom::AllOnOffer)
+        );
+        assert_eq!(
+            plan_room(&stored, &admin_new, &all, None),
+            Err(NoRoom::AllOnOffer)
+        );
+        // Another device type has room.
+        let other = row("n", "u", "1.0.0", MIB, Some("p-other"));
+        assert_eq!(plan_room(&stored, &other, &none, Some("p-other")), Ok(None));
+        assert!(NoRoom::OthersPackages
+            .message("t")
+            .contains("someone else uploaded"));
+    }
+
+    #[test]
+    fn each_publisher_has_its_own_cap_and_the_shelf_one_for_all() {
+        let none = std::collections::HashSet::new();
+        // 60 MiB from this publisher, across four device types.
+        let stored: Vec<PackageRow> = (0..4)
+            .map(|i| {
+                row(
+                    &format!("m{i}"),
+                    &format!("t{i}"),
+                    "1.0.0",
+                    15 * MIB,
+                    Some("p-me"),
+                )
+            })
+            .collect();
+        let new = row("n", "t9", "1.0.0", 5 * MIB, Some("p-me"));
+        assert_eq!(
+            plan_room(&stored, &new, &none, Some("p-me")),
+            Err(NoRoom::PublisherFull)
+        );
+        let small = row("n", "t9", "1.0.0", 4 * MIB, Some("p-me"));
+        assert_eq!(plan_room(&stored, &small, &none, Some("p-me")), Ok(None));
+        // Another publisher, or an admin, isn't held to this one's cap.
+        let theirs = row("n", "t9", "1.0.0", 5 * MIB, Some("p-other"));
+        assert_eq!(plan_room(&stored, &theirs, &none, Some("p-other")), Ok(None));
+        let admin = row("n", "t9", "1.0.0", 5 * MIB, None);
+        assert_eq!(plan_room(&stored, &admin, &none, None), Ok(None));
+        // Removing one of its own makes room under its cap.
+        let mut full: Vec<PackageRow> = (0..3)
+            .map(|i| {
+                row(
+                    &format!("s{i}"),
+                    "t0",
+                    &format!("1.{i}.0"),
+                    15 * MIB,
+                    Some("p-me"),
+                )
+            })
+            .collect();
+        full.push(row("x", "t1", "1.0.0", 15 * MIB, Some("p-me")));
+        let next = row("n", "t0", "2.0.0", 15 * MIB, Some("p-me"));
+        assert_eq!(
+            plan_room(&full, &next, &none, Some("p-me")),
+            Ok(Some("s0".into()))
+        );
+        // The whole shelf: 256 MiB for everyone together.
+        let big: Vec<PackageRow> = (0..16)
+            .map(|i| row(&format!("b{i}"), &format!("t{i}"), "1.0.0", 16 * MIB, None))
+            .collect();
+        let one_more = row("n", "t99", "1.0.0", 1, None);
+        assert_eq!(plan_room(&big, &one_more, &none, None), Err(NoRoom::StoreFull));
+    }
+
+    #[test]
+    fn the_official_name_is_reserved() {
+        for bad in [
+            "Official Display Hub firmware",
+            "official display hub firmware",
+            "OFFICIAL-DISPLAY-HUB-FIRMWARE",
+            "Official  Display Hub  Firmware.",
+            "officialdisplayhubfirmware",
+            "Display Hub (official)",
+            "The official DisplayHub build",
+        ] {
+            assert!(reserved_label(bad), "{bad}");
+        }
+        for ok in [
+            "Kiwi Displays",
+            "Display Hub fan",
+            "Officially Kiwi",
+            "Hub firmware",
+        ] {
+            assert!(!reserved_label(ok), "{ok}");
         }
     }
 

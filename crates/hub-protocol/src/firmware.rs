@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::device::MAX_DEVICE_FIELD_LEN;
-use crate::limits::{MAX_FIRMWARE_UPDATE_BYTES, MAX_TRUSTED_KEYS};
+use crate::limits::{MAX_FIRMWARE_ATTEMPTS_LEFT, MAX_FIRMWARE_UPDATE_BYTES, MAX_TRUSTED_KEYS};
 use crate::text::check_text;
 
 /// Hex digits in a key id (the SHA-256 of a public key) and in a package id (of a whole package).
@@ -37,6 +37,11 @@ pub struct FirmwareInfo {
     pub security_floor: u32,
     /// The size of the display's spare app partition, in bytes.
     pub slot_bytes: u64,
+    /// How many more download attempts the display will make before it must wait, 0 to 5. The
+    /// display refills it over a few hours by itself, so a hub shows it and never refuses an offer
+    /// because it is 0. Absent from firmware that doesn't report it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempts_left: Option<u32>,
 }
 
 impl FirmwareInfo {
@@ -55,6 +60,11 @@ impl FirmwareInfo {
         }
         if has_repeats(&self.key_ids) {
             out.push("firmware.key_ids must not repeat a key id".into());
+        }
+        if self.attempts_left.is_some_and(|n| n > MAX_FIRMWARE_ATTEMPTS_LEFT) {
+            out.push(format!(
+                "firmware.attempts_left must be 0-{MAX_FIRMWARE_ATTEMPTS_LEFT}"
+            ));
         }
         out
     }
@@ -287,8 +297,18 @@ mod tests {
             key_ids: vec!["A".repeat(64), "a".repeat(64), "a".repeat(64), "b".repeat(64)],
             security_floor: 0,
             slot_bytes: 0,
+            attempts_left: Some(6),
         };
-        assert_eq!(info.problems().len(), 3);
+        assert_eq!(info.problems().len(), 4);
+        for ok in [None, Some(0), Some(5)] {
+            let info = FirmwareInfo {
+                key_ids: vec![],
+                security_floor: 0,
+                slot_bytes: 0,
+                attempts_left: ok,
+            };
+            assert!(info.problems().is_empty(), "{ok:?}");
+        }
         let offer = FirmwareUpdate {
             offer_id: "x".into(),
             package_id: "0".repeat(64),

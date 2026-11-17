@@ -3,8 +3,10 @@
 //! download and the report.
 //!
 //! Uploads and downloads stream through a fixed-size buffer, so a 16 MiB package never sits in
-//! memory. They alone get the long time limit ([`FIRMWARE_REQUEST_TIMEOUT`]); every other route
-//! here keeps the hub's usual limits.
+//! memory. They alone get the long time limit ([`shelf::FIRMWARE_REQUEST_TIMEOUT`]); every other
+//! route here keeps the hub's usual limits. An upload that sends nothing for a minute is dropped
+//! sooner, and a download that runs past its limit loses its connection even if the display has
+//! stopped reading.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -13,8 +15,9 @@ use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes, HttpBody};
 use hub_core::api::{
-    DisplayFirmware, FirmwareOfferRequest, FirmwareOfferView, FirmwarePackageView, NewPublisher,
-    PublisherInvite, PublisherPairRequest, PublisherPairResponse, PublisherView, SignerLabel, SignerView,
+    DisplayFirmware, EvictedPackage, FirmwareOfferRequest, FirmwareOfferView, FirmwarePackageView,
+    NewPublisher, PublisherInvite, PublisherPairRequest, PublisherPairResponse, PublisherView, SignerLabel,
+    SignerView,
 };
 use hub_protocol::firmware::{is_lower_hex, FirmwareReport, KEY_ID_HEX_LEN, PACKAGE_ID_HEX_LEN};
 use hub_protocol::limits::{FIRMWARE_OFFER_LIFETIME_SECONDS, MAX_FIRMWARE_DOWNLOADS_PER_WINDOW};
@@ -22,7 +25,8 @@ use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tokio::sync::OwnedSemaphorePermit;
 
 use super::*;
-use crate::firmware::{self as shelf, FIRMWARE_REQUEST_TIMEOUT, MAX_UPLOAD_BYTES, MIN_FREE_DISK_BYTES};
+use crate::firmware::{self as shelf, MAX_UPLOAD_BYTES, MIN_FREE_DISK_BYTES};
+use crate::http::CloseConnection;
 use crate::store::firmware::{NewOffer, OfferRow, PackageRow, ReportOutcome, CANCELLED_PACKAGE_DELETED};
 
 fn conflict(message: impl Into<String>) -> ApiError {
@@ -225,7 +229,20 @@ async fn upload(
         tracing::error!(error = %e, "couldn't write an upload");
         ApiError::unavailable("The hub couldn't save the upload. Check the hub's log.")
     };
-    while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+    let idle = hub.firmware_time_limits().upload_idle;
+    loop {
+        let next = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx));
+        let Ok(frame) = tokio::time::timeout(idle, next).await else {
+            return Err(ApiError::new(
+                StatusCode::REQUEST_TIMEOUT,
+                ErrorCode::Unavailable,
+                format!(
+                    "The upload sent nothing for {} s, so the hub gave up on it. Try again.",
+                    idle.as_secs()
+                ),
+            ));
+        };
+        let Some(frame) = frame else { break };
         let frame = frame.map_err(|_| ApiError::bad_request("The upload was cut short. Try again."))?;
         let Ok(data) = frame.into_data() else { continue };
         got += data.len() as u64;
@@ -263,38 +280,41 @@ async fn upload(
     };
 
     let row = shelf::row_from(&checked, role, &who, now);
+    let publisher = (role == Role::Publisher).then(|| who.clone());
     let (status, view) = db_api(&hub, move |s| {
         let dest = shelf::package_path(&dir, &row.id);
         if let Some(existing) = s.firmware_package(&row.id)? {
             if dest.is_file() {
                 // Uploading the same file twice is harmless.
                 let offered = s.offered_to(now)?.remove(&existing.id).unwrap_or_default();
-                return Ok((StatusCode::OK, shelf::package_view(&existing, &labels(s)?, offered)));
+                return Ok((
+                    StatusCode::OK,
+                    shelf::package_view(&existing, &labels(s)?, offered),
+                ));
             }
             // A row whose file went missing: start again.
             s.remove_firmware_package(&row.id, crate::store::firmware::CANCELLED_PACKAGE_MISSING, now)?;
         }
         let stored = s.firmware_packages()?;
+        // The same release signed again is the same release: the stored file stays.
+        if let Some(existing) = shelf::same_release(&dir, &stored, &checked) {
+            let offered = s.offered_to(now)?.remove(&existing.id).unwrap_or_default();
+            return Ok((
+                StatusCode::OK,
+                shelf::package_view(existing, &labels(s)?, offered),
+            ));
+        }
         let on_offer = s.packages_on_offer(now)?;
-        let evict = shelf::pick_eviction(&stored, &row.device_type, &on_offer).map_err(|shelf::AllOnOffer| {
-            conflict(format!(
-                "The hub already holds {} packages for {} displays, and every one is on offer to a display. \
-                 Wait for those updates to finish, or cancel one, then upload again.",
-                shelf::MAX_PACKAGES_PER_DEVICE_TYPE, row.device_type
-            ))
-        })?;
-        let freed = evict
+        let evict = shelf::plan_room(&stored, &row, &on_offer, publisher.as_deref())
+            .map_err(|why| conflict(why.message(&row.device_type)))?;
+        let evicted = evict
             .as_ref()
             .and_then(|id| stored.iter().find(|p| &p.id == id))
-            .map_or(0, |p| p.size);
-        let total: u64 = stored.iter().map(|p| p.size).sum::<u64>() - freed + row.size;
-        if total > shelf::MAX_FIRMWARE_STORE_BYTES {
-            return Err(conflict(format!(
-                "The hub keeps at most {} MiB of firmware, and this package would take it past that. Remove a \
-                 package first.",
-                shelf::MAX_FIRMWARE_STORE_BYTES / (1024 * 1024)
-            )));
-        }
+            .map(|p| EvictedPackage {
+                package_id: p.id.clone(),
+                device_type: p.device_type.clone(),
+                firmware_version: p.firmware_version.clone(),
+            });
         shelf::keep_upload(&path, &dest).map_err(|e| {
             tracing::error!(error = %e, "couldn't keep an upload");
             ApiError::unavailable("The hub couldn't save the upload. Check the hub's log.")
@@ -304,9 +324,16 @@ async fn upload(
             let _ = std::fs::remove_file(&dest);
             return Err(e.into());
         }
-        for id in &evict {
-            let _ = std::fs::remove_file(shelf::package_path(&dir, id));
-            s.audit(now, "firmware_evicted", &format!("{id} to make room for {}", row.id))?;
+        if let Some(gone) = &evicted {
+            let _ = std::fs::remove_file(shelf::package_path(&dir, &gone.package_id));
+            s.audit(
+                now,
+                "firmware_evicted",
+                &format!(
+                    "{} {} {} to make room for {}",
+                    gone.package_id, gone.device_type, gone.firmware_version, row.id
+                ),
+            )?;
         }
         s.audit(
             now,
@@ -321,7 +348,9 @@ async fn upload(
             ),
         )?;
         let kept = s.firmware_package(&row.id)?.unwrap_or(row);
-        Ok((StatusCode::CREATED, shelf::package_view(&kept, &labels(s)?, Vec::new())))
+        let mut view = shelf::package_view(&kept, &labels(s)?, Vec::new());
+        view.evicted = evicted;
+        Ok((StatusCode::CREATED, view))
     })
     .await?;
     // A kept upload was renamed; the guard removes a duplicate's temporary file.
@@ -382,7 +411,7 @@ pub(super) async fn package_file(
     let pkg = db(&hub, move |s| s.firmware_package(&id))
         .await?
         .ok_or_else(no_package)?;
-    serve_file(&hub, &pkg, pkg.size, None).await
+    serve_file(&hub, &pkg, pkg.size, None, None).await
 }
 
 pub(super) async fn delete_package(
@@ -548,6 +577,12 @@ pub(super) async fn put_signer(
     }
     let label = clean_title(&req.label)
         .ok_or_else(|| ApiError::bad_request("The label needs some printable text."))?;
+    if shelf::reserved_label(&label) {
+        return Err(ApiError::bad_request(
+            "That name is kept for firmware whose key is built into the app, so a label can't use it. \
+             Name the key after its maker instead.",
+        ));
+    }
     let now = hub.clock.now();
     let (k, l) = (key_id.clone(), label.clone());
     db(&hub, move |s| {
@@ -704,6 +739,7 @@ fn no_offer() -> ApiError {
 pub(super) async fn device_download(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    close: Option<axum::Extension<CloseConnection>>,
     headers: HeaderMap,
     Path(package_id): Path<String>,
 ) -> Result<Response, ApiError> {
@@ -735,22 +771,89 @@ pub(super) async fn device_download(
         ));
     }
     hub.download_starts.hit(device.clone(), t);
-    let Ok(permit) = hub.download_slots.clone().try_acquire_owned() else {
+    // One download at a time for each display, and a few across the hub.
+    let Some(turn) = DisplayTurn::take(&hub.downloading, &device) else {
+        return Err(ApiError::unavailable(
+            "This display is already downloading firmware. Try again when that download ends.",
+        ));
+    };
+    let Ok(slot) = hub.download_slots.clone().try_acquire_owned() else {
         return Err(ApiError::unavailable(
             "The hub is already sending firmware to other displays. Try again later.",
         ));
     };
     tracing::info!(%device, package = %pkg.id, "sending firmware");
-    serve_file(&hub, &pkg, pkg.update_size, Some(permit)).await
+    let permit = DownloadPermit {
+        _slot: slot,
+        _turn: turn,
+    };
+    serve_file(&hub, &pkg, pkg.update_size, Some(permit), close.map(|c| c.0)).await
+}
+
+/// A display's turn to download: while it is held, that display can't start another download.
+struct DisplayTurn {
+    device: String,
+    downloading: Arc<Mutex<std::collections::HashSet<String>>>,
+}
+
+impl DisplayTurn {
+    /// The display's turn, unless it is downloading already.
+    fn take(downloading: &Arc<Mutex<std::collections::HashSet<String>>>, device: &str) -> Option<Self> {
+        let fresh = downloading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(device.to_string());
+        fresh.then(|| Self {
+            device: device.to_string(),
+            downloading: downloading.clone(),
+        })
+    }
+}
+
+impl Drop for DisplayTurn {
+    fn drop(&mut self) {
+        self.downloading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.device);
+    }
+}
+
+/// What a display's download holds until it ends: one of the hub's download slots, and its turn.
+struct DownloadPermit {
+    _slot: OwnedSemaphorePermit,
+    _turn: DisplayTurn,
+}
+
+/// What a running download holds, shared by its body and its watchdog. Emptied when the download
+/// ends, by whichever of the two gets there first.
+#[derive(Default)]
+struct Held {
+    permit: Option<DownloadPermit>,
+    /// The connection the download is on, to close if it runs past its time limit.
+    close: Option<CloseConnection>,
+    /// Dropped as the download ends, which tells the watchdog to stop waiting.
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Held {
+    fn release(&mut self) {
+        self.permit.take();
+        self.close.take();
+        self.done.take();
+    }
 }
 
 /// The first `len` bytes of a stored package, with an exact `Content-Length`, no compression and no
-/// chunking. A download slot, if given, is held until the body ends or the time limit passes.
+/// chunking. A display's download holds its `permit` until the body ends, or until the time limit
+/// passes: then a watchdog closes the connection too, since a display that has stopped reading is
+/// never asked for more of the body, and only dropping the connection frees the socket and the file.
 async fn serve_file(
     hub: &AppState,
     pkg: &PackageRow,
     len: u64,
-    permit: Option<OwnedSemaphorePermit>,
+    permit: Option<DownloadPermit>,
+    close: Option<CloseConnection>,
 ) -> Result<Response, ApiError> {
     let path = shelf::package_path(&hub.firmware_dir(), &pkg.id);
     let file = match tokio::fs::File::open(&path).await {
@@ -771,19 +874,39 @@ async fn serve_file(
             ));
         }
     }
-    let slot = Arc::new(Mutex::new(permit));
-    // The slot is given back at the time limit even if the display stops reading and the body is
-    // never asked for more.
-    let watchdog = slot.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(FIRMWARE_REQUEST_TIMEOUT).await;
-        watchdog.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let limit = hub.firmware_time_limits().download;
+    // Only a display's download has anything for a watchdog to release.
+    let held = permit.map(|permit| {
+        let (done, finished) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(Mutex::new(Held {
+            permit: Some(permit),
+            close,
+            done: Some(done),
+        }));
+        let watchdog = held.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(limit) => {
+                    let mut h = watchdog.lock().unwrap_or_else(|e| e.into_inner());
+                    if h.permit.is_some() {
+                        tracing::warn!("a firmware download ran past its time limit; closing its connection");
+                        if let Some(c) = &h.close {
+                            c.close();
+                        }
+                    }
+                    h.release();
+                }
+                _ = finished => {}
+            }
+        });
+        held
     });
     let body = FileBody {
         file,
         remaining: len,
-        deadline: tokio::time::Instant::now() + FIRMWARE_REQUEST_TIMEOUT,
-        slot,
+        deadline: tokio::time::Instant::now() + limit,
+        held,
+        buf: vec![0u8; shelf::STREAM_CHUNK_BYTES],
     };
     Ok((
         [
@@ -795,17 +918,21 @@ async fn serve_file(
         .into_response())
 }
 
-/// A file's first bytes as a body of exactly known length, read a piece at a time.
+/// A file's first bytes as a body of exactly known length, read a piece at a time through one
+/// buffer.
 struct FileBody {
     file: tokio::fs::File,
     remaining: u64,
     deadline: tokio::time::Instant,
-    slot: Arc<Mutex<Option<OwnedSemaphorePermit>>>,
+    held: Option<Arc<Mutex<Held>>>,
+    buf: Vec<u8>,
 }
 
 impl FileBody {
     fn release(&self) {
-        self.slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = &self.held {
+            h.lock().unwrap_or_else(|e| e.into_inner()).release();
+        }
     }
 }
 
@@ -832,9 +959,8 @@ impl HttpBody for FileBody {
             this.release();
             return Poll::Ready(Some(Err(std::io::ErrorKind::TimedOut.into())));
         }
-        let want = this.remaining.min(shelf::STREAM_CHUNK_BYTES as u64) as usize;
-        let mut buf = vec![0u8; want];
-        let mut read = ReadBuf::new(&mut buf);
+        let want = this.remaining.min(this.buf.len() as u64) as usize;
+        let mut read = ReadBuf::new(&mut this.buf[..want]);
         match Pin::new(&mut this.file).poll_read(cx, &mut read) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -843,9 +969,14 @@ impl HttpBody for FileBody {
                 if n == 0 {
                     return Poll::Ready(Some(Err(std::io::ErrorKind::UnexpectedEof.into())));
                 }
-                buf.truncate(n);
+                let chunk = Bytes::copy_from_slice(read.filled());
                 this.remaining -= n as u64;
-                Poll::Ready(Some(Ok(hyper::body::Frame::data(Bytes::from(buf)))))
+                if this.remaining == 0 {
+                    // Every byte is handed over: the slot is free for the next download now, not
+                    // only once the connection gets round to dropping the body.
+                    this.release();
+                }
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
             }
         }
     }
@@ -874,7 +1005,10 @@ pub(super) async fn device_report(
     }
     note_seen(&hub, &device, None);
     let now = hub.clock.now();
+    let d = device.clone();
+    let reported = report.firmware_version.clone();
     let outcome = db(&hub, move |s| {
+        let device = d;
         let outcome = s.record_report(
             &device,
             &report.offer_id,
@@ -883,6 +1017,13 @@ pub(super) async fn device_report(
             report.firmware_version.as_deref(),
             now,
         )?;
+        if let (ReportOutcome::Recorded { settled: true, .. }, Some(v)) =
+            (&outcome, report.firmware_version.as_deref())
+        {
+            // A final report says what the display runs now (the new version once installed, the
+            // old one after a rollback or failure): the app needn't wait for its next heartbeat.
+            s.set_reported_firmware_version(&device, v)?;
+        }
         if let ReportOutcome::Recorded { offer, settled: true } = &outcome {
             s.audit(
                 now,
@@ -903,6 +1044,12 @@ pub(super) async fn device_report(
         Ok(outcome)
     })
     .await?;
+    if let (ReportOutcome::Recorded { settled: true, .. }, Some(v)) = (&outcome, reported) {
+        // And in a buffered heartbeat, which the app reads first.
+        if let Some(info) = hub.seen().get_mut(&device).and_then(|s| s.info.as_mut()) {
+            info.firmware_version = v;
+        }
+    }
     match outcome {
         ReportOutcome::NoOffer => Err(ApiError::new(
             StatusCode::NOT_FOUND,

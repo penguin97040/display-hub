@@ -564,7 +564,8 @@ impl HubClient {
 
     /// Uploads a package, as an admin (`publisher` false) or a publisher. The hub checks it before
     /// keeping it. `true` with the package's description when it is new, `false` when the hub already
-    /// had it.
+    /// had it (the same file, or the same release signed again). The description's `evicted` names
+    /// the package the hub removed to make room, if it removed one.
     async fn upload_to(
         &self,
         path: &str,

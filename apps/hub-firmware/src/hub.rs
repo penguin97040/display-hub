@@ -150,12 +150,22 @@ pub async fn add(profile: &Profile, path: &Path) -> Result<(FirmwarePackageView,
 
 /// What `add` and `publish` print about a package the hub now holds.
 pub fn added(view: &FirmwarePackageView, created: bool, conn: &Connection) -> String {
+    let evicted = view
+        .evicted
+        .as_ref()
+        .map(|e| {
+            format!(
+                "\nTo make room, the hub removed your earlier package {} {} ({}).",
+                e.device_type, e.firmware_version, e.package_id
+            )
+        })
+        .unwrap_or_default();
     format!(
         "{} {} {} for {} on the hub at {}:{}.\n\
          Package id: {}\n\
          Signer fingerprint: {}\n\
          It is on the hub's shelf. Nothing installs until the owner presses Update for a display, and the \
-         display checks it again itself.",
+         display checks it again itself.{}",
         if created { "Added" } else { "The hub already had" },
         view.device_type,
         view.firmware_version,
@@ -163,6 +173,7 @@ pub fn added(view: &FirmwarePackageView, created: bool, conn: &Connection) -> St
         conn.host,
         conn.port,
         view.package_id,
-        view.signer_fingerprint
+        view.signer_fingerprint,
+        evicted
     )
 }

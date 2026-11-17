@@ -333,6 +333,18 @@ pub struct FirmwarePackageView {
     /// The displays it is on offer to now. Always empty in a publisher's list.
     #[serde(default)]
     pub offered_to: Vec<String>,
+    /// Only in an upload's answer: the package the hub removed to make room for this one, if it
+    /// removed one. Left out otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evicted: Option<EvictedPackage>,
+}
+
+/// A package removed from the shelf to make room for an upload.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvictedPackage {
+    pub package_id: String,
+    pub device_type: String,
+    pub firmware_version: String,
 }
 
 /// `PUT /v1/admin/devices/{id}/firmware-update`: offer this package to the display (the **Update**
