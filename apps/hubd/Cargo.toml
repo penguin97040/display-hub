@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 hub-protocol.workspace = true
 hub-core.workspace = true
+firmware-package.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

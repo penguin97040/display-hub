@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::firmware::FirmwareInfo;
 use crate::text::check_text;
 
 /// Short free-text fields a display reports about itself.
@@ -35,10 +36,15 @@ pub struct DeviceInfo {
     pub hardware_revision: String,
     /// The protocol version the firmware speaks.
     pub protocol_version: u32,
+    /// Its trusted keys, security floor and spare partition, for signed updates. Absent from
+    /// firmware made before them (`docs/firmware-updates.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<FirmwareInfo>,
 }
 
 impl DeviceInfo {
-    /// Problems with the reported fields, if any.
+    /// Problems with the reported text fields, if any. The `firmware` member is checked on its own
+    /// ([`FirmwareInfo::problems`]), so a hub can drop a bad one and keep the rest.
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
         for (name, value) in [

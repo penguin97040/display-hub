@@ -45,6 +45,35 @@
         "protocol_version": {
           "type": "integer",
           "minimum": 1
+        },
+        "firmware": {
+          "description": "Signed firmware updates: the display's trusted keys, security floor and spare app partition. Optional: firmware made before signed updates leaves it out. See docs/firmware-updates.md, 'What a display reports'.",
+          "type": "object",
+          "required": [
+            "key_ids",
+            "security_floor",
+            "slot_bytes"
+          ],
+          "properties": {
+            "key_ids": {
+              "type": "array",
+              "maxItems": 3,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "security_floor": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "slot_bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
         }
       }
     }

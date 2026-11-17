@@ -38,3 +38,32 @@ pub const REFRESH_RANGE: RangeInclusive<u32> = 30..=3600;
 pub const STALE_AFTER_RANGE: RangeInclusive<u32> = 60..=604_800;
 /// The largest heartbeat, enrolment or other request body a hub accepts from a display.
 pub const MAX_DEVICE_REQUEST_BYTES: usize = 2 * 1024;
+
+// ----- signed firmware updates (`docs/firmware-updates.md`) -----
+
+/// Trusted keys a display holds, and keys in a bundle's `firmware.trusted_keys`.
+pub const MAX_TRUSTED_KEYS: usize = 3;
+/// The largest whole package a hub stores, and the largest upload it accepts.
+pub const MAX_FIRMWARE_PACKAGE_BYTES: u64 = 16 * 1024 * 1024;
+/// The largest update form: the 137-byte header, a 4096-byte manifest and an 8 MiB image. A
+/// snapshot's `firmware_update.size` is never more.
+pub const MAX_FIRMWARE_UPDATE_BYTES: u64 = 137 + 4096 + 8 * 1024 * 1024;
+/// An offer ends this long after it was made, if nothing else ended it first.
+pub const FIRMWARE_OFFER_LIFETIME_SECONDS: i64 = 24 * 3600;
+/// Downloads a hub serves at once, across all displays. Another is answered `unavailable`.
+pub const MAX_CONCURRENT_FIRMWARE_DOWNLOADS: usize = 2;
+/// Download starts a hub allows one display in [`FIRMWARE_DOWNLOAD_WINDOW_SECONDS`]. Another is
+/// answered `rate_limited`.
+pub const MAX_FIRMWARE_DOWNLOADS_PER_WINDOW: u32 = 6;
+pub const FIRMWARE_DOWNLOAD_WINDOW_SECONDS: u64 = 3600;
+/// The longest a download may take, end to end, on either side.
+pub const FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS: u64 = 15 * 60;
+/// A display gives up on a download that sends nothing for this long.
+pub const FIRMWARE_DOWNLOAD_STALL_SECONDS: u64 = 30;
+/// The least time a display leaves between download attempts, and after
+/// [`FIRMWARE_FAILURES_BEFORE_LONG_WAIT`] failures in a row, the least before the next.
+pub const FIRMWARE_RETRY_WAIT_SECONDS: u64 = 10 * 60;
+pub const FIRMWARE_FAILURES_BEFORE_LONG_WAIT: u32 = 3;
+pub const FIRMWARE_LONG_WAIT_SECONDS: u64 = 6 * 3600;
+/// New firmware rolls back unless it reaches the hub within this long of its trial boot.
+pub const FIRMWARE_TRIAL_SECONDS: u64 = 5 * 60;

@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::firmware::BundleFirmware;
 use crate::timestamp::Timestamp;
 
 pub const FORMAT: &str = "display-hub.provisioning";
@@ -28,6 +29,10 @@ pub struct Bundle {
     pub enrolment: Enrolment,
     /// `null` when the display already has Wi-Fi settings, or for the simulator.
     pub wifi: Option<Wifi>,
+    /// The keys to trust for signed updates and the starting security floor, from the package the
+    /// app just installed. Absent otherwise (`docs/firmware-updates.md`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<BundleFirmware>,
 }
 
 impl std::fmt::Debug for Bundle {
@@ -36,6 +41,7 @@ impl std::fmt::Debug for Bundle {
             .field("hub", &self.hub)
             .field("enrolment_expires_at", &self.enrolment.expires_at)
             .field("wifi", &self.wifi.as_ref().map(|w| &w.ssid))
+            .field("firmware", &self.firmware)
             .finish_non_exhaustive()
     }
 }
@@ -124,6 +130,9 @@ impl Bundle {
             if !w.password.is_empty() && !(8..=63).contains(&w.password.len()) {
                 out.push("Wi-Fi password must be empty (open network) or 8-63 characters".into());
             }
+        }
+        if let Some(f) = &self.firmware {
+            out.extend(f.problems());
         }
         if serde_json::to_vec(self).map(|b| b.len()).unwrap_or(usize::MAX) > MAX_BUNDLE_BYTES {
             out.push(format!("bundle larger than {MAX_BUNDLE_BYTES} bytes"));

@@ -26,7 +26,7 @@
 
 ## Storage
 
-The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/var/lib/display-hub` on a Pi), at schema version 5:
+The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/var/lib/display-hub` on a Pi), at schema version 6:
 
 | Table | Holds |
 |---|---|
@@ -34,9 +34,12 @@ The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/
 | `display_pages` | Which pages each display shows: one row per display and ticked page. |
 | `devices`, `credentials`, `one_time_codes` | Displays, the hashes of every token, and pairing and enrolment codes. |
 | `helper_feeds` | The feeds each helper may send to. |
+| `firmware_packages` | Each firmware package the hub holds: its id (the SHA-256 of the file), what its manifest says (device type, hardware revisions, version, security counter, summary), the signer's key, its sizes, whether it can be used for a USB install, and who uploaded it and when. The file itself is `firmware/<package id>.dhfw` in the data folder, owner-only. |
+| `firmware_signers` | The owner's labels for signing keys, by key id. |
+| `firmware_offers` | Each offer of a package to a display, what the display reported about it, and when it ended. At most one is open per display (a partial unique index), and the 10 most recent ended ones are kept. |
 | `audit_log` | Security-relevant events, kept for 90 days. |
 
-Schema 3 replaced version 2's `subscriptions` and `page_data` tables. The upgrade turned each subscription into a `meter` page with the same id, title, order and source, its service as the feed, and its stored figures, typed-in ones included, as meter data, so every display showed what it did before. Every display that wasn't revoked was ticked for every page. Schema 4 renamed the helper on the PC's old name, "collector", to "helper" wherever it was stored (page sources, credential roles and pairing codes), and turned each helper's services into feeds of the same names (`claude-max`, `chatgpt-plus`, `opencode-go-plus`), so the pairings and tokens the hub holds, and invites not yet used, keep working. A PC paired with the old `hubctl` tool needs `usage-helper` installed and `usage-helper login` run again with a fresh helper string, because `usage-helper` doesn't read what `hubctl` kept (see [providers.md](providers.md), "Upgrading from `hubctl`"). The hub no longer makes up demo figures, so each demo usage page with nothing stored was given the sample figures it showed, without reset times. Schema 5 added each page's `template` and `settings`, empty for every page that was already there; nothing else changed. Before upgrading an existing database, the hub saves a copy beside it (`hub-before-upgrade-schema-<old version>-<UTC time>.db`, owner-only), and the upgrade runs in one transaction ([deploy-raspberry-pi.md](deploy-raspberry-pi.md), "Upgrading").
+Schema 3 replaced version 2's `subscriptions` and `page_data` tables. The upgrade turned each subscription into a `meter` page with the same id, title, order and source, its service as the feed, and its stored figures, typed-in ones included, as meter data, so every display showed what it did before. Every display that wasn't revoked was ticked for every page. Schema 4 renamed the helper on the PC's old name, "collector", to "helper" wherever it was stored (page sources, credential roles and pairing codes), and turned each helper's services into feeds of the same names (`claude-max`, `chatgpt-plus`, `opencode-go-plus`), so the pairings and tokens the hub holds, and invites not yet used, keep working. A PC paired with the old `hubctl` tool needs `usage-helper` installed and `usage-helper login` run again with a fresh helper string, because `usage-helper` doesn't read what `hubctl` kept (see [providers.md](providers.md), "Upgrading from `hubctl`"). The hub no longer makes up demo figures, so each demo usage page with nothing stored was given the sample figures it showed, without reset times. Schema 5 added each page's `template` and `settings`, empty for every page that was already there; nothing else changed. Schema 6 added the three firmware tables, each display's `auto_update` (always off for now), and the `publisher` role and `publisher-pair` code purpose, copying `credentials` and `one_time_codes` into new tables to widen their checks, as schema 4 did; every existing row is kept as it was. Before upgrading an existing database, the hub saves a copy beside it (`hub-before-upgrade-schema-<old version>-<UTC time>.db`, owner-only), and the upgrade runs in one transaction ([deploy-raspberry-pi.md](deploy-raspberry-pi.md), "Upgrading").
 
 ## Admin API
 
@@ -56,12 +59,23 @@ Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, excep
 | `POST /v1/admin/enrolments` | A one-time secret to set up a display. |
 | `GET /v1/admin/preview-snapshot` | The snapshot a display would get now. With `?display=<id>`, that display's; without, the first 10 of all pages. |
 | `GET`, `POST /v1/admin/helpers`, `DELETE /v1/admin/helpers/{id}` | Helpers: list, invite (`{"label": ..., "feeds": [...]}`, at least one valid feed name), revoke. |
+| `POST /v1/admin/firmware` | Uploads a firmware package: the raw file as the body, with a `Content-Length` of at most 16 MiB. It is streamed to disk and checked with `firmware_package::check` before it is kept. `201` with its description, `200` if the hub already had it, `400` with the reason if it fails a check, `413` if too large, `409` when the storage limits stop it (below). |
+| `GET /v1/admin/firmware` | Every package, with its signer's fingerprint and label and the displays it is on offer to. `GET …/{package_id}/file` is the whole file, for a USB install; `DELETE …/{package_id}` removes it and cancels its offers. |
+| `PUT`, `DELETE /v1/admin/devices/{id}/firmware-update` | `{"package_id": ...}` offers a package to a display (the **Update** button), replacing any open offer; `DELETE` cancels it. `409` with a plain sentence when the display's last report says it would refuse the package. |
+| `GET /v1/admin/firmware/signers`, `PUT`, `DELETE …/signers/{key_id}` | The owner's labels for signing keys (`{"label": ...}`). |
+| `GET`, `POST /v1/admin/publishers`, `DELETE /v1/admin/publishers/{id}` | Publishers (a firmware maker's `hub-firmware` tool): list, invite (`{"label": ...}`), revoke. |
+
+`GET /v1/admin/devices` also gives each display `firmware`: what it reported (trusted key ids, security floor, spare partition), its open or most recent offer and what became of it, the newest package it could take that is newer than what it runs, and `auto_update`. [firmware-updates.md](firmware-updates.md) is the design.
+
+**Firmware storage limits:** 3 packages for each device type (a fourth makes room by removing that type's lowest version that isn't on offer; the new one is always kept), 256 MiB in all, and at least 64 MiB left free on the disk. One upload at a time. Uploads and downloads stream through a 64 KiB buffer and have a 15-minute time limit; every other route keeps the usual 10 seconds and its own body limit. Packages are not in `hubd backup`. When the hub starts serving, it forgets packages whose file is missing (after a restore, say) and removes unfinished uploads and files no row names.
 
 The manager still works in usage subscriptions. `hub-client` maps them onto meter pages with the `usage` crate, and leaves other pages where they are when it reorders. It checks typed-in figures against the service's windows (each item one of its windows, listed once, with a share from 0 to 100) and rounds shares to one decimal place before sending them (`usage::clean_figures`); the hub stores meter content as sent. A new demo usage page is given the service's sample figures the same way.
 
 ## Helper API
 
 Makers writing their own helper: see [helpers.md](helpers.md).
+
+A firmware maker's `hub-firmware` tool pairs as a **publisher** with `POST /v1/publisher/pair` (`{"secret": ...}` from a publisher string made by the app or `hubd pair-publisher`), and gets `{"publisher_id", "publisher_token"}`. The token (`dhp_…`) works only on `POST` and `GET /v1/publisher/firmware`, which upload and list packages as the admin routes do (the list without the displays a package is offered to). Everything else answers `403`.
 
 A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper string), and gets `{"helper_id", "helper_token", "feeds"}`. The token (`dhc_…`) works only on the two routes below, and only for those feeds.
 

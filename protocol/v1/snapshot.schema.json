@@ -221,6 +221,31 @@
           }
         ]
       }
+    },
+    "firmware_update": {
+      "description": "Present only while this display has an open firmware offer. A display that doesn't know it ignores it. See docs/firmware-updates.md, 'The offer, in the snapshot'.",
+      "type": "object",
+      "required": [
+        "offer_id",
+        "package_id",
+        "size"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "offer_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{32}$"
+        },
+        "package_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 8392841
+        }
+      }
     }
   },
   "$defs": {

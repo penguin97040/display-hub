@@ -153,7 +153,17 @@ sudo display-hub-helper add garden-weather --run /home/<user>/garden-weather --e
 | See the key fingerprint, to compare with the manager's Settings | `sudo -u display-hub hubd fingerprint` |
 | List or cut off paired PCs | `sudo -u display-hub hubd admin list`, then `sudo -u display-hub hubd admin revoke <id>` |
 | Check on helpers | `sudo display-hub-helper list` (see [Helpers on the Pi](#helpers-on-the-pi)) |
+| Let a firmware maker's computer upload packages, without the app | `sudo -u display-hub hubd pair-publisher` (see [Firmware packages](#firmware-packages)) |
 | Restart | `sudo systemctl restart display-hub` |
+
+## Firmware packages
+
+Signed firmware updates reach displays through the hub ([firmware-updates.md](firmware-updates.md)). The hub keeps the packages it is given in `/var/lib/display-hub/firmware/`, one owner-only file per package, named by its SHA-256. The service already may write there: it is inside its state folder, so the unit needs nothing extra.
+
+- **Limits:** 3 packages for each kind of display (a fourth replaces that kind's lowest version that isn't on offer), 256 MiB in all, and the hub refuses an upload that would leave less than 64 MiB free on the SD card.
+- **Memory:** uploads and downloads stream through a 64 KiB buffer, so a 16 MiB package never sits in the hub's memory, and the service's `MemoryMax=256M` is plenty. Files written pass through the kernel's page cache, which counts towards that limit but is given back under pressure.
+- **Who can add one:** the app, or a maker's `hub-firmware` tool paired as a *publisher*. To make a publisher string on the Pi: `sudo -u display-hub hubd pair-publisher`, with `--host <address>` if the maker's computer can't find the Pi's `.local` name. It works once, within 10 minutes, and the publisher can only add and list packages. Revoke publishers in the app.
+- **Nothing installs by itself:** an update goes to a display only when you press **Update** for it, and the display checks the signature with its own keys before it writes anything.
 
 ## Backups
 
@@ -199,6 +209,8 @@ The installer also backs up automatically before every upgrade, into `/var/backu
    ```
 
 `--replace` moves the empty hub aside into `/var/lib/display-hub/replaced-<time>/` rather than deleting it.
+
+Firmware packages aren't in the backup either: they are large, and can be uploaded again. After a restore, the hub forgets any package whose file is missing.
 
 Helpers on the Pi aren't in the backup. On a new SD card or Pi, set them up again with `display-hub-helper add`. The old ones are still listed by `sudo -u display-hub hubd helper list`; cut them off with `sudo -u display-hub hubd helper revoke <id>`. Displays and the manager carry on as before, because the key is the same. If the Pi's address changed, they find it through the other addresses they know, or you can pair the manager again.
 

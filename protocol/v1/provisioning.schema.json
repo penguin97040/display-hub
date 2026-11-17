@@ -117,6 +117,32 @@
           }
         }
       ]
+    },
+    "firmware": {
+      "description": "Optional. The keys a display with none should trust for signed updates, and its starting security floor, from the package the app just installed. A display that already has keys accepts the bundle only if this names the same set, or is absent; otherwise it answers firmware_keys_locked. See docs/firmware-updates.md.",
+      "type": "object",
+      "required": [
+        "trusted_keys",
+        "security_counter"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "trusted_keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^04[0-9a-f]{128}$"
+          }
+        },
+        "security_counter": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        }
+      }
     }
   }
 }

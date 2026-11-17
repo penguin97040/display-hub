@@ -2833,11 +2833,20 @@ dependencies = [
 name = "hub-firmware"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "firmware-package",
+ "hub-client",
+ "hub-core",
+ "hub-protocol",
+ "hub-send",
+ "hubd",
  "libc",
+ "os-secrets",
+ "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "windows-sys 0.61.2",
  "zeroize",
 ]
@@ -2925,6 +2934,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
+ "firmware-package",
  "hub-client",
  "hub-core",
  "hub-protocol",

@@ -131,6 +131,7 @@ fn info(rev: &str) -> DeviceInfo {
         firmware_version: "0.0.0-simulator".into(),
         hardware_revision: rev.into(),
         protocol_version: 1,
+        firmware: None,
     }
 }
 

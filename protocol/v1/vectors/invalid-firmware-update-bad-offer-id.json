@@ -1,0 +1,84 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "invalid-firmware-update-bad-offer-id",
+  "description": "A snapshot a hub must never send. A display refuses it, tolerates it or shows a card for the page, as expected here: examples/invalid/firmware-update-bad-offer-id.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [\n    {\n      \"id\": \"claude-max\",\n      \"title\": \"Claude Max\",\n      \"kind\": \"meter\",\n      \"data_quality\": \"demo\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": \"Sample figures, not real usage\",\n      \"data\": {\n        \"items\": [\n          {\n            \"id\": \"five-hour\",\n            \"label\": \"Five-hour allowance used\",\n            \"percent\": 42.0,\n            \"resets_at\": \"2026-11-10T22:00:00Z\"\n          },\n          {\n            \"id\": \"weekly\",\n            \"label\": \"Weekly allowance used\",\n            \"percent\": 24.0,\n            \"resets_at\": \"2026-11-15T00:00:00Z\"\n          }\n        ]\n      }\n    },\n    {\n      \"id\": \"chatgpt-plus\",\n      \"title\": \"ChatGPT Plus\",\n      \"kind\": \"meter\",\n      \"data_quality\": \"unavailable\",\n      \"updated_at\": null,\n      \"stale_after_seconds\": 1800,\n      \"note\": \"No supported source connected yet\"\n    },\n    {\n      \"id\": \"opencode-go-plus\",\n      \"title\": \"OpenCode Go Plus\",\n      \"kind\": \"meter\",\n      \"data_quality\": \"demo\",\n      \"updated_at\": \"2026-11-10T20:00:00Z\",\n      \"stale_after_seconds\": 1800,\n      \"note\": \"Sample figures, not real usage\",\n      \"data\": {\n        \"items\": [\n          {\n            \"id\": \"five-hour\",\n            \"label\": \"Five-hour allowance used\",\n            \"percent\": 17.0\n          }\n        ]\n      }\n    }\n  ],\n  \"firmware_update\": {\n    \"offer_id\": \"NOT-HEX\",\n    \"package_id\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\n    \"size\": 1484937\n  }\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": [
+      {
+        "id": "claude-max",
+        "title": "Claude Max",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "DEMO",
+        "note": "Sample figures, not real usage",
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "meter",
+          "items": [
+            {
+              "id": "five-hour",
+              "label": "Five-hour allowance used",
+              "percent": 42.0,
+              "resets_in_seconds": 7200,
+              "reset_due": false
+            },
+            {
+              "id": "weekly",
+              "label": "Weekly allowance used",
+              "percent": 24.0,
+              "resets_in_seconds": 360000,
+              "reset_due": false
+            }
+          ]
+        }
+      },
+      {
+        "id": "chatgpt-plus",
+        "title": "ChatGPT Plus",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "UNAVAILABLE",
+        "note": "No supported source connected yet",
+        "age_seconds": null,
+        "stale": false,
+        "content": null
+      },
+      {
+        "id": "opencode-go-plus",
+        "title": "OpenCode Go Plus",
+        "show": "show",
+        "cant_show_reason": null,
+        "card_lines": [],
+        "quality_label": "DEMO",
+        "note": "Sample figures, not real usage",
+        "age_seconds": 0,
+        "stale": false,
+        "content": {
+          "shape": "meter",
+          "items": [
+            {
+              "id": "five-hour",
+              "label": "Five-hour allowance used",
+              "percent": 17.0,
+              "resets_in_seconds": null,
+              "reset_due": false
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

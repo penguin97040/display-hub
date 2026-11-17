@@ -6,6 +6,7 @@
 
 pub mod device;
 pub mod error;
+pub mod firmware;
 pub mod limits;
 pub mod pairing;
 pub mod provisioning;

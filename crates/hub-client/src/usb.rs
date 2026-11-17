@@ -41,6 +41,11 @@ pub enum UsbError {
     InvalidBundle(String),
     #[error("the display couldn't save the setup details: {0}")]
     StorageFailed(String),
+    #[error(
+        "the display already trusts firmware from a different maker's keys, so it refused these setup \
+         details. Only Install firmware, which erases the display, can change whose firmware it accepts."
+    )]
+    FirmwareKeysLocked,
     #[error("the display refused the setup details ({0})")]
     Refused(String),
 }
@@ -169,6 +174,7 @@ pub fn provision<P: Read + Write>(port: &mut P, bundle: &Bundle) -> Result<UsbDi
                     UsbErrorCode::AlreadyProvisioned => UsbError::AlreadyProvisioned,
                     UsbErrorCode::InvalidBundle => UsbError::InvalidBundle(message),
                     UsbErrorCode::StorageFailed => UsbError::StorageFailed(message),
+                    UsbErrorCode::FirmwareKeysLocked => UsbError::FirmwareKeysLocked,
                     UsbErrorCode::Unrecognised => UsbError::Refused(message),
                 });
             }

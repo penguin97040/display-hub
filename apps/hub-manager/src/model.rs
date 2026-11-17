@@ -1974,6 +1974,7 @@ mod tests {
                 generated_at: ts("2026-11-10T20:00:00Z"),
                 refresh_after_seconds: 300,
                 pages: vec![],
+                firmware_update: None,
             },
             helpers: vec![],
             ticks: Default::default(),
@@ -2811,6 +2812,7 @@ mod tests {
             last_seen_at: None,
             device: None,
             pages: None,
+            firmware: None,
         });
         m.finish(Ok(Outcome::Refreshed(Some(r))), now + WATCH_EVERY);
         assert_eq!(m.enrol.stage, EnrolStage::Joined { name: "Desk".into() });
@@ -2823,6 +2825,7 @@ mod tests {
             firmware_version: "1.0.0".into(),
             hardware_revision: "x".into(),
             protocol_version: 1,
+            firmware: None,
         }
     }
 
@@ -2862,6 +2865,7 @@ mod tests {
             last_seen_at: None,
             device: None,
             pages: None,
+            firmware: None,
         }
     }
 
@@ -3328,6 +3332,7 @@ mod helper_string_tests {
                 generated_at: t,
                 refresh_after_seconds: 300,
                 pages: vec![],
+                firmware_update: None,
             },
             helpers: vec![],
             ticks: Default::default(),

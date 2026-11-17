@@ -29,6 +29,7 @@ pub fn bundle(
             expires_at: grant.expires_at,
         },
         wifi,
+        firmware: None,
     };
     let problems = b.problems();
     if problems.is_empty() {

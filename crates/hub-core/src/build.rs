@@ -36,6 +36,7 @@ pub fn build_snapshot(now: Timestamp, refresh_after_seconds: u32, pages: &[Store
             *hub_protocol::limits::REFRESH_RANGE.end(),
         ),
         pages: Vec::new(),
+        firmware_update: None,
     };
     let guarded: Vec<Page> = pages
         .iter()
@@ -399,6 +400,7 @@ mod tests {
             generated_at: t,
             refresh_after_seconds: 300,
             pages: vec![big, fine, bad],
+            firmware_update: None,
         };
         snap.to_wire().unwrap();
     }

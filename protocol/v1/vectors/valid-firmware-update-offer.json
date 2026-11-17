@@ -1,0 +1,18 @@
+{
+  "format": "display-hub.conformance",
+  "version": 1,
+  "name": "valid-firmware-update-offer",
+  "description": "A valid snapshot: examples/valid/firmware-update-offer.json.",
+  "response": {
+    "status": 200,
+    "body": "{\n  \"protocol_version\": 1,\n  \"message_type\": \"dashboard.snapshot\",\n  \"generated_at\": \"2026-11-10T20:00:00Z\",\n  \"refresh_after_seconds\": 300,\n  \"pages\": [],\n  \"firmware_update\": {\n    \"offer_id\": \"5d41402abc4b2a76b9719d911017c592\",\n    \"package_id\": \"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08\",\n    \"size\": 1484937\n  }\n}\n"
+  },
+  "held_seconds": 0,
+  "expect": {
+    "outcome": "show",
+    "next_poll": "refresh",
+    "refresh_after_seconds": 300,
+    "error_code": null,
+    "pages": []
+  }
+}

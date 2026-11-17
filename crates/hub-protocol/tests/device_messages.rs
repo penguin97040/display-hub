@@ -36,6 +36,73 @@ fn device_messages_match_their_schemas_and_types() {
     let _: ErrorBody = round_trip(check("error.schema.json", "error-revoked.json"));
     let b: Bundle = round_trip(check("provisioning.schema.json", "provisioning-bundle.json"));
     assert_eq!(b.problems(), Vec::<String>::new());
+    assert_eq!(b.firmware, None);
+}
+
+/// The signed-update additions: optional members of the heartbeat and bundle, and the report.
+/// Older messages, without them, still read the same (above).
+#[test]
+fn firmware_additions_match_their_schemas_and_types() {
+    use hub_protocol::firmware::{FirmwareReport, ReportReason, ReportState};
+    let h: Heartbeat = round_trip(check("heartbeat.schema.json", "heartbeat-with-firmware.json"));
+    assert!(h.problems().is_empty());
+    let fw = h.firmware.unwrap();
+    assert!(fw.problems().is_empty());
+    assert_eq!((fw.key_ids.len(), fw.security_floor), (2, 3));
+    // An enrolment carries the same `device` object.
+    let mut enrol: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir().join("examples/device/enrol-request.json")).unwrap())
+            .unwrap();
+    enrol["device"] = serde_json::to_value(Heartbeat {
+        firmware: Some(fw),
+        ..serde_json::from_value(enrol["device"].clone()).unwrap()
+    })
+    .unwrap();
+    let schema: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir().join("enrol-request.schema.json")).unwrap()).unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&enrol));
+    let _: EnrolRequest = round_trip(enrol);
+
+    let b: Bundle = round_trip(check(
+        "provisioning.schema.json",
+        "provisioning-bundle-with-firmware.json",
+    ));
+    assert_eq!(b.problems(), Vec::<String>::new());
+    assert_eq!(b.firmware.as_ref().unwrap().trusted_keys.len(), 2);
+    assert!(
+        format!("{b:?}").contains("trusted_keys"),
+        "public keys are not secret"
+    );
+
+    for (file, state, reason) in [
+        ("firmware-report-downloading.json", ReportState::Downloading, None),
+        (
+            "firmware-report-refused.json",
+            ReportState::Refused,
+            Some(ReportReason::Downgrade),
+        ),
+        ("firmware-report-installed.json", ReportState::Installed, None),
+        ("firmware-report-rolled-back.json", ReportState::RolledBack, None),
+    ] {
+        let r: FirmwareReport = round_trip(check("firmware-report.schema.json", file));
+        assert!(r.problems().is_empty(), "{file}");
+        assert_eq!((r.state, r.reason), (state, reason), "{file}");
+    }
+    // The schema says what a display sends; the hub reads more leniently.
+    let s: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir().join("firmware-report.schema.json")).unwrap()).unwrap();
+    let v = jsonschema::validator_for(&s).unwrap();
+    let offer = "5d41402abc4b2a76b9719d911017c592";
+    for bad in [
+        serde_json::json!({"offer_id": offer, "state": "refused"}),
+        serde_json::json!({"offer_id": offer, "state": "refused", "reason": "flash"}),
+        serde_json::json!({"offer_id": offer, "state": "installed", "reason": "flash"}),
+        serde_json::json!({"offer_id": "x", "state": "installed"}),
+        serde_json::json!({"offer_id": offer, "state": "exploded"}),
+    ] {
+        assert!(!v.is_valid(&bad), "{bad}");
+    }
+    assert!(v.is_valid(&serde_json::json!({"offer_id": offer, "state": "failed", "reason": "flash"})));
 }
 
 #[test]
@@ -77,6 +144,8 @@ fn usb_messages_match_their_schema_and_types() {
         ("display-hello.json", false),
         ("display-provisioned.json", false),
         ("display-error.json", false),
+        ("display-hello-with-firmware.json", false),
+        ("display-error-keys-locked.json", false),
     ] {
         let v = read(&format!("examples/usb/{file}"));
         let errors: Vec<_> = validator.iter_errors(&v).map(|e| e.to_string()).collect();
@@ -94,4 +163,19 @@ fn usb_messages_match_their_schema_and_types() {
         assert!(text.len() <= hub_protocol::usb::MAX_LINE_BYTES);
     }
     assert!(!validator.is_valid(&serde_json::json!({"type": "provision", "bundle": {}})));
+    let locked: FromDisplay =
+        serde_json::from_value(read("examples/usb/display-error-keys-locked.json")).unwrap();
+    assert!(matches!(
+        locked,
+        FromDisplay::Error {
+            code: hub_protocol::usb::UsbErrorCode::FirmwareKeysLocked,
+            ..
+        }
+    ));
+    let hello: FromDisplay =
+        serde_json::from_value(read("examples/usb/display-hello-with-firmware.json")).unwrap();
+    let FromDisplay::Hello { device, .. } = hello else {
+        panic!("hello")
+    };
+    assert_eq!(device.firmware.unwrap().slot_bytes, 3_145_728);
 }

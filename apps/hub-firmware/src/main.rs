@@ -1,21 +1,22 @@
 //! `hub-firmware`: makes signing keys, and signs and checks firmware packages, for people who make
 //! display firmware. See "The signing tool" in `docs/firmware-updates.md`.
 //!
-//! This build has the offline commands (`keygen`, `sign`, `inspect`). The commands that talk to a hub
-//! (`login`, `add`, `publish`) come with the hub's publisher routes: each is one more [`Cmd`] variant
-//! and one more function.
+//! `keygen`, `sign` and `inspect` work offline. `login`, `add` and `publish` talk to a hub as a
+//! publisher, which may add packages to the hub and list them, nothing else (see [`hub`]).
 
 mod esp_image;
+mod hub;
 mod passphrase;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use firmware_package::keyfile::{self, MAX_KEY_FILE_BYTES};
 use firmware_package::limits::{MAX_IMAGE_SIZE, MAX_PACKAGE_LEN};
 use firmware_package::{build_and_sign, check_file, PublicKey, Release, UsbLayout, UsbPartFile};
+use hub_core::{Clock, SystemClock};
 
 const TOOL: &str = "hub-firmware";
 
@@ -23,8 +24,23 @@ const TOOL: &str = "hub-firmware";
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Keep the hub's details here instead of `<your config folder>/display-hub/hub-firmware`. Also
+    /// set by the HUB_FIRMWARE_DIR environment variable.
+    #[arg(long, global = true)]
+    config_dir: Option<PathBuf>,
+    /// Where the publisher token is kept: `os` (the system's credential store, the default) or `file`
+    /// (an owner-only file named `token` in the settings folder, for a headless Linux build machine
+    /// with no keyring). Also set by HUB_FIRMWARE_STORE.
+    #[arg(long, global = true, value_enum)]
+    store: Option<Store>,
     #[command(subcommand)]
     command: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Store {
+    Os,
+    File,
 }
 
 #[derive(Subcommand)]
@@ -43,6 +59,17 @@ enum Cmd {
         /// The package file (`.dhfw`).
         package: PathBuf,
     },
+    /// Pair with a hub as a publisher. Paste the publisher string from the hub's owner when asked (it
+    /// is read from standard input, never from the command line).
+    Login,
+    /// Check a package, then upload it to the paired hub. It waits there until the owner chooses to
+    /// install it.
+    Add {
+        /// The package file (`.dhfw`).
+        package: PathBuf,
+    },
+    /// `sign`, then `add`, in one step. Takes the same options as `sign`.
+    Publish(Box<SignArgs>),
 }
 
 #[derive(Args)]
@@ -131,7 +158,7 @@ fn keygen(out: &Path) -> Result<String, String> {
 }
 
 /// Reads a whole file of at most `max` bytes.
-fn read_bounded(path: &Path, what: &str, max: u64) -> Result<Vec<u8>, String> {
+pub(crate) fn read_bounded(path: &Path, what: &str, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
     let f =
         std::fs::File::open(path).map_err(|e| format!("couldn't open the {what} {}: {e}", path.display()))?;
@@ -235,6 +262,79 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     written.map_err(fail)
 }
 
+/// The folder, from `--config-dir`, then HUB_FIRMWARE_DIR, then the default.
+fn folder(arg: Option<PathBuf>) -> PathBuf {
+    arg.or_else(|| {
+        std::env::var_os("HUB_FIRMWARE_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    })
+    .unwrap_or_else(|| hub_send::default_dir(TOOL))
+}
+
+/// The token store, from `--store`, then HUB_FIRMWARE_STORE, then the system's credential store.
+fn store_kind(arg: Option<Store>) -> Result<hub_send::StoreKind, String> {
+    if let Some(s) = arg {
+        return Ok(match s {
+            Store::Os => hub_send::StoreKind::Os,
+            Store::File => hub_send::StoreKind::File,
+        });
+    }
+    match std::env::var("HUB_FIRMWARE_STORE") {
+        Ok(v) if !v.trim().is_empty() => {
+            hub_send::StoreKind::parse(&v).map_err(|e| format!("HUB_FIRMWARE_STORE: {e}"))
+        }
+        _ => Ok(hub_send::StoreKind::Os),
+    }
+}
+
+fn profile(cli: &Cli) -> Result<hub::Profile, String> {
+    let dir = folder(cli.config_dir.clone());
+    let store = hub_send::token_store(store_kind(cli.store)?, hub::SERVICE, &dir)?;
+    Ok(hub::Profile::new(dir, store))
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime starts")
+}
+
+fn login(p: &hub::Profile) -> Result<String, String> {
+    use zeroize::Zeroize;
+    if std::io::stdin().is_terminal() {
+        eprint!("Paste the publisher string from the hub's owner, then press Enter: ");
+        let _ = std::io::stderr().flush();
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    if read.is_err() || line.trim().is_empty() {
+        line.zeroize();
+        return Err("no publisher string given".into());
+    }
+    let r = runtime().block_on(p.login(&line, SystemClock.now()));
+    line.zeroize();
+    let conn = r?;
+    Ok(format!(
+        "Paired with the hub at {}:{} as a publisher. This computer can now add firmware packages to it          with `hub-firmware add` or `hub-firmware publish`, and nothing else.",
+        conn.host, conn.port
+    ))
+}
+
+fn add(p: &hub::Profile, package: &Path) -> Result<String, String> {
+    let (view, created) = runtime().block_on(hub::add(p, package))?;
+    Ok(hub::added(&view, created, &p.connection()?))
+}
+
+fn publish(p: &hub::Profile, a: &SignArgs) -> Result<String, String> {
+    // Paired first, so a release isn't signed for a hub that can't take it.
+    p.open()?;
+    let signed = sign(a)?;
+    let added = add(p, &a.out)?;
+    Ok(format!("{signed}\n{added}"))
+}
+
 fn sign(a: &SignArgs) -> Result<String, String> {
     // Everything that can be checked without the passphrase is checked first.
     let usb_install = usb_layout(a)?;
@@ -324,6 +424,21 @@ fn main() -> ExitCode {
         Cmd::Keygen { out } => finish(keygen(out)),
         Cmd::Sign(a) => finish(sign(a)),
         Cmd::Inspect { package } => finish(inspect(package)),
+        Cmd::Login | Cmd::Add { .. } | Cmd::Publish(_) => {
+            let p = match profile(&cli) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{TOOL}: {e}");
+                    return ExitCode::from(2);
+                }
+            };
+            finish(match &cli.command {
+                Cmd::Login => login(&p),
+                Cmd::Add { package } => add(&p, package),
+                Cmd::Publish(a) => publish(&p, a),
+                _ => unreachable!("matched above"),
+            })
+        }
     }
 }
 

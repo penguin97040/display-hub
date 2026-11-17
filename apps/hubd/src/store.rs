@@ -21,6 +21,8 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::secret::Role;
 
+pub mod firmware;
+
 /// Each entry upgrades the schema by one version. Never edit one that has shipped: add another.
 /// The newest schema this build knows.
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -160,6 +162,81 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE pages ADD COLUMN template TEXT;
     ALTER TABLE pages ADD COLUMN settings TEXT;
+    "#,
+    // 6: signed firmware updates (`docs/firmware-updates.md`). Packages the hub holds (each file is
+    // `firmware/<id>.dhfw` in the data folder), the owner's labels for signing keys, and offers, with
+    // at most one open offer per display. Each display gains `auto_update`, always off for now.
+    // Publishers, a new role with their own pairing codes, need the two CHECK constraints widened,
+    // so those tables are copied as in version 4.
+    r#"
+    CREATE TABLE firmware_packages (
+        id TEXT PRIMARY KEY,
+        device_type TEXT NOT NULL,
+        hardware_revisions TEXT NOT NULL,
+        firmware_version TEXT NOT NULL,
+        security_counter INTEGER NOT NULL,
+        summary TEXT,
+        signer_key_id TEXT NOT NULL,
+        signer_public_key TEXT NOT NULL,
+        image_size INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        update_size INTEGER NOT NULL,
+        usb_install INTEGER NOT NULL,
+        uploaded_at INTEGER NOT NULL,
+        uploaded_by_role TEXT NOT NULL CHECK (uploaded_by_role IN ('admin', 'publisher')),
+        uploaded_by TEXT NOT NULL
+    );
+    CREATE INDEX firmware_packages_device_type ON firmware_packages(device_type);
+    CREATE TABLE firmware_signers (
+        key_id TEXT PRIMARY KEY,
+        label TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE firmware_offers (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        package_id TEXT NOT NULL,
+        firmware_version TEXT NOT NULL,
+        from_version TEXT,
+        made_at INTEGER NOT NULL,
+        made_by TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT,
+        reported_version TEXT,
+        updated_at INTEGER NOT NULL,
+        ended_at INTEGER
+    );
+    CREATE UNIQUE INDEX firmware_offers_one_open ON firmware_offers(device_id) WHERE ended_at IS NULL;
+    CREATE INDEX firmware_offers_package ON firmware_offers(package_id);
+    ALTER TABLE devices ADD COLUMN auto_update INTEGER NOT NULL DEFAULT 0;
+
+    CREATE TABLE credentials_new (
+        token_hash BLOB PRIMARY KEY,
+        role TEXT NOT NULL CHECK (role IN ('admin', 'device', 'helper', 'publisher')),
+        subject TEXT NOT NULL,
+        label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        revoked_at INTEGER
+    );
+    INSERT INTO credentials_new (token_hash, role, subject, label, created_at, revoked_at)
+        SELECT token_hash, role, subject, label, created_at, revoked_at FROM credentials;
+    DROP TABLE credentials;
+    ALTER TABLE credentials_new RENAME TO credentials;
+    CREATE INDEX credentials_subject ON credentials(role, subject);
+
+    CREATE TABLE one_time_codes_new (
+        code_hash BLOB PRIMARY KEY,
+        purpose TEXT NOT NULL CHECK (purpose IN ('admin-pair', 'device-enrol', 'helper-pair', 'publisher-pair')),
+        label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER
+    );
+    INSERT INTO one_time_codes_new (code_hash, purpose, label, created_at, expires_at, used_at)
+        SELECT code_hash, purpose, label, created_at, expires_at, used_at FROM one_time_codes;
+    DROP TABLE one_time_codes;
+    ALTER TABLE one_time_codes_new RENAME TO one_time_codes;
     "#,
 ];
 
@@ -481,6 +558,8 @@ pub struct DeviceRow {
     pub info: Option<DeviceInfo>,
     /// The ids of the pages the display shows (its ticks), in the shared page order.
     pub pages: Vec<String>,
+    /// Whether the hub may offer it updates by itself. Always off for now.
+    pub auto_update: bool,
 }
 
 #[derive(Clone)]
@@ -871,20 +950,9 @@ impl Store {
     pub fn devices(&self) -> Result<Vec<DeviceRow>, StoreError> {
         let conn = self.conn();
         let mut st = conn.prepare(
-            "SELECT id, name, enrolled_at, last_seen_at, info FROM devices WHERE revoked_at IS NULL ORDER BY enrolled_at",
+            "SELECT id, name, enrolled_at, last_seen_at, info, auto_update FROM devices WHERE revoked_at IS NULL ORDER BY enrolled_at",
         )?;
-        let rows = st.query_map([], |r| {
-            Ok(DeviceRow {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                enrolled_at: ts(r.get(2)?),
-                last_seen_at: r.get::<_, Option<i64>>(3)?.map(ts),
-                info: r
-                    .get::<_, Option<String>>(4)?
-                    .and_then(|s| serde_json::from_str(&s).ok()),
-                pages: Vec::new(),
-            })
-        })?;
+        let rows = st.query_map([], device_row)?;
         let mut devices: Vec<DeviceRow> = rows.collect::<Result<_, _>>()?;
         // Every display's ticks in a second query (not one per display), in the shared page order.
         let at: std::collections::HashMap<String, usize> = devices
@@ -904,6 +972,18 @@ impl Store {
             }
         }
         Ok(devices)
+    }
+
+    /// One active display, without its ticks.
+    pub fn device(&self, id: &str) -> Result<Option<DeviceRow>, StoreError> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT id, name, enrolled_at, last_seen_at, info, auto_update FROM devices WHERE id = ?1 AND revoked_at IS NULL",
+                params![id],
+                device_row,
+            )
+            .optional()?)
     }
 
     /// How many displays are active, without reading their ticks.
@@ -929,6 +1009,7 @@ impl Store {
             params![now.unix(), id],
         )?;
         tx.execute("DELETE FROM display_pages WHERE device_id = ?1", params![id])?;
+        firmware::cancel_for_removed_display(&tx, id, now)?;
         tx.commit()?;
         Ok(n > 0)
     }
@@ -1315,6 +1396,21 @@ impl Store {
     }
 }
 
+/// A display's row: id, name, enrolled_at, last_seen_at, info and auto_update, in that order.
+fn device_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceRow> {
+    Ok(DeviceRow {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        enrolled_at: ts(r.get(2)?),
+        last_seen_at: r.get::<_, Option<i64>>(3)?.map(ts),
+        info: r
+            .get::<_, Option<String>>(4)?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        pages: Vec::new(),
+        auto_update: r.get(5)?,
+    })
+}
+
 /// The columns [`read_pages`] reads, from `pages` aliased as `p`.
 const PAGE_COLUMNS: &str = "p.id, p.title, p.kind, p.source, p.feed, p.stale_after_seconds, p.quality, \
      p.updated_at, p.data, p.note, p.template, p.settings";
@@ -1509,7 +1605,10 @@ mod tests {
         let purpose = "CASE purpose WHEN 'collector-pair' THEN 'helper-pair' ELSE purpose END";
         let mut out = Vec::new();
         for (table, sql) in [
-            ("devices", "SELECT * FROM devices ORDER BY id".to_string()),
+            (
+                "devices",
+                "SELECT id, name, enrolled_at, last_seen_at, info, revoked_at FROM devices ORDER BY id".to_string(),
+            ),
             (
                 "credentials",
                 format!("SELECT token_hash, {role}, subject, label, created_at, revoked_at FROM credentials ORDER BY token_hash"),
@@ -1808,6 +1907,7 @@ mod tests {
             firmware_version: "0.0.0-test".into(),
             hardware_revision: "simulated".into(),
             protocol_version: 1,
+            firmware: None,
         };
         store.add_device(id, id, &info, ts(NOW)).unwrap();
     }
@@ -2250,7 +2350,7 @@ mod tests {
             (untouched_tables(&conn), page_rows(&conn))
         };
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let saved = copies(dir.path());
         assert_eq!(saved.len(), 1);
         let name = saved[0].file_name().unwrap().to_str().unwrap();
@@ -2355,5 +2455,403 @@ mod tests {
             .execute("UPDATE pages SET settings = '[1]' WHERE id = 'typed'", [])
             .unwrap();
         assert_eq!(store.page("typed").unwrap().unwrap().settings, None);
+    }
+
+    /// Representative data in the layout schema 5 used.
+    const SCHEMA_5_DATA: &str = include_str!("../tests/fixtures/schema-5-data.sql");
+
+    #[test]
+    fn upgrading_schema_5_keeps_every_row_and_makes_room_for_firmware_and_publishers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_at_schema(&conn, 5).unwrap();
+            conn.execute_batch(SCHEMA_5_DATA).unwrap();
+        }
+        let (before, pages_before) = {
+            let conn = Connection::open(&path).unwrap();
+            (untouched_tables(&conn), page_rows(&conn))
+        };
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
+        let saved = copies(dir.path());
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hub-before-upgrade-schema-5-"), "{name}");
+        assert_eq!(Store::inspect(&saved[0]).unwrap(), (5, 4, 2));
+
+        // Every row is kept as it was, settings included.
+        assert_eq!(untouched_tables(&store.conn()), before);
+        assert_eq!(page_rows(&store.conn()), pages_before);
+        let pi = store.page("pi-status").unwrap().unwrap();
+        assert_eq!(pi.template.as_deref(), Some("pi-status/1"));
+        assert_eq!(pi.settings.unwrap()["sensor"], json!("cpu"));
+
+        // Displays keep their report and start with automatic updates off.
+        let desk = store.device("d-desk").unwrap().unwrap();
+        assert!(!desk.auto_update);
+        assert_eq!(desk.info.unwrap().firmware_version, "1.0.0");
+        assert!(store.device("d-old").unwrap().is_none());
+
+        // Tokens and codes keep working, and the new role and purpose are allowed.
+        let token = crate::secret::hash("dhc_test_helper");
+        assert_eq!(store.credential(&token).unwrap().unwrap().subject, "h-pi");
+        let admin = crate::secret::hash("dha_test_admin");
+        assert_eq!(store.credential(&admin).unwrap().unwrap().role, Role::Admin);
+        let pair = crate::secret::hash("pair-before-upgrade");
+        assert_eq!(
+            store.use_code(&pair, "admin-pair", ts(NOW)).unwrap().0,
+            CodeUse::Accepted
+        );
+        let p = crate::secret::hash("dhp_new");
+        store
+            .add_credential(&p, Role::Publisher, "p-1", "Maker", ts(NOW))
+            .unwrap();
+        assert_eq!(store.credential(&p).unwrap().unwrap().role, Role::Publisher);
+        store
+            .add_code(
+                &crate::secret::hash("c"),
+                "publisher-pair",
+                "Maker",
+                ts(NOW),
+                ts(NOW + 600),
+            )
+            .unwrap();
+        assert!(store
+            .add_code(&crate::secret::hash("d"), "nonsense", "x", ts(NOW), ts(NOW + 600))
+            .is_err());
+        assert!(store.firmware_packages().unwrap().is_empty());
+        assert!(store.latest_offers(ts(NOW)).unwrap().is_empty());
+    }
+
+    fn package(id: &str, device_type: &str, version: &str) -> firmware::PackageRow {
+        firmware::PackageRow {
+            id: id.into(),
+            device_type: device_type.into(),
+            hardware_revisions: vec!["simulated".into()],
+            firmware_version: version.into(),
+            security_counter: 1,
+            summary: None,
+            signer_key_id: "k".repeat(64),
+            signer_public_key: format!("04{}", "0".repeat(128)),
+            image_size: 100,
+            size: 300,
+            update_size: 280,
+            usb_install: false,
+            uploaded_at: ts(NOW),
+            uploaded_by_role: Role::Admin,
+            uploaded_by: "a-1".into(),
+            uploaded_by_label: None,
+        }
+    }
+
+    fn offer<'a>(id: &'a str, device: &'a str, pkg: &'a str, now: i64) -> firmware::NewOffer<'a> {
+        firmware::NewOffer {
+            id,
+            device_id: device,
+            package_id: pkg,
+            from_version: Some("0.0.0-test"),
+            made_by: "a-1",
+            now: ts(now),
+            expires_at: ts(now + hub_protocol::limits::FIRMWARE_OFFER_LIFETIME_SECONDS),
+        }
+    }
+
+    #[test]
+    fn a_display_has_one_open_offer_which_ends_when_replaced_cancelled_expired_or_removed() {
+        use firmware::*;
+        let store = Store::in_memory().unwrap();
+        device(&store, "d-a");
+        device(&store, "d-b");
+        store
+            .add_firmware_package(&package("p1", "test-display", "1.0.0"), &[], ts(NOW))
+            .unwrap();
+        store
+            .add_firmware_package(&package("p2", "test-display", "1.1.0"), &[], ts(NOW))
+            .unwrap();
+
+        let first = store.make_offer(&offer("o1", "d-a", "p1", NOW)).unwrap();
+        assert_eq!(
+            (first.state.as_str(), first.firmware_version.as_str()),
+            (OFFERED, "1.0.0")
+        );
+        assert_eq!(store.open_offer("d-a", ts(NOW)).unwrap().unwrap().id, "o1");
+        // Pressing Update again replaces it.
+        store.make_offer(&offer("o2", "d-a", "p2", NOW + 1)).unwrap();
+        assert_eq!(store.open_offer("d-a", ts(NOW + 1)).unwrap().unwrap().id, "o2");
+        let latest = store.latest_offers(ts(NOW + 1)).unwrap();
+        assert_eq!(latest["d-a"].id, "o2");
+        let replaced = store
+            .record_report(
+                "d-a",
+                "o1",
+                hub_protocol::firmware::ReportState::Downloading,
+                None,
+                None,
+                ts(NOW + 2),
+            )
+            .unwrap();
+        assert_eq!(
+            replaced,
+            ReportOutcome::Unchanged,
+            "progress on an ended offer is ignored"
+        );
+        assert_eq!(
+            store.packages_on_offer(ts(NOW + 2)).unwrap(),
+            std::collections::HashSet::from(["p2".to_string()])
+        );
+
+        // Cancelled.
+        assert!(store.cancel_offer("d-a", ts(NOW + 3)).unwrap());
+        assert!(!store.cancel_offer("d-a", ts(NOW + 3)).unwrap());
+        assert!(store.open_offer("d-a", ts(NOW + 3)).unwrap().is_none());
+        assert_eq!(store.latest_offers(ts(NOW + 3)).unwrap()["d-a"].state, CANCELLED);
+
+        // Expired: gone from reads at once, and recorded by the next write.
+        store.make_offer(&offer("o3", "d-a", "p1", NOW + 4)).unwrap();
+        let later = NOW + 4 + hub_protocol::limits::FIRMWARE_OFFER_LIFETIME_SECONDS;
+        assert!(store.open_offer("d-a", ts(later)).unwrap().is_none());
+        assert_eq!(
+            store.latest_offers(ts(later)).unwrap()["d-a"].state_at(ts(later)),
+            EXPIRED
+        );
+        store.make_offer(&offer("o4", "d-a", "p1", later)).unwrap();
+        assert_eq!(store.open_offer("d-a", ts(later)).unwrap().unwrap().id, "o4");
+
+        // Deleting the package cancels its offers; removing the display cancels its own.
+        store.make_offer(&offer("o5", "d-b", "p2", later)).unwrap();
+        assert!(store
+            .remove_firmware_package("p1", CANCELLED_PACKAGE_DELETED, ts(later))
+            .unwrap());
+        assert!(store.open_offer("d-a", ts(later)).unwrap().is_none());
+        assert_eq!(
+            store.latest_offers(ts(later)).unwrap()["d-a"].reason.as_deref(),
+            Some(CANCELLED_PACKAGE_DELETED)
+        );
+        assert!(store.revoke_device("d-b", ts(later)).unwrap());
+        assert!(store.open_offer("d-b", ts(later)).unwrap().is_none());
+        assert!(store.make_offer(&offer("o6", "d-b", "p2", later)).is_err());
+        // The index itself refuses a second open offer.
+        let dup = store.conn().execute(
+            "INSERT INTO firmware_offers (id, device_id, package_id, firmware_version, made_at, made_by, \
+             expires_at, state, updated_at) VALUES ('x', 'd-a', 'p2', '1', 0, 'a', 9999999999, 'offered', 0), \
+             ('y', 'd-a', 'p2', '1', 0, 'a', 9999999999, 'offered', 0)",
+            [],
+        );
+        assert!(dup.is_err());
+    }
+
+    #[test]
+    fn reports_settle_offers_once_and_a_heartbeat_can_stand_in_for_a_lost_one() {
+        use firmware::*;
+        use hub_protocol::firmware::{ReportReason, ReportState};
+        let store = Store::in_memory().unwrap();
+        device(&store, "d-a");
+        device(&store, "d-b");
+        store
+            .add_firmware_package(&package("p1", "test-display", "1.0.0"), &[], ts(NOW))
+            .unwrap();
+        store.make_offer(&offer("o1", "d-a", "p1", NOW)).unwrap();
+
+        assert_eq!(
+            store
+                .record_report("d-b", "o1", ReportState::Installed, None, None, ts(NOW))
+                .unwrap(),
+            ReportOutcome::NoOffer,
+            "another display's offer"
+        );
+        let ReportOutcome::Recorded {
+            offer: o,
+            settled: false,
+        } = store
+            .record_report(
+                "d-a",
+                "o1",
+                ReportState::Downloading,
+                None,
+                Some("0.0.0-test"),
+                ts(NOW + 1),
+            )
+            .unwrap()
+        else {
+            panic!("progress recorded")
+        };
+        assert!(o.is_open(ts(NOW + 1)));
+        let ReportOutcome::Recorded {
+            offer: o,
+            settled: true,
+        } = store
+            .record_report(
+                "d-a",
+                "o1",
+                ReportState::Refused,
+                Some(ReportReason::Downgrade),
+                Some("0.0.0-test"),
+                ts(NOW + 2),
+            )
+            .unwrap()
+        else {
+            panic!("result recorded")
+        };
+        assert_eq!(
+            (o.state.as_str(), o.reason.as_deref()),
+            ("refused", Some("downgrade"))
+        );
+        assert!(!o.is_open(ts(NOW + 2)));
+        // Repeated, or contradicted, it changes nothing.
+        assert_eq!(
+            store
+                .record_report("d-a", "o1", ReportState::Installed, None, None, ts(NOW + 3))
+                .unwrap(),
+            ReportOutcome::Unchanged
+        );
+
+        // Unknown states and reasons are failures.
+        store.make_offer(&offer("o2", "d-a", "p1", NOW + 4)).unwrap();
+        let ReportOutcome::Recorded { offer: o, .. } = store
+            .record_report(
+                "d-a",
+                "o2",
+                ReportState::Refused,
+                Some(ReportReason::Unrecognised),
+                None,
+                ts(NOW + 5),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (o.state.as_str(), o.reason.as_deref()),
+            ("failed", Some("unrecognised"))
+        );
+        store.make_offer(&offer("o3", "d-a", "p1", NOW + 6)).unwrap();
+        let ReportOutcome::Recorded { offer: o, .. } = store
+            .record_report("d-a", "o3", ReportState::Unrecognised, None, None, ts(NOW + 7))
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(o.state, "failed");
+
+        // A result arriving after the owner cancelled is still recorded: the display acted first.
+        store.make_offer(&offer("o4", "d-a", "p1", NOW + 8)).unwrap();
+        store.cancel_offer("d-a", ts(NOW + 9)).unwrap();
+        let ReportOutcome::Recorded {
+            offer: o,
+            settled: true,
+        } = store
+            .record_report(
+                "d-a",
+                "o4",
+                ReportState::Installed,
+                None,
+                Some("1.0.0"),
+                ts(NOW + 10),
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((o.state.as_str(), o.ended_at), ("installed", Some(ts(NOW + 9))));
+
+        // A heartbeat naming the offered version counts as installed, unless the display was
+        // already running it when the offer was made.
+        store.make_offer(&offer("o5", "d-a", "p1", NOW + 11)).unwrap();
+        assert!(store
+            .installed_by_heartbeat("d-a", "0.0.0-test", ts(NOW + 12))
+            .unwrap()
+            .is_none());
+        assert!(store
+            .open_offer_for_version("d-a", "1.0.0", ts(NOW + 12))
+            .unwrap());
+        let o = store
+            .installed_by_heartbeat("d-a", "1.0.0", ts(NOW + 12))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (o.id.as_str(), o.reason.as_deref()),
+            ("o5", Some(INSTALLED_BY_HEARTBEAT))
+        );
+        assert!(store.open_offer("d-a", ts(NOW + 12)).unwrap().is_none());
+        let same = firmware::NewOffer {
+            from_version: Some("1.0.0"),
+            ..offer("o6", "d-a", "p1", NOW + 13)
+        };
+        store.make_offer(&same).unwrap();
+        assert!(store
+            .installed_by_heartbeat("d-a", "1.0.0", ts(NOW + 14))
+            .unwrap()
+            .is_none());
+        assert!(store.open_offer("d-a", ts(NOW + 14)).unwrap().is_some());
+
+        // Only the newest ended offers are kept.
+        for i in 0..(MAX_OFFER_HISTORY_PER_DISPLAY + 5) {
+            store
+                .make_offer(&offer(&format!("h{i}"), "d-a", "p1", NOW + 20 + i as i64))
+                .unwrap();
+        }
+        let n: i64 = store
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM firmware_offers WHERE device_id = 'd-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n as usize, MAX_OFFER_HISTORY_PER_DISPLAY + 1);
+    }
+
+    #[test]
+    fn eviction_refuses_a_package_that_came_on_offer_and_rows_without_files_are_dropped() {
+        use firmware::*;
+        let store = Store::in_memory().unwrap();
+        device(&store, "d-a");
+        store
+            .add_firmware_package(&package("p1", "test-display", "1.0.0"), &[], ts(NOW))
+            .unwrap();
+        store
+            .add_firmware_package(&package("p2", "test-display", "1.1.0"), &[], ts(NOW))
+            .unwrap();
+        store.make_offer(&offer("o1", "d-a", "p1", NOW)).unwrap();
+        assert!(store
+            .add_firmware_package(&package("p3", "test-display", "1.2.0"), &["p1".into()], ts(NOW))
+            .is_err());
+        assert!(store.firmware_package("p3").unwrap().is_none(), "nothing changed");
+        store
+            .add_firmware_package(&package("p3", "test-display", "1.2.0"), &["p2".into()], ts(NOW))
+            .unwrap();
+        let ids: Vec<String> = store
+            .firmware_packages()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&"p1".to_string()) && ids.contains(&"p3".to_string()));
+
+        let dropped = store.drop_missing_packages(|id| id != "p1", ts(NOW + 1)).unwrap();
+        assert_eq!(dropped, ["p1"]);
+        assert!(store.open_offer("d-a", ts(NOW + 1)).unwrap().is_none());
+        assert_eq!(
+            store.latest_offers(ts(NOW + 1)).unwrap()["d-a"].reason.as_deref(),
+            Some(CANCELLED_PACKAGE_MISSING)
+        );
+
+        // Signer labels.
+        store.set_signer_label(&"a".repeat(64), "Maker", ts(NOW)).unwrap();
+        store
+            .set_signer_label(&"a".repeat(64), "Maker 2", ts(NOW))
+            .unwrap();
+        assert_eq!(store.firmware_signers().unwrap()[0].1, "Maker 2");
+        for i in 1..MAX_SIGNER_LABELS {
+            store.set_signer_label(&format!("{i:064}"), "x", ts(NOW)).unwrap();
+        }
+        assert!(store
+            .set_signer_label(&"b".repeat(64), "one too many", ts(NOW))
+            .is_err());
+        assert!(store.remove_signer_label(&"a".repeat(64)).unwrap());
+        assert!(!store.remove_signer_label(&"a".repeat(64)).unwrap());
     }
 }

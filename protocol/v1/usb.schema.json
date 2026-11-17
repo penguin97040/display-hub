@@ -34,7 +34,17 @@
         "firmware_version": { "type": "string", "minLength": 1, "maxLength": 48 },
         "hardware_revision": { "type": "string", "minLength": 1, "maxLength": 48 },
         "protocol_version": { "type": "integer", "minimum": 1 },
-        "provisioned": { "type": "boolean", "description": "Whether it already holds a bundle. If so it refuses another until factory-reset on the device." }
+        "provisioned": { "type": "boolean", "description": "Whether it already holds a bundle. If so it refuses another until factory-reset on the device." },
+        "firmware": {
+          "type": "object",
+          "description": "Optional, as in a heartbeat: the display's trusted key ids, security floor and spare app partition size. See docs/firmware-updates.md.",
+          "required": ["key_ids", "security_floor", "slot_bytes"],
+          "properties": {
+            "key_ids": { "type": "array", "maxItems": 3, "uniqueItems": true, "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } },
+            "security_floor": { "type": "integer", "minimum": 0, "maximum": 4294967295 },
+            "slot_bytes": { "type": "integer", "minimum": 0 }
+          }
+        }
       }
     },
     {
@@ -51,7 +61,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "const": "error" },
-        "code": { "enum": ["invalid_bundle", "already_provisioned", "storage_failed"] },
+        "code": { "enum": ["invalid_bundle", "already_provisioned", "storage_failed", "firmware_keys_locked"] },
         "message": { "type": "string", "maxLength": 200 }
       }
     }

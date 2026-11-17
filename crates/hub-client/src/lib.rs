@@ -20,8 +20,11 @@ use serde::Serialize;
 use url::Url;
 use usage::{ManualFigures, NewSubscription, SubscriptionChange, SubscriptionView};
 
-/// The largest response body the client reads from any endpoint.
+/// The largest response body the client reads from any endpoint but a firmware file.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+/// The time allowed for a firmware upload or download, which can be megabytes over Wi-Fi.
+pub const FIRMWARE_TIMEOUT: Duration =
+    Duration::from_secs(hub_protocol::limits::FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -557,6 +560,243 @@ impl HubClient {
         .await
     }
 
+    // ----- firmware (`docs/firmware-updates.md`) -----
+
+    /// Uploads a package, as an admin (`publisher` false) or a publisher. The hub checks it before
+    /// keeping it. `true` with the package's description when it is new, `false` when the hub already
+    /// had it.
+    async fn upload_to(
+        &self,
+        path: &str,
+        token: &str,
+        package: Vec<u8>,
+    ) -> Result<(FirmwarePackageView, bool), ClientError> {
+        let req = self
+            .request(Method::POST, path, Some(token))
+            .timeout(FIRMWARE_TIMEOUT)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(package);
+        let resp = req.send().await.map_err(classify)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_capped(resp, 8192).await.ok();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body: body.and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok()),
+            });
+        }
+        let body = read_capped(resp, MAX_RESPONSE_BYTES).await?;
+        let view = serde_json::from_slice(&body).map_err(|e| ClientError::Malformed(e.to_string()))?;
+        Ok((view, status == reqwest::StatusCode::CREATED))
+    }
+
+    /// `POST /v1/admin/firmware`.
+    pub async fn upload_firmware(
+        &self,
+        token: &str,
+        package: Vec<u8>,
+    ) -> Result<(FirmwarePackageView, bool), ClientError> {
+        self.upload_to("v1/admin/firmware", token, package).await
+    }
+
+    /// `GET /v1/admin/firmware`: every package, with the displays each is on offer to.
+    pub async fn firmware_packages(&self, token: &str) -> Result<Vec<FirmwarePackageView>, ClientError> {
+        self.call(Method::GET, "v1/admin/firmware", token, None::<&()>)
+            .await
+    }
+
+    /// `GET /v1/admin/firmware/{package_id}/file`: the whole package, for a USB install.
+    pub async fn firmware_file(&self, token: &str, package_id: &str) -> Result<Vec<u8>, ClientError> {
+        let req = self
+            .request(
+                Method::GET,
+                &format!("v1/admin/firmware/{}/file", seg(package_id)),
+                Some(token),
+            )
+            .timeout(FIRMWARE_TIMEOUT);
+        self.send(req, hub_protocol::limits::MAX_FIRMWARE_PACKAGE_BYTES as usize)
+            .await
+    }
+
+    /// `DELETE /v1/admin/firmware/{package_id}`: also cancels its open offers.
+    pub async fn delete_firmware(&self, token: &str, package_id: &str) -> Result<(), ClientError> {
+        self.call_empty(
+            Method::DELETE,
+            &format!("v1/admin/firmware/{}", seg(package_id)),
+            token,
+        )
+        .await
+    }
+
+    /// `PUT /v1/admin/devices/{id}/firmware-update`: the **Update** button. Replaces any open offer.
+    pub async fn offer_firmware(
+        &self,
+        token: &str,
+        display: &str,
+        package_id: &str,
+    ) -> Result<FirmwareOfferView, ClientError> {
+        self.call(
+            Method::PUT,
+            &format!("v1/admin/devices/{}/firmware-update", seg(display)),
+            token,
+            Some(&FirmwareOfferRequest {
+                package_id: package_id.to_string(),
+            }),
+        )
+        .await
+    }
+
+    /// `DELETE /v1/admin/devices/{id}/firmware-update`.
+    pub async fn cancel_firmware_offer(&self, token: &str, display: &str) -> Result<(), ClientError> {
+        self.call_empty(
+            Method::DELETE,
+            &format!("v1/admin/devices/{}/firmware-update", seg(display)),
+            token,
+        )
+        .await
+    }
+
+    /// `GET /v1/admin/firmware/signers`: the owner's labels for signing keys.
+    pub async fn firmware_signers(&self, token: &str) -> Result<Vec<SignerView>, ClientError> {
+        self.call(Method::GET, "v1/admin/firmware/signers", token, None::<&()>)
+            .await
+    }
+
+    pub async fn set_signer_label(
+        &self,
+        token: &str,
+        key_id: &str,
+        label: &str,
+    ) -> Result<SignerView, ClientError> {
+        self.call(
+            Method::PUT,
+            &format!("v1/admin/firmware/signers/{}", seg(key_id)),
+            token,
+            Some(&SignerLabel {
+                label: label.to_string(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn remove_signer_label(&self, token: &str, key_id: &str) -> Result<(), ClientError> {
+        self.call_empty(
+            Method::DELETE,
+            &format!("v1/admin/firmware/signers/{}", seg(key_id)),
+            token,
+        )
+        .await
+    }
+
+    pub async fn publishers(&self, token: &str) -> Result<Vec<PublisherView>, ClientError> {
+        self.call(Method::GET, "v1/admin/publishers", token, None::<&()>)
+            .await
+    }
+
+    /// `POST /v1/admin/publishers`: a one-time secret for `hub-firmware login`.
+    pub async fn new_publisher(&self, token: &str, label: &str) -> Result<PublisherInvite, ClientError> {
+        self.call(
+            Method::POST,
+            "v1/admin/publishers",
+            token,
+            Some(&NewPublisher {
+                label: label.to_string(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn revoke_publisher(&self, token: &str, id: &str) -> Result<(), ClientError> {
+        self.call_empty(Method::DELETE, &format!("v1/admin/publishers/{}", seg(id)), token)
+            .await
+    }
+
+    // ----- publisher -----
+
+    /// `POST /v1/publisher/pair`: the secret from a publisher string, for a publisher token.
+    pub async fn publisher_pair(&self, secret: &str) -> Result<PublisherPairResponse, ClientError> {
+        let req = PublisherPairRequest {
+            secret: secret.to_string(),
+        };
+        self.json(self.request(Method::POST, "v1/publisher/pair", None).json(&req))
+            .await
+    }
+
+    /// `POST /v1/publisher/firmware`.
+    pub async fn publisher_upload(
+        &self,
+        token: &str,
+        package: Vec<u8>,
+    ) -> Result<(FirmwarePackageView, bool), ClientError> {
+        self.upload_to("v1/publisher/firmware", token, package).await
+    }
+
+    /// `GET /v1/publisher/firmware`: the packages on the hub, without the displays they are offered to.
+    pub async fn publisher_packages(&self, token: &str) -> Result<Vec<FirmwarePackageView>, ClientError> {
+        self.call(Method::GET, "v1/publisher/firmware", token, None::<&()>)
+            .await
+    }
+
+    // ----- display firmware -----
+
+    /// `GET /v1/device/firmware/{package_id}`, as a display makes it: the update form, with what the
+    /// hub said about its length and encoding.
+    pub async fn firmware_download(
+        &self,
+        token: &str,
+        package_id: &str,
+    ) -> Result<FirmwareDownload, ClientError> {
+        let req = self
+            .request(
+                Method::GET,
+                &format!("v1/device/firmware/{}", seg(package_id)),
+                Some(token),
+            )
+            .timeout(FIRMWARE_TIMEOUT);
+        let resp = req.send().await.map_err(classify)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_capped(resp, 8192).await.ok();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body: body.and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok()),
+            });
+        }
+        let header = |name: reqwest::header::HeaderName| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let content_length = header(reqwest::header::CONTENT_LENGTH).and_then(|v| v.parse().ok());
+        let transfer_encoding = header(reqwest::header::TRANSFER_ENCODING);
+        let content_encoding = header(reqwest::header::CONTENT_ENCODING);
+        let content_type = header(reqwest::header::CONTENT_TYPE);
+        let bytes = read_capped(resp, hub_protocol::limits::MAX_FIRMWARE_UPDATE_BYTES as usize).await?;
+        Ok(FirmwareDownload {
+            bytes,
+            content_length,
+            transfer_encoding,
+            content_encoding,
+            content_type,
+        })
+    }
+
+    /// `POST /v1/device/firmware/report`.
+    pub async fn firmware_report(
+        &self,
+        token: &str,
+        report: &hub_protocol::firmware::FirmwareReport,
+    ) -> Result<(), ClientError> {
+        self.send(
+            self.request(Method::POST, "v1/device/firmware/report", Some(token))
+                .json(report),
+            8192,
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Sends a request and reads at most `cap` bytes of a successful body.
     async fn send(&self, req: reqwest::RequestBuilder, cap: usize) -> Result<Vec<u8>, ClientError> {
         let resp = req.send().await.map_err(classify)?;
@@ -571,6 +811,16 @@ impl HubClient {
         }
         read_capped(resp, cap).await
     }
+}
+
+/// A firmware download, with the headers a display checks.
+#[derive(Clone, Debug)]
+pub struct FirmwareDownload {
+    pub bytes: Vec<u8>,
+    pub content_length: Option<u64>,
+    pub transfer_encoding: Option<String>,
+    pub content_encoding: Option<String>,
+    pub content_type: Option<String>,
 }
 
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ClientError> {

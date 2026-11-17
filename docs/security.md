@@ -16,6 +16,7 @@
 | An unknown or unpaired display | Yes | It has no credential, so it gets nothing. Enrolment needs a short-lived, single-use secret from an admin. |
 | A lost or stolen display | Yes | Revoke it in the manager. Its token stops working immediately. It never held provider credentials. |
 | Stolen manager configuration | Yes | The admin token lives in the OS credential store, never a plain file. `hubd admin revoke` and `revoke-all` on the Pi cut it off. |
+| A hub, app or network that offers hostile firmware | Yes | Displays install only packages signed by a key they already hold, for their own board, at or above their security floor; the hub only stores and passes packages on, and never signs ([firmware-updates.md](firmware-updates.md), "Threat model"). |
 | Malformed or oversized requests and responses | Yes | Body limits, timeouts, a concurrency cap, strict validation and bounded text. |
 | Accidental exposure of keys in logs, Git or fixtures | Yes | Credentials sit in redacting types. Request logs record no headers or queries. A test asserts no token reaches the logs. The Git ignore rules and pre-commit checks cover the rest. |
 | Someone with root on the Pi, or an unlocked PC | Partly | Documented below. Out of reach of software alone. |
@@ -71,6 +72,7 @@
 - **Backups contain the private key.** `hubd backup` writes them 0700/0600 and says so. Keep copies off the Pi somewhere private.
 - `hubd restore` refuses while the hub runs, and moves whatever it replaces aside instead of deleting it.
 - `hubd display-bundle` writes a setup file, owner-only, for adding a display from the Pi itself. It works once, within 10 minutes.
+- **Firmware packages** are in `/var/lib/display-hub/firmware/` (0700), each file 0600 and named by its SHA-256. The hub checks every upload in full before keeping it, but a display never relies on that: it checks the signature with its own keys. Packages aren't in backups; they can be uploaded again.
 - **Helpers on the Pi** run apart from the hub (next section).
 
 ## Helpers on the Pi
@@ -115,7 +117,8 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 | Admin token `dha_` | Desktop manager (OS credential store) | Everything under `/v1/admin/` | SHA-256 hash |
 | Device token `dhd_` | One display (encrypted NVS) | Read the snapshot, send heartbeats, as itself only | SHA-256 hash |
 | Helper token `dhc_` | A helper, such as the helper on a PC, `usage-helper` (OS credential store, or an owner-only file for headless `hub-send`) | Send page content to the feeds it was invited for, for pages whose source is "Helper" and whose kind matches. Nothing else. | SHA-256 hash |
-| Pairing and enrolment secrets | Pairing string, bundle | Exchanged once for a token, within 10 minutes | SHA-256 hash |
+| Publisher token `dhp_` | A firmware maker's `hub-firmware` (OS credential store, or an owner-only file on a headless Linux build machine) | Upload firmware packages and list them. Nothing installs without the owner pressing **Update** and the display's own checks. | SHA-256 hash |
+| Pairing and enrolment secrets | Pairing string, publisher string, bundle | Exchanged once for a token, within 10 minutes | SHA-256 hash |
 
 - Each token type has its own prefix. A token used on another role's route gets `403`.
 - Tokens and one-time secrets come from the OS's secure random source. They are held in types that print as `[redacted]` and are zeroed on drop.
@@ -127,7 +130,8 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 - Before TLS starts, it closes connections from anything except private, link-local and loopback addresses.
 - IPv6 is off by default. When it is on, only link-local and unique local sources are accepted, never global addresses, because a home router's IPv6 firewall can't be relied on.
 - The systemd unit allows the service only local addresses too (`IPAddressAllow=`), and `deploy/raspberry-pi/nftables-display-hub.conf` can drop other sources before they reach it. There is no UPnP and no port forwarding.
-- **Request limits:** request bodies are limited (2 KiB for displays, 16 KiB for admin). Requests time out after 10 seconds, TLS handshakes after 10 seconds, and headers after 10 seconds. At most 128 connections and 64 requests are handled at once.
+- **Request limits:** request bodies are limited (2 KiB for displays, 16 KiB for admin, 16 MiB for a firmware upload, which is streamed to disk). Requests time out after 10 seconds (15 minutes for a firmware upload or download), TLS handshakes after 10 seconds, and headers after 10 seconds. At most 128 connections and 64 requests are handled at once.
+- **Firmware downloads:** only to a display with an open offer for that package, at most 2 at once across the hub and 6 starts per display per hour.
 - **Rate limits:** failed sign-ins are limited to 20 a minute per address. Pairing and enrolment attempts are limited to 10 per 10 minutes per address. A 128-bit code can't be guessed within those limits.
 
 ## Recovery
@@ -141,6 +145,7 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 | The SD card failed or the Pi was replaced | Install, then `hubd restore` the latest backup, which includes the identity ([deploy-raspberry-pi.md](deploy-raspberry-pi.md#backups)). Without the identity, every display and admin must be set up again. |
 | The key must change (suspected compromise) | Not automated in v0. Stop the hub, move `identity/` and the database aside, start fresh, then pair the manager and re-provision every display. Bundles already have room for two trust anchors, so a later version can roll keys over without re-provisioning. |
 | A helper on the Pi misbehaves | `sudo display-hub-helper remove <name>`: it stops, its token is revoked and its files are deleted. |
+| A publisher token is stolen | Revoke the publisher in the app. It could only add packages, which install on nothing without the owner's **Update** and the display's checks. |
 | A pairing or enrolment code appears in the audit log as `ALARM_` | Someone tried a code that had already been used. Check `hubd admin list` and the manager's list of displays, and revoke anything you don't recognise. |
 
 ## Limitations (stated plainly)

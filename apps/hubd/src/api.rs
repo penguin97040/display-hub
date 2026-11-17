@@ -2,6 +2,9 @@
 //!
 //! Every route except health, pairing and enrolment needs a bearer token, and each token works
 //! only for its own role. A display's identity comes from its token, never from the request.
+//! The firmware routes are in [`firmware`].
+
+mod firmware;
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -54,6 +57,12 @@ pub struct Hub {
     pub code_attempts: Limiter,
     /// Last-seen times and heartbeat details, flushed to the database now and then.
     seen: Mutex<HashMap<String, Seen>>,
+    /// Firmware downloads being sent now, across all displays.
+    pub download_slots: Arc<tokio::sync::Semaphore>,
+    /// Firmware download starts per display.
+    pub download_starts: Limiter<String>,
+    /// Firmware uploads being received now.
+    pub upload_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone)]
@@ -75,6 +84,16 @@ impl Hub {
             auth_failures: Limiter::new(20, std::time::Duration::from_secs(60)),
             code_attempts: Limiter::new(10, std::time::Duration::from_secs(600)),
             seen: Mutex::new(HashMap::new()),
+            download_slots: Arc::new(tokio::sync::Semaphore::new(
+                hub_protocol::limits::MAX_CONCURRENT_FIRMWARE_DOWNLOADS,
+            )),
+            download_starts: Limiter::new(
+                hub_protocol::limits::MAX_FIRMWARE_DOWNLOADS_PER_WINDOW,
+                std::time::Duration::from_secs(hub_protocol::limits::FIRMWARE_DOWNLOAD_WINDOW_SECONDS),
+            ),
+            upload_slots: Arc::new(tokio::sync::Semaphore::new(
+                crate::firmware::MAX_CONCURRENT_UPLOADS,
+            )),
         })
     }
 
@@ -290,6 +309,9 @@ async fn authenticate(
             Role::Device => "This display's access was revoked. Set it up again from the desktop manager.",
             Role::Admin => "This admin access was revoked. Pair again with `hubd pair-admin` on the hub.",
             Role::Helper => "This helper's access was revoked. Set it up again from the desktop manager.",
+            Role::Publisher => {
+                "This publisher's access was revoked. Ask the hub's owner for a new publisher string."
+            }
         };
         return Err(fail(ErrorCode::TokenRevoked, msg));
     }
@@ -303,14 +325,43 @@ async fn authenticate(
     Ok(cred.subject)
 }
 
+/// The hub's usual time limit, for every route but a firmware upload or download.
+/// A time limit, with its timeout answered as a structured error.
+type TimeLimit = ServiceBuilder<
+    tower::layer::util::Stack<
+        tower::timeout::TimeoutLayer,
+        tower::layer::util::Stack<HandleErrorLayer<ErrorHandler, ()>, tower::layer::util::Identity>,
+    >,
+>;
+
+type ErrorHandler = fn(tower::BoxError) -> ErrorFuture;
+
+fn usual_time_limit() -> TimeLimit {
+    time_limit(REQUEST_TIMEOUT)
+}
+
+type ErrorFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ApiError> + Send>>;
+
+fn layer_error(err: tower::BoxError) -> ErrorFuture {
+    Box::pin(handle_layer_error(err))
+}
+
+fn time_limit(limit: std::time::Duration) -> TimeLimit {
+    ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(layer_error as ErrorHandler))
+        .timeout(limit)
+}
+
 pub fn router(hub: AppState) -> Router {
     let device = Router::new()
         .route("/v1/device/enrol", post(device_enrol))
         .route("/v1/device/snapshot", get(device_snapshot))
         .route("/v1/device/heartbeat", post(device_heartbeat))
+        .route("/v1/device/firmware/report", post(firmware::device_report))
         .layer(DefaultBodyLimit::max(
             hub_protocol::limits::MAX_DEVICE_REQUEST_BYTES,
-        ));
+        ))
+        .layer(usual_time_limit());
     let admin = Router::new()
         .route("/v1/admin/pair", post(admin_pair))
         .route("/v1/admin/status", get(admin_status))
@@ -331,26 +382,74 @@ pub fn router(hub: AppState) -> Router {
         .route("/v1/admin/preview-snapshot", get(preview_snapshot))
         .route("/v1/admin/helpers", get(list_helpers).post(new_helper))
         .route("/v1/admin/helpers/{id}", delete(revoke_helper))
-        .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
+        .route(
+            "/v1/admin/devices/{id}/firmware-update",
+            put(firmware::put_offer).delete(firmware::delete_offer),
+        )
+        .route(
+            "/v1/admin/firmware/{package_id}",
+            delete(firmware::delete_package),
+        )
+        .route(
+            "/v1/admin/firmware/{package_id}/file",
+            get(firmware::package_file),
+        )
+        .route("/v1/admin/firmware/signers", get(firmware::list_signers))
+        .route(
+            "/v1/admin/firmware/signers/{key_id}",
+            put(firmware::put_signer).delete(firmware::delete_signer),
+        )
+        .route(
+            "/v1/admin/publishers",
+            get(firmware::list_publishers).post(firmware::new_publisher),
+        )
+        .route("/v1/admin/publishers/{id}", delete(firmware::revoke_publisher))
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES))
+        .layer(usual_time_limit());
     // A feed body is a whole page, so it may be as large as an admin one.
     let helper = Router::new()
         .route("/v1/helper/pair", post(helper_pair))
         .route("/v1/helper/feeds/{feed}", put(put_feed))
         .route("/v1/helper/feeds/{feed}/settings", get(feed_settings))
-        .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
+        .route("/v1/publisher/pair", post(firmware::publisher_pair))
+        .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES))
+        .layer(usual_time_limit());
+    // Uploads and downloads stream their bodies themselves, within their own size limits, and get
+    // the long time limit. The lists that share their paths keep the usual one.
+    let long = || time_limit(crate::firmware::FIRMWARE_REQUEST_TIMEOUT);
+    let firmware = Router::new()
+        .route(
+            "/v1/admin/firmware",
+            get(firmware::list_admin)
+                .layer(usual_time_limit())
+                .merge(post(firmware::upload_admin).layer(long())),
+        )
+        .route(
+            "/v1/publisher/firmware",
+            get(firmware::list_publisher)
+                .layer(usual_time_limit())
+                .merge(post(firmware::upload_publisher).layer(long())),
+        )
+        .route(
+            "/v1/device/firmware/{package_id}",
+            get(firmware::device_download).layer(long()),
+        );
     Router::new()
-        .route("/v1/health", get(|| async { Json(Health::ok()) }))
+        .route(
+            "/v1/health",
+            get(|| async { Json(Health::ok()) }).layer(usual_time_limit()),
+        )
         .merge(device)
         .merge(admin)
         .merge(helper)
+        .merge(firmware)
         .fallback(|| async { ApiError::not_found() })
         .layer(middleware::from_fn(log_request))
         .layer(
             ServiceBuilder::new()
                 .layer(HandleErrorLayer::new(handle_layer_error))
                 .load_shed()
-                .concurrency_limit(MAX_CONCURRENT_REQUESTS)
-                .timeout(REQUEST_TIMEOUT),
+                .concurrency_limit(MAX_CONCURRENT_REQUESTS),
         )
         .with_state(hub)
 }
@@ -392,6 +491,8 @@ async fn device_enrol(
     if !problems.is_empty() {
         return Err(ApiError::bad_request(problems.join("; ")));
     }
+    let mut req = req;
+    firmware::drop_bad_firmware(&mut req.device);
     let now = hub.clock.now();
     let h = hash(&req.enrolment_secret);
     let (outcome, name) = db(&hub, move |s| s.use_code(&h, "device-enrol", now)).await?;
@@ -468,9 +569,15 @@ async fn device_snapshot(
     note_seen(&hub, &device, None);
     let h = hub.clone();
     // A display revoked since it authenticated has nothing to show.
-    let snap = db(&hub, move |_| h.snapshot(Some(&device)))
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let snap = db(&hub, move |s| {
+        let Some(mut snap) = h.snapshot(Some(&device))? else {
+            return Ok(None);
+        };
+        snap.firmware_update = h.snapshot_offer(s, &device)?;
+        Ok(Some(snap))
+    })
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     let body = snap.to_wire().map_err(|v| {
         tracing::error!(violations = ?v, "refusing to send an invalid snapshot");
         ApiError::unavailable("The hub could not build a valid snapshot.")
@@ -482,7 +589,7 @@ async fn device_heartbeat(
     State(hub): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    ApiJson(beat): ApiJson<Heartbeat>,
+    ApiJson(mut beat): ApiJson<Heartbeat>,
 ) -> Result<StatusCode, ApiError> {
     check_protocol(&headers)?;
     let device = authenticate(&hub, &headers, peer.ip(), Role::Device).await?;
@@ -490,7 +597,10 @@ async fn device_heartbeat(
     if !problems.is_empty() {
         return Err(ApiError::bad_request(problems.join("; ")));
     }
+    firmware::drop_bad_firmware(&mut beat);
+    let version = beat.firmware_version.clone();
     note_seen(&hub, &device, Some(beat));
+    firmware::check_installed(&hub, &device, &version).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1188,20 +1298,36 @@ async fn list_devices(
     headers: HeaderMap,
 ) -> Result<Json<Vec<DisplayView>>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
-    let rows = db(&hub, |s| s.devices()).await?;
+    let now = hub.clock.now();
+    let (rows, packages, offers) = db(&hub, move |s| {
+        Ok((s.devices()?, s.firmware_packages()?, s.latest_offers(now)?))
+    })
+    .await?;
     let seen = hub.seen();
+    let rows: Vec<_> = rows
+        .into_iter()
+        .map(|r| {
+            let live = seen.get(&r.id);
+            let info = live.and_then(|s| s.info.clone()).or(r.info.clone());
+            (r, live.map(|s| s.at), info)
+        })
+        .collect();
+    drop(seen);
+    let infos: Vec<_> = rows
+        .iter()
+        .map(|(r, _, info)| (r.id.clone(), info.clone(), r.auto_update))
+        .collect();
+    let mut fw = firmware::display_firmware(&infos, &packages, &offers, now);
     Ok(Json(
         rows.into_iter()
-            .map(|r| {
-                let live = seen.get(&r.id);
-                DisplayView {
-                    last_seen_at: live.map(|s| s.at).max(r.last_seen_at),
-                    device: live.and_then(|s| s.info.clone()).or(r.info),
-                    id: r.id,
-                    name: r.name,
-                    enrolled_at: r.enrolled_at,
-                    pages: Some(r.pages),
-                }
+            .map(|(r, live_at, info)| DisplayView {
+                last_seen_at: live_at.max(r.last_seen_at),
+                device: info,
+                firmware: fw.remove(&r.id),
+                id: r.id,
+                name: r.name,
+                enrolled_at: r.enrolled_at,
+                pages: Some(r.pages),
             })
             .collect(),
     ))

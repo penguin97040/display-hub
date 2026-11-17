@@ -32,6 +32,7 @@ pub fn simulator_info() -> DeviceInfo {
         firmware_version: "0.0.0-simulator".into(),
         hardware_revision: "simulated".into(),
         protocol_version: hub_protocol::PROTOCOL_VERSION,
+        firmware: None,
     }
 }
 

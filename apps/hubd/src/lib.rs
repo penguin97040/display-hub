@@ -3,6 +3,7 @@
 pub mod api;
 pub mod config;
 pub mod dev;
+pub mod firmware;
 pub mod http;
 pub mod identity;
 pub mod maintenance;
@@ -78,6 +79,16 @@ pub async fn serve_https(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let tls = Arc::new(tls::server_config(&hub.identity)?);
+    // Only the serving hub tidies the firmware folder: a command run beside it must never remove
+    // an upload in progress.
+    {
+        let h = hub.clone();
+        match tokio::task::spawn_blocking(move || h.tidy_firmware()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "couldn't tidy the firmware folder"),
+            Err(e) => tracing::warn!(error = %e, "couldn't tidy the firmware folder"),
+        }
+    }
     let flusher = {
         let hub = hub.clone();
         tokio::spawn(async move {

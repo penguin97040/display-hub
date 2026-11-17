@@ -448,6 +448,7 @@ mod tests {
             last_seen_at: None,
             device: None,
             pages,
+            firmware: None,
         };
         let shown = ticks(&[display("new", Some(vec!["a".into()])), display("old", None)]);
         assert_eq!(

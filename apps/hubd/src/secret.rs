@@ -14,14 +14,19 @@ pub enum Role {
     Admin,
     Device,
     Helper,
+    /// A firmware maker's `hub-firmware` tool: may upload and list packages, nothing else.
+    Publisher,
 }
 
 impl Role {
+    pub const ALL: [Role; 4] = [Role::Admin, Role::Device, Role::Helper, Role::Publisher];
+
     pub fn prefix(self) -> &'static str {
         match self {
             Role::Admin => "dha_",
             Role::Device => "dhd_",
             Role::Helper => "dhc_",
+            Role::Publisher => "dhp_",
         }
     }
 
@@ -30,20 +35,17 @@ impl Role {
             Role::Admin => "admin",
             Role::Device => "device",
             Role::Helper => "helper",
+            Role::Publisher => "publisher",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        [Role::Admin, Role::Device, Role::Helper]
-            .into_iter()
-            .find(|r| r.as_str() == s)
+        Role::ALL.into_iter().find(|r| r.as_str() == s)
     }
 
     /// The role a token's prefix claims. Says nothing about whether the token is real.
     pub fn of_token(token: &str) -> Option<Self> {
-        [Role::Admin, Role::Device, Role::Helper]
-            .into_iter()
-            .find(|r| token.starts_with(r.prefix()))
+        Role::ALL.into_iter().find(|r| token.starts_with(r.prefix()))
     }
 }
 
@@ -129,6 +131,10 @@ mod tests {
             Some(Role::Device)
         );
         assert_eq!(a.expose().len(), 4 + 43);
+        let p = new_token(Role::Publisher);
+        assert!(p.expose().starts_with("dhp_"));
+        assert_eq!(Role::of_token(p.expose()), Some(Role::Publisher));
+        assert_eq!(Role::parse("publisher"), Some(Role::Publisher));
         assert_eq!(format!("{a:?}"), "[redacted]");
     }
 

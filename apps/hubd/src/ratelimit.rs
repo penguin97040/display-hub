@@ -1,19 +1,21 @@
 //! Per-address limits on failed sign-ins and on pairing and enrolment attempts, so guessing a
-//! token or code from the network is hopeless. Held in memory: a restart forgives everyone, which
-//! is fine for a home hub.
+//! token or code from the network is hopeless, and per-display limits on firmware downloads. Held
+//! in memory: a restart forgives everyone, which is fine for a home hub.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-pub struct Limiter {
+/// Counts events per key: an address by default, or a display's id.
+pub struct Limiter<K = IpAddr> {
     max: u32,
     window: Duration,
-    hits: Mutex<HashMap<IpAddr, (Instant, u32)>>,
+    hits: Mutex<HashMap<K, (Instant, u32)>>,
 }
 
-impl Limiter {
+impl<K: Eq + Hash + Clone> Limiter<K> {
     /// At most `max` events per address in each `window`.
     pub fn new(max: u32, window: Duration) -> Self {
         Self {
@@ -24,14 +26,14 @@ impl Limiter {
     }
 
     /// Whether `ip` is currently blocked.
-    pub fn blocked(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn blocked(&self, ip: K, now: Instant) -> bool {
         let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         hits.get(&ip)
             .is_some_and(|(start, n)| now.duration_since(*start) < self.window && *n >= self.max)
     }
 
     /// Records one event for `ip`. Returns whether it is now blocked.
-    pub fn hit(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn hit(&self, ip: K, now: Instant) -> bool {
         let mut hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         if hits.len() > 4096 {
             let window = self.window;
@@ -46,7 +48,7 @@ impl Limiter {
     }
 
     /// How long until `ip` may try again.
-    pub fn retry_after(&self, ip: IpAddr, now: Instant) -> Duration {
+    pub fn retry_after(&self, ip: K, now: Instant) -> Duration {
         let hits = self.hits.lock().unwrap_or_else(|e| e.into_inner());
         hits.get(&ip)
             .map(|(start, _)| self.window.saturating_sub(now.duration_since(*start)))

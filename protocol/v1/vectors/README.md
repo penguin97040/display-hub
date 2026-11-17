@@ -74,6 +74,7 @@ Compare `percent` exactly as decimals with one place; everything else is exact.
   - **Refused** (keep the last good snapshot): a wrong version or message type, a bad envelope or page `id`, title, note, `updated_at` or `stale_after_seconds`, too many pages, and an unreadable timestamp.
   - **Tolerated and shown:** an extra field, an unknown quality (read as unavailable) and a missing `percent` (read as unknown).
   - **A card for that page only:** an unknown shape name, a custom kind with a bad version, bad shape data (too long, out of range including a `big_number` beyond ±1e15, too many items, duplicate ids, a missing `data`), `data` on an unavailable page, a custom `data` that isn't an object or nests too deep, and a single page over 3072 bytes.
+- A snapshot carrying a firmware offer, and one whose offer a display can't use: either way the pages show as usual.
 - Holding a snapshot until it goes stale, and past a reset time.
 - A body over 32 KiB, and a captive portal's HTML.
 - Every error group, an unknown error code, and errors with no structured body.

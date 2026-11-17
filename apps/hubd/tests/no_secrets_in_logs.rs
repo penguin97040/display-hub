@@ -107,6 +107,7 @@ async fn no_credential_reaches_the_logs() {
         firmware_version: "1".into(),
         hardware_revision: "sim".into(),
         protocol_version: 1,
+        firmware: None,
     };
     let e = c.enrol(&grant.secret, info.clone()).await.unwrap();
     secrets.push(e.device_token.clone());

@@ -99,6 +99,12 @@ fn displays_refuse_tolerate_or_card_invalid_examples_as_documented() {
         };
         match name.as_str() {
             // Additions from a newer v1 revision: shown, with the unknown quality as unavailable.
+            // A firmware offer a display can't use is ignored; its pages still show.
+            "firmware-update-bad-offer-id" => {
+                let snap = got.unwrap();
+                assert!(snap.pages.iter().all(|p| p.content().is_ok()), "{name}");
+                assert!(snap.firmware_update.unwrap().problems().len() == 1, "{name}");
+            }
             "extra-field" | "shape-extra-field" => {
                 assert!(got.unwrap().pages.iter().all(|p| p.content().is_ok()), "{name}")
             }
@@ -138,6 +144,33 @@ fn displays_refuse_tolerate_or_card_invalid_examples_as_documented() {
             _ => assert!(matches!(got, Err(ReceiveError::Invalid(_))), "{name}: {got:?}"),
         }
     }
+}
+
+/// A firmware offer round-trips, a snapshot without one reads as it always did, and an offer of the
+/// wrong shape reads as no offer rather than costing the display its pages.
+#[test]
+fn firmware_offers_are_optional_and_read_leniently() {
+    let read = |name: &str| std::fs::read(protocol_dir().join("examples/valid").join(name)).unwrap();
+    let with = receive(&read("firmware-update-offer.json")).unwrap();
+    let offer = with.firmware_update.clone().unwrap();
+    assert_eq!(offer.size, 1_484_937);
+    assert!(offer.problems().is_empty());
+    let without = receive(&read("empty-no-pages.json")).unwrap();
+    assert_eq!(without.firmware_update, None);
+    assert!(!String::from_utf8(serde_json::to_vec(&without).unwrap())
+        .unwrap()
+        .contains("firmware_update"));
+    let mut odd: serde_json::Value = serde_json::from_slice(&read("firmware-update-offer.json")).unwrap();
+    odd["firmware_update"]["size"] = serde_json::json!("large");
+    let snap = receive(&serde_json::to_vec(&odd).unwrap()).unwrap();
+    assert_eq!(snap.firmware_update, None);
+    odd["firmware_update"] = serde_json::json!(null);
+    assert_eq!(
+        receive(&serde_json::to_vec(&odd).unwrap())
+            .unwrap()
+            .firmware_update,
+        None
+    );
 }
 
 #[test]
@@ -263,6 +296,7 @@ fn envelope(pages: Vec<Page>) -> Snapshot {
         generated_at: Timestamp::parse("2026-11-10T20:00:00Z").unwrap(),
         refresh_after_seconds: 3600,
         pages,
+        firmware_update: None,
     }
 }
 
@@ -288,14 +322,21 @@ fn full_page(i: usize, t: Timestamp) -> Page {
     page
 }
 
-/// The per-page cap must guarantee the size cap, with the longest envelope there is.
+/// The per-page cap must guarantee the size cap, with the longest envelope there is: a firmware
+/// offer included, with the longest size there can be.
 #[test]
 fn ten_largest_pages_fit_the_size_cap() {
     let t = Timestamp::parse("2026-11-10T20:00:00Z").unwrap();
-    let snap = envelope((0..MAX_PAGES).map(|i| full_page(i, t)).collect());
+    let mut snap = envelope((0..MAX_PAGES).map(|i| full_page(i, t)).collect());
+    snap.firmware_update = Some(hub_protocol::firmware::FirmwareUpdate {
+        offer_id: "f".repeat(hub_protocol::firmware::OFFER_ID_HEX_LEN),
+        package_id: "f".repeat(hub_protocol::firmware::PACKAGE_ID_HEX_LEN),
+        size: MAX_FIRMWARE_UPDATE_BYTES,
+    });
     let size = serde_json::to_vec(&snap).unwrap().len();
     assert!(size <= MAX_SNAPSHOT_BYTES, "worst case is {size} bytes");
     snap.validate().unwrap();
+    assert_eq!(receive(&serde_json::to_vec(&snap).unwrap()).unwrap(), snap);
     // One byte more in a page is refused, not squeezed in.
     let mut over = snap.clone();
     over.pages[0].data = Some(serde_json::json!({ "pad": "x".repeat(MAX_PAGE_BYTES) }));

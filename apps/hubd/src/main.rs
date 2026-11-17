@@ -87,6 +87,21 @@ enum Command {
         #[arg(long, default_value = "Helper")]
         label: String,
     },
+    /// Print a one-time publisher string for a firmware maker's `hub-firmware login` (valid 10
+    /// minutes), without the app. A publisher may upload and list firmware packages, nothing else.
+    PairPublisher {
+        #[command(flatten)]
+        settings: Settings,
+        /// Host name or address the maker's computer should use, if not this machine's `.local` name.
+        #[arg(long, conflicts_with = "local")]
+        host: Option<String>,
+        /// For `hub-firmware` on this machine: use the address the hub listens on, loopback by default.
+        #[arg(long)]
+        local: bool,
+        /// A name for the publisher, such as the maker or their computer.
+        #[arg(long, default_value = "Publisher")]
+        label: String,
+    },
     /// List or revoke admin access.
     Admin {
         #[command(subcommand)]
@@ -290,6 +305,39 @@ async fn main() -> anyhow::Result<()> {
             println!("  {}\n", pairing.encode());
             println!("Paste it when the login asks. Don't share it or save it anywhere.");
         }
+        Command::PairPublisher {
+            settings,
+            host,
+            local,
+            label,
+        } => {
+            let config = settings.load()?;
+            let port = config.listen.port();
+            let host = match host {
+                Some(h) => h,
+                None if local => config.local_host(),
+                None => config.hosts().remove(0),
+            };
+            let hub = hubd::open_hub(config, clock)?;
+            let invite = hub.new_publisher_invite(&label, "command line")?;
+            let mut secret = [0u8; 16];
+            use base64::Engine;
+            let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&invite.secret)?;
+            secret.copy_from_slice(&raw);
+            let pairing = PairingString {
+                host,
+                port,
+                spki_sha256: hub.identity.spki_sha256,
+                secret,
+            };
+            println!("Publisher string for `hub-firmware login`. It works once, within 10 minutes:\n");
+            println!("  {}\n", pairing.encode());
+            println!("Hub fingerprint: {}", fingerprint(&hub.identity.spki_sha256));
+            println!(
+                "Paste it when `hub-firmware login` asks. It lets that computer upload firmware packages to \
+                 this hub, and nothing else. Don't share it or save it anywhere."
+            );
+        }
         Command::Admin { action, settings } => {
             let hub = hubd::open_hub(settings.load()?, clock.clone())?;
             match action {
@@ -438,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
                     expires_at: grant.expires_at,
                 },
                 wifi: None,
+                firmware: None,
             };
             let problems = bundle.problems();
             if !problems.is_empty() {

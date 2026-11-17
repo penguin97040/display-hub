@@ -15,7 +15,9 @@ pub const MAX_LINE_BYTES: usize = 16 * 1024;
 /// How long either side waits for each answer.
 pub const ANSWER_TIMEOUT_SECONDS: u64 = 10;
 
-/// What the manager sends.
+/// What the manager sends. A bundle is large next to a `hello`, but only a few messages are ever
+/// sent, so it isn't boxed.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToDisplay {
@@ -62,6 +64,9 @@ pub enum UsbErrorCode {
     AlreadyProvisioned,
     /// The display couldn't save the bundle.
     StorageFailed,
+    /// The display already trusts a different set of firmware keys, and only a first install over
+    /// USB (**Install firmware**, which erases it) can change them.
+    FirmwareKeysLocked,
     /// A code from a newer revision.
     #[serde(other)]
     Unrecognised,

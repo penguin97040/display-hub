@@ -8,6 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::firmware::FirmwareUpdate;
 use crate::limits::*;
 use crate::shapes::{self, classify_kind, id_problem, text_problem, CantShow, KindClass, PageContent};
 use crate::timestamp::Timestamp;
@@ -25,6 +26,22 @@ pub struct Snapshot {
     pub refresh_after_seconds: u32,
     /// In display order. The display shows exactly these pages, in this order.
     pub pages: Vec<Page>,
+    /// An update the owner asked this display to install, present only while the offer is open
+    /// (`docs/firmware-updates.md`). Read leniently: a member a display can't make sense of reads as
+    /// absent, and never costs it the pages.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_firmware_update"
+    )]
+    pub firmware_update: Option<FirmwareUpdate>,
+}
+
+fn lenient_firmware_update<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<FirmwareUpdate>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).ok())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -249,6 +266,9 @@ impl Snapshot {
                 )),
                 Ok(_) => {}
             }
+        }
+        if let Some(offer) = &self.firmware_update {
+            out.extend(offer.problems().into_iter().map(|p| v("firmware_update", p)));
         }
         if out.is_empty() {
             match serde_json::to_vec(self) {

@@ -155,6 +155,10 @@ pub struct DisplayView {
     /// hub that doesn't say, so the manager never reads that as "none".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pages: Option<Vec<String>>,
+    /// Its firmware: what it reported, its offer, the best package for it and `auto_update`. Left
+    /// out by a hub without signed updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub firmware: Option<DisplayFirmware>,
 }
 
 /// `POST /v1/admin/enrolments`: asks for a one-time secret to set up a display.
@@ -293,4 +297,169 @@ pub struct HelperView {
     pub created_at: Timestamp,
     pub revoked: bool,
     pub feeds: Vec<String>,
+}
+
+// ----- signed firmware updates (`docs/firmware-updates.md`) -----
+
+/// One package the hub holds, as `GET /v1/admin/firmware` (and the publisher's list) shows it, and
+/// as an upload answers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirmwarePackageView {
+    /// The SHA-256 of the whole file, as 64 lower-case hex digits. Only a name for the file.
+    pub package_id: String,
+    pub device_type: String,
+    pub hardware_revisions: Vec<String>,
+    pub firmware_version: String,
+    pub security_counter: u32,
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The key id of the key that signed it (64 hex digits), its fingerprint, and the owner's label
+    /// for it if there is one. A label is only as trustworthy as the hub.
+    pub signer_key_id: String,
+    pub signer_fingerprint: String,
+    #[serde(default)]
+    pub signer_label: Option<String>,
+    /// The whole file, and the part a display receives (without the USB-install parts).
+    pub size: u64,
+    pub update_size: u64,
+    /// Whether it has what a first install over USB needs.
+    pub usb_install: bool,
+    pub uploaded_at: Timestamp,
+    /// `admin` or `publisher`, with that credential's id and label.
+    pub uploaded_by_role: String,
+    pub uploaded_by: String,
+    #[serde(default)]
+    pub uploaded_by_label: Option<String>,
+    /// The displays it is on offer to now. Always empty in a publisher's list.
+    #[serde(default)]
+    pub offered_to: Vec<String>,
+}
+
+/// `PUT /v1/admin/devices/{id}/firmware-update`: offer this package to the display (the **Update**
+/// button).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirmwareOfferRequest {
+    pub package_id: String,
+}
+
+/// One offer and what became of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FirmwareOfferView {
+    pub offer_id: String,
+    pub package_id: String,
+    /// The version on offer.
+    pub firmware_version: String,
+    /// `offered` (waiting for the display to check in), `downloading`, `installed`, `refused`,
+    /// `failed`, `rolled_back`, `cancelled` or `expired`.
+    pub state: String,
+    /// For `refused` and `failed`, the display's reason (`unrecognised` for one this hub doesn't
+    /// know); for `cancelled`, why (`by_admin`, `replaced`, `package_deleted`, `display_removed`,
+    /// `package_missing`); for `installed`, `seen_in_heartbeat` when the display's report was lost.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// What the display said it was running in its last report about this offer.
+    #[serde(default)]
+    pub reported_version: Option<String>,
+    pub made_at: Timestamp,
+    pub expires_at: Timestamp,
+    pub updated_at: Timestamp,
+    #[serde(default)]
+    pub ended_at: Option<Timestamp>,
+}
+
+/// A display's firmware, in `GET /v1/admin/devices`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayFirmware {
+    /// What the display last reported: its trusted keys, security floor and spare partition.
+    /// `None` for firmware made before signed updates, which can't take them.
+    #[serde(default)]
+    pub reported: Option<hub_protocol::firmware::FirmwareInfo>,
+    /// Its open offer, or else its most recent one.
+    #[serde(default)]
+    pub offer: Option<FirmwareOfferView>,
+    /// The newest package the hub holds that passes every check the hub can make for this display
+    /// and is newer than what it runs, if any.
+    #[serde(default)]
+    pub available_package_id: Option<String>,
+    /// Whether the hub may offer updates by itself. Always off for now.
+    pub auto_update: bool,
+}
+
+/// The owner's label for a signing key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerView {
+    pub key_id: String,
+    pub fingerprint: String,
+    pub label: String,
+    pub updated_at: Timestamp,
+}
+
+/// `PUT /v1/admin/firmware/signers/{key_id}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignerLabel {
+    /// Plain text, such as the maker's name.
+    pub label: String,
+}
+
+/// `POST /v1/admin/publishers`: invites a firmware maker's `hub-firmware` tool to upload packages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewPublisher {
+    /// A name for the publisher, such as the maker or their computer. Plain text.
+    pub label: String,
+}
+
+/// The one-time secret for pairing a publisher (`hub-firmware login`), valid for 10 minutes.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublisherInvite {
+    pub secret: String,
+    pub expires_at: Timestamp,
+    pub identity: HubIdentity,
+}
+
+impl std::fmt::Debug for PublisherInvite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherInvite")
+            .field("secret", &"[redacted]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// `POST /v1/publisher/pair`: exchanges the invite's secret for a publisher token.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublisherPairRequest {
+    pub secret: String,
+}
+
+impl std::fmt::Debug for PublisherPairRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherPairRequest")
+            .field("secret", &"[redacted]")
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublisherPairResponse {
+    pub publisher_id: String,
+    /// `dhp_…`: may upload and list packages, and nothing else.
+    pub publisher_token: String,
+}
+
+impl std::fmt::Debug for PublisherPairResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PublisherPairResponse")
+            .field("publisher_id", &self.publisher_id)
+            .field("publisher_token", &"[redacted]")
+            .finish()
+    }
+}
+
+/// One publisher, as the app sees it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PublisherView {
+    pub id: String,
+    pub label: String,
+    pub created_at: Timestamp,
+    pub revoked: bool,
 }
