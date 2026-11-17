@@ -792,10 +792,10 @@ mod tests {
         let (svc, src) = (setting_index(&f, "service"), setting_index(&f, "source"));
         let labels = |f: &TemplateForm| f.options(src).into_iter().map(|o| o.label).collect::<Vec<_>>();
         f.pick(src, "helper");
-        assert!(labels(&f).contains(&"PC helper".to_string()));
+        assert!(labels(&f).contains(&"Helper".to_string()));
         // OpenCode has no helper: the option goes away, and the answer that used it is dropped.
         f.pick(svc, "opencode-go-plus");
-        assert!(!labels(&f).contains(&"PC helper".to_string()));
+        assert!(!labels(&f).contains(&"Helper".to_string()));
         let Input::Choice(chosen) = &f.inputs[src] else {
             panic!()
         };

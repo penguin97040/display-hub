@@ -1,4 +1,4 @@
-//! A client for a Display Hub, used by the desktop manager, the display simulator and the PC helper.
+//! A client for a Display Hub, used by the desktop manager, the display simulator and the usage helper.
 //!
 //! Every response body is read with a size cap, every request has a timeout, and failures are
 //! sorted into kinds a person can act on ([`ClientError`]).

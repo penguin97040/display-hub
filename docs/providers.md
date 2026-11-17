@@ -9,7 +9,7 @@ Each usage page on a display (a `meter` page whose feed is the service) shows on
 - No undocumented or private endpoints.
 - No scraping.
 - A share that isn't known is shown as unknown, never as zero.
-- Nothing provider-related runs on the Pi. The PC helper (`usage-helper`, built on the general [`hub-send`](helpers.md) library) only forwards what a provider's own tool already reports to its signed-in user on that PC.
+- Nothing provider-related runs on the Pi. The helper on a PC (`usage-helper`, built on the general [`hub-send`](helpers.md) library) only forwards what a provider's own tool already reports to its signed-in user on that PC.
 
 Documentation checked on 11/11/2026. Providers change these interfaces; re-check them before relying on a new release.
 
@@ -45,11 +45,11 @@ Neither Anthropic nor OpenAI documents an API that returns a consumer subscripti
    - A missing `rate_limits` sends nothing.
 4. At most once a minute, it queues the figures in an owner-only file and starts `usage-helper send-pending` as a separate, detached process: its own process group on Unix, no window on Windows. Claude Code therefore never waits on the network, and cancelling the status line doesn't cancel the send.
    - It sends when the figures change, or every five minutes while Claude Code is in use, so the page doesn't go stale for no reason.
-5. The hub stores the figures as `provider_reported`, with the time Claude Code reported them, on every Claude Max page whose figures come from "PC helper". They are stale after 30 minutes, so a display shows plainly when the PC has been off.
+5. The hub stores the figures as `provider_reported`, with the time Claude Code reported them, on every Claude Max page whose figures come from "Helper". They are stale after 30 minutes, so a display shows plainly when the PC has been off.
 
 **Set-up**, on the PC where you use Claude Code:
 
-1. In the manager, open **Settings**, then **PC helper**. Tick **Claude Max (Claude Code)**, choose **Create helper string**, then **Copy helper string**.
+1. In the manager, open **Settings**, then **Helper**. Tick **Claude Max (Claude Code)**, choose **Create helper string**, then **Copy helper string**.
 2. Run `usage-helper login` and paste the string when asked. It works once, within 10 minutes.
 3. In Claude Code's settings (`~/.claude/settings.json`, which is `%USERPROFILE%\.claude\settings.json` on Windows), add:
 
@@ -58,7 +58,7 @@ Neither Anthropic nor OpenAI documents an API that returns a consumer subscripti
    ```
 
    Use the full path to `usage-helper` if it isn't on PATH. On Windows, write it with forward slashes, such as `C:/Tools/usage-helper.exe claude-statusline`, because Claude Code runs it through Git Bash. If you already have a status line script, keep it, and pipe the same input into `usage-helper claude-statusline --quiet`, which forwards without printing.
-4. In the manager, set a Claude Max page's figures to **PC helper**.
+4. In the manager, set a Claude Max page's figures to **Helper**.
 
 `usage-helper status` shows the hub, what this PC reports and the last few sends.
 
@@ -107,7 +107,7 @@ Neither Anthropic nor OpenAI documents an API that returns a consumer subscripti
    2. Leave **Run only when user is logged on** selected, so it can reach your Credential Manager.
    3. Add a trigger **At log on**, repeating every 15 minutes indefinitely.
    4. For the action, choose **Start a program**: `usage-helper-sync.exe`. It's the same as `usage-helper codex-sync`, without a console window. Add `--codex <path>` if needed.
-4. In the manager, set a ChatGPT Plus page's figures to **PC helper**. Figures from a helper are stale after 30 minutes, so a 15-minute schedule keeps the page fresh while the PC is on.
+4. In the manager, set a ChatGPT Plus page's figures to **Helper**. Figures from a helper are stale after 30 minutes, so a 15-minute schedule keeps the page fresh while the PC is on.
 
 **Verification report (11/11/2026):**
 
@@ -123,14 +123,14 @@ OpenCode documents the Go plan's limits as dollar amounts per model:
 - the weekly window is 50%;
 - the monthly window is 100%.
 
-You track usage in its web console. Each API response carries a per-request `opencode.allowance` figure. But nothing documented reports the running totals, and no local file has them. So the page takes figures typed into the manager (**Pages**, **Edit**), shown as MANUAL, and stale after a day. The manager doesn't offer "PC helper" for it.
+You track usage in its web console. Each API response carries a per-request `opencode.allowance` figure. But nothing documented reports the running totals, and no local file has them. So the page takes figures typed into the manager (**Pages**, **Edit**), shown as MANUAL, and stale after a day. The manager doesn't offer "Helper" for it.
 
 ## Upgrading from `hubctl`
 
 `usage-helper` replaces the old `hubctl` tool and doesn't read the pairing `hubctl` kept, so a PC paired with `hubctl` needs a fresh pairing:
 
 1. In the manager, open **Settings** and remove the old helper.
-2. Make a new helper string (**Settings**, **PC helper**, **Create helper string**).
+2. Make a new helper string (**Settings**, **Helper**, **Create helper string**).
 3. Run `usage-helper login` and paste it.
 4. Point Claude Code's `statusLine` and the Codex schedule at `usage-helper` instead of `hubctl`.
 

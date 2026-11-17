@@ -45,11 +45,10 @@ scp -r dist\display-hub-pi <user>@raspberrypi.local:
 ssh <user>@raspberrypi.local
 ```
 
-Then on the Pi:
+Then on the Pi, from the folder you land in (your home folder), run the one command the manager's first-run guide shows with a **Copy** button:
 
 ```sh
-cd display-hub-pi
-sudo bash install.sh
+sudo bash display-hub-pi/install.sh
 ```
 
 The installer does the following:
@@ -60,10 +59,11 @@ The installer does the following:
 4. Installs what helpers need: `hub-send`, the `display-hub-helper` command and the example helper. It turns no helper on (see [Helpers on the Pi](#helpers-on-the-pi)).
 5. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
 6. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
+7. On a first install only, ends by printing a pairing string (the `dh1.…` line), ready for step 4. It is shown on the terminal only: the installer doesn't save it or send it to the log. An upgrade doesn't print one.
 
 ## 4. Pair the desktop manager
 
-On the Pi:
+After a first install, the installer has just printed a pairing string: skip to the copying below. If it has run out (it lasts 10 minutes), or you are pairing another PC, make a new one on the Pi:
 
 ```sh
 sudo -u display-hub hubd pair-admin

@@ -854,13 +854,21 @@ impl Manager {
             let op = this.model.submit_pairing();
             this.run(op, cx);
         });
+        let first = self.model.first_run();
         let lead = if self.model.needs_pairing {
             "This PC's credential no longer works. Pair again with a new string from the hub."
+        } else if first {
+            "Three short steps get your hub going. On the Pi there's just one command to run."
         } else {
             "Connect this PC to the hub on your Raspberry Pi. You need its pairing string, which you make on the Pi."
         };
+        let form_title = if first {
+            "3. Connect this app to your hub"
+        } else {
+            "Paste the string"
+        };
         let form = ui::with_ticks(
-            ui::panel(Some(("Paste the string", "Works once")), m).child(
+            ui::panel(Some((form_title, "Works once")), m).child(
                 ui::body(m)
                     .child(
                         div()
@@ -871,7 +879,14 @@ impl Manager {
                             .child(ui::p_muted(
                                 "It starts with dh1. and works once, for 10 minutes. The clipboard is cleared once \
                                  it's pasted.",
-                            ).text_size(px(14.0))),
+                            ).text_size(px(14.0)))
+                            .when(first, |d| {
+                                d.child(ui::p(
+                                    "The pairing string is a one-time code that lets this app manage your hub. The \
+                                     installer on the Pi printed it at the end. Copy that whole line, starting with \
+                                     dh1., and paste it here.",
+                                ))
+                            }),
                     )
                     .child(name)
                     .child(div().flex().child(pair)),
@@ -886,6 +901,34 @@ impl Manager {
             ("2", "Copy the whole line it prints, starting with dh1.", None),
             ("3", "Paste it here and choose Pair.", None),
         ];
+        if first {
+            let mut out = vec![self.head("Set up Display Hub", lead, m, cx).into_any_element()];
+            let guide = self.first_run_steps(m, cx);
+            out.extend(guide.into_iter().map(|d| d.into_any_element()));
+            out.push(div().w_full().max_w(px(860.0)).child(form).into_any_element());
+            let again = ui::with_ticks(
+                ui::panel(Some(("If the string has gone", "On the Pi")), m).child(
+                    ui::body(m)
+                        .child(ui::p(
+                            "A string only lasts 10 minutes and works once. If yours has run out or the screen \
+                             has cleared, make a new one by running this on the Pi:",
+                        ))
+                        .child(
+                            ui::data(model::NEW_PAIRING_COMMAND)
+                                .px(px(10.0))
+                                .py(px(6.0))
+                                .border_1()
+                                .border_color(c(LINE)),
+                        )
+                        .child(ui::p_muted(
+                            "The string carries the hub's key, so this app only ever talks to that hub. Anything \
+                             else answering at that address is refused before anything is sent.",
+                        )),
+                ),
+            );
+            out.push(div().w_full().max_w(px(860.0)).child(again).into_any_element());
+            return out;
+        }
         let help = ui::with_ticks(
             ui::panel(Some(("How to get one", "On the Pi")), m).child(
                 ui::body(m)
@@ -928,6 +971,182 @@ impl Manager {
         ]
     }
 
+    /// A command in its own box, with a Copy button under it.
+    fn command_box(
+        &mut self,
+        id: &str,
+        command: &'static str,
+        copied: bool,
+        cx: &mut Context<Self>,
+        on_copy: impl Fn(&mut Self) + 'static,
+    ) -> Div {
+        let copy = self.button(
+            id.to_string(),
+            if copied { "Copied" } else { "Copy command" },
+            Kind::Primary,
+            true,
+            cx,
+            move |this, _, cx| {
+                on_copy(this);
+                cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+            },
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{id}-text").into()))
+                    .role(Role::Group)
+                    .aria_label(SharedString::from(format!("Command to run: {command}")))
+                    .p(px(12.0))
+                    .border_1()
+                    .border_color(c(MUTED))
+                    .child(ui::data(command)),
+            )
+            .child(div().flex().child(copy))
+    }
+
+    /// Steps 1 and 2 of the first-run guide. Step 3, the pairing form, follows them.
+    fn first_run_steps(&mut self, m: Metrics, cx: &mut Context<Self>) -> Vec<Div> {
+        let need = |text: &'static str| {
+            div()
+                .flex()
+                .gap(px(12.0))
+                .child(ui::data("-").text_color(c(BEAK)))
+                .child(div().flex_1().min_w_0().child(ui::p(text)))
+        };
+        let needs = ui::with_ticks(
+            ui::panel(Some(("1. What you need", "")), m).child(
+                ui::body(m)
+                    .child(ui::p(
+                        "Display Hub has a small hub that runs all day, and this app that manages it. For that you need:",
+                    ))
+                    .child(need(
+                        "A computer that stays on all the time. A Raspberry Pi is the best choice, and it's what \
+                         this guide uses.",
+                    ))
+                    .child(need("A Display Hub screen. You'll add it a little later, from this app."))
+                    .child(need("This PC, on the same home network as the Pi.")),
+            ),
+        );
+        let copied = self.model.install_copied;
+        let command = self.command_box("install-copy", model::INSTALL_COMMAND, copied, cx, |this| {
+            this.model.copy_install();
+        });
+        let install = ui::with_ticks(
+            ui::panel(Some(("2. Set up the hub on the Pi", "")), m).child(
+                ui::body(m)
+                    .child(ui::p(
+                        "The hub keeps your pages and sends them to your displays. First copy the display-hub-pi \
+                         folder onto the Pi (the full guide says how). Then open a terminal on the Pi and run this \
+                         one command:",
+                    ))
+                    .child(command)
+                    .child(ui::p(
+                        "It takes about a minute, and ends by printing a pairing string for the next step.",
+                    ))
+                    .child(ui::p_muted(
+                        "Every step in detail, including getting the files: docs/deploy-raspberry-pi.md.",
+                    )),
+            ),
+        );
+        vec![
+            div().w_full().max_w(px(860.0)).child(needs),
+            div().w_full().max_w(px(860.0)).child(install),
+        ]
+    }
+
+    /// What's left to do after pairing, ticked off from what the hub really has.
+    fn guide_panel(&mut self, m: Metrics, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let items = self.model.guide_items()?;
+        let next = self.model.guide_next();
+        let total = items.len();
+        let done = items.iter().filter(|i| i.done).count();
+        let all_done = done == total;
+        let note = if all_done {
+            "All done".to_string()
+        } else {
+            format!("{done} of {total} done")
+        };
+        let busy = self.model.busy.is_some();
+        let mut rows = Vec::new();
+        for (i, item) in items.iter().enumerate() {
+            let go = item.go;
+            let button = (!item.done && Some(i) == next).then(|| {
+                self.button(
+                    format!("guide-go-{i}"),
+                    "Go there",
+                    Kind::Secondary,
+                    true,
+                    cx,
+                    move |this, _, cx| this.go(go, cx),
+                )
+            });
+            rows.push(
+                div()
+                    .id(ElementId::Name(format!("guide-item-{i}").into()))
+                    .role(Role::ListItem)
+                    .aria_label(SharedString::from(format!(
+                        "{}: {}",
+                        item.title,
+                        if item.done { "done" } else { "to do" }
+                    )))
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(12.0))
+                    .py(px(8.0))
+                    .border_t_1()
+                    .border_color(c(LINE))
+                    .child(div().w(px(64.0)).flex_none().child(if item.done {
+                        ui::tag("Done", BEAK)
+                    } else {
+                        ui::tag("To do", MUTED)
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .child(ui::h3(item.title))
+                            .child(ui::p_muted(item.help)),
+                    )
+                    .children(button),
+            );
+        }
+        let close = self.button(
+            "guide-close",
+            if all_done { "Finish" } else { "Hide this checklist" },
+            if all_done { Kind::Primary } else { Kind::Quiet },
+            !busy,
+            cx,
+            |this, _, cx| {
+                let op = this.model.dismiss_guide();
+                this.run(op, cx);
+            },
+        );
+        Some(
+            ui::with_ticks(
+                ui::panel(Some(("Finish setting up", &note)), m).child(
+                    ui::body(m)
+                        .child(ui::p(if all_done {
+                            "Everything is set up. Your displays will show your pages on their next check."
+                        } else {
+                            "Your hub is connected. Three things are left, and this list ticks itself off as you go."
+                        }))
+                        .child(div().flex().flex_col().children(rows))
+                        .child(div().flex().child(close))
+                        .child(ui::p_muted("You can bring this list back from Settings.")),
+                ),
+            )
+            .into_any_element(),
+        )
+    }
+
     fn overview(&mut self, m: Metrics, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let head = self
             .head(
@@ -958,7 +1177,9 @@ impl Manager {
                 m,
             ))
             .child(stat_panel(s.version.clone(), "Hub version", m));
-        let mut out = vec![head, stats.into_any_element()];
+        let mut out = vec![head];
+        out.extend(self.guide_panel(m, cx));
+        out.push(stats.into_any_element());
         if s.clock_synchronised == Some(false) {
             out.push(
                 self.notice_static(
@@ -2202,6 +2423,27 @@ impl Manager {
                     .child(div().flex().flex_wrap().gap(px(8.0)).child(copy_fp).child(copy_diag).child(forget)),
             ),
         );
+        let again = self.button(
+            "guide-again",
+            "Show the setup guide again",
+            Kind::Secondary,
+            self.model.busy.is_none(),
+            cx,
+            |this, _, cx| {
+                let op = this.model.show_guide_again();
+                this.run(op, cx);
+            },
+        );
+        let guide_panel = ui::with_ticks(
+            ui::panel(Some(("Setup guide", "")), m).child(
+                ui::body(m)
+                    .child(ui::p_muted(
+                        "The checklist on the Overview shows what's left to set up: a display, a page, and what the \
+                         display shows.",
+                    ))
+                    .child(div().flex().child(again)),
+            ),
+        );
         let helper_panel = self.helper_panel(m, cx);
         let about = ui::with_ticks(
             ui::panel(Some(("About", "")), m).child(
@@ -2230,6 +2472,7 @@ impl Manager {
                         .flex_col()
                         .gap(px(m.gap))
                         .child(hub_panel)
+                        .child(guide_panel)
                         .child(helper_panel),
                 )
                 .child(div().w(px(460.0)).flex_none().child(about))
@@ -2239,6 +2482,7 @@ impl Manager {
                 .flex_col()
                 .gap(px(m.gap))
                 .child(hub_panel)
+                .child(guide_panel)
                 .child(helper_panel)
                 .child(about)
         };
@@ -2336,9 +2580,10 @@ impl Manager {
         );
         let mut body = ui::body(m)
             .child(ui::p_muted(
-                "usage-helper runs on a PC where Claude Code or Codex is signed in, and forwards the plan limits they \
-                 report there. Pages whose figures are set to PC helper show them, marked REPORTED. It reads \
-                 nothing else: no browser data, passwords or other apps' tokens.",
+                "A helper is a small program that sends figures to your pages, and you can do without it. This one, usage-helper, runs on a computer \
+                 where Claude Code or Codex is signed in, and passes on the plan limits they report there. Pages whose \
+                 figures are set to Helper show them, marked REPORTED. It reads nothing else: no browser data, \
+                 passwords or other apps' tokens. (Helpers on the Pi are set up there, with the Pi status template.)",
             ))
             .child(div().flex().flex_wrap().gap(px(8.0)).child(claude).child(chatgpt))
             .child(div().flex().child(create));
@@ -2379,7 +2624,7 @@ impl Manager {
                     .child(ui::data(shown))
                     .child(div().flex().child(copy))
                     .child(ui::p_muted(
-                        "On that PC, run usage-helper login and paste it. Then add usage-helper claude-statusline as Claude \
+                        "On that computer, run usage-helper login and paste it. Then add usage-helper claude-statusline as Claude \
                          Code's status line, or schedule usage-helper-sync for Codex: docs/providers.md has the steps.",
                     )),
             );
@@ -2436,7 +2681,7 @@ impl Manager {
             }
             body = body.child(list);
         }
-        ui::with_ticks(ui::panel(Some(("PC helper", "Optional")), m).child(body))
+        ui::with_ticks(ui::panel(Some(("Helper", "On this computer")), m).child(body))
     }
 
     fn confirm_view(&mut self, c: &Confirm, m: Metrics, cx: &mut Context<Self>) -> impl IntoElement {

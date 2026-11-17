@@ -18,13 +18,13 @@
     {
       "key": "source",
       "label": "Figures from",
-      "help": "The PC helper can report Claude Max (from Claude Code) and ChatGPT Plus (from Codex). Nothing reports OpenCode Go Plus, so type its figures in.",
+      "help": "The helper (a small program on your computer) can report Claude Max (from Claude Code) and ChatGPT Plus (from Codex). Nothing reports OpenCode Go Plus, so type its figures in.",
       "type": "choice",
       "required": true,
       "default": "manual",
       "options": [
         { "value": "manual", "label": "Typed in" },
-        { "value": "helper", "label": "PC helper", "when": { "service": ["claude-max", "chatgpt-plus"] } },
+        { "value": "helper", "label": "Helper", "when": { "service": ["claude-max", "chatgpt-plus"] } },
         { "value": "demo", "label": "Demo figures" },
         { "value": "none", "label": "Nothing yet" }
       ]

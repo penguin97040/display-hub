@@ -76,6 +76,10 @@ if ! id "$user" >/dev/null 2>&1; then
   say "Created the $user system user."
 fi
 
+# A first install has no database yet. Only then does the end of this script make a pairing string.
+fresh_install=1
+[ -f "$data_dir/hub.db" ] && fresh_install=0
+
 # Upgrading a hub that has data: back it up first, while it still runs the old version.
 if [ -f "$data_dir/hub.db" ] && [ -x "$bin" ]; then
   install -d -m 0700 -o "$user" -g "$user" "$backups"
@@ -120,6 +124,15 @@ say ""
 say "Display Hub is running: $new_version"
 as_hub "$bin" check || say "(Problems above are worth a look. An unsynchronised clock fixes itself once the Pi reaches a time server.)"
 say ""
-say "Next, pair the desktop manager:"
-say "  sudo -u $user hubd pair-admin"
+if [ "$fresh_install" = 1 ]; then
+  # Printed to this terminal only, never saved: it works once, for 10 minutes.
+  say "Next, connect the Display Hub app on your PC. Copy the whole line below that starts with"
+  say "dh1 and paste it into the app. It works once, within 10 minutes. Don't share it or save it."
+  say ""
+  as_hub "$bin" pair-admin || say "(Couldn't make one. Try again with: sudo -u $user hubd pair-admin)"
+else
+  say "To connect another PC to this hub, make a pairing string:"
+  say "  sudo -u $user hubd pair-admin"
+fi
+say ""
 say "To send your own data to the hub from this Pi, see: sudo display-hub-helper help"

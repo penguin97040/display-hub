@@ -65,7 +65,7 @@ pub fn logout(p: &Profile) -> Result<String, String> {
             "Forgot the hub on this PC. Remove the helper in the manager's Settings too, to cut it off."
                 .into(),
         ),
-        None => Ok("This PC helper wasn't set up.".into()),
+        None => Ok("This helper wasn't set up.".into()),
     }
 }
 
@@ -201,7 +201,7 @@ fn send(p: &Profile, report: &UsageReport) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     Ok(if accepted.updated.is_empty() {
         format!(
-            "sent, but no page uses it yet: in the manager, set a {} page's figures to \"PC helper\"",
+            "sent, but no page uses it yet: in the manager, set a {} page's figures to \"Helper\"",
             report.service.default_title()
         )
     } else {

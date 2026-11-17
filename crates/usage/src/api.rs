@@ -1,4 +1,4 @@
-//! Usage pages as the manager and the PC helper see them, and the checks their figures pass before
+//! Usage pages as the manager and the usage helper see them, and the checks their figures pass before
 //! they are sent. The hub takes these as ordinary meter pages.
 
 use hub_core::api::{FeedContent, NewPage, PageContentInput, PageView};
@@ -117,7 +117,7 @@ pub fn clean_figures(service: Service, input: &[ManualMetric]) -> Result<Vec<Met
     Ok(metrics)
 }
 
-/// One allowance figure, as typed in or reported by a PC helper.
+/// One allowance figure, as typed in or reported by a helper.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ManualMetric {
     pub window: Window,

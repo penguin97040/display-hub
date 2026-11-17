@@ -146,7 +146,7 @@ impl Hub {
         let mut feeds = feeds.to_vec();
         feeds.sort();
         feeds.dedup();
-        let label = clean_title(label).unwrap_or_else(|| "PC helper".into());
+        let label = clean_title(label).unwrap_or_else(|| "Helper".into());
         let detail = serde_json::to_string(&InviteDetail {
             label: label.clone(),
             feeds,

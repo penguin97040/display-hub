@@ -272,6 +272,13 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             s.client.revoke_helper(&s.token, &id).await.map_err(c)?;
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
+        Op::SaveGuide { dismissed } => {
+            let dir = ctx.settings_dir.clone();
+            blocking(move || settings::save_guide_dismissed(&dir, dismissed))
+                .await
+                .map_err(Failure::Settings)?;
+            Ok(Outcome::GuideSaved)
+        }
         Op::ListPorts => Ok(Outcome::Ports(blocking(list_ports).await)),
         Op::SendUsb { port, bundle } => blocking(move || send_usb(&port, &bundle))
             .await

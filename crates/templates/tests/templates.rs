@@ -11,7 +11,7 @@ fn answers(v: Value) -> Settings {
 }
 
 /// The sources the manager offers a usage page today (`apps/hub-manager/src/model.rs`,
-/// `sources_for`): the PC helper reports Claude Max and ChatGPT Plus only.
+/// `sources_for`): the helper reports Claude Max and ChatGPT Plus only.
 fn usage_sources(service: Service) -> Vec<Source> {
     [Source::Manual, Source::Helper, Source::Demo, Source::None]
         .into_iter()
@@ -89,7 +89,7 @@ fn usage_limits_offers_the_pc_helper_only_where_something_reports() {
             json!({"service": "opencode-go-plus", "source": "helper"}),
         ))
         .unwrap_err();
-    assert_eq!(e, "PC helper isn't available when Service is OpenCode Go Plus.");
+    assert_eq!(e, "Helper isn't available when Service is OpenCode Go Plus.");
     // Not answering takes the defaults, as the manager's form starts.
     let pages = t.make_pages(&Settings::new()).unwrap();
     assert_eq!(

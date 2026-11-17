@@ -14,7 +14,7 @@ They are in `crates/templates/templates/`:
 
 | Id | Makes |
 |---|---|
-| `usage-limits/1` | A usage-limit meter for Claude Max, ChatGPT Plus or OpenCode Go Plus, exactly as the manager's "Add page" does today. "PC helper" is offered only for Claude Max and ChatGPT Plus. |
+| `usage-limits/1` | A usage-limit meter for Claude Max, ChatGPT Plus or OpenCode Go Plus, exactly as the manager's "Add page" does today. "Helper" is offered only for Claude Max and ChatGPT Plus. |
 | `pi-status/1` | A big number page for the `pi-status` helper on the hub's Pi, with the one command that starts that helper. |
 | `big-number/1`, `short-text/1`, `list/1`, `meter/1` | One typed-in page of each ready-made shape. |
 
@@ -133,7 +133,7 @@ A `when` (on an option or a page) names one or more settings, each with a value 
 
 It matches when every setting named has one of the values listed. A multi-choice setting matches when any of its chosen options is listed. Only choice, multi-choice and yes/no settings can be tested, and only with values they can have. An option can't depend on its own setting.
 
-When an answer picks an option whose condition doesn't match, the form refuses it with a sentence such as "PC helper isn't available when Service is OpenCode Go Plus." If the answers make no pages at all, the form says so.
+When an answer picks an option whose condition doesn't match, the form refuses it with a sentence such as "Helper isn't available when Service is OpenCode Go Plus." If the answers make no pages at all, the form says so.
 
 ## In code
 

@@ -176,7 +176,7 @@ impl std::fmt::Debug for EnrolmentGrant {
     }
 }
 
-/// `POST /v1/admin/helpers`: invites a helper, such as the PC helper, to send pages to some feeds.
+/// `POST /v1/admin/helpers`: invites a helper, such as the usage helper, to send pages to some feeds.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NewHelper {
     /// A name for the helper, such as the PC's name. Plain text.

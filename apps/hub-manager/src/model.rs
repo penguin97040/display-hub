@@ -123,6 +123,10 @@ pub enum Op {
         name: String,
     },
     NewHelper(NewHelper),
+    /// Remembers whether the setup checklist was closed, in `manager.json`.
+    SaveGuide {
+        dismissed: bool,
+    },
     RevokeHelper {
         id: String,
     },
@@ -158,6 +162,7 @@ pub enum Outcome {
         invite: HelperInvite,
         refresh: Refresh,
     },
+    GuideSaved,
     Ports(Vec<PortInfo>),
     Sent(UsbDisplay),
     Saved(PathBuf),
@@ -202,6 +207,7 @@ pub enum Busy {
         port: String,
     },
     SavingFile,
+    SavingGuide,
     Forgetting,
 }
 
@@ -216,6 +222,7 @@ impl Busy {
             Busy::Ports => "Looking for USB ports",
             Busy::Sending { .. } => "Sending over USB",
             Busy::SavingFile => "Saving the file",
+            Busy::SavingGuide => "Saving",
             Busy::Forgetting => "Forgetting the hub",
         }
     }
@@ -247,7 +254,7 @@ impl Confirm {
             Confirm::RevokeHelper { label, .. } => (
                 format!("Remove the helper on {label}?"),
                 "Its credential stops working straight away. Pages it fed keep their last figures, and go stale. On \
-                 that PC, usage-helper logout tidies up."
+                 that computer, usage-helper logout tidies up."
                     .into(),
                 "Remove helper",
             ),
@@ -580,7 +587,7 @@ impl TickView {
     }
 }
 
-/// Setting up a PC helper (`usage-helper`).
+/// Setting up a helper on this computer (`usage-helper`).
 #[derive(Default)]
 pub struct HelperForm {
     pub claude: bool,
@@ -611,6 +618,27 @@ pub struct Model {
     pub tick_changes: HashMap<String, HashMap<String, bool>>,
     pub enrol: Enrol,
     pub helper: HelperForm,
+    /// The person closed the setup checklist (kept in `manager.json`).
+    pub guide_dismissed: bool,
+    /// The install command was put on the clipboard.
+    pub install_copied: bool,
+}
+
+/// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
+/// `docs/deploy-raspberry-pi.md` shows the same line (a test keeps them together).
+pub const INSTALL_COMMAND: &str = "sudo bash display-hub-pi/install.sh";
+/// For a pairing string that has expired or was lost.
+pub const NEW_PAIRING_COMMAND: &str = "sudo -u display-hub hubd pair-admin";
+
+/// One line of the setup checklist on the Overview.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuideItem {
+    pub title: &'static str,
+    pub help: &'static str,
+    /// Ticked off by what the hub really has, not by clicking.
+    pub done: bool,
+    /// Where to go to do it.
+    pub go: Section,
 }
 
 impl Model {
@@ -642,7 +670,84 @@ impl Model {
                 chatgpt: true,
                 ..HelperForm::default()
             },
+            guide_dismissed: false,
+            install_copied: false,
         }
+    }
+
+    /// Starts with the setup checklist already closed or not, as `manager.json` says.
+    pub fn with_guide_dismissed(mut self, dismissed: bool) -> Self {
+        self.guide_dismissed = dismissed;
+        self
+    }
+
+    // ---- the setup guide -------------------------------------------------------------------------
+
+    /// No hub has ever been paired here: show the whole first-run guide, not a bare pairing screen.
+    pub fn first_run(&self) -> bool {
+        self.hub.is_none()
+    }
+
+    /// The text to put on the clipboard for the install step, and a note that it was copied.
+    pub fn copy_install(&mut self) -> &'static str {
+        self.install_copied = true;
+        INSTALL_COMMAND
+    }
+
+    /// The steps left after pairing, ticked from what the hub has. `None` when it shouldn't show:
+    /// closed, not paired, or the hub hasn't answered yet.
+    pub fn guide_items(&self) -> Option<Vec<GuideItem>> {
+        if self.guide_dismissed || !self.connected() || self.last.is_none() {
+            return None;
+        }
+        let shows = self
+            .displays()
+            .iter()
+            .any(|d| self.shown_ids(&d.id).is_some_and(|ids| !ids.is_empty()));
+        Some(vec![
+            GuideItem {
+                title: "Add a display",
+                help: "Plug it into this PC with a USB cable. The app sets it up for you.",
+                done: !self.displays().is_empty(),
+                go: Section::Displays,
+            },
+            GuideItem {
+                title: "Add a page",
+                help: "A page is one thing to show, such as your usage limits. Pick one from a template.",
+                done: !self.pages().is_empty(),
+                go: Section::Pages,
+            },
+            GuideItem {
+                title: "Choose what a display shows",
+                help: "Tick the pages you want on each display.",
+                done: shows,
+                go: Section::Displays,
+            },
+        ])
+    }
+
+    /// The first checklist step not done yet, if any.
+    pub fn guide_next(&self) -> Option<usize> {
+        self.guide_items()?.iter().position(|i| !i.done)
+    }
+
+    /// Closes the checklist and remembers it.
+    pub fn dismiss_guide(&mut self) -> Option<Op> {
+        self.set_guide(true)
+    }
+
+    /// Settings: brings the guide back.
+    pub fn show_guide_again(&mut self) -> Option<Op> {
+        self.section = Section::Overview;
+        self.set_guide(false)
+    }
+
+    fn set_guide(&mut self, dismissed: bool) -> Option<Op> {
+        if self.busy.is_some() {
+            return None;
+        }
+        self.guide_dismissed = dismissed;
+        self.start(Busy::SavingGuide, Op::SaveGuide { dismissed })
     }
 
     pub fn connected(&self) -> bool {
@@ -1247,7 +1352,7 @@ impl Model {
         Some(self.hub_now(now)?.seconds_until(b.enrolment.expires_at))
     }
 
-    // ---- PC helpers -----------------------------------------------------------------------------------
+    // ---- helpers -----------------------------------------------------------------------------------
 
     pub fn helpers(&self) -> &[HelperView] {
         self.last
@@ -1274,7 +1379,7 @@ impl Model {
                 next: Next::None,
             });
         }
-        let label = clean_title(self.pc_name.trimmed()).unwrap_or_else(|| "PC helper".into());
+        let label = clean_title(self.pc_name.trimmed()).unwrap_or_else(|| "Helper".into());
         self.helper.string = None;
         self.start(
             Busy::Saving { done: String::new() },
@@ -1360,7 +1465,7 @@ impl Model {
                 self.take_refresh(refresh, now);
                 self.notice = Some(Guidance::done(
                     "Paired",
-                    "This PC's credential is in the system's credential store. Add pages, then add a display.",
+                    "This PC can now manage your hub. The checklist on the Overview shows what's left to do.",
                 ));
             }
             Ok(Outcome::Refreshed(r)) => {
@@ -1465,6 +1570,7 @@ impl Model {
                     }
                 }
             }
+            Ok(Outcome::GuideSaved) => {}
             Ok(Outcome::Ports(p)) => {
                 self.enrol.ports = p;
                 self.enrol.scanned = true;
@@ -2719,6 +2825,118 @@ mod tests {
             now,
         );
         assert_eq!(m.notice.as_ref().unwrap().detail, "");
+    }
+
+    fn done_flags(m: &Model) -> Vec<bool> {
+        m.guide_items()
+            .expect("the checklist shows")
+            .iter()
+            .map(|i| i.done)
+            .collect()
+    }
+
+    #[test]
+    fn with_no_hub_the_first_run_guide_shows_and_there_is_no_checklist() {
+        let m = Model::new(None, "PC");
+        assert!(m.first_run() && m.guide_items().is_none());
+        // A hub whose credential stopped working is not a first run: it just needs pairing again.
+        let (mut m, _) = connected(vec![]);
+        m.needs_pairing = true;
+        assert!(!m.first_run() && m.guide_items().is_none());
+    }
+
+    #[test]
+    fn the_checklist_ticks_itself_from_the_hubs_state() {
+        // Nothing yet.
+        let (m, _) = with_ticks(0, &[]);
+        assert_eq!(done_flags(&m), [false, false, false]);
+        assert_eq!(m.guide_next(), Some(0));
+        // A page but no display.
+        let (m, _) = with_ticks(2, &[]);
+        assert_eq!(done_flags(&m), [false, true, false]);
+        assert_eq!(m.guide_next(), Some(0));
+        // A display that shows nothing.
+        let (m, _) = with_ticks(2, &[("d1", "Desk", vec![])]);
+        assert_eq!(done_flags(&m), [true, true, false]);
+        assert_eq!(m.guide_next(), Some(2));
+        // A display with no pages made yet can't be showing one.
+        let (m, _) = with_ticks(0, &[("d1", "Desk", vec![])]);
+        assert_eq!(done_flags(&m), [true, false, false]);
+        assert_eq!(m.guide_next(), Some(1));
+        // A display showing a page: all done.
+        let (m, _) = with_ticks(2, &[("d1", "Desk", vec!["p01".into()])]);
+        assert_eq!(done_flags(&m), [true, true, true]);
+        assert_eq!(m.guide_next(), None);
+        // A tick for a page that no longer exists doesn't count.
+        let (m, _) = with_ticks(1, &[("d1", "Desk", vec!["gone".into()])]);
+        assert_eq!(done_flags(&m), [true, true, false]);
+    }
+
+    #[test]
+    fn the_checklist_waits_for_the_hub_and_never_shows_when_closed() {
+        let hub = SavedHub::new(
+            "192.168.1.20",
+            8443,
+            &[0xab; 32],
+            "Desk PC",
+            ts("2026-11-10T19:00:00Z"),
+        );
+        let m = Model::new(Some(hub), "Desk PC");
+        assert!(m.guide_items().is_none(), "no answer from the hub yet");
+        let (mut m, _) = with_ticks(1, &[]);
+        assert!(m.guide_items().is_some());
+        m.guide_dismissed = true;
+        assert!(m.guide_items().is_none());
+    }
+
+    #[test]
+    fn closing_the_checklist_saves_it_and_settings_brings_it_back() {
+        let (mut m, now) = with_ticks(0, &[]);
+        let Some(Op::SaveGuide { dismissed: true }) = m.dismiss_guide() else {
+            panic!("saves the choice")
+        };
+        assert!(m.guide_dismissed && m.guide_items().is_none());
+        m.finish(Ok(Outcome::GuideSaved), now);
+        assert!(m.busy.is_none() && m.notice.is_none());
+        m.section = Section::Settings;
+        let Some(Op::SaveGuide { dismissed: false }) = m.show_guide_again() else {
+            panic!("saves the choice")
+        };
+        assert!(!m.guide_dismissed && m.section == Section::Overview && m.guide_items().is_some());
+    }
+
+    #[test]
+    fn closing_the_checklist_waits_while_something_else_is_running() {
+        let (mut m, _) = with_ticks(0, &[]);
+        m.busy = Some(Busy::Refreshing);
+        assert!(m.dismiss_guide().is_none());
+        assert!(!m.guide_dismissed, "nothing was saved, so nothing changes");
+    }
+
+    #[test]
+    fn a_failed_save_of_the_choice_says_so() {
+        let (mut m, now) = with_ticks(0, &[]);
+        m.dismiss_guide();
+        m.finish(Err(Failure::Settings("disk full".into())), now);
+        assert!(m.notice.as_ref().is_some_and(|n| n.detail.contains("disk full")));
+    }
+
+    #[test]
+    fn forgetting_the_hub_brings_the_whole_guide_back() {
+        let (mut m, now) = with_ticks(0, &[]);
+        m.guide_dismissed = true;
+        m.finish(Ok(Outcome::Forgotten), now);
+        assert!(m.first_run() && !m.guide_dismissed);
+    }
+
+    #[test]
+    fn the_install_command_is_the_one_in_the_pi_guide() {
+        let docs = include_str!("../../../docs/deploy-raspberry-pi.md");
+        assert!(docs.contains(INSTALL_COMMAND) && docs.contains(NEW_PAIRING_COMMAND));
+        let mut m = Model::new(None, "PC");
+        assert!(!m.install_copied);
+        assert_eq!(m.copy_install(), INSTALL_COMMAND);
+        assert!(m.install_copied);
     }
 }
 

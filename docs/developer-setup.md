@@ -6,12 +6,12 @@
 |---|---|
 | `crates/hub-protocol` | Protocol v1: wire types, bounds and validation. No I/O. The contract with firmware. |
 | `crates/hub-core` | Domain: pages as stored, data quality, freshness, admin and helper API bodies and snapshot building. Nothing about any particular kind of page. No I/O. |
-| `crates/usage` | Usage limits (Claude Max, ChatGPT Plus, OpenCode Go Plus) as meter pages: services, windows, figure checks and demo figures. Used by the manager and the PC helper, never by the hub. |
-| `crates/hub-client` | Client for the hub's HTTP API, used by the simulator, the manager and the PC helper. |
+| `crates/usage` | Usage limits (Claude Max, ChatGPT Plus, OpenCode Go Plus) as meter pages: services, windows, figure checks and demo figures. Used by the manager and the helper on the PC, never by the hub. |
+| `crates/hub-client` | Client for the hub's HTTP API, used by the simulator, the manager and the helper on the PC. |
 | `apps/hubd` | The hub service (library plus a command-line binary). |
 | `apps/hub-manager` | The native desktop manager (GPUI). |
 | `apps/hub-send` | The general "send data" tool and library: pairing, token storage and sending a page body to a feed ([helpers.md](helpers.md)). |
-| `apps/usage-helper` | The PC helper: forwards Claude Code and Codex usage figures, built on `hub-send`'s library ([providers.md](providers.md)). |
+| `apps/usage-helper` | The helper on a PC: forwards Claude Code and Codex usage figures, built on `hub-send`'s library ([providers.md](providers.md)). |
 | `crates/os-secrets` | Tokens in the OS credential store, shared by the manager, `hub-send` and `usage-helper`. |
 | `tools/display-simulator` | Emulates a display, for testing without hardware. |
 | `protocol/v1` | JSON Schema and valid and invalid example snapshots. |
@@ -113,7 +113,7 @@ This builds a small C client configured like ESP-IDF's HTTP client and checks fo
 
 CI runs it too.
 
-## The PC helper against a local hub
+## The helper on the PC against a local hub
 
 ```sh
 cargo run -p hubd -- pair-helper --data-dir dev-data/hub --listen 127.0.0.1:8443 --host 127.0.0.1 --feed claude-max
@@ -123,7 +123,7 @@ echo '{"rate_limits":{"five_hour":{"used_percentage":42,"resets_at":1900000000}}
 cargo run -p usage-helper -- --config-dir dev-data/helper status
 ```
 
-`pair-helper` makes the same invite as the manager's **Settings**, **PC helper**: each `--feed` is a feed the helper may send to, and Claude Max's feed is `claude-max`. The figures appear on Claude Max pages whose figures are set to **PC helper**.
+`pair-helper` makes the same invite as the manager's **Settings**, **Helper**: each `--feed` is a feed the helper may send to, and Claude Max's feed is `claude-max`. The figures appear on Claude Max pages whose figures are set to **Helper**.
 
 ## Building for the Raspberry Pi
 

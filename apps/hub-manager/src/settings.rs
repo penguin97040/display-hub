@@ -63,6 +63,9 @@ impl SavedHub {
 struct FileV1 {
     version: u32,
     hub: Option<SavedHub>,
+    /// The person closed the setup checklist on the Overview. Older files don't have this.
+    #[serde(default)]
+    guide_dismissed: bool,
 }
 
 /// Where settings live: `dir` if given (for testing), else the user's configuration folder.
@@ -73,7 +76,7 @@ pub fn folder(dir: Option<&Path>) -> Option<PathBuf> {
     }
 }
 
-pub fn load(dir: &Path) -> Result<Option<SavedHub>, String> {
+fn read(dir: &Path) -> Result<Option<FileV1>, String> {
     let path = dir.join(FILE);
     let bytes = match std::fs::read(&path) {
         Ok(b) => b,
@@ -95,11 +98,32 @@ pub fn load(dir: &Path) -> Result<Option<SavedHub>, String> {
             path.display()
         ));
     }
-    Ok(file.hub)
+    Ok(Some(file))
+}
+
+pub fn load(dir: &Path) -> Result<Option<SavedHub>, String> {
+    Ok(read(dir)?.and_then(|f| f.hub))
+}
+
+/// Whether the setup checklist was closed. A missing or unreadable file means not closed.
+pub fn load_guide_dismissed(dir: &Path) -> bool {
+    read(dir).ok().flatten().is_some_and(|f| f.guide_dismissed)
+}
+
+/// Saves the paired hub. Forgetting it (`None`) also brings the setup guide back, for the next hub.
+pub fn save(dir: &Path, hub: Option<&SavedHub>) -> Result<(), String> {
+    let guide_dismissed = hub.is_some() && load_guide_dismissed(dir);
+    write(dir, hub, guide_dismissed)
+}
+
+/// Remembers whether the setup checklist was closed, keeping the paired hub as it is.
+pub fn save_guide_dismissed(dir: &Path, dismissed: bool) -> Result<(), String> {
+    let hub = read(dir)?.and_then(|f| f.hub);
+    write(dir, hub.as_ref(), dismissed)
 }
 
 /// Writes atomically, so a crash leaves the old file or the new one.
-pub fn save(dir: &Path, hub: Option<&SavedHub>) -> Result<(), String> {
+fn write(dir: &Path, hub: Option<&SavedHub>, guide_dismissed: bool) -> Result<(), String> {
     let fail = |e: std::io::Error| format!("couldn't save settings in {}: {e}", dir.display());
     std::fs::create_dir_all(dir).map_err(fail)?;
     let path = dir.join(FILE);
@@ -107,6 +131,7 @@ pub fn save(dir: &Path, hub: Option<&SavedHub>) -> Result<(), String> {
     let body = serde_json::to_vec_pretty(&FileV1 {
         version: VERSION,
         hub: hub.cloned(),
+        guide_dismissed,
     })
     .expect("serialises");
     let mut opts = std::fs::OpenOptions::new();
@@ -146,5 +171,28 @@ mod tests {
         assert_eq!(load(dir.path()).unwrap(), None);
         std::fs::write(dir.path().join(FILE), "{").unwrap();
         assert!(load(dir.path()).unwrap_err().contains("damaged"));
+    }
+
+    #[test]
+    fn closing_the_guide_is_remembered_and_forgetting_the_hub_brings_it_back() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!load_guide_dismissed(dir.path()));
+        let hub = SavedHub::new("pi.local", 8443, &[1; 32], "PC", Timestamp::from_unix(0).unwrap());
+        save(dir.path(), Some(&hub)).unwrap();
+        save_guide_dismissed(dir.path(), true).unwrap();
+        assert!(load_guide_dismissed(dir.path()));
+        assert_eq!(load(dir.path()).unwrap(), Some(hub.clone()));
+        // Saving the hub again (a refresh of its details) doesn't undo it.
+        save(dir.path(), Some(&hub)).unwrap();
+        assert!(load_guide_dismissed(dir.path()));
+        save_guide_dismissed(dir.path(), false).unwrap();
+        assert!(!load_guide_dismissed(dir.path()));
+        save_guide_dismissed(dir.path(), true).unwrap();
+        save(dir.path(), None).unwrap();
+        assert!(!load_guide_dismissed(dir.path()));
+        // A file from before this setting existed still loads.
+        std::fs::write(dir.path().join(FILE), r#"{"version":1,"hub":null}"#).unwrap();
+        assert_eq!(load(dir.path()).unwrap(), None);
+        assert!(!load_guide_dismissed(dir.path()));
     }
 }

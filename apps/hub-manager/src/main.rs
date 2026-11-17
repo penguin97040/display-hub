@@ -89,13 +89,14 @@ fn main() {
             }),
         ),
     };
+    let guide_dismissed = settings::load_guide_dismissed(&dir);
     let ctx = worker::Ctx::new(
         Arc::new(os_secrets::OsStore {
             service: "display-hub-manager",
         }),
         dir,
     );
-    let mut model = Model::new(saved, &pc_name());
+    let mut model = Model::new(saved, &pc_name()).with_guide_dismissed(guide_dismissed);
     let mut start = None;
     if let Some(hub) = model.hub.clone() {
         match ctx.resume(&hub) {

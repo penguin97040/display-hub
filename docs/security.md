@@ -99,13 +99,13 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 - **Setup details over USB** go only to the port you choose. **Save as a file** writes a file you should delete once the display has checked in; the manager says so.
 - **What it talks to:** only the paired hub, pinned by key. It makes no other network requests and collects nothing.
 
-## Helpers (`hub-send`, and the PC helper `usage-helper`)
+## Helpers (`hub-send`, and the helper on a PC, `usage-helper`)
 
 - **What it reads:** only what Claude Code passes its status line on stdin, and what `codex app-server` answers. It reads no browser data, passwords or other apps' tokens, and calls no provider endpoint itself ([providers.md](providers.md)).
 - **What it holds:** a helper token (`dhc_`), in the OS credential store by default. `connection.json` has only the hub's address and key hash. The helper string is read from stdin, never the command line, so it stays out of shell history and process lists.
 - **The file store:** a headless Linux service with no keyring (a Raspberry Pi helper under systemd) can ask `hub-send` for `--store file` (or `HUB_SEND_STORE=file`) instead. The token is then the file `token` in the helper's folder, created owner-only (0600) in an owner-only folder (0700), by writing a new file and renaming it into place. `hub-send` refuses to use it if it is a link, belongs to another user, or can be read by its group or anyone else. It is Unix only, and never chosen unless asked for.
-- **What its token can do:** send page content to the feeds it was invited for (for the PC helper, Claude Max's, ChatGPT Plus's or both), and only to pages of those feeds whose figures come from "PC helper" and whose kind matches. The hub refuses other feeds (403), content dated more than five minutes ahead, and content that breaks the page rules, such as shares outside 0–100 or a page over 3072 bytes. It can't read anything, change pages, or act as an admin or a display. `usage-helper` also checks the figures against the service's windows before sending them.
-- **Cutting it off:** **Settings**, **PC helper**, **Remove** in the manager, or `hubd helper revoke <id>` on the Pi (`hubd helper list` shows the ids). Its token stops working at once. `logout` (`usage-helper logout` or `hub-send logout`) deletes it from that computer.
+- **What its token can do:** send page content to the feeds it was invited for (for the helper on the PC, Claude Max's, ChatGPT Plus's or both), and only to pages of those feeds whose figures come from "Helper" and whose kind matches. The hub refuses other feeds (403), content dated more than five minutes ahead, and content that breaks the page rules, such as shares outside 0–100 or a page over 3072 bytes. It can't read anything, change pages, or act as an admin or a display. `usage-helper` also checks the figures against the service's windows before sending them.
+- **Cutting it off:** **Settings**, **Helper**, **Remove** in the manager, or `hubd helper revoke <id>` on the Pi (`hubd helper list` shows the ids). Its token stops working at once. `logout` (`usage-helper logout` or `hub-send logout`) deletes it from that computer.
 - **Invites** work once, within 10 minutes. A reused invite is recorded as an `ALARM_` audit event, as pairing codes are.
 
 ## Credentials
@@ -114,7 +114,7 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 |---|---|---|---|
 | Admin token `dha_` | Desktop manager (OS credential store) | Everything under `/v1/admin/` | SHA-256 hash |
 | Device token `dhd_` | One display (encrypted NVS) | Read the snapshot, send heartbeats, as itself only | SHA-256 hash |
-| Helper token `dhc_` | A helper, such as the PC helper `usage-helper` (OS credential store, or an owner-only file for headless `hub-send`) | Send page content to the feeds it was invited for, for pages whose source is "PC helper" and whose kind matches. Nothing else. | SHA-256 hash |
+| Helper token `dhc_` | A helper, such as the helper on a PC, `usage-helper` (OS credential store, or an owner-only file for headless `hub-send`) | Send page content to the feeds it was invited for, for pages whose source is "Helper" and whose kind matches. Nothing else. | SHA-256 hash |
 | Pairing and enrolment secrets | Pairing string, bundle | Exchanged once for a token, within 10 minutes | SHA-256 hash |
 
 - Each token type has its own prefix. A token used on another role's route gets `403`.

@@ -6,7 +6,7 @@ A helper is invited to one or more **feeds**. A feed is just a name, such as `ga
 
 ### Pages for a helper
 
-For now the manager's own "Add page" makes helper pages for usage limits only (as "PC helper"). **Templates** ([templates.md](templates.md)) describe other pages, such as `pi-status/1`, and the hub keeps the template and settings each page was made with, but the manager doesn't offer templates yet. Until it does, any other page is made with the hub's admin API: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
+The manager makes helper pages from **templates** ([templates.md](templates.md)), such as usage limits and `pi-status/1`: in the manager, open **Pages**, then **Add from template**. Any other page can be made with the hub's admin API: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
 
 ## Pairing
 

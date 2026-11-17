@@ -83,6 +83,18 @@ docker cp "$root/tools/pi-container-test/probe-helper" "$name:/root/display-hub/
 box chmod 0644 /root/display-hub/hubd /root/display-hub/hub-send /root/display-hub/display-hub-helper /root/display-hub/helpers/pi-status
 out=$(box bash /root/display-hub/install.sh 2>&1) || { echo "$out"; bad "install.sh"; }
 check "install.sh starts the service" active
+install_pairing=$(grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' <<<"$out" | head -1 || true)
+check "install.sh prints a pairing string on a first install" test -n "$install_pairing"
+hub=https://127.0.0.1:8443
+# The manager's side: the string install.sh printed must really work, and at once (it expires).
+pairing=$install_pairing
+secret=$(python3 -c 'import base64, sys
+p = sys.argv[1].split(".")[1]
+b = base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))
+print(base64.urlsafe_b64encode(b[34:50]).decode().rstrip("="))' "$pairing")
+admin=$(curl -sk --noproxy '*' --max-time 10 -H 'Content-Type: application/json' \
+  -d "{\"secret\": \"$secret\", \"label\": \"container test\"}" "$hub/v1/admin/pair" |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["admin_token"])')
 check "the hub answers on 8443" healthy
 check "the unit file verifies" box systemd-analyze verify /etc/systemd/system/display-hub.service
 check "the data folder is private" bash -c "[ \"\$(docker exec $name stat -c '%a %U' /var/lib/display-hub)\" = '700 display-hub' ]"
@@ -148,14 +160,6 @@ check "restored: the display still polls" display_online
 # probe helper that tries to get out of its sandbox.
 hub=https://127.0.0.1:8443
 api() { curl -sk --noproxy '*' --max-time 10 -H "Authorization: Bearer $admin" -H 'Content-Type: application/json' "$@"; }
-pairing=$(as_hub hubd pair-admin --host 127.0.0.1 | grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}')
-secret=$(python3 -c 'import base64, sys
-p = sys.argv[1].split(".")[1]
-b = base64.urlsafe_b64decode(p + "=" * (-len(p) % 4))
-print(base64.urlsafe_b64encode(b[34:50]).decode().rstrip("="))' "$pairing")
-admin=$(curl -sk --noproxy '*' --max-time 10 -H 'Content-Type: application/json' \
-  -d "{\"secret\": \"$secret\", \"label\": \"container test\"}" "$hub/v1/admin/pair" |
-  python3 -c 'import json, sys; print(json.load(sys.stdin)["admin_token"])')
 api -o /dev/null -d '{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status", "id": "pi-status"}' "$hub/v1/admin/pages"
 api -o /dev/null -d '{"title": "Probe", "kind": "text", "source": "helper", "feed": "probe", "id": "probe"}' "$hub/v1/admin/pages"
 # A page's data field and when it was last updated, as "<value> <time>".
@@ -236,6 +240,9 @@ check "helper: the exposure score is low (under $helper_max)" awk "BEGIN { exit 
 out=$(box bash /root/display-hub/install.sh 2>&1) || bad "install.sh again"
 check "upgrade: backed up first" grep -q "Backed up the current hub" <<<"$out"
 check "upgrade: settings kept" grep -q "Kept your" <<<"$out"
+# shellcheck disable=SC2016  # $0 is expanded by the inner bash, on purpose
+check "upgrade: no pairing string is printed" bash -c '! grep -qE "dh1\." <<<"$0"' "$out"
+check "the pairing string was never logged" not_in_journal "$install_pairing"
 check "upgrade: running, same key" bash -c "docker exec $name systemctl is-active --quiet display-hub && [ \"\$(docker exec $name runuser -u display-hub -- hubd fingerprint)\" = '$key' ]"
 check "upgrade: helpers kept" listed '^pi-status +5min'
 check "upgrade: a helper still runs" box sh -c 'display-hub-helper run-now pi-status >/dev/null'

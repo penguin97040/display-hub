@@ -258,7 +258,7 @@ cmd_add() {
     say "Fix the program, then try it with: sudo $me run-now $name"
   fi
   say "The hub shows what it sends on pages of that kind whose figures come from a helper"
-  say "(\"PC helper\" in the manager) and whose feed is ${feeds[0]}. Check on it with: sudo $me list"
+  say "(\"Helper\" in the manager) and whose feed is ${feeds[0]}. Check on it with: sudo $me list"
 }
 
 cmd_list() {

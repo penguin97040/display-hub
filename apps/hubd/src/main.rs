@@ -84,7 +84,7 @@ enum Command {
         #[arg(long = "feed", required = true)]
         feeds: Vec<String>,
         /// A name for the helper, such as the PC's name.
-        #[arg(long, default_value = "PC helper")]
+        #[arg(long, default_value = "Helper")]
         label: String,
     },
     /// List or revoke admin access.

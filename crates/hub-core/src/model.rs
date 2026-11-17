@@ -14,7 +14,7 @@ pub enum Source {
     Demo,
     /// Typed in by the owner through the manager.
     Manual,
-    /// Sent by a paired helper, such as the PC helper, to the page's feed.
+    /// Sent by a paired helper, such as the usage helper, to the page's feed.
     Helper,
     /// Nothing yet. The page shows as unavailable, with the reason.
     None,

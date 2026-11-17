@@ -50,7 +50,7 @@ Start `dist\hub-manager.exe`. Check each of these, and note anything that differ
 | 3 | Paste into Notepad | Nothing: the manager cleared the clipboard once it read the string. |
 | 4 | Open **Credential Manager** (Start, type "Credential Manager"), then **Windows Credentials** | An entry mentioning `display-hub-manager` under Generic Credentials. That is where the admin token lives; it's in no file. |
 | 5 | Close the manager and start it again | It reconnects straight to the Overview, with no pairing. |
-| 6 | **Pages**: choose **Add from template**, then **Usage limits**, and add Claude Max ("Typed in"), ChatGPT Plus ("Demo") and OpenCode Go Plus ("Nothing yet") | Each appears in the list with MANUAL, DEMO or UNAVAILABLE, and a message along the bottom. Choosing a different service changes which sources the form offers ("PC helper" isn't offered for OpenCode Go Plus). |
+| 6 | **Pages**: choose **Add from template**, then **Usage limits**, and add Claude Max ("Typed in"), ChatGPT Plus ("Demo") and OpenCode Go Plus ("Nothing yet") | Each appears in the list with MANUAL, DEMO or UNAVAILABLE, and a message along the bottom. Choosing a different service changes which sources the form offers ("Helper" isn't offered for OpenCode Go Plus). |
 | 7 | **Edit** Claude Max: type `42` and `3h 20m` for five-hour, leave weekly empty, press Enter | A meter at 42 % with "Resets in 3 h 19 min". Weekly says "Not known", never 0 %. |
 | 7a | **Add from template** again: **Big number**, **Short text**, **List**, **Meter**, then **Pi status** | Each appears with its kind named ("Big number", "Short text", "List", "Meter"). **Edit** lets you type in its content, and the list and the Overview draw it. Pi status offers a command with a **Copy** button; paste it into Notepad to check it, and it starts with `sudo display-hub-helper add pi-status`. The hub holds up to 50 pages. |
 | 8 | Move pages with the arrow buttons, then Tab to a page's button and press **Alt+↑** or **Alt+↓** | The order changes and stays changed after **Refresh**. |
@@ -98,20 +98,20 @@ Sending setup details over USB needs the display firmware to speak the serial ex
 
 The manager opens the port with DTR set and RTS clear, so an ESP32 board shouldn't reset when the port opens. If one does, the manager repeats its hello every 2 seconds until the board answers.
 
-## 6. The PC helper (optional)
+## 6. The helper on the PC (optional)
 
 Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) has the full set-up. If this PC was paired with the old `hubctl`, first remove that helper in **Settings**, then log in with `usage-helper` as below ([providers.md](providers.md), "Upgrading from `hubctl`").
 
-1. In the manager, open **Settings**, then **PC helper**. Choose **Create helper string**, then **Copy helper string**.
+1. In the manager, open **Settings**, then **Helper**. Choose **Create helper string**, then **Copy helper string**.
 2. Run `.\dist\usage-helper.exe login` and paste it. Expect "Paired with the hub at 127.0.0.1:8443 …".
-3. In **Pages**, **Edit** a Claude Max page and set its figures to **PC helper**.
+3. In **Pages**, **Edit** a Claude Max page and set its figures to **Helper**.
 4. **Claude Code:** add `{"statusLine": {"type": "command", "command": "C:/path/to/dist/usage-helper.exe claude-statusline"}}` to `%USERPROFILE%\.claude\settings.json`, and send Claude a message. Use forward slashes: Claude Code runs the command through Git Bash, where backslashes are escape characters.
    - Expect a status line like `Opus 4.7 · 5h 42% · 7d 18%`.
    - Within a minute, the page shows those figures as REPORTED.
    - `.\dist\usage-helper.exe status` shows the send.
 5. **Codex:** run `.\dist\usage-helper.exe codex-sync --dry-run`.
    - Expect "Codex reports five-hour …, weekly …".
-   - Without `--dry-run`, it sends them to a ChatGPT Plus page set to **PC helper**.
+   - Without `--dry-run`, it sends them to a ChatGPT Plus page set to **Helper**.
    - In Task Scheduler, `dist\usage-helper-sync.exe` should run with no window.
 6. Remove the helper in **Settings**. The next send is refused, and `usage-helper status` says why.
 
