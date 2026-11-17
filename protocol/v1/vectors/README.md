@@ -4,6 +4,8 @@ Each file is one case: a hub response, how long the display has held it, and exa
 
 They come from the reference display (`tools/display-simulator`, `src/conform.rs`). `display-simulator conform check` proves these files still match it, and a test runs the same check in CI. After a deliberate change, regenerate them with `display-simulator conform write`.
 
+The vectors for signed firmware updates are in [`../firmware`](../firmware/README.md), in a format of their own. The same two commands check and write them, but because signatures are random, `write` keeps every firmware vector that is still right and writes only the missing or out-of-date ones.
+
 ## Format
 
 ```json

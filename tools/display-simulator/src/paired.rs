@@ -4,8 +4,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use hub_client::{ClientError, HubClient};
+use hub_client::{ClientError, FirmwareStream, HubClient};
 use hub_protocol::device::DeviceInfo;
+use hub_protocol::firmware::FirmwareReport;
 use hub_protocol::provisioning::{Bundle, HubLocation};
 use hub_protocol::Snapshot;
 use serde::{Deserialize, Serialize};
@@ -26,14 +27,21 @@ impl std::fmt::Debug for State {
     }
 }
 
-pub fn simulator_info() -> DeviceInfo {
-    DeviceInfo {
-        device_type: "llm-usage-display".into(),
-        firmware_version: "0.0.0-simulator".into(),
-        hardware_revision: "simulated".into(),
-        protocol_version: hub_protocol::PROTOCOL_VERSION,
-        firmware: None,
-    }
+/// What the display in `dir` says about itself: its running firmware's version, and its trusted
+/// keys, floor and spare slot (`firmware::store::device_info`). A state folder that can't be read
+/// reports a factory board.
+pub fn device_info(dir: &Path) -> DeviceInfo {
+    crate::firmware::store::device_info(dir).unwrap_or_else(|e| {
+        eprintln!("display-simulator: couldn't read the firmware state: {e}");
+        let board = crate::firmware::store::Board::default();
+        DeviceInfo {
+            device_type: crate::firmware::store::DEVICE_TYPE.into(),
+            firmware_version: board.factory_version,
+            hardware_revision: crate::firmware::store::HARDWARE_REVISION.into(),
+            protocol_version: hub_protocol::PROTOCOL_VERSION,
+            firmware: None,
+        }
+    })
 }
 
 fn state_file(dir: &Path) -> PathBuf {
@@ -76,7 +84,9 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-/// Erases everything the display holds, as a factory reset must.
+/// A factory reset: erases the hub details, token, saved pages and any received bundle. The firmware
+/// state beside them (trusted keys, floor, app slots and update record) is kept: those belong to the
+/// firmware's maker, not to the hub the display was paired with.
 pub fn reset(dir: &Path) -> std::io::Result<()> {
     for f in [state_file(dir), cache_file(dir), crate::usb::bundle_file(dir)] {
         match std::fs::remove_file(f) {
@@ -115,10 +125,16 @@ pub async fn enrol(bundle: &Bundle, dir: &Path) -> Result<State, String> {
             problems.join("; ")
         ));
     }
+    match crate::firmware::store::accept_bundle(dir, bundle.firmware.as_ref()) {
+        Ok(Ok(())) => {}
+        Ok(Err(locked)) => return Err(locked.to_string()),
+        Err(e) => return Err(format!("couldn't save the firmware keys: {e}")),
+    }
     let secret = bundle.enrolment.secret.clone();
+    let info = device_info(dir);
     let resp = first_host(&bundle.hub, |c| {
-        let secret = secret.clone();
-        async move { c.enrol(&secret, simulator_info()).await }
+        let (secret, info) = (secret.clone(), info.clone());
+        async move { c.enrol(&secret, info).await }
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -142,11 +158,31 @@ pub async fn snapshot(state: &State) -> Result<Snapshot, ClientError> {
     .await
 }
 
-pub async fn heartbeat(state: &State) -> Result<(), ClientError> {
+/// A heartbeat saying `info`, from [`device_info`].
+pub async fn heartbeat(state: &State, info: &DeviceInfo) -> Result<(), ClientError> {
     let token = state.device_token.clone();
     first_host(&state.hub, |c| {
         let token = token.clone();
-        async move { c.heartbeat(&token, &simulator_info()).await }
+        async move { c.heartbeat(&token, info).await }
+    })
+    .await
+}
+
+/// Starts reading a firmware download.
+pub async fn firmware_stream(state: &State, package_id: &str) -> Result<FirmwareStream, ClientError> {
+    let token = state.device_token.clone();
+    first_host(&state.hub, |c| {
+        let token = token.clone();
+        async move { c.firmware_stream(&token, package_id).await }
+    })
+    .await
+}
+
+pub async fn firmware_report(state: &State, report: &FirmwareReport) -> Result<(), ClientError> {
+    let token = state.device_token.clone();
+    first_host(&state.hub, |c| {
+        let token = token.clone();
+        async move { c.firmware_report(&token, report).await }
     })
     .await
 }

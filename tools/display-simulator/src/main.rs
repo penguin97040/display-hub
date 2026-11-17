@@ -2,10 +2,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use display_simulator::firmware::store::NextStart;
+use display_simulator::firmware::{self, Acted, Firmware, Started, TrialOutcome};
 use display_simulator::render::screen;
 use display_simulator::{paired, ClockJitter, Device, Link};
 use hub_client::HubClient;
 use hub_core::{Clock, SystemClock};
+use std::sync::Arc;
 
 /// Emulates a Display Hub display.
 #[derive(Parser)]
@@ -42,9 +45,9 @@ impl Target {
         }
     }
 
-    async fn heartbeat(&self) {
-        if let Target::Paired(s) = self {
-            if let Err(e) = paired::heartbeat(s).await {
+    async fn heartbeat(&self, dir: Option<&std::path::Path>) {
+        if let (Target::Paired(s), Some(dir)) = (self, dir) {
+            if let Err(e) = paired::heartbeat(s, &paired::device_info(dir)).await {
                 eprintln!("display-simulator: heartbeat not sent: {e}");
             }
         }
@@ -55,6 +58,52 @@ impl Target {
 enum ConformAction {
     Check,
     Write,
+}
+
+#[derive(Subcommand)]
+enum FirmwareAction {
+    /// Print the trusted keys, floor, app slots and update record.
+    Show {
+        #[arg(long)]
+        state: PathBuf,
+    },
+    /// Change the simulated board, set keys on a display that has none, or set test switches.
+    Set {
+        #[arg(long)]
+        state: PathBuf,
+        /// The version the factory image reports, until an update replaces it.
+        #[arg(long)]
+        version: Option<String>,
+        /// The size of each app partition, in bytes.
+        #[arg(long)]
+        slot_bytes: Option<u64>,
+        /// A key to trust (repeat for up to three): 130 hex digits, or a key file's public half. Only
+        /// for a display with no keys, as a provisioning bundle would set them.
+        #[arg(long = "trust")]
+        trust: Vec<String>,
+        /// The starting security floor, with --trust.
+        #[arg(long, requires = "trust")]
+        floor: Option<u32>,
+        /// How the next new firmware behaves on its trial boot.
+        #[arg(long, value_enum)]
+        next_start: Option<NextStart>,
+        /// Lose power once this many bytes of the next image are written.
+        #[arg(long)]
+        power_cut_after: Option<u64>,
+        /// Make the next write to the spare slot fail.
+        #[arg(long)]
+        flash_fails: bool,
+    },
+    /// Simulate the app's Install firmware: erase everything, write the package's image, then take
+    /// the keys and floor the app's provisioning bundle would carry (the package's key_set, or the key
+    /// that signed it, and its security counter).
+    Install {
+        #[arg(long)]
+        state: PathBuf,
+        /// The package (`.dhfw`). It needs no USB-install parts here.
+        #[arg(long)]
+        package: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -99,17 +148,28 @@ enum Command {
         #[arg(long)]
         max_wait: Option<u64>,
     },
-    /// Conformance vectors for display firmware (protocol/v1/vectors): `check` proves the files match
-    /// this reference display; `write` regenerates them from protocol/v1.
+    /// Conformance vectors for display firmware (protocol/v1/vectors and protocol/v1/firmware):
+    /// `check` proves the files match this reference display; `write` regenerates the snapshot vectors
+    /// from protocol/v1, and writes any firmware vector that is missing or out of date (signatures are
+    /// random, so the others are kept as they are).
     Conform {
         #[arg(value_enum)]
         action: ConformAction,
-        /// The vectors folder.
+        /// The snapshot vectors folder.
         #[arg(long, default_value = "protocol/v1/vectors")]
         dir: PathBuf,
-        /// The protocol folder the vectors are built from (for `write`).
+        /// The firmware update vectors folder.
+        #[arg(long, default_value = "protocol/v1/firmware")]
+        firmware_dir: PathBuf,
+        /// The protocol folder the snapshot vectors are built from (for `write`).
         #[arg(long, default_value = "protocol/v1")]
         protocol: PathBuf,
+    },
+    /// This display's signed-update state: show it, change the board or test switches, or simulate
+    /// the app's first install over USB.
+    Firmware {
+        #[command(subcommand)]
+        action: FirmwareAction,
     },
     /// Check snapshot files against protocol v1 as a hub must follow it.
     Validate {
@@ -173,36 +233,57 @@ async fn main() -> ExitCode {
         Command::Conform {
             action,
             dir,
+            firmware_dir,
             protocol,
         } => match action {
-            ConformAction::Write => match display_simulator::conform::write(&protocol, &dir) {
-                Ok(n) => {
-                    println!("Wrote {n} vectors to {}.", dir.display());
+            ConformAction::Write => {
+                let snapshots = display_simulator::conform::write(&protocol, &dir).map_err(|e| e.to_string());
+                let updates = firmware::vectors::write(&firmware_dir);
+                match (snapshots, updates) {
+                    (Ok(n), Ok((written, kept))) => {
+                        println!("Wrote {n} vectors to {}.", dir.display());
+                        println!(
+                            "Wrote {written} firmware vectors to {}, and kept {kept} that are still right.",
+                            firmware_dir.display()
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        eprintln!("display-simulator: {e}");
+                        ExitCode::FAILURE
+                    }
+                }
+            }
+            ConformAction::Check => {
+                let results = [
+                    display_simulator::conform::check(&dir),
+                    firmware::vectors::check(&firmware_dir),
+                ];
+                let mut total = 0;
+                let mut all = Vec::new();
+                for r in results {
+                    match r {
+                        Ok((n, failures)) if n > 0 => {
+                            total += n;
+                            all.extend(failures);
+                        }
+                        Ok(_) => all.push("a vectors folder is empty".into()),
+                        Err(e) => all.push(e.to_string()),
+                    }
+                }
+                if all.is_empty() {
+                    println!("All {total} vectors match the reference display.");
                     ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("display-simulator: {e}");
-                    ExitCode::FAILURE
-                }
-            },
-            ConformAction::Check => match display_simulator::conform::check(&dir) {
-                Ok((n, failures)) if failures.is_empty() && n > 0 => {
-                    println!("All {n} vectors match the reference display.");
-                    ExitCode::SUCCESS
-                }
-                Ok((n, failures)) => {
-                    for f in &failures {
+                } else {
+                    for f in &all {
                         eprintln!("FAIL {f}");
                     }
-                    eprintln!("{} of {n} vectors failed", failures.len());
+                    eprintln!("{} of {total} vectors failed", all.len());
                     ExitCode::FAILURE
                 }
-                Err(e) => {
-                    eprintln!("display-simulator: {e}");
-                    ExitCode::FAILURE
-                }
-            },
+            }
         },
+        Command::Firmware { action } => firmware_command(action),
         Command::Reset { state } => match paired::reset(&state) {
             Ok(()) => {
                 println!("Erased the display's credentials and saved data.");
@@ -237,14 +318,47 @@ async fn main() -> ExitCode {
                 Err(code) => return code,
             };
             let mut device = Device::new(cache, Box::new(ClockJitter::default()));
+            let mut updates = match (&hub, &conn.state) {
+                (Target::Paired(_), Some(dir)) => match Firmware::open(dir, Arc::new(SystemClock)) {
+                    Ok(mut fw) => match fw.boot() {
+                        Ok(started) => {
+                            println!("{}", started_text(&started));
+                            Some(fw)
+                        }
+                        Err(e) => {
+                            eprintln!("display-simulator: couldn't start: {e}");
+                            return ExitCode::FAILURE;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("display-simulator: couldn't read the firmware state: {e}");
+                        return ExitCode::FAILURE;
+                    }
+                },
+                _ => None,
+            };
             let mut polls = 0;
             let mut last_heartbeat: Option<std::time::Instant> = None;
             loop {
-                let mut wait = device.accept(clock.now(), hub.poll().await);
+                let result = hub.poll().await;
+                let offer = result.as_ref().ok().and_then(|s| s.firmware_update.clone());
+                if let (Some(fw), Target::Paired(state)) = (updates.as_mut(), &hub) {
+                    if let Err(e) = act_on_updates(fw, state, &result, offer.as_ref()).await {
+                        eprintln!("display-simulator: firmware update: {e}");
+                    }
+                }
+                let mut wait = device.accept(clock.now(), result);
+                if updates.as_ref().is_some_and(Firmware::in_trial) {
+                    // On trial, check in often: it has five minutes to reach the hub.
+                    wait = wait.min(std::time::Duration::from_secs(TRIAL_POLL_SECONDS));
+                }
+                // Not while on trial: the hub counts a heartbeat naming the new version as installed,
+                // and the firmware hasn't been marked good yet.
                 if matches!(device.link, Link::Online { .. })
+                    && !updates.as_ref().is_some_and(Firmware::in_trial)
                     && last_heartbeat.is_none_or(|t| t.elapsed().as_secs() >= 3600)
                 {
-                    hub.heartbeat().await;
+                    hub.heartbeat(conn.state.as_deref()).await;
                     last_heartbeat = Some(std::time::Instant::now());
                 }
                 if let Some(max) = max_wait {
@@ -289,6 +403,260 @@ async fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// How often new firmware on trial polls, so it reaches the hub well within its five minutes.
+const TRIAL_POLL_SECONDS: u64 = 15;
+
+fn started_text(s: &Started) -> String {
+    match s {
+        Started::Normal { version } => format!("Running firmware {version}."),
+        Started::Trial { version } => {
+            format!("Started new firmware {version} on trial: it must reach the hub within five minutes.")
+        }
+        Started::RolledBack { version } => {
+            format!("The update didn't start properly, so this display went back to {version}.")
+        }
+        Started::Interrupted { version } => {
+            format!("An update was cut short. Still running {version}; it will be reported as failed.")
+        }
+    }
+}
+
+/// One poll's part in signed updates: the trial boot's check-in, any unanswered report, and the
+/// offer in the snapshot.
+async fn act_on_updates(
+    fw: &mut Firmware,
+    state: &paired::State,
+    result: &Result<hub_protocol::Snapshot, hub_client::ClientError>,
+    offer: Option<&hub_protocol::firmware::FirmwareUpdate>,
+) -> std::io::Result<()> {
+    if fw.in_trial() {
+        let outcome = match fw.check_in_with(result)? {
+            TrialOutcome::Waiting => fw.tick()?,
+            other => other,
+        };
+        match outcome {
+            TrialOutcome::MarkedGood { version } => {
+                println!("Firmware {version} reached the hub and is now marked good.")
+            }
+            TrialOutcome::RolledBack(s) => println!("{}", started_text(&s)),
+            TrialOutcome::Waiting | TrialOutcome::NotInTrial => {}
+        }
+    }
+    fw.send_report(state).await?;
+    if let Some(offer) = offer {
+        match fw.on_offer(state, offer).await? {
+            Acted::Ignored | Acted::Busy => {}
+            Acted::Waiting { seconds } => {
+                println!("A firmware update is offered; waiting {seconds} s before trying.")
+            }
+            Acted::Refused(r) => println!("Refused the offered firmware ({r}). Nothing was written."),
+            Acted::Failed(f) => println!(
+                "The firmware update failed ({}). The old firmware is still running.",
+                f.reason().as_str()
+            ),
+            Acted::PowerCut => {
+                println!("The power went off during the update (a test switch). Starting again.");
+                println!("{}", started_text(&fw.boot()?));
+            }
+            Acted::Restarted(s) => println!("Installed the update and restarted. {}", started_text(&s)),
+        }
+    }
+    Ok(())
+}
+
+/// A key to trust: 130 hex digits, or a key file's public half.
+fn trusted_key(arg: &str) -> Result<String, String> {
+    if let Some(k) =
+        firmware_package::PublicKey::from_hex(arg).filter(firmware_package::PublicKey::is_valid_point)
+    {
+        return Ok(k.to_hex());
+    }
+    let bytes = std::fs::read(arg)
+        .map_err(|e| format!("{arg:?} is neither a public key nor a readable key file: {e}"))?;
+    firmware_package::keyfile::public_key(&bytes)
+        .map(|k| k.to_hex())
+        .map_err(|e| format!("{arg} isn't a key file: {e}"))
+}
+
+fn firmware_command(action: FirmwareAction) -> ExitCode {
+    let result = match action {
+        FirmwareAction::Show { state } => show_firmware(&state),
+        FirmwareAction::Set {
+            state,
+            version,
+            slot_bytes,
+            trust,
+            floor,
+            next_start,
+            power_cut_after,
+            flash_fails,
+        } => (|| -> Result<(), String> {
+            let mut board = firmware::store::board(&state).map_err(|e| e.to_string())?;
+            if let Some(v) = version {
+                firmware_package::manifest::check_firmware_version(&v)
+                    .map_err(|p| format!("--version {p}"))?;
+                board.factory_version = v;
+            }
+            if let Some(n) = slot_bytes {
+                if n == 0 || n > firmware_package::limits::MAX_IMAGE_SIZE {
+                    return Err(format!(
+                        "--slot-bytes must be from 1 to {}",
+                        firmware_package::limits::MAX_IMAGE_SIZE
+                    ));
+                }
+                board.slot_bytes = n;
+            }
+            firmware::store::set_board(&state, &board).map_err(|e| e.to_string())?;
+            if !trust.is_empty() {
+                let keys = trust
+                    .iter()
+                    .map(|t| trusted_key(t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let section = hub_protocol::firmware::BundleFirmware {
+                    trusted_keys: keys,
+                    security_counter: floor.unwrap_or(0),
+                };
+                let problems = section.problems();
+                if !problems.is_empty() {
+                    return Err(problems.join("; "));
+                }
+                let store = firmware::store::keys(&state).map_err(|e| e.to_string())?;
+                if !store.trusted_keys.is_empty() {
+                    return Err(
+                        "this display already trusts keys; only `firmware install` can change them".into(),
+                    );
+                }
+                firmware::store::accept_bundle(&state, Some(&section))
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())?;
+            }
+            let mut switches = firmware::store::switches(&state).map_err(|e| e.to_string())?;
+            if let Some(n) = next_start {
+                switches.next_start = n;
+            }
+            if power_cut_after.is_some() {
+                switches.power_cut_after_image_bytes = power_cut_after;
+            }
+            if flash_fails {
+                switches.flash_fails = true;
+            }
+            firmware::store::set_switches(&state, &switches).map_err(|e| e.to_string())?;
+            show_firmware(&state)
+        })(),
+        FirmwareAction::Install { state, package } => (|| -> Result<(), String> {
+            let checked =
+                firmware_package::check_file(&package).map_err(|e| format!("{}: {e}", package.display()))?;
+            let bytes = std::fs::read(&package).map_err(|e| e.to_string())?;
+            firmware::store::install_firmware(&state, &checked, &bytes).map_err(|e| e.to_string())?;
+            let section = firmware::store::bundle_for(&checked);
+            firmware::store::accept_bundle(&state, Some(&section))
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?;
+            println!(
+                "Erased the display and installed {} {}, signed by {}.",
+                checked.manifest.device_type,
+                checked.manifest.firmware_version,
+                checked.signer().fingerprint()
+            );
+            println!("Set it up with `usb` or `enrol`, as after a factory reset.");
+            show_firmware(&state)
+        })(),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("display-simulator: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn show_firmware(state: &std::path::Path) -> Result<(), String> {
+    use firmware::store;
+    let text = |e: std::io::Error| e.to_string();
+    let board = store::board(state).map_err(text)?;
+    let keys = store::keys(state).map_err(text)?;
+    let ota = store::ota(state).map_err(text)?;
+    let record = store::record(state).map_err(text)?;
+    let switches = store::switches(state).map_err(text)?;
+    println!(
+        "Firmware {} ({}, {})",
+        store::running_version(state).map_err(text)?,
+        store::DEVICE_TYPE,
+        store::HARDWARE_REVISION
+    );
+    if keys.trusted_keys.is_empty() {
+        println!("Trusted keys: none, so every update is refused");
+    } else {
+        println!("Trusted keys:");
+        for k in keys.keys() {
+            println!("  {}", k.fingerprint());
+        }
+    }
+    println!("Security floor: {}", keys.security_floor);
+    println!("App slots: {} bytes each", board.slot_bytes);
+    for name in [store::SlotName::A, store::SlotName::B] {
+        let slot = ota.slot(name);
+        let marks = [
+            (ota.running == name).then_some("running"),
+            (ota.boot == name).then_some("boots next"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        println!(
+            "  {}: {:?}, {}{}",
+            name.as_str(),
+            slot.state,
+            match (slot.state, slot.firmware_version.as_deref()) {
+                (store::SlotState::Empty, _) => "nothing to start",
+                (_, Some(v)) => v,
+                (_, None) => "factory image",
+            },
+            if marks.is_empty() {
+                String::new()
+            } else {
+                format!(" ({marks})")
+            }
+        );
+    }
+    if let Some(id) = &record.last_offer_id {
+        println!("Last offer acted on: {id}");
+    }
+    if let Some(p) = &record.pending {
+        println!(
+            "Waiting for its trial boot: {} (security counter {})",
+            p.firmware_version, p.security_counter
+        );
+    }
+    if let Some(r) = &record.last_result {
+        println!(
+            "Last result: {}{}{}",
+            r.state.as_str(),
+            r.reason.map(|x| format!(" ({})", x.as_str())).unwrap_or_default(),
+            if r.answered { "" } else { ", not yet reported" }
+        );
+    }
+    println!("Failures in a row: {}", record.failures_in_row);
+    let mut on = Vec::new();
+    match switches.next_start {
+        NextStart::Normal => {}
+        NextStart::Fails => on.push("the next new firmware fails to start".to_string()),
+        NextStart::NoHub => on.push("the next new firmware can't reach the hub".to_string()),
+    }
+    if let Some(n) = switches.power_cut_after_image_bytes {
+        on.push(format!("the power goes off after {n} bytes of the next image"));
+    }
+    if switches.flash_fails {
+        on.push("the next write to the spare slot fails".into());
+    }
+    if !on.is_empty() {
+        println!("Test switches: {}", on.join("; "));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

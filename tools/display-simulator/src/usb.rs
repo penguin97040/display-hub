@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use hub_protocol::provisioning::Bundle;
 use hub_protocol::usb::{encode, FromDisplay, Line, LineReader, ToDisplay, UsbErrorCode};
 
-use crate::paired;
+use crate::{firmware, paired};
 
 /// Where a received bundle waits until the display has enrolled with it.
 pub fn bundle_file(dir: &Path) -> PathBuf {
@@ -67,7 +67,7 @@ pub fn answer<P: Read + Write>(port: &mut P, dir: &Path) -> std::io::Result<Opti
                 ToDisplay::Hello { .. } => reply(
                     port,
                     &FromDisplay::Hello {
-                        device: paired::simulator_info(),
+                        device: paired::device_info(dir),
                         provisioned: is_provisioned(dir),
                     },
                 )?,
@@ -87,11 +87,32 @@ pub fn answer<P: Read + Write>(port: &mut P, dir: &Path) -> std::io::Result<Opti
                         )?;
                     } else if !problems.is_empty() {
                         reply(port, &refuse(UsbErrorCode::InvalidBundle, &problems.join("; ")))?;
-                    } else if let Err(e) = store_bundle(dir, &bundle) {
-                        reply(port, &refuse(UsbErrorCode::StorageFailed, &e.to_string()))?;
                     } else {
-                        reply(port, &FromDisplay::Provisioned)?;
-                        return Ok(Some(bundle));
+                        // "What each action may change": keys already held can't be replaced here.
+                        let keys = firmware::store::keys(dir)
+                            .map(|k| firmware::store::bundle_keys(&k, bundle.firmware.as_ref()));
+                        match keys {
+                            Err(e) => reply(port, &refuse(UsbErrorCode::StorageFailed, &e.to_string()))?,
+                            Ok(Err(locked)) => reply(
+                                port,
+                                &refuse(UsbErrorCode::FirmwareKeysLocked, &locked.to_string()),
+                            )?,
+                            Ok(Ok(new_keys)) => {
+                                let saved = store_bundle(dir, &bundle).and_then(|()| match &new_keys {
+                                    Some(k) => firmware::store::set_keys(dir, k),
+                                    None => Ok(()),
+                                });
+                                match saved {
+                                    Err(e) => {
+                                        reply(port, &refuse(UsbErrorCode::StorageFailed, &e.to_string()))?
+                                    }
+                                    Ok(()) => {
+                                        reply(port, &FromDisplay::Provisioned)?;
+                                        return Ok(Some(bundle));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

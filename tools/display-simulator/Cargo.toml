@@ -11,6 +11,8 @@ rust-version.workspace = true
 hub-protocol.workspace = true
 hub-core.workspace = true
 hub-client.workspace = true
+firmware-package.workspace = true
+ring.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -25,5 +27,6 @@ serialport.workspace = true
 hubd = { path = "../../apps/hubd" }
 usage.workspace = true
 axum.workspace = true
+hyper.workspace = true
 tempfile.workspace = true
 serialport.workspace = true

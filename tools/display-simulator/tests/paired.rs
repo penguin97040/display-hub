@@ -75,7 +75,9 @@ async fn a_bundle_enrols_the_display_which_then_follows_the_hub() {
     let mut device = Device::new(Some(paired::cache_file(&state_dir)), Box::new(NoJitter));
     device.accept(clock.now(), paired::snapshot(&state).await);
     assert_eq!(count_pages(&screen(&device, clock.now())), 3);
-    paired::heartbeat(&state).await.unwrap();
+    paired::heartbeat(&state, &paired::device_info(&state_dir))
+        .await
+        .unwrap();
 
     // Changes in the manager reach the next poll, with no change on the display.
     manager.remove_subscription(&admin, "chatgpt-plus").await.unwrap();

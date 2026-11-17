@@ -129,3 +129,56 @@ fn a_bad_bundle_is_refused_and_silence_times_out() {
     assert_eq!(hello(&mut port).unwrap_err(), UsbError::NoAnswer);
     assert!(started.elapsed() >= Duration::from_secs(9));
 }
+
+/// Cases 39 and 40 through the manager's own sender: a display that has keys refuses a bundle naming
+/// other keys with `firmware_keys_locked`, after a factory reset as before it.
+#[test]
+fn a_display_with_keys_refuses_other_keys_over_usb() {
+    use display_simulator::firmware::store;
+    use hub_protocol::firmware::BundleFirmware;
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("display");
+    let maker = firmware_package::SigningKey::generate().unwrap().0;
+    let stranger = firmware_package::SigningKey::generate().unwrap().0;
+    let mut bundle: hub_protocol::provisioning::Bundle = serde_json::from_str(include_str!(
+        "../../../protocol/v1/examples/device/provisioning-bundle.json"
+    ))
+    .unwrap();
+    let with = |key: &firmware_package::SigningKey, counter| BundleFirmware {
+        trusted_keys: vec![key.public_key().to_hex()],
+        security_counter: counter,
+    };
+
+    // A display with no keys takes them, and says so in its next hello.
+    bundle.firmware = Some(with(&maker, 2));
+    let (path, display) = display_on_pty(state.clone());
+    let mut port = open(&path);
+    let shown = provision(&mut port, &bundle).unwrap();
+    assert_eq!(shown.device.firmware.unwrap().key_ids, Vec::<String>::new());
+    drop(port);
+    display.join().unwrap();
+    let keys = store::keys(&state).unwrap();
+    assert_eq!((keys.trusted_keys.len(), keys.security_floor), (1, 2));
+
+    // Factory-reset, then another maker's keys: refused, and nothing changes.
+    paired::reset(&state).unwrap();
+    let (path, _display) = display_on_pty(state.clone());
+    let mut port = open(&path);
+    let first = hello(&mut port).unwrap();
+    assert_eq!(
+        first.device.firmware.unwrap().key_ids,
+        [maker.public_key().key_id().to_hex()]
+    );
+    bundle.firmware = Some(with(&stranger, 0));
+    assert_eq!(
+        provision(&mut port, &bundle).unwrap_err(),
+        UsbError::FirmwareKeysLocked
+    );
+    assert_eq!(store::keys(&state).unwrap(), keys);
+    assert!(!usb::is_provisioned(&state));
+    // The same key is accepted.
+    bundle.firmware = Some(with(&maker, 7));
+    provision(&mut port, &bundle).unwrap();
+    assert_eq!(store::keys(&state).unwrap(), keys);
+}

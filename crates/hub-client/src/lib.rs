@@ -782,6 +782,39 @@ impl HubClient {
         })
     }
 
+    /// `GET /v1/device/firmware/{package_id}`, read a piece at a time, as a display reads it: it checks
+    /// the `Content-Length` before reading anything, and the header and manifest before it writes the
+    /// image. Nothing is buffered here, and no limit is applied: the caller decides how much to read
+    /// and how long to wait for each piece.
+    pub async fn firmware_stream(
+        &self,
+        token: &str,
+        package_id: &str,
+    ) -> Result<FirmwareStream, ClientError> {
+        let req = self
+            .request(
+                Method::GET,
+                &format!("v1/device/firmware/{}", seg(package_id)),
+                Some(token),
+            )
+            .timeout(FIRMWARE_TIMEOUT);
+        let resp = req.send().await.map_err(classify)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = read_capped(resp, 8192).await.ok();
+            return Err(ClientError::Status {
+                status: status.as_u16(),
+                body: body.and_then(|b| serde_json::from_slice::<ErrorBody>(&b).ok()),
+            });
+        }
+        let content_length = resp
+            .headers()
+            .get(reqwest::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok());
+        Ok(FirmwareStream { resp, content_length })
+    }
+
     /// `POST /v1/device/firmware/report`.
     pub async fn firmware_report(
         &self,
@@ -821,6 +854,21 @@ pub struct FirmwareDownload {
     pub transfer_encoding: Option<String>,
     pub content_encoding: Option<String>,
     pub content_type: Option<String>,
+}
+
+/// A firmware download being read, from [`HubClient::firmware_stream`].
+#[derive(Debug)]
+pub struct FirmwareStream {
+    resp: reqwest::Response,
+    /// The response's `Content-Length`, if it had one.
+    pub content_length: Option<u64>,
+}
+
+impl FirmwareStream {
+    /// The next piece of the body, as it arrives, or `None` once the body has ended.
+    pub async fn chunk(&mut self) -> Result<Option<Vec<u8>>, ClientError> {
+        Ok(self.resp.chunk().await.map_err(classify)?.map(|b| b.to_vec()))
+    }
 }
 
 async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>, ClientError> {

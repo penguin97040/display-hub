@@ -1,0 +1,30 @@
+{
+  "format": "display-hub.firmware-conformance",
+  "version": 1,
+  "name": "offer-24-first-offer",
+  "cases": [
+    24
+  ],
+  "description": "The first offer a display has seen: it acts on it.",
+  "keys": {
+    "maker": "04795c666d0cdda58bfb27c60b936bba8ad0c8801218dcb6d5f50a73c00a9904229fa366102a70677d0ca5410d6300b8273e102bba8920cef822483339734b7eb3",
+    "new": "0490299b1ed43fb649a8393bfed5f3aeca248477041ab04ea8e58cbf2f1b56f7c681909238409a049e9dcaba0e5433f448335e0f0ea9484f4df3de45d3b2a1a834",
+    "recovery": "049c4b8faad133bdb521d9e5f419343b0f5579d64ae71a88227b19d0b07b59c7d047f5f695a9671d01043223ac9cf38246e8d54f3e47cc9832b68efba12d918f30",
+    "retired": "040a886bdb7c9265d3cd3dbc45ace8780a97b7997bce57cb4a2cbf27d7124303275b37f6084e42d46ea3d09cbc0e049922e04db832a8b942ce21c549f94a6c070d",
+    "stranger": "04d60f588ff97c238828d8b662100faf6cdc3a873a57458203b81eb0ccc498d8518590614975395bf016774b5570df2ad3f95b46e6107ae5ab5d9319e40711849c"
+  },
+  "kind": "offer",
+  "record": {
+    "last_offer_id": null,
+    "seconds_since_last_attempt": null,
+    "failures_in_row": 0
+  },
+  "offer": {
+    "offer_id": "00000000000000000000000000000001",
+    "size": 1000
+  },
+  "expect": {
+    "action": "attempt",
+    "wait_seconds": null
+  }
+}
