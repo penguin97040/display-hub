@@ -24,6 +24,8 @@ fn meter(feed: &str, source: Source) -> NewPage {
         feed: Some(feed.into()),
         id: None,
         stale_after_seconds: None,
+        template: None,
+        settings: None,
     }
 }
 
@@ -790,6 +792,8 @@ async fn a_feed_write_is_all_or_nothing_across_its_pages() {
         feed: Some("t".into()),
         id: Some(id.into()),
         stale_after_seconds: None,
+        template: None,
+        settings: None,
     };
     c.add_page(&admin, &text_page("s", "S")).await.unwrap();
     c.add_page(
@@ -925,7 +929,7 @@ async fn a_helper_paired_before_the_upgrade_to_feeds_keeps_working() {
     let clock = FakeClock::parse(NOW);
     old_hub(dir.path(), &clock, 3, include_str!("fixtures/schema-3-data.sql")).await;
     let r = Running::start(dir.path(), &clock).await;
-    assert_eq!(r.hub.store.schema_version().unwrap(), 4);
+    assert_eq!(r.hub.store.schema_version().unwrap(), hubd::store::SCHEMA_VERSION);
     let c = r.client();
     // Its token, issued for services, now sends to the feeds of the same names.
     let body = FeedContent {
@@ -969,6 +973,8 @@ async fn pages_of_any_kind_through_the_admin_api() {
         feed: None,
         id: None,
         stale_after_seconds: None,
+        template: None,
+        settings: None,
     };
     let fed = add_meter(&c, &admin, "garden", Source::Helper).await;
     let flights = c
@@ -1110,6 +1116,8 @@ async fn the_admin_api_keeps_its_page_rules() {
         feed: feed.map(String::from),
         id: None,
         stale_after_seconds: None,
+        template: None,
+        settings: None,
     };
     let refused = |e: ClientError, words: &str| {
         assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{e}");
@@ -1221,5 +1229,151 @@ async fn the_admin_api_keeps_its_page_rules() {
         c.set_display_pages(&admin, &display, many).await.unwrap(),
         std::slice::from_ref(&words.id)
     );
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn template_settings_are_kept_with_pages_and_only_their_helper_reads_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let obj = |v: Value| v.as_object().unwrap().clone();
+
+    // The manager's side: pages made from built-in templates record the template and settings.
+    let pi = hub_templates::built_in_template("pi-status/1").unwrap();
+    let new = pi
+        .make_pages(&obj(json!({"title": "Shed Pi"})))
+        .unwrap()
+        .remove(0);
+    let page = c.add_page(&admin, &new).await.unwrap();
+    assert_eq!(
+        (page.id.as_str(), page.template.as_deref()),
+        ("pi-status", Some("pi-status/1"))
+    );
+    assert_eq!(page.settings, Some(obj(json!({"title": "Shed Pi"}))));
+    let usage = hub_templates::built_in_template("usage-limits/1").unwrap();
+    let new = usage
+        .make_pages(&obj(json!({"service": "claude-max", "source": "manual"})))
+        .unwrap()
+        .remove(0);
+    let typed = c.add_page(&admin, &new).await.unwrap();
+    // A page made by hand has neither, as before, and lists without them.
+    let plain = c
+        .add_page(&admin, &meter("pi-status", Source::Helper))
+        .await
+        .unwrap();
+    assert_eq!((plain.template, plain.settings), (None, None));
+    let listed = serde_json::to_value(c.page(&admin, &plain.id).await.unwrap()).unwrap();
+    assert!(
+        listed.get("template").is_none() && listed.get("settings").is_none(),
+        "{listed}"
+    );
+
+    // Changing the settings replaces them; empty ones remove them; the template stays.
+    let change = |v: Value| PageChange {
+        settings: Some(obj(v)),
+        ..PageChange::default()
+    };
+    let changed = c
+        .change_page(
+            &admin,
+            "pi-status",
+            &change(json!({"title": "Shed Pi", "every": 5})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        changed.settings,
+        Some(obj(json!({"title": "Shed Pi", "every": 5})))
+    );
+    let cleared = c
+        .change_page(&admin, &typed.id, &change(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(
+        (cleared.settings, cleared.template.as_deref()),
+        (None, Some("usage-limits/1"))
+    );
+
+    // Settings that are too big or too deep, and badly written template ids, are refused.
+    let refused = |e: ClientError, words: &str| {
+        assert_eq!(code(&e), Some(ErrorCode::BadRequest), "{e}");
+        assert!(e.to_string().contains(words), "{e}");
+    };
+    let e = c
+        .change_page(&admin, "pi-status", &change(json!({"note": "x".repeat(2100)})))
+        .await
+        .unwrap_err();
+    refused(e, "at most 2048");
+    let e = c
+        .change_page(&admin, "pi-status", &change(json!({"a": [[[1]]]})))
+        .await
+        .unwrap_err();
+    refused(e, "nest too deeply");
+    let e = c
+        .add_page(
+            &admin,
+            &NewPage {
+                template: Some("Pi status".into()),
+                ..meter("x", Source::Manual)
+            },
+        )
+        .await
+        .unwrap_err();
+    refused(e, "A template id");
+    let e = c
+        .add_page(
+            &admin,
+            &NewPage {
+                settings: Some(obj(json!({"big": "x".repeat(2100)}))),
+                ..meter("x", Source::Manual)
+            },
+        )
+        .await
+        .unwrap_err();
+    refused(e, "at most 2048");
+    assert_eq!(
+        c.status(&admin).await.unwrap().pages,
+        3,
+        "nothing refused was added"
+    );
+
+    // A helper reads the settings of its feed's helper pages, in order, and nothing else.
+    let invite = c
+        .new_helper(
+            &admin,
+            &NewHelper {
+                label: "Pi".into(),
+                feeds: vec!["pi-status".into()],
+            },
+        )
+        .await
+        .unwrap();
+    let token = c.helper_pair(&invite.secret).await.unwrap().helper_token;
+    let read = c.feed_settings(&token, "pi-status").await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&read).unwrap(),
+        json!({"pages": [
+            {"page_id": "pi-status", "template": "pi-status/1", "settings": {"title": "Shed Pi", "every": 5}},
+            {"page_id": "pi-status-2", "template": null, "settings": {}}
+        ]})
+    );
+    // The usage page's feed wasn't in the invite, and admins and displays can't use this door.
+    let e = c.feed_settings(&token, "claude-max").await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::Forbidden));
+    let e = c.feed_settings(&admin, "pi-status").await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::Forbidden));
+    let e = c.feed_settings("dhc_not_a_token", "pi-status").await.unwrap_err();
+    assert_eq!(code(&e), Some(ErrorCode::Unauthorised));
+    // A helper page that becomes typed in is no longer the helper's to read.
+    let to_manual = PageChange {
+        source: Some(Source::Manual),
+        ..PageChange::default()
+    };
+    c.change_page(&admin, "pi-status-2", &to_manual).await.unwrap();
+    let read = c.feed_settings(&token, "pi-status").await.unwrap();
+    assert_eq!(read.pages.len(), 1);
     r.stop().await;
 }

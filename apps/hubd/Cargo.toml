@@ -39,5 +39,6 @@ libc.workspace = true
 
 [dev-dependencies]
 hub-client.workspace = true
+hub-templates.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true

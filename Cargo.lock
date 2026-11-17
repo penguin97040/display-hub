@@ -2879,6 +2879,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-templates"
+version = "0.1.0"
+dependencies = [
+ "hub-core",
+ "hub-protocol",
+ "serde",
+ "serde_json",
+ "usage",
+]
+
+[[package]]
 name = "hubd"
 version = "0.1.0"
 dependencies = [
@@ -2889,6 +2900,7 @@ dependencies = [
  "hub-client",
  "hub-core",
  "hub-protocol",
+ "hub-templates",
  "hyper",
  "hyper-util",
  "libc",

@@ -1,0 +1,15 @@
+{
+  "id": "pi-status/1",
+  "name": "Pi status",
+  "description": "The hub's Raspberry Pi CPU temperature, sent every five minutes by the pi-status helper that comes with Display Hub.",
+  "setup": {
+    "help": "Run this once on the hub's Raspberry Pi to start the helper that fills this page.",
+    "command": "sudo display-hub-helper add pi-status --run /usr/local/share/display-hub/helpers/pi-status"
+  },
+  "settings": [
+    { "key": "title", "label": "Title", "type": "text", "max_length": 48, "default": "Pi status" }
+  ],
+  "pages": [
+    { "title": "{title}", "kind": "big_number", "source": "helper", "feed": "pi-status" }
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "id": "big-number/1",
+  "name": "Big number",
+  "description": "One number you type in, with a unit and a caption if you like, such as the days until a trip.",
+  "settings": [
+    { "key": "title", "label": "Title", "type": "text", "required": true, "max_length": 48, "default": "Big number" }
+  ],
+  "pages": [
+    { "title": "{title}", "kind": "big_number", "source": "manual" }
+  ]
+}

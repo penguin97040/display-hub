@@ -3,7 +3,7 @@
 use hub_protocol::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Source, StoredPage};
+use crate::model::{Settings, Source, StoredPage};
 
 /// `POST /v1/admin/pair`: exchanges the one-time secret from `hubd pair-admin` for an admin token.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -90,6 +90,16 @@ pub struct NewPage {
     /// Defaults to the source's.
     #[serde(default)]
     pub stale_after_seconds: Option<u32>,
+    /// The template the page is made from, as `name/version` such as `usage-limits/1`
+    /// ([`valid_template_id`](crate::model::valid_template_id)). Only recorded: the hub doesn't
+    /// read templates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The answers to the template's settings form, kept with the page for its helper to read
+    /// ([`settings_problem`](crate::model::settings_problem)). Not secret: never API keys or
+    /// passwords. An empty object is the same as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
 }
 
 /// `PATCH /v1/admin/pages/{id}`. Changing the source drops what was stored and resets the stale
@@ -102,6 +112,10 @@ pub struct PageChange {
     pub source: Option<Source>,
     #[serde(default)]
     pub stale_after_seconds: Option<u32>,
+    /// Replaces the page's settings; an empty object removes them. The template it was made from
+    /// can't change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
 }
 
 /// `PUT /v1/admin/pages/{id}/content`: what a manual or demo page shows, checked against its kind's
@@ -245,6 +259,26 @@ pub struct FeedAccepted {
     pub updated: Vec<String>,
     /// Pages of the feed that take content from a helper, but of another kind, left as they were.
     pub skipped: Vec<String>,
+}
+
+/// `GET /v1/helper/feeds/{feed}/settings`: the settings of every page of the feed whose source is
+/// `helper`, in page order, so a helper can do what each page was set up for. Nothing else about the
+/// pages is readable this way.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct FeedSettings {
+    pub pages: Vec<PageSettings>,
+}
+
+/// One helper page's template and settings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PageSettings {
+    pub page_id: String,
+    /// The template it was made from, if any.
+    #[serde(default)]
+    pub template: Option<String>,
+    /// Its settings; empty when it has none.
+    #[serde(default)]
+    pub settings: Settings,
 }
 
 /// One helper, as the manager sees it.

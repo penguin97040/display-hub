@@ -10,4 +10,4 @@ pub mod model;
 pub use build::build_snapshot;
 pub use clock::{Clock, FakeClock, SystemClock};
 pub use freshness::{short_duration, Freshness};
-pub use model::{Source, StoredContent, StoredPage};
+pub use model::{Settings, Source, StoredContent, StoredPage};

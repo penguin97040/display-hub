@@ -329,6 +329,8 @@ mod tests {
             feed: None,
             stale_after_seconds: Source::Demo.stale_after_seconds(),
             content: None,
+            template: None,
+            settings: None,
         };
         hub.store.add_page(&page, clock.now()).unwrap();
         let dest = tmp.path().join("backup");

@@ -1,0 +1,11 @@
+{
+  "id": "short-text/1",
+  "name": "Short text",
+  "description": "A note you type in, up to 280 characters, such as a reminder for whoever is at the desk.",
+  "settings": [
+    { "key": "title", "label": "Title", "type": "text", "required": true, "max_length": 48, "default": "Note" }
+  ],
+  "pages": [
+    { "title": "{title}", "kind": "text", "source": "manual" }
+  ]
+}

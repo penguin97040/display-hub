@@ -17,8 +17,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hub_core::api::*;
-use hub_core::model::{clean_note, clean_title, valid_feed, valid_page_id, MAX_FEED_LEN};
-use hub_core::{build_snapshot, Clock, Source, StoredContent, StoredPage};
+use hub_core::model::{
+    clean_note, clean_title, settings_problem, valid_feed, valid_page_id, valid_template_id, MAX_FEED_LEN,
+};
+use hub_core::{build_snapshot, Clock, Settings, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
 use hub_protocol::shapes::{classify_kind, KindClass};
 use hub_protocol::{CantShow, DataQuality, ErrorCode, Health, Page, Timestamp};
@@ -334,6 +336,7 @@ pub fn router(hub: AppState) -> Router {
     let helper = Router::new()
         .route("/v1/helper/pair", post(helper_pair))
         .route("/v1/helper/feeds/{feed}", put(put_feed))
+        .route("/v1/helper/feeds/{feed}/settings", get(feed_settings))
         .layer(DefaultBodyLimit::max(MAX_ADMIN_REQUEST_BYTES));
     Router::new()
         .route("/v1/health", get(|| async { Json(Health::ok()) }))
@@ -665,6 +668,17 @@ pub fn check_feeds(feeds: &[String]) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// A page's settings, checked as hub-core says ([`settings_problem`]). Empty settings are none.
+fn check_settings(settings: Option<Settings>) -> Result<Option<Settings>, ApiError> {
+    match settings {
+        Some(s) => match settings_problem(&s) {
+            Some(why) => Err(ApiError::bad_request(why)),
+            None => Ok(Some(s).filter(|s| !s.is_empty())),
+        },
+        None => Ok(None),
+    }
+}
+
 /// `base` made into a page id: lower case, other characters as hyphens, at most 40 long.
 fn id_from(base: &str) -> String {
     let mut id = String::new();
@@ -699,6 +713,12 @@ async fn add_page(
         return Err(bad_feed());
     }
     check_helper(req.source, req.feed.as_deref())?;
+    if req.template.as_deref().is_some_and(|t| !valid_template_id(t)) {
+        return Err(ApiError::bad_request(
+            "A template id is a name and a version, such as usage-limits/1.",
+        ));
+    }
+    let settings = check_settings(req.settings)?;
     let stale_after_seconds = check_stale(
         req.stale_after_seconds
             .unwrap_or_else(|| req.source.stale_after_seconds()),
@@ -738,6 +758,8 @@ async fn add_page(
         feed: req.feed,
         stale_after_seconds,
         content: None,
+        template: req.template,
+        settings,
     };
     let (p2, now) = (page.clone(), hub.clock.now());
     db(&hub, move |s| s.add_page(&p2, now)).await?;
@@ -754,10 +776,15 @@ async fn change_page(
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let title = req.title.as_deref().map(clean_page_title).transpose()?;
     let stale = req.stale_after_seconds.map(check_stale).transpose()?;
+    // Empty settings remove them.
+    let settings = req
+        .settings
+        .map(|s| check_settings(Some(s)).map(Option::unwrap_or_default))
+        .transpose()?;
     // The helper rule is checked in the same transaction as the change, and only when the source
     // actually changes.
     let (outcome, page) = db(&hub, move |s| {
-        let outcome = s.update_page(&id, title.as_deref(), req.source, stale)?;
+        let outcome = s.update_page(&id, title.as_deref(), req.source, stale, settings.as_ref())?;
         Ok((outcome, s.page(&id)?))
     })
     .await?;
@@ -1021,11 +1048,7 @@ async fn put_feed(
     let subject = authenticate(&hub, &headers, peer.ip(), Role::Helper).await?;
     let allowed = db(&hub, move |s| s.helper_feeds(&subject)).await?;
     if !allowed.contains(&feed) {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            ErrorCode::Forbidden,
-            "This helper isn't set up to send to that feed. Invite it for the feed in the manager's Settings.",
-        ));
+        return Err(not_invited());
     }
     if classify_kind(&req.kind) == KindClass::Invalid {
         return Err(ApiError::bad_request(
@@ -1051,6 +1074,8 @@ async fn put_feed(
         feed: Some(feed.clone()),
         stale_after_seconds: Source::Helper.stale_after_seconds(),
         content: None,
+        template: None,
+        settings: None,
     };
     check_content(&stand_in, &req.data, &note, quality, now)?;
     let content = StoredContent {
@@ -1074,6 +1099,40 @@ async fn put_feed(
         updated: written.updated,
         skipped: written.skipped,
     }))
+}
+
+/// `GET /v1/helper/feeds/{feed}/settings`: the template and settings of each helper page of a feed
+/// the helper was invited for, so it can do what each page was set up for. Nothing else is read.
+async fn feed_settings(
+    State(hub): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(feed): Path<String>,
+) -> Result<Json<FeedSettings>, ApiError> {
+    let subject = authenticate(&hub, &headers, peer.ip(), Role::Helper).await?;
+    let allowed = db(&hub, move |s| s.helper_feeds(&subject)).await?;
+    if !allowed.contains(&feed) {
+        return Err(not_invited());
+    }
+    let pages = db(&hub, move |s| s.feed_pages(&feed)).await?;
+    Ok(Json(FeedSettings {
+        pages: pages
+            .into_iter()
+            .map(|p| PageSettings {
+                page_id: p.id,
+                template: p.template,
+                settings: p.settings.unwrap_or_default(),
+            })
+            .collect(),
+    }))
+}
+
+fn not_invited() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        ErrorCode::Forbidden,
+        "This helper isn't set up to send to that feed. Invite it for the feed in the manager's Settings.",
+    )
 }
 
 async fn list_helpers(

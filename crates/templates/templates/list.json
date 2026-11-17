@@ -1,0 +1,11 @@
+{
+  "id": "list/1",
+  "name": "List",
+  "description": "A short list you type in, up to eight items, such as today's jobs.",
+  "settings": [
+    { "key": "title", "label": "Title", "type": "text", "required": true, "max_length": 48, "default": "List" }
+  ],
+  "pages": [
+    { "title": "{title}", "kind": "list", "source": "manual" }
+  ]
+}

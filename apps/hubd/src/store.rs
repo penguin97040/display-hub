@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
-use hub_core::{Source, StoredContent, StoredPage};
+use hub_core::{Settings, Source, StoredContent, StoredPage};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::limits::{MAX_METER_ITEMS, MAX_TITLE_LEN};
 use hub_protocol::shapes::KIND_METER;
@@ -154,6 +154,12 @@ const MIGRATIONS: &[&str] = &[
         FROM one_time_codes;
     DROP TABLE one_time_codes;
     ALTER TABLE one_time_codes_new RENAME TO one_time_codes;
+    "#,
+    // 5: the template a page was made from (`name/version`) and the answers to its settings form,
+    // as a JSON object. Both are null for pages made without a template.
+    r#"
+    ALTER TABLE pages ADD COLUMN template TEXT;
+    ALTER TABLE pages ADD COLUMN settings TEXT;
     "#,
 ];
 
@@ -1037,8 +1043,9 @@ impl Store {
             r.get(0)
         })?;
         tx.execute(
-            "INSERT INTO pages (id, title, kind, source, feed, position, stale_after_seconds, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO pages (id, title, kind, source, feed, position, stale_after_seconds, created_at,
+                                template, settings)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 page.id,
                 page.title,
@@ -1047,7 +1054,9 @@ impl Store {
                 page.feed,
                 next,
                 page.stale_after_seconds,
-                now.unix()
+                now.unix(),
+                page.template,
+                settings_column(page.settings.as_ref()),
             ],
         )?;
         if let Some(content) = &page.content {
@@ -1062,15 +1071,17 @@ impl Store {
         Ok(())
     }
 
-    /// Changes a page's title, source or stale time, all or nothing. Changing the source drops the
-    /// stored content, which came from the old source, and resets the stale time to the new
-    /// source's default unless `stale_after_seconds` is given too.
+    /// Changes a page's title, source, stale time or settings, all or nothing. Changing the source
+    /// drops the stored content, which came from the old source, and resets the stale time to the
+    /// new source's default unless `stale_after_seconds` is given too. New settings replace the old;
+    /// empty ones remove them.
     pub fn update_page(
         &self,
         id: &str,
         title: Option<&str>,
         source: Option<Source>,
         stale_after_seconds: Option<u32>,
+        settings: Option<&Settings>,
     ) -> Result<PageUpdate, StoreError> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1101,6 +1112,12 @@ impl Store {
             tx.execute(
                 "UPDATE pages SET stale_after_seconds = ?1 WHERE id = ?2",
                 params![stale, id],
+            )?;
+        }
+        if let Some(settings) = settings {
+            tx.execute(
+                "UPDATE pages SET settings = ?1 WHERE id = ?2",
+                params![settings_column(Some(settings)), id],
             )?;
         }
         tx.commit()?;
@@ -1191,14 +1208,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
         let mut out = FeedWrite::default();
-        let pages = read_pages(
-            &tx,
-            &format!(
-                "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.feed = ?1 AND p.source = 'helper' \
-                 ORDER BY p.position, p.created_at"
-            ),
-            params![feed],
-        )?;
+        let pages = read_pages(&tx, &FEED_PAGES_SQL, params![feed])?;
         for page in pages {
             if page.kind == kind {
                 check(&page)?;
@@ -1218,6 +1228,12 @@ impl Store {
         }
         tx.commit().map_err(StoreError::from)?;
         Ok(out)
+    }
+
+    /// The pages of `feed` whose source is `helper`, in order: the pages a helper of the feed fills.
+    pub fn feed_pages(&self, feed: &str) -> Result<Vec<StoredPage>, StoreError> {
+        let conn = self.conn();
+        read_pages(&conn, &FEED_PAGES_SQL, params![feed])
     }
 
     // ----- helpers -----
@@ -1269,14 +1285,22 @@ impl Store {
 }
 
 /// The columns [`read_pages`] reads, from `pages` aliased as `p`.
-const PAGE_COLUMNS: &str =
-    "p.id, p.title, p.kind, p.source, p.feed, p.stale_after_seconds, p.quality, p.updated_at, p.data, p.note";
+const PAGE_COLUMNS: &str = "p.id, p.title, p.kind, p.source, p.feed, p.stale_after_seconds, p.quality, \
+     p.updated_at, p.data, p.note, p.template, p.settings";
 
 static ALL_PAGES_SQL: LazyLock<String> =
     LazyLock::new(|| format!("SELECT {PAGE_COLUMNS} FROM pages p ORDER BY p.position, p.created_at"));
 
 static ONE_PAGE_SQL: LazyLock<String> =
     LazyLock::new(|| format!("SELECT {PAGE_COLUMNS} FROM pages p WHERE p.id = ?1"));
+
+/// The helper pages of the feed `?1`, in order.
+static FEED_PAGES_SQL: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.feed = ?1 AND p.source = 'helper' \
+         ORDER BY p.position, p.created_at"
+    )
+});
 
 /// A display's ticked pages whose source this build knows, in order, when the display is active.
 /// `?1` is the display, `?2` the most pages to return.
@@ -1310,11 +1334,12 @@ fn read_pages(
             r.get::<_, Option<i64>>(7)?,
             r.get::<_, Option<String>>(8)?,
             r.get::<_, Option<String>>(9)?,
+            (r.get::<_, Option<String>>(10)?, r.get::<_, Option<String>>(11)?),
         ))
     })?;
     let mut out = Vec::new();
     for row in rows {
-        let (id, title, kind, source, feed, stale, quality, updated, data, note) = row?;
+        let (id, title, kind, source, feed, stale, quality, updated, data, note, (template, settings)) = row?;
         // A row this build can't interpret is skipped and logged, rather than breaking every snapshot.
         let Some(source) = Source::from_slug(&source) else {
             tracing::warn!(%id, "skipping a page with an unknown source");
@@ -1332,6 +1357,13 @@ fn read_pages(
             }),
             note,
         });
+        let settings = settings.and_then(|s| match serde_json::from_str::<Settings>(&s) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!(%id, "ignoring a page's stored settings, which aren't a JSON object");
+                None
+            }
+        });
         out.push(StoredPage {
             id,
             title,
@@ -1341,9 +1373,18 @@ fn read_pages(
             // Out of range is left for snapshot checks to catch, which leave the page off.
             stale_after_seconds: u32::try_from(stale).unwrap_or(0),
             content,
+            template,
+            settings,
         });
     }
     Ok(out)
+}
+
+/// Settings as their column: JSON text, or null when there are none.
+fn settings_column(settings: Option<&Settings>) -> Option<String> {
+    settings
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::to_string(s).expect("settings serialise"))
 }
 
 /// `2026-11-11T01-02-03Z`: a timestamp that is also a valid file name everywhere.
@@ -1685,6 +1726,8 @@ mod tests {
                 ),
                 note: Some("Hand-made".into()),
             }),
+            template: None,
+            settings: None,
         };
         store.add_page(&page, now).unwrap();
         assert_eq!(store.pages().unwrap(), vec![page.clone()]);
@@ -1723,6 +1766,8 @@ mod tests {
             feed: None,
             stale_after_seconds: 600,
             content: None,
+            template: None,
+            settings: None,
         }
     }
 
@@ -1846,7 +1891,9 @@ mod tests {
             ContentWrite::Written
         );
         // Its source changed since the caller looked: the write is refused, and nothing changes.
-        store.update_page("a", None, Some(Source::Demo), None).unwrap();
+        store
+            .update_page("a", None, Some(Source::Demo), None, None)
+            .unwrap();
         assert_eq!(
             store.put_content("a", Source::Manual, &content, now).unwrap(),
             ContentWrite::SourceChanged
@@ -1953,7 +2000,7 @@ mod tests {
         store.add_page(&fed, now).unwrap();
         let to_helper = |id: &str| {
             store
-                .update_page(id, Some("Changed"), Some(Source::Helper), Some(900))
+                .update_page(id, Some("Changed"), Some(Source::Helper), Some(900), None)
                 .unwrap()
         };
         assert_eq!(to_helper("bare"), PageUpdate::HelperNeedsFeed);
@@ -1984,7 +2031,7 @@ mod tests {
         }
         let before = untouched_tables(&Connection::open(&path).unwrap());
         let store = Store::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let saved = copies(dir.path());
         assert_eq!(saved.len(), 1);
         let name = saved[0].file_name().unwrap().to_str().unwrap();
@@ -2112,5 +2159,152 @@ mod tests {
             store.display_page_ids("d-1").unwrap().unwrap(),
             ["order-3", "order-2"]
         );
+    }
+
+    /// Representative data in the layout schema 4 used.
+    const SCHEMA_4_DATA: &str = include_str!("../tests/fixtures/schema-4-data.sql");
+
+    /// Every column version 4 had in `pages` and `display_pages`, as text, in a fixed order.
+    fn page_rows(conn: &Connection) -> Vec<String> {
+        let mut out = Vec::new();
+        for sql in [
+            "SELECT id, title, kind, source, feed, position, stale_after_seconds, created_at, quality, \
+             updated_at, data, note, stored_at FROM pages ORDER BY id",
+            "SELECT device_id, page_id FROM display_pages ORDER BY 1, 2",
+        ] {
+            let mut st = conn.prepare(sql).unwrap();
+            let n = st.column_count();
+            let rows = st
+                .query_map([], |r| {
+                    Ok((0..n)
+                        .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                        .collect::<Vec<_>>()
+                        .join(", "))
+                })
+                .unwrap();
+            out.extend(rows.map(Result::unwrap));
+        }
+        out
+    }
+
+    #[test]
+    fn upgrading_schema_4_keeps_every_row_and_gives_pages_room_for_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_at_schema(&conn, 4).unwrap();
+            conn.execute_batch(SCHEMA_4_DATA).unwrap();
+        }
+        let (before, pages_before) = {
+            let conn = Connection::open(&path).unwrap();
+            (untouched_tables(&conn), page_rows(&conn))
+        };
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+        let saved = copies(dir.path());
+        assert_eq!(saved.len(), 1);
+        let name = saved[0].file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("hub-before-upgrade-schema-4-"), "{name}");
+        assert_eq!(Store::inspect(&saved[0]).unwrap(), (4, 4, 2));
+        assert_eq!(page_rows(&Connection::open(&saved[0]).unwrap()), pages_before);
+
+        // Every row is kept as it was, and no page has a template or settings yet.
+        assert_eq!(untouched_tables(&store.conn()), before);
+        assert_eq!(page_rows(&store.conn()), pages_before);
+        let pages = store.pages().unwrap();
+        assert_eq!(
+            pages.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["pi-status", "words", "chatgpt-plus", "flights"]
+        );
+        assert!(pages.iter().all(|p| p.template.is_none() && p.settings.is_none()));
+        let snap = hub_core::build_snapshot(ts(NOW), 300, &store.display_pages("d-desk").unwrap().unwrap());
+        snap.validate().unwrap();
+        assert_eq!(snap.pages.len(), 3);
+        assert_eq!(snap.pages[0].data.as_ref().unwrap()["value"], json!(48.2));
+
+        // The helper and the invite keep working, and a page can now keep settings.
+        let token = crate::secret::hash("dhc_test_helper");
+        assert_eq!(store.credential(&token).unwrap().unwrap().subject, "h-pi");
+        assert_eq!(store.helper_feeds("h-pi").unwrap(), ["claude-max", "pi-status"]);
+        let invite = crate::secret::hash("invite-before-upgrade");
+        assert_eq!(
+            store.use_code(&invite, "helper-pair", ts(NOW)).unwrap().0,
+            CodeUse::Accepted
+        );
+        let settings = json!({"title": "Pi status"}).as_object().unwrap().clone();
+        assert_eq!(
+            store
+                .update_page("pi-status", None, None, None, Some(&settings))
+                .unwrap(),
+            PageUpdate::Updated
+        );
+        assert_eq!(store.page("pi-status").unwrap().unwrap().settings, Some(settings));
+    }
+
+    #[test]
+    fn a_page_keeps_its_template_and_settings_and_its_helper_can_find_them() {
+        let store = Store::in_memory().unwrap();
+        let now = ts(NOW);
+        let settings = json!({"service": "claude-max", "shows": ["weekly"]})
+            .as_object()
+            .unwrap()
+            .clone();
+        let page = StoredPage {
+            id: "claude-max".into(),
+            title: "Claude Max".into(),
+            kind: "meter".into(),
+            source: Source::Helper,
+            feed: Some("claude-max".into()),
+            stale_after_seconds: 1800,
+            content: None,
+            template: Some("usage-limits/1".into()),
+            settings: Some(settings.clone()),
+        };
+        store.add_page(&page, now).unwrap();
+        store
+            .add_page(
+                &StoredPage {
+                    id: "typed".into(),
+                    source: Source::Manual,
+                    ..page.clone()
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(store.page("claude-max").unwrap(), Some(page.clone()));
+        // Only the feed's helper pages are found.
+        let found = store.feed_pages("claude-max").unwrap();
+        assert_eq!(
+            found.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            ["claude-max"]
+        );
+        assert!(store.feed_pages("other").unwrap().is_empty());
+
+        // New settings replace the old; empty ones remove them; none leaves them be.
+        let other = json!({"service": "chatgpt-plus"}).as_object().unwrap().clone();
+        store
+            .update_page("claude-max", Some("Renamed"), None, None, Some(&other))
+            .unwrap();
+        let changed = store.page("claude-max").unwrap().unwrap();
+        assert_eq!(
+            (changed.title.as_str(), changed.settings),
+            ("Renamed", Some(other.clone()))
+        );
+        store.update_page("claude-max", None, None, None, None).unwrap();
+        assert_eq!(store.page("claude-max").unwrap().unwrap().settings, Some(other));
+        store
+            .update_page("claude-max", None, None, None, Some(&Settings::new()))
+            .unwrap();
+        let cleared = store.page("claude-max").unwrap().unwrap();
+        assert_eq!(cleared.settings, None);
+        assert_eq!(cleared.template.as_deref(), Some("usage-limits/1"));
+
+        // Damaged settings are left out rather than breaking the page.
+        store
+            .conn()
+            .execute("UPDATE pages SET settings = '[1]' WHERE id = 'typed'", [])
+            .unwrap();
+        assert_eq!(store.page("typed").unwrap().unwrap().settings, None);
     }
 }

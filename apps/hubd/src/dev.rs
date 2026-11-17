@@ -120,6 +120,8 @@ fn sample(clock: &dyn Clock, id: &str, title: &str, source: Source, shares: &[(f
             data: Some(json!({ "items": items })),
             note: Some("Sample figures, not real usage".into()),
         }),
+        template: None,
+        settings: None,
     }
 }
 

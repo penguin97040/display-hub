@@ -188,6 +188,8 @@ mod tests {
                 data: Some(data),
                 note: None,
             }),
+            template: None,
+            settings: None,
         }
     }
 

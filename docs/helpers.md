@@ -6,7 +6,7 @@ A helper is invited to one or more **feeds**. A feed is just a name, such as `ga
 
 ### Pages for a helper
 
-For now the manager makes helper pages for usage limits only (as "PC helper"). Any other page is made with the hub's admin API until templates arrive in the manager: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
+For now the manager's own "Add page" makes helper pages for usage limits only (as "PC helper"). **Templates** ([templates.md](templates.md)) describe other pages, such as `pi-status/1`, and the hub keeps the template and settings each page was made with, but the manager doesn't offer templates yet. Until it does, any other page is made with the hub's admin API: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
 
 ## Pairing
 
@@ -43,9 +43,26 @@ It prints which pages were updated or skipped, and exits non-zero with the hub's
 
 A Rust helper can use the `hub_send` library instead: `Profile::login`, `Profile::open` and `Hub::send_page` do the same steps.
 
+## Reading the pages' settings
+
+A page made from a template keeps the owner's answers to its form, its **settings** ([templates.md](templates.md)), such as which garden bed or which service. A helper can read the settings of the pages it fills, so one program can serve pages set up in different ways:
+
+`GET /v1/helper/feeds/{feed}/settings` with the helper token answers, for each page of the feed whose source is a helper, in page order:
+
+```json
+{ "pages": [
+    { "page_id": "garden-north", "template": "garden/1", "settings": { "bed": "north", "depth": 10 } },
+    { "page_id": "greenhouse-temp", "template": null, "settings": {} }
+] }
+```
+
+A page made without a template has `template: null` and empty settings. With `hub-send`, `hub-send settings garden-weather` prints the same, and a Rust helper can call `Hub::settings`.
+
+Settings are not secret: every helper of the feed can read them. Keep API keys and passwords on the helper's own computer, never in a page's settings.
+
 ## Own feeds only
 
-A helper's token can write only to the feeds it was invited for, and only to pages whose source is a helper and whose kind matches what it sent. It can't read anything, change pages, or act as an admin or a display. A feed it wasn't invited for is refused with a 403.
+A helper's token can write only to the feeds it was invited for, and only to pages whose source is a helper and whose kind matches what it sent. The only thing it can read is the settings of those pages, as above. It can't read pages' content, change pages, or act as an admin or a display. A feed it wasn't invited for is refused with a 403, for reading and for sending.
 
 ## Headless services: the file store
 

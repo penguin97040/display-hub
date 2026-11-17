@@ -56,6 +56,8 @@ impl NewSubscription {
             feed: Some(self.service.slug().into()),
             id: self.id.clone(),
             stale_after_seconds: None,
+            template: None,
+            settings: None,
         }
     }
 }

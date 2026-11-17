@@ -73,6 +73,8 @@ async fn no_credential_reaches_the_logs() {
             feed: Some("garden".into()),
             id: None,
             stale_after_seconds: None,
+            template: None,
+            settings: None,
         },
     )
     .await

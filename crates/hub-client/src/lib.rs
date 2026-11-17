@@ -391,6 +391,7 @@ impl HubClient {
             title: change.title.clone(),
             source: change.source,
             stale_after_seconds: None,
+            settings: None,
         };
         let page = self.change_page(token, id, &change).await?;
         let view = as_usage(page)?;
@@ -521,6 +522,17 @@ impl HubClient {
             &format!("v1/helper/feeds/{}", seg(feed)),
             token,
             Some(content),
+        )
+        .await
+    }
+
+    /// `GET /v1/helper/feeds/{feed}/settings`: the template and settings of the feed's helper pages.
+    pub async fn feed_settings(&self, token: &str, feed: &str) -> Result<FeedSettings, ClientError> {
+        self.call(
+            Method::GET,
+            &format!("v1/helper/feeds/{}/settings", seg(feed)),
+            token,
+            None::<&()>,
         )
         .await
     }

@@ -73,6 +73,8 @@ async fn usage_pages_are_meters_whose_figures_are_checked_before_sending() {
         feed: None,
         id: None,
         stale_after_seconds: None,
+        template: None,
+        settings: None,
     };
     c.add_page(&admin, &notes).await.unwrap();
     let typed = c

@@ -149,6 +149,8 @@ impl Subscription {
             feed: Some(self.service.slug().into()),
             stale_after_seconds: self.source.stale_after_seconds(),
             content: data.map(PageData::to_content),
+            template: None,
+            settings: None,
         }
     }
 }
@@ -217,6 +219,8 @@ mod tests {
             feed: feed.map(String::from),
             stale_after_seconds: 600,
             content: None,
+            template: None,
+            settings: None,
         };
         assert_eq!(
             usage_service(&page("meter", Some("claude-max"))),

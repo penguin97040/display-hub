@@ -66,6 +66,12 @@ enum Cmd {
         #[arg(long)]
         collected_at: Option<String>,
     },
+    /// Print, as JSON, the settings of each page this helper fills on one of its feeds: what the
+    /// owner chose when they made the page from a template.
+    Settings {
+        /// The feed, as named in the manager.
+        feed: String,
+    },
 }
 
 fn finish(r: Result<String, String>) -> ExitCode {
@@ -246,6 +252,12 @@ fn page(
     Ok(lines.join("\n"))
 }
 
+fn settings(p: &Profile, feed: &str) -> Result<String, String> {
+    let h = p.open().map_err(|e| e.to_string())?;
+    let found = runtime().block_on(h.settings(feed)).map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&found).map_err(|e| e.to_string())
+}
+
 fn plural(n: usize) -> String {
     if n == 1 {
         "1 page".into()
@@ -274,5 +286,6 @@ fn main() -> ExitCode {
             note,
             collected_at,
         } => finish(page(&p, &feed, &kind, &data, note, collected_at.as_deref())),
+        Cmd::Settings { feed } => finish(settings(&p, &feed)),
     }
 }

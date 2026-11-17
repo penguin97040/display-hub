@@ -99,6 +99,10 @@ async fn login_then_pages_to_allowed_other_kind_and_forbidden_feeds() {
                     feed: Some(feed.into()),
                     id: Some(id.into()),
                     stale_after_seconds: None,
+                    template: None,
+                    // What the owner chose for the note page, for the helper to read.
+                    settings: (id == "garden-note")
+                        .then(|| serde_json::json!({"bed": "beans"}).as_object().unwrap().clone()),
                 },
             )
             .await
@@ -177,11 +181,23 @@ async fn login_then_pages_to_allowed_other_kind_and_forbidden_feeds() {
             "not json",
         );
         let status = run(&cfg2, &["status"], "");
-        (login, token, ok, piped, big, forbidden, bad_json, status)
+        let settings = run(&cfg2, &["settings", "garden"], "");
+        let private_settings = run(&cfg2, &["settings", "private"], "");
+        (
+            login,
+            token,
+            ok,
+            piped,
+            big,
+            forbidden,
+            bad_json,
+            status,
+            (settings, private_settings),
+        )
     })
     .await
     .unwrap();
-    let (login, token, ok, piped, big, forbidden, bad_json, status) = outputs;
+    let (login, token, ok, piped, big, forbidden, bad_json, status, (settings, private_settings)) = outputs;
 
     let (out, err) = text(&login);
     assert!(login.status.success(), "{err}");
@@ -214,6 +230,21 @@ async fn login_then_pages_to_allowed_other_kind_and_forbidden_feeds() {
     let (_, err) = text(&bad_json);
     assert!(!bad_json.status.success());
     assert!(err.contains("isn't valid JSON"), "{err}");
+
+    // The helper reads what the owner chose for its feed's pages, but not another feed's.
+    let (out, err) = text(&settings);
+    assert!(settings.status.success(), "{err}");
+    let read: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        read,
+        serde_json::json!({"pages": [
+            {"page_id": "garden-note", "template": null, "settings": {"bed": "beans"}},
+            {"page_id": "garden-count", "template": null, "settings": {}}
+        ]})
+    );
+    let (_, err) = text(&private_settings);
+    assert!(!private_settings.status.success());
+    assert!(err.contains("403"), "{err}");
 
     // The hub shows what was sent.
     let snap = manager.preview_snapshot(&admin).await.unwrap();

@@ -62,7 +62,24 @@ pub struct StoredPage {
     pub stale_after_seconds: u32,
     /// What was last stored for the page. `None` until something is.
     pub content: Option<StoredContent>,
+    /// The template the page was made from, as `name/version` ([`valid_template_id`]), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// The answers given to the template's settings form, if any ([`settings_problem`]). Not
+    /// secret: the page's helper can read them, so API keys and passwords never go here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<Settings>,
 }
+
+/// A page's template settings: a JSON object of answers, such as `{"service": "claude-max"}`.
+pub type Settings = serde_json::Map<String, serde_json::Value>;
+
+/// The most a page's settings may take, written out as JSON.
+pub const MAX_SETTINGS_BYTES: usize = 2048;
+/// How deeply a page's settings may nest: the object itself, and lists or objects in it.
+pub const MAX_SETTINGS_DEPTH: usize = 3;
+/// The longest name of a setting.
+pub const MAX_SETTING_KEY_LEN: usize = 64;
 
 /// What was last stored for a page.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -109,9 +126,88 @@ pub fn valid_feed(name: &str) -> bool {
         })
 }
 
+/// A template id is written like a custom kind, `name/version`, such as `usage-limits/1`.
+pub fn valid_template_id(id: &str) -> bool {
+    hub_protocol::shapes::custom_kind_ok(id)
+}
+
+/// Why a page's settings can't be kept, as a sentence, or `None` when they can: they must be at most
+/// [`MAX_SETTINGS_BYTES`] as JSON, nest at most [`MAX_SETTINGS_DEPTH`] deep, and name each setting
+/// in 1 to [`MAX_SETTING_KEY_LEN`] bytes.
+pub fn settings_problem(settings: &Settings) -> Option<String> {
+    fn depth(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Array(a) => 1 + a.iter().map(depth).max().unwrap_or(0),
+            serde_json::Value::Object(o) => 1 + o.values().map(depth).max().unwrap_or(0),
+            _ => 0,
+        }
+    }
+    fn keys_ok(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Array(a) => a.iter().all(keys_ok),
+            serde_json::Value::Object(o) => o
+                .iter()
+                .all(|(k, v)| !k.is_empty() && k.len() <= MAX_SETTING_KEY_LEN && keys_ok(v)),
+            _ => true,
+        }
+    }
+    let size = serde_json::to_string(settings).map_or(usize::MAX, |s| s.len());
+    if size > MAX_SETTINGS_BYTES {
+        return Some(format!(
+            "These settings take {size} bytes; a page's settings may take at most {MAX_SETTINGS_BYTES}. Shorten the longer answers."
+        ));
+    }
+    if 1 + settings.values().map(depth).max().unwrap_or(0) > MAX_SETTINGS_DEPTH {
+        return Some(format!(
+            "These settings nest too deeply: at most {MAX_SETTINGS_DEPTH} levels, counting the settings themselves."
+        ));
+    }
+    let object = serde_json::Value::Object(settings.clone());
+    if !keys_ok(&object) {
+        return Some(format!(
+            "Each setting needs a name of 1 to {MAX_SETTING_KEY_LEN} characters."
+        ));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn settings(v: serde_json::Value) -> Settings {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn settings_are_small_shallow_and_named() {
+        assert_eq!(settings_problem(&Settings::new()), None);
+        let ok = settings(json!({"service": "claude-max", "days": ["mon", "tue"], "level": 3, "on": true}));
+        assert_eq!(settings_problem(&ok), None);
+        let ok = settings(json!({"a": [{"b": 1}]}));
+        assert_eq!(settings_problem(&ok), None);
+        let deep = settings(json!({"a": [[[1]]]}));
+        assert!(settings_problem(&deep).unwrap().contains("nest too deeply"));
+        let big = settings(json!({"note": "x".repeat(MAX_SETTINGS_BYTES)}));
+        assert!(settings_problem(&big).unwrap().contains("at most 2048"));
+        let fits = settings(json!({"n": "x".repeat(MAX_SETTINGS_BYTES - 8)}));
+        assert_eq!(serde_json::to_string(&fits).unwrap().len(), MAX_SETTINGS_BYTES);
+        assert_eq!(settings_problem(&fits), None);
+        for bad in [json!({"": 1}), json!({"a": {"": 1}}), json!({"k".repeat(65): 1})] {
+            assert!(settings_problem(&settings(bad)).unwrap().contains("a name"));
+        }
+    }
+
+    #[test]
+    fn template_ids_are_written_like_custom_kinds() {
+        for ok in ["usage-limits/1", "pi-status/12", "garden.weather/3"] {
+            assert!(valid_template_id(ok), "{ok}");
+        }
+        for bad in ["usage-limits", "usage-limits/0", "Usage/1", "a/1.0", ""] {
+            assert!(!valid_template_id(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn feed_names_are_short_lower_case_slugs() {

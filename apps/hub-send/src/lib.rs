@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 pub use file_store::{FileStore, TOKEN_FILE};
 pub use hub_client::ClientError;
 use hub_client::HubClient;
-pub use hub_core::api::{FeedAccepted, FeedContent};
+pub use hub_core::api::{FeedAccepted, FeedContent, FeedSettings, PageSettings};
 use hub_protocol::pairing::{hex, PairingString};
 use hub_protocol::{ErrorCode, Timestamp};
 use os_secrets::{OsStore, TokenStore};
@@ -320,6 +320,12 @@ impl Hub {
     /// Sends a page body to one of the feeds this helper was invited for.
     pub async fn send_page(&self, feed: &str, content: &FeedContent) -> Result<FeedAccepted, Error> {
         Ok(self.client.put_feed(&self.token, feed, content).await?)
+    }
+
+    /// The template and settings of each page this helper fills on one of its feeds, so it can do
+    /// what each page was set up for.
+    pub async fn settings(&self, feed: &str) -> Result<FeedSettings, Error> {
+        Ok(self.client.feed_settings(&self.token, feed).await?)
     }
 
     pub async fn reachable(&self) -> Result<(), Error> {

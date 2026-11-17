@@ -8,6 +8,7 @@
 | ESP32 displays (`llm-usage-display` repo) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
 | `hub-manager` | Windows PC (macOS and Linux later) | Pairs with the hub. Adds, removes and reorders pages. Enters manual figures. Adds and revokes displays. Shows diagnostics. Doesn't need to stay open. |
 | `hub-send` | Any computer | The general "send data" tool and library: pairs a helper with the hub, keeps its token, and sends a page body to a feed ([helpers.md](helpers.md)). |
+| `hub-templates` | Inside the manager (later) | Reads, checks and fills in page templates: a settings form and the pages it makes, as declarative JSON ([templates.md](templates.md)). The hub doesn't use it. |
 | `usage-helper` | The PC | Optional helper that forwards usage figures your own tools already report (Claude Code, Codex) to the hub ([providers.md](providers.md)). It builds usage meter pages with the `usage` crate and sends them through `hub-send`'s library. |
 | `display-simulator` | Any computer | Behaves like a display, for testing without hardware. |
 
@@ -25,17 +26,17 @@
 
 ## Storage
 
-The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/var/lib/display-hub` on a Pi), at schema version 4:
+The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/var/lib/display-hub` on a Pi), at schema version 5:
 
 | Table | Holds |
 |---|---|
-| `pages` | Each page: id, title, kind, source, feed, position in the shared order, stale time, and what was last stored for it (quality, `updated_at`, `data` as JSON text, note). |
+| `pages` | Each page: id, title, kind, source, feed, position in the shared order, stale time, what was last stored for it (quality, `updated_at`, `data` as JSON text, note), and the template it was made from and its settings (JSON text), if any. |
 | `display_pages` | Which pages each display shows: one row per display and ticked page. |
 | `devices`, `credentials`, `one_time_codes` | Displays, the hashes of every token, and pairing and enrolment codes. |
 | `helper_feeds` | The feeds each helper may send to. |
 | `audit_log` | Security-relevant events, kept for 90 days. |
 
-Schema 3 replaced version 2's `subscriptions` and `page_data` tables. The upgrade turned each subscription into a `meter` page with the same id, title, order and source, its service as the feed, and its stored figures, typed-in ones included, as meter data, so every display showed what it did before. Every display that wasn't revoked was ticked for every page. Schema 4 renamed the PC helper's old name, "collector", to "helper" wherever it was stored (page sources, credential roles and pairing codes), and turned each helper's services into feeds of the same names (`claude-max`, `chatgpt-plus`, `opencode-go-plus`), so the pairings and tokens the hub holds, and invites not yet used, keep working. A PC paired with the old `hubctl` tool needs `usage-helper` installed and `usage-helper login` run again with a fresh helper string, because `usage-helper` doesn't read what `hubctl` kept (see [providers.md](providers.md), "Upgrading from `hubctl`"). The hub no longer makes up demo figures, so each demo usage page with nothing stored was given the sample figures it showed, without reset times. Before upgrading an existing database, the hub saves a copy beside it (`hub-before-upgrade-schema-<old version>-<UTC time>.db`, owner-only), and the upgrade runs in one transaction ([deploy-raspberry-pi.md](deploy-raspberry-pi.md), "Upgrading").
+Schema 3 replaced version 2's `subscriptions` and `page_data` tables. The upgrade turned each subscription into a `meter` page with the same id, title, order and source, its service as the feed, and its stored figures, typed-in ones included, as meter data, so every display showed what it did before. Every display that wasn't revoked was ticked for every page. Schema 4 renamed the PC helper's old name, "collector", to "helper" wherever it was stored (page sources, credential roles and pairing codes), and turned each helper's services into feeds of the same names (`claude-max`, `chatgpt-plus`, `opencode-go-plus`), so the pairings and tokens the hub holds, and invites not yet used, keep working. A PC paired with the old `hubctl` tool needs `usage-helper` installed and `usage-helper login` run again with a fresh helper string, because `usage-helper` doesn't read what `hubctl` kept (see [providers.md](providers.md), "Upgrading from `hubctl`"). The hub no longer makes up demo figures, so each demo usage page with nothing stored was given the sample figures it showed, without reset times. Schema 5 added each page's `template` and `settings`, empty for every page that was already there; nothing else changed. Before upgrading an existing database, the hub saves a copy beside it (`hub-before-upgrade-schema-<old version>-<UTC time>.db`, owner-only), and the upgrade runs in one transaction ([deploy-raspberry-pi.md](deploy-raspberry-pi.md), "Upgrading").
 
 ## Admin API
 
@@ -46,8 +47,8 @@ Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, excep
 | `POST /v1/admin/pair` | Exchanges a pairing secret for an admin token. |
 | `GET /v1/admin/status` | Version, clocks, identity, addresses, and how many pages, displays and admins. |
 | `GET /v1/admin/pages` | Every page, in order, with what was last stored for it. |
-| `POST /v1/admin/pages` | Adds a page (title, kind, source, and optionally feed, id and stale time) at the end, ticked on every display. The hub holds at most 50. The id `order` is reserved for the route below (the schema 3 upgrade renamed any page that had it to `order-2`, or the next unused number). A feed name is a lower-case slug (`a-z` and `0-9` in words joined by single hyphens, up to 48 characters). A page with source `helper` needs a feed; it may be of any kind. |
-| `GET`, `PATCH`, `DELETE /v1/admin/pages/{id}` | One page; change its title, source or stale time (a new source drops what was stored, and the helper rule above applies); remove it. The kind can't change. |
+| `POST /v1/admin/pages` | Adds a page (title, kind, source, and optionally feed, id, stale time, template and settings) at the end, ticked on every display. The hub holds at most 50. The id `order` is reserved for the route below (the schema 3 upgrade renamed any page that had it to `order-2`, or the next unused number). A feed name is a lower-case slug (`a-z` and `0-9` in words joined by single hyphens, up to 48 characters). A page with source `helper` needs a feed; it may be of any kind. A template id is written like a custom kind (`usage-limits/1`); the hub only records it. Settings are a JSON object of the answers to the template's form, at most 2048 bytes as JSON and three levels deep (`hub_core::model::settings_problem`), and not secret: the page's helpers can read them. Empty settings are the same as none. |
+| `GET`, `PATCH`, `DELETE /v1/admin/pages/{id}` | One page; change its title, source, stale time or settings (a new source drops what was stored, and the helper rule above applies; new settings replace the old, and `{}` removes them); remove it. The kind and template can't change. Pages without a template or settings list without those fields. |
 | `PUT /v1/admin/pages/order` | The new order, naming every page once. |
 | `PUT /v1/admin/pages/{id}/content` | What a manual or demo page shows: `data` in its kind's shape, and a note, stored as `manual` or `demo` after the page's source. It is checked as the hub checks a page before sending it (the kind's rules and the 3072-byte page cap), and a refusal says which rule broke. A meter with no items (`{"items": []}`) is also accepted, and shows as "No figures yet". The page must keep its source until the write happens. |
 | `GET /v1/admin/devices` | The displays. `DELETE /v1/admin/devices/{id}` revokes one and clears its ticks. |
@@ -62,7 +63,7 @@ The manager still works in usage subscriptions. `hub-client` maps them onto mete
 
 Makers writing their own helper: see [helpers.md](helpers.md).
 
-A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper string), and gets `{"helper_id", "helper_token", "feeds"}`. The token (`dhc_…`) works only on the route below, and only for those feeds.
+A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper string), and gets `{"helper_id", "helper_token", "feeds"}`. The token (`dhc_…`) works only on the two routes below, and only for those feeds.
 
 `PUT /v1/helper/feeds/{feed}` sends a whole page body:
 
@@ -78,6 +79,8 @@ A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper st
 - `collected_at` (optional, by the helper's clock) is refused if it is more than five minutes ahead of the hub's clock, and is never stored later than the hub's clock. Without it, the content is dated now.
 - A feed the helper wasn't invited for gets `forbidden`. Bodies are at most 16 KiB.
 
+`GET /v1/helper/feeds/{feed}/settings` gives the template and settings of every page of the feed whose source is `helper`, in page order, as `{"pages": [{"page_id", "template", "settings"}]}` (`settings` is `{}` for a page with none). It reads nothing else about the pages. A feed the helper wasn't invited for gets `forbidden`, as above.
+
 ## Decisions
 
 | Decision | Why |
@@ -91,6 +94,7 @@ A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper st
 | Pi releases built with `cargo zigbuild` against glibc 2.36. | One binary runs on Raspberry Pi OS Bookworm and Trixie. CI checks the ceiling, and the binary ran under emulation on both. |
 | The PC helper forwards only what Claude Code and Codex already report on the PC, and only to pages set to "PC helper". Its token is scoped to feeds. | No provider credentials anywhere, no undocumented endpoints, and a stolen helper token can only write to its own feeds' helper pages. |
 | The hub has one generic door for helpers, and no usage knowledge. Usage limits live in the `usage` crate, used by the manager and `usage-helper`. | Anyone can write a helper for a new kind of page without changing the hub, and the hub's attack surface doesn't grow with each service. |
+| Templates are declarative JSON (fields, options, conditions and `{key}` placeholders, no scripting), read by the manager. The hub only records each page's template id and settings, checked for size, and lets the page's helpers read the settings. | A template from anyone can't run code, the hub stays generic, and one helper can serve pages set up in different ways. |
 | A hardened systemd unit: no capabilities, read-only system, local addresses only. | `systemd-analyze security` rates it 1.0. hubd's own checks stay in place; the unit is a second wall. |
 | Backups are folders, and restores move the old hub aside. | Easy to copy with `scp`, and a mistaken restore loses nothing. |
 | The manager's logic is a plain model (`apps/hub-manager/src/model.rs`) that returns operations; a worker runs them on a tokio runtime; GPUI only draws and forwards input. | The rules are unit-tested without a window, and one test drives the model against a real hub and a simulated display. |
