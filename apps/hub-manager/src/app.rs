@@ -1131,12 +1131,13 @@ impl Manager {
             );
             let editing = self.model.edit.as_ref().is_some_and(|x| x.id == id);
             let summary = format!(
-                "Page {} of {n}: {}, {}, {}. {}",
+                "Page {} of {n}: {}, {}, {}. {}.{}",
                 i + 1,
                 r.title,
                 r.quality,
                 r.origin,
-                r.freshness
+                r.freshness,
+                r.on_displays.as_ref().map_or(String::new(), |t| format!(" {t}."))
             );
             let key_id = id.clone();
             list.push(
@@ -1184,6 +1185,7 @@ impl Manager {
                                     .when(r.stale, |d| d.child(ui::tag("Stale", TEXT))),
                             )
                             .child(ui::label(&format!("{} · {} · {}", r.kind, r.origin, r.freshness)))
+                            .when_some(r.on_displays.clone(), |d, t| d.child(ui::label_in(&t, TEXT)))
                             .when_some(r.note.clone(), |d, note| {
                                 d.child(ui::p_muted(note).text_size(px(14.0)))
                             })
@@ -1832,30 +1834,38 @@ impl Manager {
                     window.focus(&fh, cx);
                 },
             );
+            let ticks = self.tick_panel(&d.id, &d.name, cx);
             rows.push(
                 div()
                     .id(ElementId::Name(format!("display-{}", d.id).into()))
                     .role(Role::Group)
                     .aria_label(SharedString::from(format!("{}. {seen}. {what}", d.name)))
                     .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap(px(16.0))
+                    .flex_col()
+                    .gap(px(14.0))
                     .px(px(m.pad))
                     .py(px(14.0))
                     .border_b_1()
                     .border_color(c(LINE))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(220.0))
                             .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(ui::h3(d.name.clone()))
-                            .child(ui::label(&format!("{seen} · {what}"))),
+                            .flex_wrap()
+                            .items_center()
+                            .gap(px(16.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(220.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .child(ui::h3(d.name.clone()))
+                                    .child(ui::label(&format!("{seen} · {what}"))),
+                            )
+                            .child(remove),
                     )
-                    .child(remove)
+                    .when_some(ticks, |d, t| d.child(t))
                     .into_any_element(),
             );
         }
@@ -1879,6 +1889,151 @@ impl Manager {
             div().flex().flex_col().gap(px(m.gap)).child(list).child(side)
         };
         vec![head, row.into_any_element()]
+    }
+
+    /// "Pages on this display": a tick box for every page, with Save and Cancel while there are
+    /// unsaved changes. Nothing is sent until Save, so one tap never changes what a display shows.
+    fn tick_panel(&mut self, display: &str, name: &str, cx: &mut Context<Self>) -> Option<Div> {
+        let view = self.model.tick_view(display)?;
+        let busy = self.model.busy.is_some();
+        let mut boxes = div().flex().flex_col().gap(px(2.0));
+        if view.rows.is_empty() {
+            boxes = boxes.child(ui::p_muted("No pages yet. Add one under Pages."));
+        }
+        for r in &view.rows {
+            let (d, p) = (display.to_string(), r.id.clone());
+            let label = if r.waiting {
+                format!("{} (not shown yet)", r.title)
+            } else {
+                r.title.clone()
+            };
+            boxes = boxes.child(self.tick_box(
+                format!("tick-{display}-{}", r.id),
+                &label,
+                &format!("{} on {name}", r.title),
+                r.ticked,
+                r.can_change,
+                cx,
+                move |this| this.model.toggle_tick(&d, &p),
+            ));
+        }
+        let (a, b) = (display.to_string(), display.to_string());
+        let save = self.button(
+            format!("ticks-save-{display}"),
+            "Save",
+            Kind::Primary,
+            view.dirty && view.can_save && !busy,
+            cx,
+            move |this, _, cx| {
+                let op = this.model.save_ticks(&a);
+                this.run(op, cx);
+            },
+        );
+        let cancel = self.button(
+            format!("ticks-cancel-{display}"),
+            "Cancel",
+            Kind::Quiet,
+            view.dirty,
+            cx,
+            move |this, _, _| this.model.cancel_ticks(&b),
+        );
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap(px(8.0))
+                        .child(ui::label("Pages on this display"))
+                        .child(
+                            div()
+                                .flex()
+                                .gap(px(6.0))
+                                .when(view.dirty, |d| d.child(ui::tag("Unsaved changes", BEAK)))
+                                .child(ui::tag(&view.count_text(), MUTED)),
+                        ),
+                )
+                .child(boxes)
+                .when_some(view.note(), |d, n| d.child(ui::p_muted(n).text_size(px(14.0))))
+                .when(view.dirty, |d| {
+                    d.child(div().flex().flex_wrap().gap(px(8.0)).child(save).child(cancel))
+                }),
+        )
+    }
+
+    /// One tick box. A box that can't be changed isn't a tab stop, and says why in its description.
+    #[allow(clippy::too_many_arguments)]
+    fn tick_box(
+        &mut self,
+        id: String,
+        text: &str,
+        aria: &str,
+        on: bool,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        set: impl Fn(&mut Self) + 'static,
+    ) -> Stateful<Div> {
+        let key: SharedString = id.into();
+        let fh = self.fh(key.clone(), cx);
+        let hot = enabled && self.is_hot(&key);
+        let colour = if !enabled {
+            MUTED
+        } else if on || hot {
+            TEXT
+        } else {
+            MUTED
+        };
+        let edge = if on { BEAK } else { colour };
+        div()
+            .id(ElementId::Name(key.clone()))
+            .on_hover(Self::track_hover(key, cx))
+            .role(Role::CheckBox)
+            .aria_label(SharedString::from(aria.to_string()))
+            .aria_toggled(if on { Toggled::True } else { Toggled::False })
+            .when(!enabled, |d| {
+                d.aria_description("Ten pages are ticked already. Untick one to choose another.")
+                    .a11y_synthetic_children(|b| b.parent_node().set_disabled())
+            })
+            .when(enabled, |d| d.track_focus(&fh))
+            .p(px(2.0))
+            .border_2()
+            .border_color(c(BLACK))
+            .focus_visible(|s| s.border_color(c(BEAK)))
+            .when(enabled, |d| d.cursor_pointer())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if enabled {
+                    set(this);
+                    cx.notify();
+                }
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .min_h(px(TARGET_MIN - 4.0))
+                    .px(px(10.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(18.0))
+                            .border_1()
+                            .border_color(c(edge))
+                            .p(px(3.0))
+                            .child(div().size_full().when(on, |d| d.bg(c(BEAK)))),
+                    )
+                    .child(
+                        div()
+                            .text_color(c(colour))
+                            .child(ui::p(text.to_string()).text_color(c(colour))),
+                    ),
+            )
     }
 
     fn enrol_panel(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Div {

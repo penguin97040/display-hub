@@ -75,6 +75,8 @@ The first command tries `raspberrypi.local` first and fails there (there's no Pi
 Then:
 
 - Change a page in the manager and run `once` again: the change is there.
+- In **Displays**, find "Pages on this display" under "Desk". Untick one page. "Unsaved changes" appears with **Save** and **Cancel**, and nothing has changed on the hub yet. Choose **Save**, run `once` again, and that page is gone. On **Pages**, the page now says "Not on any display", and the others say "On: Desk". Tick it again and save to bring it back.
+- Tick pages until 10 are ticked (add pages first if you need to). The unticked boxes go grey and can't be ticked, with the note "A display shows at most 10 pages. Untick one to choose another." Tab to a tick box and press Space or Enter: it changes, with the same orange frame as other controls. Adding another page when "Desk" already shows 10 says "Not shown on Desk yet: it already shows 10 pages."
 - Remove "Desk" in the manager and run `once` again: it says the display needs setting up again.
 
 ## 4. Things going wrong

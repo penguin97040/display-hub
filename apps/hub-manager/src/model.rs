@@ -4,6 +4,7 @@
 //! the view hands to the worker; the worker's answer comes back through [`Model::finish`]. One
 //! operation runs at a time, so changes reach the hub in the order they were made.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,7 @@ use hub_core::api::{
 use hub_core::freshness::{short_duration, Freshness};
 use hub_core::model::clean_title;
 use hub_core::Source;
-use hub_protocol::limits::MAX_TITLE_LEN;
+use hub_protocol::limits::{MAX_PAGES, MAX_TITLE_LEN};
 use hub_protocol::pairing::PairingString;
 use hub_protocol::provisioning::{Bundle, Wifi, MAX_HOSTS};
 use hub_protocol::{DataQuality, Snapshot, Timestamp};
@@ -74,6 +75,9 @@ pub struct Refresh {
     pub displays: Vec<DisplayView>,
     pub preview: Snapshot,
     pub helpers: Vec<HelperView>,
+    /// For each display (by id), the ids of the pages ticked on it. A display removed while this was
+    /// being gathered has no entry, and isn't in `displays` either.
+    pub ticks: HashMap<String, Vec<String>>,
 }
 
 /// A serial port a display might be on.
@@ -109,6 +113,11 @@ pub enum Op {
     },
     RevokeDisplay {
         id: String,
+    },
+    /// Sets the pages ticked on one display, all at once.
+    SetDisplayPages {
+        display: String,
+        ids: Vec<String>,
     },
     NewEnrolment {
         name: String,
@@ -518,6 +527,57 @@ pub struct PageRow {
     pub stale: bool,
     pub note: Option<String>,
     pub shown: Shown,
+    /// Which displays show it, in words. `None` when there are no displays yet.
+    pub on_displays: Option<String>,
+}
+
+/// One page in a display's "Pages on this display" list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TickRow {
+    pub id: String,
+    pub title: String,
+    pub ticked: bool,
+    /// Ticked, but past the first ten, so the display doesn't show it yet.
+    pub waiting: bool,
+    /// Whether the box can be changed: unticking always can, ticking only below the limit.
+    pub can_change: bool,
+}
+
+/// A display's "Pages on this display" list, with any changes not yet saved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TickView {
+    pub rows: Vec<TickRow>,
+    pub ticked: usize,
+    pub dirty: bool,
+    /// Ten are ticked, so the rest can't be.
+    pub full: bool,
+    /// Whether this can be saved: at most ten ticked.
+    pub can_save: bool,
+}
+
+impl TickView {
+    /// "3 of 10 ticked".
+    pub fn count_text(&self) -> String {
+        format!("{} of {MAX_PAGES}", self.ticked)
+    }
+
+    /// The plain note under the list, if it has something to say.
+    pub fn note(&self) -> Option<String> {
+        if self.ticked > MAX_PAGES {
+            let extra = self.ticked - MAX_PAGES;
+            Some(format!(
+                "A display shows at most {MAX_PAGES} pages. This one has {} ticked and shows only the first \
+                 {MAX_PAGES}. Untick {extra} to save.",
+                self.ticked
+            ))
+        } else if self.full && self.rows.len() > MAX_PAGES {
+            Some(format!(
+                "A display shows at most {MAX_PAGES} pages. Untick one to choose another."
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// Setting up a PC helper (`usage-helper`).
@@ -546,6 +606,9 @@ pub struct Model {
     pub pc_name: Field,
     pub add: AddFlow,
     pub edit: Option<EditPage>,
+    /// Tick changes not yet saved: per display, page id to whether it should be ticked. Only what
+    /// the person changed, so a page added meanwhile follows the hub.
+    pub tick_changes: HashMap<String, HashMap<String, bool>>,
     pub enrol: Enrol,
     pub helper: HelperForm,
 }
@@ -572,6 +635,7 @@ impl Model {
                 setup: None,
             },
             edit: None,
+            tick_changes: HashMap::new(),
             enrol: Enrol::default(),
             helper: HelperForm {
                 claude: true,
@@ -897,6 +961,7 @@ impl Model {
                     stale,
                     note: content.and_then(|c| c.note.clone()),
                     shown: Shown::of_data(&p.kind, content.and_then(|c| c.data.as_ref()), hub_now),
+                    on_displays: self.on_displays_text(&p.id),
                 }
             })
             .collect()
@@ -909,6 +974,181 @@ impl Model {
             .as_ref()
             .map(|r| r.displays.as_slice())
             .unwrap_or_default()
+    }
+
+    /// The ids of the pages a display really shows: the first ten ticked, in the shared order. `None`
+    /// if the last refresh had nothing for it.
+    fn shown_ids(&self, display: &str) -> Option<Vec<&str>> {
+        let ticked = self.last.as_ref()?.ticks.get(display)?;
+        Some(
+            self.pages()
+                .iter()
+                .map(|p| p.id.as_str())
+                .filter(|id| ticked.iter().any(|t| t == id))
+                .take(MAX_PAGES)
+                .collect(),
+        )
+    }
+
+    /// Which displays show a page, as the Pages list words it. `None` when there are no displays.
+    pub fn on_displays_text(&self, page: &str) -> Option<String> {
+        if self.displays().is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self
+            .displays()
+            .iter()
+            .filter(|d| self.shown_ids(&d.id).is_some_and(|ids| ids.contains(&page)))
+            .map(|d| d.name.as_str())
+            .collect();
+        Some(if names.is_empty() {
+            "Not on any display".into()
+        } else {
+            format!("On: {}", names.join(", "))
+        })
+    }
+
+    /// The pages ticked on a display now: what the hub has, with any unsaved changes on top.
+    fn effective_ticks(&self, display: &str) -> Option<HashSet<String>> {
+        let saved = self.last.as_ref()?.ticks.get(display)?;
+        let mut on: HashSet<String> = saved.iter().cloned().collect();
+        for (page, want) in self.tick_changes.get(display).into_iter().flatten() {
+            if *want {
+                on.insert(page.clone());
+            } else {
+                on.remove(page);
+            }
+        }
+        Some(on)
+    }
+
+    /// A display's "Pages on this display" list. `None` if the hub's answer had nothing for it.
+    pub fn tick_view(&self, display: &str) -> Option<TickView> {
+        let on = self.effective_ticks(display)?;
+        let ticked = self.pages().iter().filter(|p| on.contains(&p.id)).count();
+        let mut seen = 0;
+        let rows = self
+            .pages()
+            .iter()
+            .map(|p| {
+                let is_on = on.contains(&p.id);
+                if is_on {
+                    seen += 1;
+                }
+                TickRow {
+                    id: p.id.clone(),
+                    title: p.title.clone(),
+                    ticked: is_on,
+                    waiting: is_on && seen > MAX_PAGES,
+                    can_change: is_on || ticked < MAX_PAGES,
+                }
+            })
+            .collect();
+        Some(TickView {
+            rows,
+            ticked,
+            dirty: self.tick_changes.get(display).is_some_and(|c| !c.is_empty()),
+            full: ticked >= MAX_PAGES,
+            can_save: ticked <= MAX_PAGES,
+        })
+    }
+
+    /// Ticks or unticks a page on a display. Ticking past ten does nothing.
+    pub fn toggle_tick(&mut self, display: &str, page: &str) {
+        let Some(on) = self.effective_ticks(display) else {
+            return;
+        };
+        if !self.pages().iter().any(|p| p.id == page) {
+            return;
+        }
+        let want = !on.contains(page);
+        let ticked = self.pages().iter().filter(|p| on.contains(&p.id)).count();
+        if want && ticked >= MAX_PAGES {
+            return;
+        }
+        let saved = self
+            .last
+            .as_ref()
+            .and_then(|r| r.ticks.get(display))
+            .is_some_and(|t| t.iter().any(|x| x == page));
+        let changes = self.tick_changes.entry(display.to_string()).or_default();
+        // Back to what the hub has: nothing to save for this page.
+        if want == saved {
+            changes.remove(page);
+        } else {
+            changes.insert(page.to_string(), want);
+        }
+        if changes.is_empty() {
+            self.tick_changes.remove(display);
+        }
+    }
+
+    /// Drops a display's unsaved tick changes.
+    pub fn cancel_ticks(&mut self, display: &str) {
+        self.tick_changes.remove(display);
+    }
+
+    /// Saves a display's ticks. Nothing is sent when nothing changed, or when more than ten are ticked.
+    pub fn save_ticks(&mut self, display: &str) -> Option<Op> {
+        let view = self.tick_view(display)?;
+        if !view.dirty || !view.can_save {
+            return None;
+        }
+        let name = self.displays().iter().find(|d| d.id == display)?.name.clone();
+        let ids: Vec<String> = view
+            .rows
+            .iter()
+            .filter(|r| r.ticked)
+            .map(|r| r.id.clone())
+            .collect();
+        let secs = self
+            .last
+            .as_ref()
+            .map_or(300, |r| r.preview.refresh_after_seconds);
+        let done = format!(
+            "Saved the pages on {name}. It shows them on its next check, within about {}.",
+            minutes(secs)
+        );
+        self.start(
+            Busy::Saving { done },
+            Op::SetDisplayPages {
+                display: display.to_string(),
+                ids,
+            },
+        )
+    }
+
+    /// New pages the hub ticked on a display that already shows ten, so it doesn't show them yet.
+    fn held_back(&self, old: &[String], new: &Refresh) -> String {
+        let fresh: Vec<&str> = new
+            .pages
+            .iter()
+            .map(|p| p.id.as_str())
+            .filter(|id| !old.iter().any(|o| o == id))
+            .collect();
+        let mut out = Vec::new();
+        for d in &new.displays {
+            let Some(ticked) = new.ticks.get(&d.id) else {
+                continue;
+            };
+            let shown: Vec<&str> = new
+                .pages
+                .iter()
+                .map(|p| p.id.as_str())
+                .filter(|id| ticked.iter().any(|t| t == id))
+                .take(MAX_PAGES)
+                .collect();
+            if fresh
+                .iter()
+                .any(|id| ticked.iter().any(|t| t == id) && !shown.contains(id))
+            {
+                out.push(format!(
+                    "Not shown on {} yet: it already shows {MAX_PAGES} pages.",
+                    d.name
+                ));
+            }
+        }
+        out.join(" ")
     }
 
     pub fn ask_revoke(&mut self, id: &str) {
@@ -1091,6 +1331,22 @@ impl Model {
         self.last = Some(r);
         self.refreshed_at = Some(now);
         self.online = Some(true);
+        self.prune_tick_changes();
+    }
+
+    /// Forgets unsaved tick changes that no longer mean anything: the display or page has gone, or
+    /// the hub already has what was asked for.
+    fn prune_tick_changes(&mut self) {
+        let Some(r) = self.last.as_ref() else { return };
+        self.tick_changes.retain(|display, changes| {
+            let Some(saved) = r.ticks.get(display) else {
+                return false;
+            };
+            changes.retain(|page, want| {
+                r.pages.iter().any(|p| &p.id == page) && saved.iter().any(|t| t == page) != *want
+            });
+            !changes.is_empty()
+        });
     }
 
     pub fn finish(&mut self, result: Result<Outcome, Failure>, now: Instant) {
@@ -1119,12 +1375,14 @@ impl Model {
                 }
             }
             Ok(Outcome::Added { refresh, failed }) => {
+                let old: Vec<String> = self.pages().iter().map(|p| p.id.clone()).collect();
+                let held = self.held_back(&old, &refresh);
                 self.take_refresh(refresh, now);
                 self.add.form = None;
                 match (failed, busy) {
                     (None, Some(Busy::Adding { done, setup })) => {
                         self.add.setup = setup;
-                        self.notice = Some(Guidance::done(done, ""));
+                        self.notice = Some(Guidance::done(done, held));
                     }
                     (None, _) => {}
                     (Some(f), _) => {
@@ -1136,11 +1394,13 @@ impl Model {
                             tone: Tone::Problem,
                             title: format!("Added {} of {} pages", f.added, f.total),
                             detail: format!(
-                                "{} wasn't added: {}. {} The pages added before it are on the list.",
+                                "{} wasn't added: {}. {} The pages added before it are on the list. {held}",
                                 f.title,
                                 why.title.to_lowercase(),
                                 why.detail
-                            ),
+                            )
+                            .trim_end()
+                            .to_string(),
                             next: why.next,
                         });
                     }
@@ -1506,6 +1766,7 @@ mod tests {
                 pages: vec![],
             },
             helpers: vec![],
+            ticks: Default::default(),
         }
     }
 
@@ -2184,6 +2445,281 @@ mod tests {
         assert!(m.hub.is_none() && m.last.is_none());
         assert_eq!(m.pc_name.text, "Desk PC");
     }
+    // ---- ticks ----
+
+    fn display(id: &str, name: &str) -> DisplayView {
+        DisplayView {
+            id: id.into(),
+            name: name.into(),
+            enrolled_at: ts("2026-11-10T19:00:00Z"),
+            last_seen_at: None,
+            device: None,
+        }
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (1..=n).map(|i| format!("p{i:02}")).collect()
+    }
+
+    /// A connected model with `pages` pages and the given displays, each with its ticked page ids.
+    fn with_ticks(pages: usize, shows: &[(&str, &str, Vec<String>)]) -> (Model, Instant) {
+        let (mut m, now) = connected(vec![]);
+        let mut r = refresh(names(pages).iter().map(|n| page(n, Source::Manual)).collect());
+        for (id, name, ticked) in shows {
+            r.displays.push(display(id, name));
+            r.ticks.insert((*id).into(), ticked.clone());
+        }
+        m.finish(Ok(Outcome::Refreshed(r)), now);
+        (m, now)
+    }
+
+    fn ticked_ids(m: &Model, d: &str) -> Vec<String> {
+        m.tick_view(d)
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|r| r.ticked)
+            .map(|r| r.id)
+            .collect()
+    }
+
+    #[test]
+    fn ticks_list_every_page_in_order_and_change_only_when_saved() {
+        let (mut m, _) = with_ticks(3, &[("d1", "Kitchen", vec!["p01".into(), "p03".into()])]);
+        let v = m.tick_view("d1").unwrap();
+        assert_eq!(
+            v.rows
+                .iter()
+                .map(|r| (r.id.as_str(), r.ticked))
+                .collect::<Vec<_>>(),
+            [("p01", true), ("p02", false), ("p03", true)]
+        );
+        assert!(!v.dirty);
+        assert_eq!(
+            m.save_ticks("d1").map(|_| ()),
+            None,
+            "nothing changed, nothing sent"
+        );
+
+        m.toggle_tick("d1", "p02");
+        m.toggle_tick("d1", "p01");
+        let v = m.tick_view("d1").unwrap();
+        assert!(v.dirty);
+        assert_eq!(ticked_ids(&m, "d1"), ["p02", "p03"]);
+        // The hub still has the old ticks until the save is answered.
+        assert_eq!(m.last.as_ref().unwrap().ticks["d1"], ["p01", "p03"]);
+
+        match m.save_ticks("d1") {
+            Some(Op::SetDisplayPages { display, ids }) => {
+                assert_eq!(display, "d1");
+                assert_eq!(ids, ["p02", "p03"]);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(m.busy.is_some(), "one operation at a time");
+    }
+
+    #[test]
+    fn changing_a_tick_back_is_not_a_change() {
+        let (mut m, _) = with_ticks(2, &[("d1", "Kitchen", vec!["p01".into()])]);
+        m.toggle_tick("d1", "p02");
+        assert!(m.tick_view("d1").unwrap().dirty);
+        m.toggle_tick("d1", "p02");
+        assert!(!m.tick_view("d1").unwrap().dirty);
+        assert!(m.tick_changes.is_empty());
+    }
+
+    #[test]
+    fn cancel_drops_unsaved_changes() {
+        let (mut m, _) = with_ticks(2, &[("d1", "Kitchen", vec!["p01".into()])]);
+        m.toggle_tick("d1", "p02");
+        m.cancel_ticks("d1");
+        assert_eq!(ticked_ids(&m, "d1"), ["p01"]);
+        assert!(!m.tick_view("d1").unwrap().dirty);
+    }
+
+    #[test]
+    fn at_most_ten_can_be_ticked() {
+        let (mut m, _) = with_ticks(12, &[("d1", "Kitchen", names(9))]);
+        assert!(!m.tick_view("d1").unwrap().full);
+        m.toggle_tick("d1", "p10");
+        let v = m.tick_view("d1").unwrap();
+        assert!(v.full && v.can_save);
+        assert_eq!(v.count_text(), "10 of 10");
+        assert_eq!(
+            v.note().as_deref(),
+            Some("A display shows at most 10 pages. Untick one to choose another.")
+        );
+        // The rest can't be ticked, and trying does nothing; ticked ones can still be unticked.
+        assert!(v.rows.iter().filter(|r| !r.ticked).all(|r| !r.can_change));
+        assert!(v.rows.iter().filter(|r| r.ticked).all(|r| r.can_change));
+        m.toggle_tick("d1", "p11");
+        assert_eq!(ticked_ids(&m, "d1").len(), 10);
+        m.toggle_tick("d1", "p01");
+        m.toggle_tick("d1", "p11");
+        assert_eq!(ticked_ids(&m, "d1").len(), 10);
+        assert!(!ticked_ids(&m, "d1").contains(&"p01".to_string()));
+    }
+
+    #[test]
+    fn no_note_when_every_page_fits() {
+        let (m, _) = with_ticks(10, &[("d1", "Kitchen", names(10))]);
+        let v = m.tick_view("d1").unwrap();
+        assert!(v.full);
+        assert_eq!(v.note(), None, "nothing is left to choose");
+    }
+
+    #[test]
+    fn a_display_with_more_than_ten_ticked_can_only_save_once_it_is_down_to_ten() {
+        // The hub ticks a new page everywhere, so a full display can end up with eleven.
+        let (mut m, _) = with_ticks(11, &[("d1", "Kitchen", names(11))]);
+        let v = m.tick_view("d1").unwrap();
+        assert_eq!(v.ticked, 11);
+        assert!(!v.can_save);
+        assert!(v.rows[10].waiting && !v.rows[9].waiting);
+        assert!(v.note().unwrap().contains("Untick 1 to save"));
+        assert!(m.save_ticks("d1").is_none(), "no change");
+        m.toggle_tick("d1", "p11");
+        let op = m.save_ticks("d1");
+        assert!(matches!(op, Some(Op::SetDisplayPages { ref ids, .. }) if ids.len() == 10));
+    }
+
+    #[test]
+    fn saving_shows_the_hubs_answer_and_keeps_changes_when_it_fails() {
+        let (mut m, now) = with_ticks(2, &[("d1", "Kitchen", vec!["p01".into()])]);
+        m.toggle_tick("d1", "p02");
+        m.save_ticks("d1").unwrap();
+        m.finish(Err(Failure::Client(ClientError::Timeout)), now);
+        assert!(m.tick_view("d1").unwrap().dirty, "still there to try again");
+
+        m.save_ticks("d1").unwrap();
+        let mut r = refresh(vec![page("p01", Source::Manual), page("p02", Source::Manual)]);
+        r.displays.push(display("d1", "Kitchen"));
+        r.ticks.insert("d1".into(), vec!["p01".into(), "p02".into()]);
+        m.finish(Ok(Outcome::Refreshed(r)), now);
+        let v = m.tick_view("d1").unwrap();
+        assert!(!v.dirty, "the hub now has what was asked for");
+        assert_eq!(ticked_ids(&m, "d1"), ["p01", "p02"]);
+        let n = m.notice.as_ref().unwrap();
+        assert!(n.title.starts_with("Saved the pages on Kitchen."), "{}", n.title);
+    }
+
+    #[test]
+    fn a_refresh_keeps_changes_for_pages_still_there_and_drops_the_rest() {
+        let (mut m, now) = with_ticks(
+            3,
+            &[
+                ("d1", "Kitchen", vec!["p01".into()]),
+                ("d2", "Desk", vec!["p01".into()]),
+            ],
+        );
+        m.toggle_tick("d1", "p02");
+        m.toggle_tick("d1", "p03");
+        m.toggle_tick("d2", "p02");
+        // p03 is removed, and d2 is gone; a new page, p04, arrives ticked on d1.
+        let mut r = refresh(vec![
+            page("p01", Source::Manual),
+            page("p02", Source::Manual),
+            page("p04", Source::Manual),
+        ]);
+        r.displays.push(display("d1", "Kitchen"));
+        r.ticks.insert("d1".into(), vec!["p01".into(), "p04".into()]);
+        m.finish(Ok(Outcome::Refreshed(r)), now);
+        assert_eq!(m.tick_changes.len(), 1);
+        assert_eq!(m.tick_changes["d1"].len(), 1);
+        assert_eq!(
+            ticked_ids(&m, "d1"),
+            ["p01", "p02", "p04"],
+            "the new page follows the hub"
+        );
+        assert!(m.tick_view("d2").is_none());
+    }
+
+    #[test]
+    fn a_display_with_no_ticks_answer_has_no_list() {
+        let (mut m, _) = with_ticks(2, &[]);
+        m.last.as_mut().unwrap().displays.push(display("d9", "Hall"));
+        assert!(m.tick_view("d9").is_none());
+        m.toggle_tick("d9", "p01");
+        assert!(m.tick_changes.is_empty());
+        assert!(m.save_ticks("d9").is_none());
+    }
+
+    #[test]
+    fn each_page_says_which_displays_show_it() {
+        let (m, now) = with_ticks(
+            3,
+            &[
+                ("d1", "Kitchen", vec!["p01".into(), "p02".into()]),
+                ("d2", "Desk", vec!["p01".into()]),
+            ],
+        );
+        let rows = m.page_rows(now);
+        assert_eq!(rows[0].on_displays.as_deref(), Some("On: Kitchen, Desk"));
+        assert_eq!(rows[1].on_displays.as_deref(), Some("On: Kitchen"));
+        assert_eq!(rows[2].on_displays.as_deref(), Some("Not on any display"));
+
+        let (m, now) = with_ticks(1, &[]);
+        assert_eq!(
+            m.page_rows(now)[0].on_displays,
+            None,
+            "no displays, nothing to say"
+        );
+    }
+
+    #[test]
+    fn a_ticked_page_past_the_first_ten_is_not_on_the_display() {
+        let (m, now) = with_ticks(11, &[("d1", "Kitchen", names(11))]);
+        let rows = m.page_rows(now);
+        assert_eq!(rows[9].on_displays.as_deref(), Some("On: Kitchen"));
+        assert_eq!(rows[10].on_displays.as_deref(), Some("Not on any display"));
+    }
+
+    #[test]
+    fn adding_a_page_says_which_displays_are_already_full() {
+        let (mut m, now) = with_ticks(10, &[("d1", "Kitchen", names(10)), ("d2", "Desk", names(3))]);
+        let mut r = refresh(names(11).iter().map(|n| page(n, Source::Manual)).collect());
+        r.displays.push(display("d1", "Kitchen"));
+        r.displays.push(display("d2", "Desk"));
+        // The hub ticks the new page on every display.
+        r.ticks.insert("d1".into(), names(11));
+        let mut desk = names(3);
+        desk.push("p11".into());
+        r.ticks.insert("d2".into(), desk);
+        m.busy = Some(Busy::Adding {
+            done: "Added Page. Displays show it soon.".into(),
+            setup: None,
+        });
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: r,
+                failed: None,
+            }),
+            now,
+        );
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.detail, "Not shown on Kitchen yet: it already shows 10 pages.");
+    }
+
+    #[test]
+    fn adding_a_page_says_nothing_when_no_display_is_full() {
+        let (mut m, now) = with_ticks(2, &[("d1", "Kitchen", names(2))]);
+        let mut r = refresh(names(3).iter().map(|n| page(n, Source::Manual)).collect());
+        r.displays.push(display("d1", "Kitchen"));
+        r.ticks.insert("d1".into(), names(3));
+        m.busy = Some(Busy::Adding {
+            done: "Added Page.".into(),
+            setup: None,
+        });
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: r,
+                failed: None,
+            }),
+            now,
+        );
+        assert_eq!(m.notice.as_ref().unwrap().detail, "");
+    }
 }
 
 #[cfg(test)]
@@ -2253,6 +2789,7 @@ mod helper_string_tests {
                 pages: vec![],
             },
             helpers: vec![],
+            ticks: Default::default(),
         };
         m.finish(Ok(Outcome::HelperInvite { invite, refresh }), Instant::now());
         let s = m.helper.string.clone().expect("a string");

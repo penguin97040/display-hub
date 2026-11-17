@@ -1,6 +1,7 @@
 //! Runs the model's operations: network calls on a tokio runtime, and blocking work (the credential
 //! store, files, the serial port) on its blocking threads. GPUI awaits the result (`app.rs`).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -94,6 +95,38 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("blocking work doesn't panic")
 }
 
+/// Each display's ticked pages, fetched side by side. A display removed since the list was read
+/// answers "not found": it is left out, so the answer matches what the hub has now.
+async fn ticks(
+    s: &Session,
+    displays: Vec<hub_core::api::DisplayView>,
+) -> Result<(Vec<hub_core::api::DisplayView>, HashMap<String, Vec<String>>), Failure> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for d in &displays {
+        let (s, id) = (s.clone(), d.id.clone());
+        tasks.spawn(async move {
+            let found = s.client.display_pages(&s.token, &id).await;
+            (id, found)
+        });
+    }
+    let mut ticks = HashMap::new();
+    while let Some(done) = tasks.join_next().await {
+        let (id, found) = done.map_err(|e| Failure::File(format!("the worker stopped: {e}")))?;
+        match found {
+            Ok(ids) => {
+                ticks.insert(id, ids);
+            }
+            Err(hub_client::ClientError::Status { status: 404, .. }) => {}
+            Err(e) => return Err(Failure::Client(e)),
+        }
+    }
+    let displays = displays
+        .into_iter()
+        .filter(|d| ticks.contains_key(&d.id))
+        .collect();
+    Ok((displays, ticks))
+}
+
 async fn refresh(s: &Session) -> Result<Refresh, Failure> {
     let t = s.token.as_str();
     let (status, pages, displays, preview, helpers) = tokio::try_join!(
@@ -104,12 +137,14 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         s.client.helpers(t),
     )
     .map_err(Failure::Client)?;
+    let (displays, ticks) = ticks(s, displays).await?;
     Ok(Refresh {
         status,
         pages,
         displays,
         preview,
         helpers,
+        ticks,
     })
 }
 
@@ -206,6 +241,14 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
         Op::RevokeDisplay { id } => {
             let s = ctx.session()?;
             s.client.revoke_display(&s.token, &id).await.map_err(c)?;
+            Ok(Outcome::Refreshed(refresh(&s).await?))
+        }
+        Op::SetDisplayPages { display, ids } => {
+            let s = ctx.session()?;
+            s.client
+                .set_display_pages(&s.token, &display, ids)
+                .await
+                .map_err(c)?;
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::NewEnrolment { name } => {
@@ -588,6 +631,29 @@ mod tests {
         run(&mut m, &ctx, op).await;
         device.accept(clock.now(), paired::snapshot(&state).await);
         assert_eq!(count_pages(&screen(&device, clock.now())), 2);
+
+        // Choosing which pages the display shows: new displays show everything, and a saved
+        // change reaches it on its next poll.
+        let op = m.refresh();
+        run(&mut m, &ctx, op).await;
+        let display = m.displays()[0].id.clone();
+        let first = m.pages()[0].id.clone();
+        assert_eq!(m.tick_view(&display).unwrap().ticked, 2);
+        assert_eq!(
+            m.page_rows(Instant::now())[0].on_displays.as_deref(),
+            Some("On: Desk")
+        );
+        m.toggle_tick(&display, &first);
+        let op = m.save_ticks(&display);
+        run(&mut m, &ctx, op).await;
+        assert!(!m.tick_view(&display).unwrap().dirty, "{:?}", m.notice);
+        assert_eq!(m.tick_view(&display).unwrap().ticked, 1);
+        assert_eq!(
+            m.page_rows(Instant::now())[0].on_displays.as_deref(),
+            Some("Not on any display")
+        );
+        device.accept(clock.now(), paired::snapshot(&state).await);
+        assert_eq!(count_pages(&screen(&device, clock.now())), 1);
 
         // Removing the display cuts it off.
         let op = m.refresh();
