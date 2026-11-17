@@ -2829,6 +2829,7 @@ dependencies = [
  "hub-client",
  "hub-core",
  "hub-protocol",
+ "hub-templates",
  "hubd",
  "os-secrets",
  "serde",

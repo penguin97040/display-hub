@@ -11,7 +11,7 @@ use hub_protocol::pairing::hex;
 use hub_protocol::provisioning::Bundle;
 use zeroize::Zeroizing;
 
-use crate::model::{Failure, Op, Outcome, PortInfo, Refresh};
+use crate::model::{AddFailure, Failure, Op, Outcome, PortInfo, Refresh};
 use crate::settings::{self, SavedHub};
 use os_secrets::TokenStore;
 
@@ -98,7 +98,7 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
     let t = s.token.as_str();
     let (status, pages, displays, preview, helpers) = tokio::try_join!(
         s.client.status(t),
-        s.client.subscriptions(t),
+        s.client.pages(t),
         s.client.displays(t),
         s.client.preview_snapshot(t),
         s.client.helpers(t),
@@ -154,30 +154,53 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             })
         }
         Op::Refresh => Ok(Outcome::Refreshed(refresh(&ctx.session()?).await?)),
-        Op::AddPage(new) => {
+        Op::AddPages { pages } => {
             let s = ctx.session()?;
-            s.client.add_subscription(&s.token, &new).await.map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            let total = pages.len();
+            let mut failed = None;
+            for (added, new) in pages.iter().enumerate() {
+                if let Err(error) = s.client.add_page_with_samples(&s.token, new).await {
+                    // Nothing was added yet: an ordinary failure. Otherwise the pages already added
+                    // stay, so say how far it got.
+                    if added == 0 {
+                        return Err(c(error));
+                    }
+                    failed = Some(AddFailure {
+                        added,
+                        total,
+                        title: new.title.clone(),
+                        error,
+                    });
+                    break;
+                }
+            }
+            Ok(Outcome::Added {
+                refresh: refresh(&s).await?,
+                failed,
+            })
         }
-        Op::ChangePage { id, change, figures } => {
+        Op::SaveEdit { id, change, content } => {
             let s = ctx.session()?;
             s.client
-                .change_subscription(&s.token, &id, &change)
+                .change_page_with_samples(&s.token, &id, &change)
                 .await
                 .map_err(c)?;
-            if let Some(f) = figures {
-                s.client.set_manual(&s.token, &id, &f).await.map_err(c)?;
+            if let Some(content) = content {
+                s.client
+                    .set_page_content(&s.token, &id, &content)
+                    .await
+                    .map_err(c)?;
             }
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::RemovePage { id } => {
             let s = ctx.session()?;
-            s.client.remove_subscription(&s.token, &id).await.map_err(c)?;
+            s.client.remove_page(&s.token, &id).await.map_err(c)?;
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::Reorder { ids } => {
             let s = ctx.session()?;
-            s.client.reorder(&s.token, ids).await.map_err(c)?;
+            s.client.reorder_pages(&s.token, ids).await.map_err(c)?;
             Ok(Outcome::Refreshed(refresh(&s).await?))
         }
         Op::RevokeDisplay { id } => {
@@ -348,18 +371,35 @@ mod tests {
 
     use display_simulator::render::{count_pages, screen};
     use display_simulator::{paired, Device, NoJitter};
-    use hub_core::{FakeClock, Source};
+    use hub_core::FakeClock;
     use hub_protocol::pairing::PairingString;
-    use usage::Service;
 
     use super::*;
+    use crate::forms::{ContentEdit, Input, Shape};
     use crate::model::{Model, Outcome};
+    use crate::shown::Shown;
     use os_secrets::MemoryStore;
 
     async fn run(model: &mut Model, ctx: &Arc<Ctx>, op: Option<Op>) {
         let op = op.expect("an operation");
         let result = execute(ctx.clone(), op).await;
         model.finish(result, Instant::now());
+    }
+
+    /// Adds pages from a built-in template the way the Pages screen does: pick it, fill in the form.
+    async fn add_from(model: &mut Model, ctx: &Arc<Ctx>, template: &str, answers: &[(&str, &str)]) {
+        let i = model.add.templates.iter().position(|t| t.id == template).unwrap();
+        model.pick_template(i);
+        let form = model.add.form.as_mut().unwrap();
+        for (key, value) in answers {
+            let i = form.template.settings.iter().position(|s| s.key == *key).unwrap();
+            match form.inputs[i] {
+                Input::Choice(_) => form.pick(i, value),
+                _ => form.text_mut(i).unwrap().set(value),
+            }
+        }
+        let op = model.submit_add();
+        run(model, ctx, op).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -429,27 +469,94 @@ mod tests {
         run(&mut again, &other, op).await;
         assert_eq!(again.notice.as_ref().unwrap().tone, crate::guidance::Tone::Danger);
 
-        // Pages, through the model.
-        for service in [Service::ClaudeMax, Service::ChatgptPlus] {
-            m.add.service = service;
-            m.add.source = Source::Demo;
-            let op = m.add_page();
-            run(&mut m, &ctx, op).await;
+        // Pages, from templates, through the model. A demo usage page gets its sample figures.
+        for service in ["claude-max", "chatgpt-plus"] {
+            add_from(
+                &mut m,
+                &ctx,
+                "usage-limits/1",
+                &[("service", service), ("source", "demo")],
+            )
+            .await;
         }
-        m.add.service = Service::OpencodeGoPlus;
-        m.add.source = Source::Manual;
-        let op = m.add_page();
-        run(&mut m, &ctx, op).await;
-        assert_eq!(m.pages().len(), 3);
+        add_from(
+            &mut m,
+            &ctx,
+            "usage-limits/1",
+            &[("service", "opencode-go-plus"), ("source", "manual")],
+        )
+        .await;
+        assert_eq!(m.pages().len(), 3, "{:?}", m.notice);
+        assert!(
+            matches!(m.page_rows(Instant::now())[0].shown, Shown::Meter(_)),
+            "the demo page holds sample figures"
+        );
         m.begin_edit("opencode-go-plus", Instant::now());
-        m.edit.as_mut().unwrap().metrics[0].percent.set("37.5");
-        m.edit.as_mut().unwrap().metrics[0].resets_in.set("2 h");
+        let Some(ContentEdit {
+            shape: Shape::UsageMeter { rows, .. },
+            ..
+        }) = m.edit.as_mut().unwrap().content.as_mut()
+        else {
+            panic!("usage editor")
+        };
+        rows[0].percent.set("37.5");
+        rows[0].resets_in.set("2 h");
         let op = m.save_edit(Instant::now());
         run(&mut m, &ctx, op).await;
         let rows = m.page_rows(Instant::now());
         assert_eq!(rows[2].quality, "MANUAL");
-        assert_eq!(rows[2].metrics[0].used_percent, Some(37.5));
-        assert_eq!(rows[2].metrics[1].used_percent, None);
+        let Shown::Meter(bars) = &rows[2].shown else {
+            panic!("{:?}", rows[2].shown)
+        };
+        assert_eq!(bars[0].used_percent, Some(37.5));
+        assert_eq!(bars[1].used_percent, None);
+
+        // Other shapes and a helper page, listed whatever their kind, and typed-in content edited.
+        add_from(&mut m, &ctx, "big-number/1", &[("title", "Water used")]).await;
+        add_from(&mut m, &ctx, "pi-status/1", &[]).await;
+        assert_eq!(m.pages().len(), 5, "{:?}", m.notice);
+        assert!(m.add.setup.is_some(), "the Pi command is offered afterwards");
+        let rows = m.page_rows(Instant::now());
+        assert_eq!(
+            (rows[3].kind.as_str(), rows[3].origin.as_str(), &rows[3].shown),
+            ("Big number", "Typed in", &Shown::Empty)
+        );
+        assert_eq!(rows[4].origin, "Filled by a helper (feed pi-status)");
+        m.begin_edit("water-used", Instant::now());
+        let Some(ContentEdit {
+            shape: Shape::BigNumber { value, unit, .. },
+            ..
+        }) = m.edit.as_mut().unwrap().content.as_mut()
+        else {
+            panic!("big number editor")
+        };
+        value.set("12.5");
+        unit.set("L");
+        let op = m.save_edit(Instant::now());
+        run(&mut m, &ctx, op).await;
+        assert_eq!(
+            m.page_rows(Instant::now())[3].shown,
+            Shown::BigNumber {
+                value: "12.5 L".into(),
+                caption: None
+            }
+        );
+        // The page's template and settings are kept on the hub, and editing them changes the title.
+        assert_eq!(m.pages()[3].template.as_deref(), Some("big-number/1"));
+        m.begin_edit("water-used", Instant::now());
+        let form = m.edit.as_mut().unwrap().form.as_mut().unwrap();
+        form.text_mut(0).unwrap().set("Water today");
+        let op = m.save_edit(Instant::now());
+        run(&mut m, &ctx, op).await;
+        assert_eq!(m.pages()[3].title, "Water today");
+        assert_eq!(m.pages()[3].settings.as_ref().unwrap()["title"], "Water today");
+        for id in ["water-used", "pi-status"] {
+            m.ask_remove_page(id);
+            let op = m.confirm_yes();
+            run(&mut m, &ctx, op).await;
+        }
+        assert_eq!(m.pages().len(), 3);
+
         let op = m.move_page("opencode-go-plus", -1);
         run(&mut m, &ctx, op).await;
         assert_eq!(m.pages()[1].id, "opencode-go-plus");

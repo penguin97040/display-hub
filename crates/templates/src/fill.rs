@@ -18,8 +18,10 @@ pub(crate) fn answer(f: &Field, v: &Value) -> Result<Option<Value>, String> {
         FieldKind::Text => {
             let s = v.as_str().ok_or_else(|| format!("{label} needs to be text."))?;
             let max = f.max_length.unwrap_or(DEFAULT_TEXT_SETTING_LEN);
-            // Cleaned with room to spare, so an answer that is too long is refused, not cut.
-            match sanitise_text(s, max + 1) {
+            // Cleaned with room for the whole answer (NFC can at most triple it), so an answer that
+            // is too long is refused, never cut and shortened to fit.
+            let room = s.chars().count().saturating_mul(3).saturating_add(1);
+            match sanitise_text(s, room) {
                 None => Ok(None),
                 Some(t) if t.chars().count() > max => {
                     Err(format!("{label} can be at most {max} characters."))

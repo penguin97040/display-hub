@@ -231,6 +231,11 @@ fn a_makers_template_fills_in_every_kind_of_setting() {
             json!({"bed": "north", "name": "x".repeat(21)}),
             "Name can be at most 20 characters.",
         ),
+        // Too long by a little, with a space where a cut would land: still refused, not shortened.
+        (
+            json!({"bed": "north", "name": format!("{} yy", "x".repeat(19))}),
+            "Name can be at most 20 characters.",
+        ),
         (
             json!({"bed": "north", "shows": []}),
             "Choose at least 1 option for Shows.",

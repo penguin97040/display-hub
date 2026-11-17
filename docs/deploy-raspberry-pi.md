@@ -104,9 +104,9 @@ sudo display-hub-helper add pi-status --run /usr/local/share/display-hub/helpers
 
 It pairs the helper with the hub, runs it once and shows what happened. From then on it runs every 5 minutes, and after every restart.
 
-The hub shows what a helper sends on pages of the same kind whose figures come from a helper ("PC helper" in the manager) and whose feed is the helper's, here `pi-status`. "Updated 1 page: pi-status" means such a page exists and now has the temperature.
+The hub shows what a helper sends on pages of the same kind whose content comes from a helper ("Filled by a helper" in the manager) and whose feed is the helper's, here `pi-status`. "Updated 1 page: pi-status" means such a page exists and now has the temperature.
 
-**The desktop manager can't make such a page yet:** it adds usage pages only. Until it can, the helper still runs and the hub accepts what it sends, but it says that no page uses the feed. (For developers: `POST /v1/admin/pages` with `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}` makes one; `tools/pi-container-test/run.sh` does this.)
+**Making the page:** in the desktop manager, open **Pages**, choose **Add from template**, then **Pi status**. The manager adds the page, then shows the command above with a **Copy** button. Run it once on the Pi. Until it has run, the page says it is waiting for the helper's first update. (For developers: `POST /v1/admin/pages` with `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}` makes the same page; `tools/pi-container-test/run.sh` does this.)
 
 ### Your own helper
 

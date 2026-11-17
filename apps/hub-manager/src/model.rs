@@ -9,24 +9,32 @@ use std::time::{Duration, Instant};
 
 use hub_client::usb::UsbDisplay;
 use hub_client::ClientError;
-use hub_core::api::{DisplayView, EnrolmentGrant, HelperInvite, HelperView, HubStatus, NewHelper};
+use hub_core::api::{
+    DisplayView, EnrolmentGrant, HelperInvite, HelperView, HubStatus, NewHelper, NewPage, PageChange,
+    PageContentInput, PageView,
+};
 use hub_core::freshness::{short_duration, Freshness};
-use hub_core::model::{clean_note, clean_title};
+use hub_core::model::clean_title;
 use hub_core::Source;
-use hub_protocol::limits::{MAX_NOTE_LEN, MAX_PAGES, MAX_TITLE_LEN};
+use hub_protocol::limits::MAX_TITLE_LEN;
 use hub_protocol::pairing::PairingString;
 use hub_protocol::provisioning::{Bundle, Wifi, MAX_HOSTS};
 use hub_protocol::{DataQuality, Snapshot, Timestamp};
 use zeroize::Zeroizing;
 
-use usage::{
-    clean_percent, ManualFigures, ManualMetric, NewSubscription, Service, SubscriptionChange,
-    SubscriptionView, Window,
-};
+use hub_templates::Template;
+use usage::{clean_percent, Service};
 
 use crate::field::Field;
+use crate::forms::{ContentEdit, TemplateForm};
 use crate::guidance::{self, Doing, Guidance, Next, Tone};
 use crate::settings::SavedHub;
+use crate::shown::{kind_label, origin_text, Shown};
+
+/// The most pages the hub holds. Each display shows at most its first ten ticked ones. This is the
+/// hub's own limit (`hubd::store::MAX_STORED_PAGES`); a test keeps the two equal, and the hub
+/// refuses a page past its limit whatever this says.
+pub const HUB_PAGE_LIMIT: usize = 50;
 
 /// How often the open app checks the hub, and how often while waiting for a new display to appear.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(30);
@@ -62,7 +70,7 @@ impl Section {
 #[derive(Clone, Debug)]
 pub struct Refresh {
     pub status: HubStatus,
-    pub pages: Vec<SubscriptionView>,
+    pub pages: Vec<PageView>,
     pub displays: Vec<DisplayView>,
     pub preview: Snapshot,
     pub helpers: Vec<HelperView>,
@@ -83,11 +91,15 @@ pub enum Op {
         label: String,
     },
     Refresh,
-    AddPage(NewSubscription),
-    ChangePage {
+    /// Adds these pages, one after another, in order.
+    AddPages {
+        pages: Vec<NewPage>,
+    },
+    /// Changes a page, then sets what it shows if the edit typed in new content.
+    SaveEdit {
         id: String,
-        change: SubscriptionChange,
-        figures: Option<ManualFigures>,
+        change: PageChange,
+        content: Option<PageContentInput>,
     },
     RemovePage {
         id: String,
@@ -119,14 +131,38 @@ pub enum Op {
 
 #[derive(Debug)]
 pub enum Outcome {
-    Paired { hub: SavedHub, refresh: Refresh },
+    Paired {
+        hub: SavedHub,
+        refresh: Refresh,
+    },
     Refreshed(Refresh),
-    Enrolment { grant: EnrolmentGrant, refresh: Refresh },
-    HelperInvite { invite: HelperInvite, refresh: Refresh },
+    /// Pages were added. `failed` is set when one of them wasn't, and the ones after it weren't tried.
+    Added {
+        refresh: Refresh,
+        failed: Option<AddFailure>,
+    },
+    Enrolment {
+        grant: EnrolmentGrant,
+        refresh: Refresh,
+    },
+    HelperInvite {
+        invite: HelperInvite,
+        refresh: Refresh,
+    },
     Ports(Vec<PortInfo>),
     Sent(UsbDisplay),
     Saved(PathBuf),
     Forgotten,
+}
+
+/// The page that couldn't be added, and why.
+#[derive(Debug)]
+pub struct AddFailure {
+    /// How many pages were added before it.
+    pub added: usize,
+    pub total: usize,
+    pub title: String,
+    pub error: ClientError,
 }
 
 #[derive(Debug)]
@@ -143,10 +179,19 @@ pub enum Failure {
 pub enum Busy {
     Pairing,
     Refreshing,
-    Saving { done: String },
+    Saving {
+        done: String,
+    },
+    /// Adding pages from a template.
+    Adding {
+        done: String,
+        setup: Option<SetupNote>,
+    },
     Enrolling,
     Ports,
-    Sending { port: String },
+    Sending {
+        port: String,
+    },
     SavingFile,
     Forgetting,
 }
@@ -157,6 +202,7 @@ impl Busy {
             Busy::Pairing => "Pairing",
             Busy::Refreshing => "Checking the hub",
             Busy::Saving { .. } => "Saving",
+            Busy::Adding { .. } => "Adding",
             Busy::Enrolling => "Preparing setup details",
             Busy::Ports => "Looking for USB ports",
             Busy::Sending { .. } => "Sending over USB",
@@ -179,7 +225,7 @@ impl Confirm {
         match self {
             Confirm::RemovePage { title, .. } => (
                 format!("Remove {title}?"),
-                "Displays stop showing it on their next poll. Its stored figures are deleted.".into(),
+                "Displays stop showing it on their next poll. What it holds is deleted.".into(),
                 "Remove page",
             ),
             Confirm::RevokeDisplay { name, .. } => (
@@ -207,23 +253,12 @@ impl Confirm {
     }
 }
 
-/// Sources the manager offers.
-pub const ADDABLE_SOURCES: [Source; 4] = [Source::Manual, Source::Helper, Source::Demo, Source::None];
-
-/// The sources that make sense for a service: the PC helper can report Claude Max (Claude Code) and
-/// ChatGPT Plus (Codex), but nothing reports OpenCode Go.
-pub fn sources_for(service: Service) -> Vec<Source> {
-    ADDABLE_SOURCES
-        .into_iter()
-        .filter(|s| *s != Source::Helper || matches!(service, Service::ClaudeMax | Service::ChatgptPlus))
-        .collect()
-}
-
+/// Where a page's content comes from, as the edit form words it.
 pub fn source_label(s: Source) -> &'static str {
     match s {
-        Source::Demo => "Demo figures",
+        Source::Demo => "Demo",
         Source::Manual => "Typed in",
-        Source::Helper => "PC helper",
+        Source::Helper => "Helper",
         Source::None => "Nothing yet",
     }
 }
@@ -238,25 +273,188 @@ pub fn quality_tag(q: DataQuality) -> &'static str {
     }
 }
 
-pub struct AddPage {
-    pub service: Service,
-    pub source: Source,
-    pub title: Field,
+/// What to do once, by hand, after adding pages: a command to run on the hub's Pi, shown with a Copy
+/// button.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetupNote {
+    pub help: String,
+    pub command: String,
+    /// The command was put on the clipboard.
+    pub copied: bool,
 }
 
-pub struct MetricFields {
-    pub window: Window,
-    pub percent: Field,
-    pub resets_in: Field,
+/// Adding pages from a template: pick one, fill in its form, then perhaps a setup step.
+pub struct AddFlow {
+    /// The templates that come with the app.
+    pub templates: Vec<Template>,
+    /// The chosen template's form. Without one, the picker shows.
+    pub form: Option<TemplateForm>,
+    /// What to do next, after pages were added.
+    pub setup: Option<SetupNote>,
 }
 
+/// A page being edited.
 pub struct EditPage {
     pub id: String,
-    pub service: Service,
+    pub kind: String,
+    pub feed: Option<String>,
+    /// The template the page was made from, if it has one.
+    pub template_id: Option<String>,
+    /// Its settings form, when the app has the template.
+    pub form: Option<TemplateForm>,
+    pub original_title: String,
     pub title: Field,
+    /// Where the content comes from, for a page with no settings form to say.
     pub source: Source,
-    pub metrics: Vec<MetricFields>,
-    pub note: Field,
+    /// Whether there are sample figures to offer.
+    pub can_demo: bool,
+    /// An editor for typed-in content, for the four shapes.
+    pub content: Option<ContentEdit>,
+}
+
+impl EditPage {
+    /// Where the content will come from once saved: the template's answers decide, when it has a form.
+    pub fn effective_source(&self) -> Source {
+        self.form
+            .as_ref()
+            .and_then(|f| f.check().ok())
+            .and_then(|made| pick_page(made, &self.kind, &self.feed, &self.original_title))
+            .map_or(self.source, |p| p.source)
+    }
+
+    /// The sources to offer for a page with no settings form.
+    pub fn source_choices(&self) -> Vec<Source> {
+        let mut out = vec![Source::Manual];
+        if self.can_demo {
+            out.push(Source::Demo);
+        }
+        if self.feed.is_some() {
+            out.push(Source::Helper);
+        }
+        out.push(Source::None);
+        if !out.contains(&self.source) {
+            out.push(self.source);
+        }
+        out
+    }
+
+    /// Whether the title is its own box. A template that asks for a title in its form has it there.
+    pub fn has_title_box(&self) -> bool {
+        self.form
+            .as_ref()
+            .is_none_or(|f| f.template.field("title").is_none())
+    }
+}
+
+/// Why an edit can't be saved yet.
+enum EditError {
+    /// About the settings form: shown under it.
+    Form(String),
+    /// About anything else: shown as a message.
+    Notice(Guidance),
+}
+
+/// What saving an edit sends.
+struct EditPlan {
+    title: String,
+    change: PageChange,
+    content: Option<PageContentInput>,
+}
+
+const KIND_CHANGE_TEXT: &str =
+    "These settings would change what kind of page this is, or the feed that fills it. \
+     A page's kind and feed can't be changed, so remove this page and add it again from the template.";
+
+/// The page the template's answers make for an existing page: the one of the same kind and feed.
+/// Where a template makes several like it, the one with the page's title, else the first.
+fn pick_page(made: Vec<NewPage>, kind: &str, feed: &Option<String>, title: &str) -> Option<NewPage> {
+    let mut same: Vec<NewPage> = made
+        .into_iter()
+        .filter(|p| p.kind == kind && p.feed == *feed)
+        .collect();
+    match same.iter().position(|p| p.title == title) {
+        Some(at) => Some(same.swap_remove(at)),
+        None if same.is_empty() => None,
+        None => Some(same.remove(0)),
+    }
+}
+
+fn typed_title(typed: &str) -> Result<String, EditError> {
+    if typed.chars().count() > MAX_TITLE_LEN {
+        return Err(EditError::Notice(bad_title()));
+    }
+    clean_title(typed).ok_or_else(|| EditError::Notice(bad_title()))
+}
+
+/// Works out what saving the edit sends, or what is wrong with it.
+fn plan_edit(e: &EditPage, page: &PageView, hub_now: Option<Timestamp>) -> Result<EditPlan, EditError> {
+    let typed = e.title.trimmed();
+    let mut change = PageChange::default();
+    let (title, source) = match &e.form {
+        Some(form) => {
+            let made = form.check().map_err(EditError::Form)?;
+            let mine = pick_page(made, &page.kind, &page.feed, &page.title)
+                .ok_or_else(|| EditError::Form(KIND_CHANGE_TEXT.into()))?;
+            let title = if e.has_title_box() && typed != page.title {
+                typed_title(typed)?
+            } else {
+                // The title follows the settings only when they change it: a page that was renamed
+                // by hand keeps its name through an edit that doesn't touch what names it.
+                let before = form
+                    .template
+                    .make_pages(&page.settings.clone().unwrap_or_default())
+                    .ok()
+                    .and_then(|m| pick_page(m, &page.kind, &page.feed, &page.title))
+                    .map(|p| p.title);
+                if before.as_deref() == Some(mine.title.as_str()) {
+                    page.title.clone()
+                } else {
+                    mine.title.clone()
+                }
+            };
+            let settings = mine.settings.clone().unwrap_or_default();
+            if page.settings.clone().unwrap_or_default() != settings {
+                change.settings = Some(settings);
+            }
+            (title, mine.source)
+        }
+        None => (typed_title(typed)?, e.source),
+    };
+    change.title = Some(title.clone());
+    if source != page.source {
+        change.source = Some(source);
+    }
+    let mut content = None;
+    if source == Source::Manual {
+        if let Some(editor) = &e.content {
+            let stored =
+                page.source == Source::Manual && page.content.as_ref().is_some_and(|c| c.data.is_some());
+            // A page with nothing typed in yet and a blank editor stays as it is.
+            if stored || !editor.is_blank() {
+                let built = editor.build(hub_now).map_err(|p| {
+                    EditError::Notice(Guidance {
+                        tone: Tone::Problem,
+                        title: p.title,
+                        detail: p.detail,
+                        next: Next::None,
+                    })
+                })?;
+                let unchanged = page.source == Source::Manual
+                    && page
+                        .content
+                        .as_ref()
+                        .is_some_and(|c| c.data == built.data && c.note == built.note);
+                if !unchanged {
+                    content = Some(built);
+                }
+            }
+        }
+    }
+    Ok(EditPlan {
+        title,
+        change,
+        content,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,20 +509,15 @@ impl Default for Enrol {
 pub struct PageRow {
     pub id: String,
     pub title: String,
-    pub service: &'static str,
-    pub source: &'static str,
+    /// "Big number", "Custom: nearby-flights/1".
+    pub kind: String,
+    /// Where the content comes from, in words.
+    pub origin: String,
     pub quality: &'static str,
     pub freshness: String,
     pub stale: bool,
     pub note: Option<String>,
-    pub metrics: Vec<MetricRow>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct MetricRow {
-    pub label: String,
-    pub used_percent: Option<f64>,
-    pub resets: String,
+    pub shown: Shown,
 }
 
 /// Setting up a PC helper (`usage-helper`).
@@ -351,7 +544,7 @@ pub struct Model {
     pub confirm: Option<Confirm>,
     pub pairing: Field,
     pub pc_name: Field,
-    pub add: AddPage,
+    pub add: AddFlow,
     pub edit: Option<EditPage>,
     pub enrol: Enrol,
     pub helper: HelperForm,
@@ -373,10 +566,10 @@ impl Model {
             confirm: None,
             pairing: Field::new(512),
             pc_name: name,
-            add: AddPage {
-                service: Service::ClaudeMax,
-                source: Source::Manual,
-                title: Field::new(MAX_TITLE_LEN),
+            add: AddFlow {
+                templates: hub_templates::built_in(),
+                form: None,
+                setup: None,
             },
             edit: None,
             enrol: Enrol::default(),
@@ -469,12 +662,12 @@ impl Model {
 
     // ---- pages -----------------------------------------------------------------------------------
 
-    pub fn pages(&self) -> &[SubscriptionView] {
+    pub fn pages(&self) -> &[PageView] {
         self.last.as_ref().map(|r| r.pages.as_slice()).unwrap_or_default()
     }
 
     pub fn can_add_page(&self) -> bool {
-        self.pages().len() < MAX_PAGES
+        self.pages().len() < HUB_PAGE_LIMIT
     }
 
     /// How soon displays pick up a change, for the confirmation message.
@@ -489,35 +682,92 @@ impl Model {
         )
     }
 
-    pub fn add_page(&mut self) -> Option<Op> {
-        if !self.can_add_page() {
-            return self.problem(Guidance {
-                tone: Tone::Problem,
-                title: format!("Displays show at most {MAX_PAGES} pages"),
-                detail: "Remove a page first.".into(),
-                next: Next::None,
-            });
+    /// The hub is full, or adding this many pages would fill it past its limit.
+    fn page_limit_problem(&self, adding: usize) -> Option<Guidance> {
+        let have = self.pages().len();
+        if have + adding <= HUB_PAGE_LIMIT {
+            return None;
         }
-        let title = match self.add.title.trimmed() {
-            "" => None,
-            t => match clean_title(t) {
-                Some(t) => Some(t),
-                None => return self.problem(bad_title()),
+        Some(Guidance {
+            tone: Tone::Problem,
+            title: format!("The hub holds at most {HUB_PAGE_LIMIT} pages"),
+            detail: if adding > 1 {
+                format!("This would add {adding} pages, and the hub has {have}. Remove some pages first.")
+            } else {
+                "Remove a page first.".into()
             },
+            next: Next::None,
+        })
+    }
+
+    /// Chooses a template from the picker, and shows its form.
+    pub fn pick_template(&mut self, i: usize) {
+        if let Some(g) = self.page_limit_problem(1) {
+            self.notice = Some(g);
+            return;
+        }
+        if let Some(t) = self.add.templates.get(i) {
+            self.add.form = Some(TemplateForm::new(t.clone(), None));
+            self.add.setup = None;
+            self.notice = None;
+        }
+    }
+
+    /// Back to the list of templates.
+    pub fn leave_form(&mut self) {
+        self.add.form = None;
+    }
+
+    /// Checks the form and adds the pages it makes.
+    pub fn submit_add(&mut self) -> Option<Op> {
+        let form = self.add.form.as_mut()?;
+        let pages = match form.check() {
+            Ok(p) => p,
+            Err(e) => {
+                form.error = Some(e);
+                return None;
+            }
         };
-        let shown = title
-            .clone()
-            .unwrap_or_else(|| self.add.service.default_title().into());
-        let op = Op::AddPage(NewSubscription {
-            service: self.add.service,
-            source: self.add.source,
-            title,
-            id: None,
-        });
+        form.error = None;
+        let setup = form.template.setup.clone();
+        if let Some(g) = self.page_limit_problem(pages.len()) {
+            self.notice = Some(g);
+            return None;
+        }
+        let shown = match pages.as_slice() {
+            [one] => one.title.clone(),
+            many => format!("{} pages", many.len()),
+        };
         let done = format!("Added {shown}. {}", self.next_poll_text());
-        let op = self.start(Busy::Saving { done }, op)?;
-        self.add.title.clear();
-        Some(op)
+        let setup = setup.map(|s| SetupNote {
+            help: s.help,
+            command: s.command,
+            copied: false,
+        });
+        self.start(Busy::Adding { done, setup }, Op::AddPages { pages })
+    }
+
+    /// The command to put on the clipboard, and a note that it was copied.
+    pub fn copy_setup(&mut self) -> Option<String> {
+        let s = self.add.setup.as_mut()?;
+        s.copied = true;
+        Some(s.command.clone())
+    }
+
+    /// Done with the setup step: back to the list of templates.
+    pub fn finish_setup(&mut self) {
+        self.add.setup = None;
+        self.add.form = None;
+    }
+
+    /// Clears messages about what was typed once someone types again.
+    pub fn typing(&mut self) {
+        if let Some(f) = self.add.form.as_mut() {
+            f.error = None;
+        }
+        if let Some(f) = self.edit.as_mut().and_then(|e| e.form.as_mut()) {
+            f.error = None;
+        }
     }
 
     /// Moves a page up (`-1`) or down (`1`).
@@ -551,109 +801,63 @@ impl Model {
             return;
         };
         let hub_now = self.hub_now(now);
-        let stored = p.data.as_ref().filter(|d| d.quality == DataQuality::Manual);
-        let metrics = p
-            .service
-            .windows()
-            .iter()
-            .map(|&w| {
-                let value = stored.and_then(|d| d.metrics.iter().find(|m| m.window == w));
-                let mut percent = Field::new(6);
-                let mut resets_in = Field::new(24);
-                if let Some(v) = value {
-                    if let Some(pct) = v.used_percent {
-                        percent.set(&format_percent(pct));
-                    }
-                    if let (Some(at), Some(now)) = (v.resets_at, hub_now) {
-                        let left = now.seconds_until(at);
-                        if left > 0 {
-                            resets_in.set(&short_duration(left));
-                        }
-                    }
-                }
-                MetricFields {
-                    window: w,
-                    percent,
-                    resets_in,
-                }
-            })
-            .collect();
-        let mut title = Field::new(MAX_TITLE_LEN);
+        // Sample figures only exist for usage pages.
+        let can_demo = p.source == Source::Demo || usage::usage_service(&p).is_some();
+        let template = p
+            .template
+            .as_deref()
+            .and_then(|id| self.add.templates.iter().find(|t| t.id == id))
+            .cloned();
+        let form = template.map(|t| TemplateForm::new(t, Some(&p.settings.clone().unwrap_or_default())));
+        let mut title = Field::new(MAX_TITLE_LEN * 4);
         title.set(&p.title);
-        let mut note = Field::new(MAX_NOTE_LEN);
-        if let Some(n) = stored.and_then(|d| d.note.as_deref()) {
-            note.set(n);
-        }
         self.edit = Some(EditPage {
+            content: ContentEdit::for_page(&p, hub_now),
             id: p.id,
-            service: p.service,
+            kind: p.kind,
+            feed: p.feed,
+            template_id: p.template,
+            form,
+            original_title: p.title,
             title,
             source: p.source,
-            metrics,
-            note,
+            can_demo,
         });
     }
 
+    /// Checks the edit and saves it: the title, where the content comes from, the template's
+    /// settings, and typed-in content.
     pub fn save_edit(&mut self, now: Instant) -> Option<Op> {
         let hub_now = self.hub_now(now);
         let e = self.edit.as_ref()?;
-        let Some(title) = clean_title(e.title.trimmed()) else {
-            return self.problem(bad_title());
+        let Some(page) = self.pages().iter().find(|p| p.id == e.id).cloned() else {
+            self.edit = None;
+            return self.problem(Guidance {
+                tone: Tone::Problem,
+                title: "That page is no longer on the hub".into(),
+                detail: "It may have been removed from another PC.".into(),
+                next: Next::None,
+            });
         };
-        let figures = if e.source == Source::Manual {
-            let mut metrics = Vec::new();
-            for m in &e.metrics {
-                let used_percent = match parse_percent(m.percent.trimmed()) {
-                    Ok(p) => p,
-                    Err(()) => {
-                        return self.problem(Guidance {
-                            tone: Tone::Problem,
-                            title: format!("{} isn't a share from 0 to 100", m.window.label()),
-                            detail: "Enter a number such as 42 or 42.5, or leave it empty if you don't know. An empty \
-                                     box shows as unknown, never as zero."
-                                .into(),
-                            next: Next::None,
-                        })
-                    }
-                };
-                let resets_at = match parse_duration(m.resets_in.trimmed()) {
-                    Ok(None) => None,
-                    Ok(Some(secs)) => hub_now.map(|now| now.plus_seconds(secs)),
-                    Err(()) => return self.problem(Guidance {
-                        tone: Tone::Problem,
-                        title: "Reset times look like 3 h 20 min".into(),
-                        detail:
-                            "Enter how long until the allowance resets, using d, h and min, such as 2 d 4 h \
-                                     or 45 min. Leave it empty if you don't know."
-                                .into(),
-                        next: Next::None,
-                    }),
-                };
-                metrics.push(ManualMetric {
-                    window: m.window,
-                    used_percent,
-                    resets_at,
-                });
+        let plan = match plan_edit(e, &page, hub_now) {
+            Ok(p) => p,
+            Err(EditError::Form(msg)) => {
+                if let Some(f) = self.edit.as_mut().and_then(|e| e.form.as_mut()) {
+                    f.error = Some(msg);
+                }
+                return None;
             }
-            let note = match e.note.trimmed() {
-                "" => None,
-                n => clean_note(n),
-            };
-            Some(ManualFigures { metrics, note })
-        } else {
-            None
+            Err(EditError::Notice(g)) => return self.problem(g),
         };
-        let change = SubscriptionChange {
-            title: Some(title.clone()),
-            source: Some(e.source),
-        };
-        let op = Op::ChangePage {
-            id: e.id.clone(),
-            change,
-            figures,
-        };
-        let done = format!("Saved {title}. {}", self.next_poll_text());
-        let op = self.start(Busy::Saving { done }, op)?;
+        let done = format!("Saved {}. {}", plan.title, self.next_poll_text());
+        let op = self.start(
+            Busy::Saving { done },
+            Op::SaveEdit {
+                id: page.id,
+                change: plan.change,
+                content: plan.content,
+            },
+        )?;
         self.edit = None;
         Some(op)
     }
@@ -663,38 +867,27 @@ impl Model {
         self.pages()
             .iter()
             .map(|p| {
-                let data = p.data.as_ref();
-                let quality = data.map_or(DataQuality::Unavailable, |d| d.quality);
-                let (freshness, stale) = match (data.and_then(|d| d.updated_at), hub_now) {
-                    _ if p.source == Source::Demo => {
-                        ("Sample figures, made fresh on every check".into(), false)
-                    }
-                    (None, _) => ("No figures yet".into(), false),
-                    (Some(at), Some(now)) => {
+                let content = p.content.as_ref();
+                let quality = content.map_or(DataQuality::Unavailable, |c| c.quality);
+                let updated = content.and_then(|c| c.updated_at);
+                let (freshness, stale) = match (p.source, updated, hub_now) {
+                    (Source::Demo, _, _) => ("Sample content".into(), false),
+                    (Source::Manual, None, _) => ("Nothing typed in yet".into(), false),
+                    (Source::Helper, None, _) => ("Waiting for the helper's first update".into(), false),
+                    (_, None, _) => ("No content yet".into(), false),
+                    (_, Some(at), Some(now)) => {
                         let age = at.seconds_until(now).max(0);
-                        let stale = age > p.source.stale_after_seconds() as i64;
+                        let stale = age > i64::from(p.stale_after_seconds);
                         let text = format!("Updated {} ago", short_duration(age));
                         (if stale { format!("Stale. {text}") } else { text }, stale)
                     }
-                    (Some(_), None) => (String::new(), false),
+                    (_, Some(_), None) => (String::new(), false),
                 };
-                let metrics = data
-                    .map(|d| {
-                        d.metrics
-                            .iter()
-                            .map(|m| MetricRow {
-                                label: m.window.label().into(),
-                                used_percent: m.used_percent,
-                                resets: resets_text(m.resets_at, hub_now),
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
                 PageRow {
                     id: p.id.clone(),
                     title: p.title.clone(),
-                    service: p.service.default_title(),
-                    source: source_label(p.source),
+                    kind: kind_label(&p.kind),
+                    origin: origin_text(p.source, p.feed.as_deref()),
                     quality: if p.source == Source::Demo {
                         "DEMO"
                     } else {
@@ -702,8 +895,8 @@ impl Model {
                     },
                     freshness,
                     stale,
-                    note: data.and_then(|d| d.note.clone()),
-                    metrics,
+                    note: content.and_then(|c| c.note.clone()),
+                    shown: Shown::of_data(&p.kind, content.and_then(|c| c.data.as_ref()), hub_now),
                 }
             })
             .collect()
@@ -925,6 +1118,34 @@ impl Model {
                     self.notice = None;
                 }
             }
+            Ok(Outcome::Added { refresh, failed }) => {
+                self.take_refresh(refresh, now);
+                self.add.form = None;
+                match (failed, busy) {
+                    (None, Some(Busy::Adding { done, setup })) => {
+                        self.add.setup = setup;
+                        self.notice = Some(Guidance::done(done, ""));
+                    }
+                    (None, _) => {}
+                    (Some(f), _) => {
+                        // What was added stays, so adding again would double it: start over from the
+                        // list, and say what happened.
+                        let address = self.address();
+                        let why = guidance::from_client(&f.error, Doing::Other, &address);
+                        self.notice = Some(Guidance {
+                            tone: Tone::Problem,
+                            title: format!("Added {} of {} pages", f.added, f.total),
+                            detail: format!(
+                                "{} wasn't added: {}. {} The pages added before it are on the list.",
+                                f.title,
+                                why.title.to_lowercase(),
+                                why.detail
+                            ),
+                            next: why.next,
+                        });
+                    }
+                }
+            }
             Ok(Outcome::Enrolment { grant, refresh }) => {
                 self.take_refresh(refresh, now);
                 let wifi = wifi_of(&self.enrol.ssid, &self.enrol.password).ok().flatten();
@@ -1060,7 +1281,7 @@ impl Model {
             self.needs_pairing = true;
         }
         // A reorder shown early is put back by the next refresh.
-        if matches!(busy, Some(Busy::Saving { .. })) {
+        if matches!(busy, Some(Busy::Saving { .. } | Busy::Adding { .. })) {
             self.refreshed_at = None;
         }
         self.notice = Some(g);
@@ -1152,7 +1373,7 @@ fn minutes(secs: u32) -> String {
     }
 }
 
-fn format_percent(p: f64) -> String {
+pub fn format_percent(p: f64) -> String {
     if p.fract() == 0.0 {
         format!("{p:.0}")
     } else {
@@ -1205,20 +1426,6 @@ pub fn parse_duration(s: &str) -> Result<Option<i64>, ()> {
     Ok(Some(total))
 }
 
-pub fn resets_text(at: Option<Timestamp>, now: Option<Timestamp>) -> String {
-    match (at, now) {
-        (Some(at), Some(now)) => {
-            let left = now.seconds_until(at);
-            if left <= 0 {
-                "Reset due".into()
-            } else {
-                format!("Resets in {}", short_duration(left))
-            }
-        }
-        _ => String::new(),
-    }
-}
-
 /// How a preview page reads on the Overview: its freshness on the hub's clock.
 pub fn preview_freshness(page: &hub_protocol::Page, snapshot: &Snapshot) -> (String, bool) {
     match Freshness::of(page, snapshot.generated_at, 0) {
@@ -1235,23 +1442,43 @@ pub fn preview_freshness(page: &hub_protocol::Page, snapshot: &Snapshot) -> (Str
 mod tests {
     use super::*;
     use hub_core::api::HubIdentity;
-    use usage::{MetricValue, PageData};
+    use hub_core::StoredContent;
+    use serde_json::json;
 
     fn ts(s: &str) -> Timestamp {
         Timestamp::parse(s).unwrap()
     }
 
-    fn page(id: &str, source: Source, data: Option<PageData>) -> SubscriptionView {
-        SubscriptionView {
+    fn page(id: &str, source: Source) -> PageView {
+        PageView {
             id: id.into(),
-            service: Service::ClaudeMax,
             title: id.into(),
+            kind: "text".into(),
             source,
-            data,
+            feed: None,
+            stale_after_seconds: source.stale_after_seconds(),
+            content: None,
+            template: None,
+            settings: None,
         }
     }
 
-    fn refresh(pages: Vec<SubscriptionView>) -> Refresh {
+    fn with_content(
+        mut p: PageView,
+        quality: DataQuality,
+        updated: &str,
+        data: serde_json::Value,
+    ) -> PageView {
+        p.content = Some(StoredContent {
+            quality,
+            updated_at: Some(ts(updated)),
+            data: Some(data),
+            note: None,
+        });
+        p
+    }
+
+    fn refresh(pages: Vec<PageView>) -> Refresh {
         Refresh {
             status: HubStatus {
                 version: "0.1.0".into(),
@@ -1282,7 +1509,7 @@ mod tests {
         }
     }
 
-    fn connected(pages: Vec<SubscriptionView>) -> (Model, Instant) {
+    fn connected(pages: Vec<PageView>) -> (Model, Instant) {
         let hub = SavedHub::new(
             "192.168.1.20",
             8443,
@@ -1324,9 +1551,9 @@ mod tests {
     #[test]
     fn reordering_is_shown_at_once_and_sends_the_whole_order() {
         let (mut m, _) = connected(vec![
-            page("a", Source::Demo, None),
-            page("b", Source::Demo, None),
-            page("c", Source::Demo, None),
+            page("a", Source::Demo),
+            page("b", Source::Demo),
+            page("c", Source::Demo),
         ]);
         assert!(m.move_page("a", -1).is_none(), "already first");
         let Some(Op::Reorder { ids }) = m.move_page("c", -1) else {
@@ -1342,76 +1569,415 @@ mod tests {
         assert!(m.refresh_due(Instant::now()).is_some());
     }
 
+    fn pick(m: &mut Model, id: &str) {
+        let i = m.add.templates.iter().position(|t| t.id == id).unwrap();
+        m.pick_template(i);
+        assert!(m.add.form.is_some());
+    }
+
+    fn set_text(m: &mut Model, key: &str, value: &str) {
+        let form = m.add.form.as_mut().unwrap();
+        let i = form.template.settings.iter().position(|s| s.key == key).unwrap();
+        form.text_mut(i).unwrap().set(value);
+    }
+
     #[test]
-    fn adding_respects_the_page_limit_and_reports_success() {
+    fn the_hub_page_limit_is_the_hubs_own() {
+        assert_eq!(HUB_PAGE_LIMIT, hubd::store::MAX_STORED_PAGES);
+    }
+
+    #[test]
+    fn adding_from_a_template_sends_the_pages_and_reports_success() {
         let (mut m, now) = connected(vec![]);
-        m.add.title.set("Work Claude");
-        let Some(Op::AddPage(new)) = m.add_page() else {
+        pick(&mut m, "big-number/1");
+        set_text(&mut m, "title", "Water used");
+        let Some(Op::AddPages { pages }) = m.submit_add() else {
             panic!("add")
         };
         assert_eq!(
-            (new.title.as_deref(), new.source),
-            (Some("Work Claude"), Source::Manual)
+            (pages[0].title.as_str(), pages[0].kind.as_str(), pages[0].source),
+            ("Water used", "big_number", Source::Manual)
         );
-        assert!(m.add.title.text.is_empty());
+        assert_eq!(pages[0].template.as_deref(), Some("big-number/1"));
+        assert!(m.submit_add().is_none(), "one operation at a time");
         m.finish(
-            Ok(Outcome::Refreshed(refresh(vec![page("x", Source::Manual, None)]))),
+            Ok(Outcome::Added {
+                refresh: refresh(vec![page("x", Source::Manual)]),
+                failed: None,
+            }),
             now,
         );
         let n = m.notice.clone().unwrap();
         assert_eq!(n.tone, Tone::Done);
         assert!(
-            n.title.contains("Added Work Claude") && n.title.contains("5 minutes"),
+            n.title.contains("Added Water used") && n.title.contains("5 minutes"),
             "{}",
             n.title
         );
-
-        let (mut full, _) = connected(
-            (0..MAX_PAGES)
-                .map(|i| page(&format!("p{i}"), Source::Demo, None))
-                .collect(),
-        );
-        assert!(full.add_page().is_none());
-        assert!(full.notice.unwrap().title.contains("at most 10"));
+        assert!(m.add.form.is_none(), "back to the list of templates");
+        assert!(m.add.setup.is_none());
     }
 
     #[test]
-    fn manual_figures_parse_and_unknown_stays_unknown() {
-        let data = PageData {
-            quality: DataQuality::Manual,
-            updated_at: Some(ts("2026-11-10T19:00:00Z")),
-            metrics: vec![MetricValue {
-                window: Window::FiveHour,
-                used_percent: Some(42.0),
-                resets_at: Some(ts("2026-11-10T22:00:00Z")),
-            }],
-            note: Some("From the website".into()),
+    fn a_mistake_in_the_form_is_shown_with_the_form_and_sends_nothing() {
+        let (mut m, _) = connected(vec![]);
+        pick(&mut m, "short-text/1");
+        set_text(&mut m, "title", &"w".repeat(80));
+        assert!(m.submit_add().is_none());
+        let msg = m.add.form.as_ref().unwrap().error.clone().unwrap();
+        assert!(msg.contains("at most 48 characters"), "{msg}");
+        assert!(
+            m.notice.is_none(),
+            "it belongs to the form, not a message along the bottom"
+        );
+        assert!(m.busy.is_none());
+        m.typing();
+        assert!(m.add.form.as_ref().unwrap().error.is_none());
+    }
+
+    #[test]
+    fn the_hub_limit_is_50_pages_not_10() {
+        // Eleven pages is fine: ten is how many one display shows, not how many the hub holds.
+        let (mut m, _) = connected((0..11).map(|i| page(&format!("p{i}"), Source::Demo)).collect());
+        assert!(m.can_add_page());
+        pick(&mut m, "list/1");
+        assert!(matches!(m.submit_add(), Some(Op::AddPages { .. })));
+
+        let (mut full, _) = connected(
+            (0..HUB_PAGE_LIMIT)
+                .map(|i| page(&format!("p{i}"), Source::Demo))
+                .collect(),
+        );
+        assert!(!full.can_add_page());
+        let i = full.add.templates.iter().position(|t| t.id == "list/1").unwrap();
+        full.pick_template(i);
+        assert!(full.add.form.is_none());
+        assert!(full.notice.as_ref().unwrap().title.contains("at most 50"));
+    }
+
+    #[test]
+    fn pi_status_shows_its_command_afterwards_to_copy() {
+        let (mut m, now) = connected(vec![]);
+        pick(&mut m, "pi-status/1");
+        let Some(Op::AddPages { pages }) = m.submit_add() else {
+            panic!("add")
         };
-        let (mut m, now) = connected(vec![page("claude-max", Source::Manual, Some(data))]);
+        assert_eq!(
+            (pages[0].source, pages[0].feed.as_deref()),
+            (Source::Helper, Some("pi-status"))
+        );
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: refresh(vec![page("pi-status", Source::Helper)]),
+                failed: None,
+            }),
+            now,
+        );
+        let setup = m.add.setup.clone().expect("a setup step");
+        assert!(setup.command.starts_with("sudo display-hub-helper add pi-status"));
+        assert!(setup.help.contains("Raspberry Pi") && !setup.copied);
+        assert_eq!(m.copy_setup().as_deref(), Some(setup.command.as_str()));
+        assert!(m.add.setup.as_ref().unwrap().copied);
+        m.finish_setup();
+        assert!(m.add.setup.is_none() && m.add.form.is_none());
+    }
+
+    #[test]
+    fn a_failure_part_way_is_reported_honestly() {
+        let (mut m, now) = connected(vec![]);
+        pick(&mut m, "usage-limits/1");
+        assert!(m.submit_add().is_some());
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: refresh(vec![page("a", Source::Manual)]),
+                failed: Some(AddFailure {
+                    added: 1,
+                    total: 3,
+                    title: "Second".into(),
+                    error: ClientError::Timeout,
+                }),
+            }),
+            now,
+        );
+        let n = m.notice.clone().unwrap();
+        assert_eq!(n.tone, Tone::Problem);
+        assert_eq!(n.title, "Added 1 of 3 pages");
+        assert!(n.detail.contains("Second wasn't added"), "{}", n.detail);
+        assert!(m.add.form.is_none(), "start over, so nothing is added twice");
+        // A failure on the first page keeps the form so it can be tried again.
+        pick(&mut m, "list/1");
+        assert!(m.submit_add().is_some());
+        m.finish(Err(Failure::Client(ClientError::Timeout)), now);
+        assert!(m.add.form.is_some());
+    }
+
+    fn typed_in(id: &str, kind: &str, data: serde_json::Value) -> PageView {
+        let mut p = with_content(
+            page(id, Source::Manual),
+            DataQuality::Manual,
+            "2026-11-10T19:00:00Z",
+            data,
+        );
+        p.kind = kind.into();
+        p
+    }
+
+    #[test]
+    fn editing_a_usage_meter_keeps_its_checks_and_reset_times() {
+        let mut p = typed_in(
+            "claude-max",
+            "meter",
+            json!({"items":[{"id":"five-hour","label":"5 hours","percent":42.0,"resets_at":"2026-11-10T22:00:00Z"}]}),
+        );
+        p.feed = Some("claude-max".into());
+        let (mut m, now) = connected(vec![p]);
         m.begin_edit("claude-max", now);
         let e = m.edit.as_mut().unwrap();
-        assert_eq!(e.metrics[0].percent.text, "42");
-        assert_eq!(e.metrics[0].resets_in.text, "2 h");
-        assert_eq!(e.metrics[1].percent.text, "", "weekly was never entered");
-        e.metrics[1].percent.set("abc");
+        let Some(crate::forms::ContentEdit {
+            shape: crate::forms::Shape::UsageMeter { rows, .. },
+            ..
+        }) = e.content.as_mut()
+        else {
+            panic!("usage editor")
+        };
+        assert_eq!(rows[0].percent.text, "42");
+        assert_eq!(rows[0].resets_in.text, "2 h");
+        rows[1].percent.set("abc");
         assert!(m.save_edit(now).is_none());
         assert!(m.notice.as_ref().unwrap().title.contains("0 to 100"));
-        let e = m.edit.as_mut().unwrap();
-        e.metrics[1].percent.set("");
-        e.metrics[1].resets_in.set("2 d 4 h");
-        let Some(Op::ChangePage {
-            figures: Some(f),
+        let Some(crate::forms::ContentEdit {
+            shape: crate::forms::Shape::UsageMeter { rows, .. },
+            ..
+        }) = m.edit.as_mut().unwrap().content.as_mut()
+        else {
+            panic!()
+        };
+        rows[1].percent.set("");
+        rows[1].resets_in.set("2 d 4 h");
+        let Some(Op::SaveEdit {
+            content: Some(c),
             change,
             ..
         }) = m.save_edit(now)
         else {
             panic!("save")
         };
-        assert_eq!(change.source, Some(Source::Manual));
-        assert_eq!(f.metrics[0].used_percent, Some(42.0));
-        assert_eq!(f.metrics[1].used_percent, None, "empty is unknown, not zero");
-        assert_eq!(f.metrics[1].resets_at, Some(ts("2026-11-13T00:00:00Z")));
-        assert_eq!(f.note.as_deref(), Some("From the website"));
+        assert_eq!(change.source, None, "still typed in");
+        let items = c.data.unwrap()["items"].clone();
+        assert_eq!(items[0]["percent"], 42.0);
+        assert!(items[1]["percent"].is_null(), "empty is unknown, not zero");
+        assert_eq!(items[1]["resets_at"], "2026-11-13T00:00:00Z");
+        assert_eq!(c.note, None);
+    }
+
+    #[test]
+    fn a_title_only_edit_of_typed_in_content_doesnt_resend_it() {
+        let (mut m, now) = connected(vec![typed_in("t", "text", json!({"text": "Back at 3"}))]);
+        m.begin_edit("t", now);
+        m.edit.as_mut().unwrap().title.set("Note");
+        let Some(Op::SaveEdit { change, content, .. }) = m.save_edit(now) else {
+            panic!("save")
+        };
+        assert_eq!(change.title.as_deref(), Some("Note"));
+        assert!(
+            content.is_none(),
+            "the words didn't change, so they keep their time"
+        );
+        assert!(m.edit.is_none());
+
+        let again = refresh(vec![typed_in("t", "text", json!({"text": "Back at 3"}))]);
+        m.finish(Ok(Outcome::Refreshed(again)), now);
+        m.begin_edit("t", now);
+        let Some(crate::forms::ContentEdit {
+            shape: crate::forms::Shape::Text { text },
+            ..
+        }) = m.edit.as_mut().unwrap().content.as_mut()
+        else {
+            panic!()
+        };
+        text.set("Back at 4");
+        let Some(Op::SaveEdit { content: Some(c), .. }) = m.save_edit(now) else {
+            panic!("save")
+        };
+        assert_eq!(c.data.unwrap(), json!({"text": "Back at 4"}));
+    }
+
+    #[test]
+    fn helper_demo_and_custom_pages_have_no_content_editor() {
+        let mut helper = page("h", Source::Helper);
+        helper.feed = Some("pi-status".into());
+        helper.kind = "big_number".into();
+        let mut custom = page("c", Source::Helper);
+        custom.kind = "nearby-flights/1".into();
+        let (mut m, now) = connected(vec![helper, custom]);
+        m.begin_edit("h", now);
+        assert_eq!(m.edit.as_ref().unwrap().effective_source(), Source::Helper);
+        // The editor exists for the shape, but only shows while the content is typed in.
+        m.begin_edit("c", now);
+        assert!(m.edit.as_ref().unwrap().content.is_none());
+        // A helper page whose title changes sends the title and nothing about its content.
+        m.begin_edit("h", now);
+        m.edit.as_mut().unwrap().title.set("CPU");
+        let Some(Op::SaveEdit { change, content, .. }) = m.save_edit(now) else {
+            panic!()
+        };
+        assert_eq!(change.title.as_deref(), Some("CPU"));
+        assert_eq!((change.source, change.settings, content), (None, None, None));
+    }
+
+    #[test]
+    fn a_template_page_edits_through_its_form_and_follows_its_settings() {
+        let t = hub_templates::built_in_template("usage-limits/1").unwrap();
+        let settings = t
+            .settings_from(
+                &json!({"service": "claude-max", "source": "manual"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let mut p = page("claude-max", Source::Manual);
+        p.kind = "meter".into();
+        p.feed = Some("claude-max".into());
+        p.template = Some("usage-limits/1".into());
+        p.settings = Some(settings);
+        let (mut m, now) = connected(vec![p]);
+        m.begin_edit("claude-max", now);
+        {
+            let e = m.edit.as_mut().unwrap();
+            assert!(e.form.is_some() && !e.has_title_box(), "the title is on the form");
+            let form = e.form.as_mut().unwrap();
+            let title = form
+                .template
+                .settings
+                .iter()
+                .position(|s| s.key == "title")
+                .unwrap();
+            form.text_mut(title).unwrap().set("Work Claude");
+            let src = form
+                .template
+                .settings
+                .iter()
+                .position(|s| s.key == "source")
+                .unwrap();
+            form.pick(src, "demo");
+        }
+        let Some(Op::SaveEdit { change, .. }) = m.save_edit(now) else {
+            panic!("save")
+        };
+        assert_eq!(change.title.as_deref(), Some("Work Claude"));
+        assert_eq!(change.source, Some(Source::Demo));
+        assert_eq!(change.settings.unwrap()["source"], "demo");
+    }
+
+    #[test]
+    fn a_rename_by_hand_survives_an_edit_that_doesnt_touch_the_title() {
+        let t = hub_templates::built_in_template("usage-limits/1").unwrap();
+        let settings = t
+            .settings_from(
+                &json!({"service": "claude-max", "source": "manual"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let mut p = page("claude-max", Source::Manual);
+        p.title = "My Claude".into();
+        p.kind = "meter".into();
+        p.feed = Some("claude-max".into());
+        p.template = Some("usage-limits/1".into());
+        p.settings = Some(settings);
+        let (mut m, now) = connected(vec![p]);
+        m.begin_edit("claude-max", now);
+        let form = m.edit.as_mut().unwrap().form.as_mut().unwrap();
+        let src = form
+            .template
+            .settings
+            .iter()
+            .position(|s| s.key == "source")
+            .unwrap();
+        form.pick(src, "none");
+        let Some(Op::SaveEdit { change, .. }) = m.save_edit(now) else {
+            panic!("save")
+        };
+        assert_eq!(change.title.as_deref(), Some("My Claude"));
+        assert_eq!(change.source, Some(Source::None));
+    }
+
+    #[test]
+    fn a_change_to_the_kind_or_feed_is_refused_in_plain_words() {
+        let t = hub_templates::built_in_template("usage-limits/1").unwrap();
+        let settings = t
+            .settings_from(
+                &json!({"service": "claude-max", "source": "manual"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+        let mut p = page("claude-max", Source::Manual);
+        p.kind = "meter".into();
+        p.feed = Some("claude-max".into());
+        p.template = Some("usage-limits/1".into());
+        p.settings = Some(settings);
+        let (mut m, now) = connected(vec![p]);
+        m.begin_edit("claude-max", now);
+        let form = m.edit.as_mut().unwrap().form.as_mut().unwrap();
+        let svc = form
+            .template
+            .settings
+            .iter()
+            .position(|s| s.key == "service")
+            .unwrap();
+        form.pick(svc, "chatgpt-plus");
+        assert!(m.save_edit(now).is_none());
+        let msg = m
+            .edit
+            .as_ref()
+            .unwrap()
+            .form
+            .as_ref()
+            .unwrap()
+            .error
+            .clone()
+            .unwrap();
+        assert!(msg.contains("remove this page and add it again"), "{msg}");
+        assert!(m.edit.is_some(), "the form stays open");
+    }
+
+    #[test]
+    fn a_page_from_an_unknown_template_still_edits_its_title() {
+        let mut p = page("x", Source::Manual);
+        p.kind = "list".into();
+        p.template = Some("someone-elses/3".into());
+        let (mut m, now) = connected(vec![p]);
+        m.begin_edit("x", now);
+        let e = m.edit.as_mut().unwrap();
+        assert!(e.form.is_none() && e.has_title_box());
+        e.title.set(&"t".repeat(49));
+        assert!(m.save_edit(now).is_none(), "over the limit is refused, not cut");
+        assert!(m.notice.as_ref().unwrap().title.contains("1 to 48"));
+    }
+
+    #[test]
+    fn only_a_usage_page_is_offered_sample_figures() {
+        let mut usage_page = page("u", Source::Manual);
+        usage_page.kind = "meter".into();
+        usage_page.feed = Some("claude-max".into());
+        let (mut m, now) = connected(vec![usage_page, page("t", Source::Manual)]);
+        m.begin_edit("u", now);
+        assert!(m.edit.as_ref().unwrap().source_choices().contains(&Source::Demo));
+        assert!(
+            m.edit
+                .as_ref()
+                .unwrap()
+                .source_choices()
+                .contains(&Source::Helper),
+            "it has a feed"
+        );
+        m.begin_edit("t", now);
+        let choices = m.edit.as_ref().unwrap().source_choices();
+        assert!(!choices.contains(&Source::Demo) && !choices.contains(&Source::Helper));
     }
 
     #[test]
@@ -1430,31 +1996,61 @@ mod tests {
     }
 
     #[test]
-    fn page_rows_label_quality_and_staleness() {
-        let old = PageData {
-            quality: DataQuality::Manual,
-            updated_at: Some(ts("2026-11-08T20:00:00Z")),
-            metrics: vec![MetricValue {
-                window: Window::Weekly,
-                used_percent: None,
-                resets_at: Some(ts("2026-11-10T19:00:00Z")),
-            }],
-            note: None,
-        };
+    fn page_rows_say_what_each_page_is_and_where_it_comes_from() {
+        let old = with_content(
+            page("m", Source::Manual),
+            DataQuality::Manual,
+            "2026-11-08T20:00:00Z",
+            json!({"text": "Back at 3"}),
+        );
+        let mut helper = with_content(
+            page("h", Source::Helper),
+            DataQuality::ProviderReported,
+            "2026-11-10T19:50:00Z",
+            json!({"value": 41.0, "unit": "°C"}),
+        );
+        helper.kind = "big_number".into();
+        helper.feed = Some("pi-status".into());
+        let mut custom = page("c", Source::Helper);
+        custom.kind = "nearby-flights/1".into();
+        let mut list = page("l", Source::Manual);
+        list.kind = "list".into();
         let (m, now) = connected(vec![
-            page("m", Source::Manual, Some(old)),
-            page("d", Source::Demo, None),
-            page("n", Source::None, None),
+            old,
+            helper,
+            page("d", Source::Demo),
+            custom,
+            list,
+            page("n", Source::None),
         ]);
         let rows = m.page_rows(now);
+        assert_eq!(
+            (rows[0].kind.as_str(), rows[0].origin.as_str()),
+            ("Short text", "Typed in")
+        );
         assert_eq!((rows[0].quality, rows[0].stale), ("MANUAL", true));
         assert_eq!(rows[0].freshness, "Stale. Updated 2 d ago");
-        assert_eq!(rows[0].metrics[0].used_percent, None);
-        assert_eq!(rows[0].metrics[0].resets, "Reset due");
-        assert_eq!(rows[1].quality, "DEMO");
+        assert_eq!(rows[0].shown, Shown::Text("Back at 3".into()));
+        assert_eq!(rows[1].kind, "Big number");
+        assert_eq!(rows[1].origin, "Filled by a helper (feed pi-status)");
         assert_eq!(
-            (rows[2].quality, rows[2].freshness.as_str()),
-            ("UNAVAILABLE", "No figures yet")
+            (rows[1].freshness.as_str(), rows[1].quality),
+            ("Updated 10 min ago", "REPORTED")
+        );
+        assert_eq!(
+            rows[1].shown,
+            Shown::BigNumber {
+                value: "41 °C".into(),
+                caption: None
+            }
+        );
+        assert_eq!((rows[2].origin.as_str(), rows[2].quality), ("Demo", "DEMO"));
+        assert_eq!(rows[3].kind, "Custom: nearby-flights/1");
+        assert_eq!(rows[3].freshness, "Waiting for the helper's first update");
+        assert_eq!(rows[4].freshness, "Nothing typed in yet");
+        assert_eq!(
+            (rows[5].quality, rows[5].freshness.as_str(), &rows[5].shown),
+            ("UNAVAILABLE", "No content yet", &Shown::Empty)
         );
     }
 
@@ -1574,7 +2170,7 @@ mod tests {
 
     #[test]
     fn confirmations_guard_destructive_actions() {
-        let (mut m, _) = connected(vec![page("a", Source::Demo, None)]);
+        let (mut m, _) = connected(vec![page("a", Source::Demo)]);
         m.ask_remove_page("a");
         assert!(m.confirm.as_ref().unwrap().question().0.contains("Remove a?"));
         m.confirm_no();
@@ -1593,13 +2189,6 @@ mod tests {
 #[cfg(test)]
 mod helper_tests {
     use super::*;
-
-    #[test]
-    fn only_services_a_helper_can_report_offer_it() {
-        assert!(sources_for(Service::ClaudeMax).contains(&Source::Helper));
-        assert!(sources_for(Service::ChatgptPlus).contains(&Source::Helper));
-        assert!(!sources_for(Service::OpencodeGoPlus).contains(&Source::Helper));
-    }
 
     #[test]
     fn a_helper_needs_a_service() {

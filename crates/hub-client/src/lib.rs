@@ -334,6 +334,38 @@ impl HubClient {
         Ok(p.ids)
     }
 
+    /// Adds a page of any kind. A demo usage page is given its service's sample figures, which the
+    /// hub doesn't make up itself. If that fails, the page is removed again so none is left with no
+    /// figures; if removing fails too, the first error is the one reported.
+    pub async fn add_page_with_samples(&self, token: &str, new: &NewPage) -> Result<PageView, ClientError> {
+        let page = self.add_page(token, new).await?;
+        let Some(samples) = sample_content(&page) else {
+            return Ok(page);
+        };
+        match self.set_page_content(token, &page.id, &samples).await {
+            Ok(view) => Ok(view),
+            Err(e) => {
+                let _ = self.remove_page(token, &page.id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Changes a page. One that becomes a demo usage page is given the sample figures; one that
+    /// already was keeps what it has.
+    pub async fn change_page_with_samples(
+        &self,
+        token: &str,
+        id: &str,
+        change: &PageChange,
+    ) -> Result<PageView, ClientError> {
+        let page = self.change_page(token, id, change).await?;
+        match sample_content(&page) {
+            Some(samples) => self.set_page_content(token, id, &samples).await,
+            None => Ok(page),
+        }
+    }
+
     // ----- usage pages, as the manager shows them -----
 
     /// The usage pages (meter pages of a known service), in order. Other pages are left out.
@@ -606,6 +638,14 @@ fn is_dns_failure(e: &(dyn std::error::Error + 'static)) -> bool {
         src = s.source();
     }
     false
+}
+
+/// The sample figures a page needs, if it is a demo usage page with nothing stored yet.
+fn sample_content(page: &PageView) -> Option<PageContentInput> {
+    if page.source != Source::Demo || page.content.is_some() {
+        return None;
+    }
+    usage::usage_service(page).map(usage::provider::demo_content)
 }
 
 /// A page the hub answered with, as a usage page.

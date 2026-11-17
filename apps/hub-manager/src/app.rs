@@ -14,29 +14,45 @@ use gpui::{
     SharedString, Stateful, TextRun, Window,
 };
 use hub_core::Source;
-use hub_protocol::limits::MAX_PAGES;
-use usage::Service;
 
 use crate::field::Field;
+use crate::forms::{Input, Shape};
 use crate::guidance::{Guidance, Next, Tone};
-use crate::model::{self, sources_for, Confirm, EnrolStage, Failure, Model, Op, Section};
+use crate::model::{self, Confirm, EnrolStage, Failure, Model, Op, Section, HUB_PAGE_LIMIT};
+use crate::shown::{self, Shown};
 use crate::theme::*;
 use crate::ui::{self, c, Metrics};
 use crate::worker::{self, Ctx};
+use usage::Service;
 
 const MAC: bool = cfg!(target_os = "macos");
 
 type HoverListener = Box<dyn Fn(&bool, &mut Window, &mut App)>;
 const FIELD_TEXT: f32 = 16.0;
 
+/// Which form a template's settings are on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FormSlot {
+    Add,
+    Edit,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FieldId {
     Pairing,
     PcName,
-    AddTitle,
+    /// A text or number setting of a template's form.
+    Form(FormSlot, usize),
     EditTitle,
-    EditPercent(usize),
-    EditResets(usize),
+    MeterLabel(usize),
+    MeterPercent(usize),
+    MeterResets(usize),
+    BigValue,
+    BigUnit,
+    BigCaption,
+    TextBody,
+    ListText(usize),
+    ListDetail(usize),
     EditNote,
     EnrolName,
     Ssid,
@@ -166,11 +182,64 @@ impl Manager {
         Some(match id {
             FieldId::Pairing => &mut m.pairing,
             FieldId::PcName => &mut m.pc_name,
-            FieldId::AddTitle => &mut m.add.title,
+            FieldId::Form(FormSlot::Add, i) => m.add.form.as_mut()?.text_mut(i)?,
+            FieldId::Form(FormSlot::Edit, i) => m.edit.as_mut()?.form.as_mut()?.text_mut(i)?,
             FieldId::EditTitle => &mut m.edit.as_mut()?.title,
-            FieldId::EditPercent(i) => &mut m.edit.as_mut()?.metrics.get_mut(i)?.percent,
-            FieldId::EditResets(i) => &mut m.edit.as_mut()?.metrics.get_mut(i)?.resets_in,
-            FieldId::EditNote => &mut m.edit.as_mut()?.note,
+            FieldId::MeterLabel(i) => {
+                &mut m
+                    .edit
+                    .as_mut()?
+                    .content
+                    .as_mut()?
+                    .meter_rows_mut()?
+                    .get_mut(i)?
+                    .label
+            }
+            FieldId::MeterPercent(i) => {
+                &mut m
+                    .edit
+                    .as_mut()?
+                    .content
+                    .as_mut()?
+                    .meter_rows_mut()?
+                    .get_mut(i)?
+                    .percent
+            }
+            FieldId::MeterResets(i) => {
+                &mut m
+                    .edit
+                    .as_mut()?
+                    .content
+                    .as_mut()?
+                    .meter_rows_mut()?
+                    .get_mut(i)?
+                    .resets_in
+            }
+            FieldId::BigValue => m.edit.as_mut()?.content.as_mut()?.big_number_mut()?.0,
+            FieldId::BigUnit => m.edit.as_mut()?.content.as_mut()?.big_number_mut()?.1,
+            FieldId::BigCaption => m.edit.as_mut()?.content.as_mut()?.big_number_mut()?.2,
+            FieldId::TextBody => m.edit.as_mut()?.content.as_mut()?.text_mut()?,
+            FieldId::ListText(i) => {
+                &mut m
+                    .edit
+                    .as_mut()?
+                    .content
+                    .as_mut()?
+                    .list_rows_mut()?
+                    .get_mut(i)?
+                    .text
+            }
+            FieldId::ListDetail(i) => {
+                &mut m
+                    .edit
+                    .as_mut()?
+                    .content
+                    .as_mut()?
+                    .list_rows_mut()?
+                    .get_mut(i)?
+                    .detail
+            }
+            FieldId::EditNote => &mut m.edit.as_mut()?.content.as_mut()?.note,
             FieldId::EnrolName => &mut m.enrol.name,
             FieldId::Ssid => &mut m.enrol.ssid,
             FieldId::Password => &mut m.enrol.password,
@@ -183,10 +252,19 @@ impl Manager {
         let now = Instant::now();
         let op = match id {
             FieldId::Pairing | FieldId::PcName => self.model.submit_pairing(),
-            FieldId::AddTitle => self.model.add_page(),
-            FieldId::EditTitle | FieldId::EditPercent(_) | FieldId::EditResets(_) | FieldId::EditNote => {
-                self.model.save_edit(now)
-            }
+            FieldId::Form(FormSlot::Add, _) => self.model.submit_add(),
+            FieldId::Form(FormSlot::Edit, _)
+            | FieldId::EditTitle
+            | FieldId::MeterLabel(_)
+            | FieldId::MeterPercent(_)
+            | FieldId::MeterResets(_)
+            | FieldId::BigValue
+            | FieldId::BigUnit
+            | FieldId::BigCaption
+            | FieldId::TextBody
+            | FieldId::ListText(_)
+            | FieldId::ListDetail(_)
+            | FieldId::EditNote => self.model.save_edit(now),
             FieldId::EnrolName | FieldId::Ssid | FieldId::Password => self.model.create_setup(),
             FieldId::OtherPort => {
                 let port = self.model.enrol.other_port.text.clone();
@@ -230,6 +308,10 @@ impl Manager {
                     self.model.confirm_no();
                 } else if self.model.edit.is_some() {
                     self.model.edit = None;
+                } else if self.model.add.setup.is_some() {
+                    self.model.finish_setup();
+                } else if self.model.add.form.is_some() {
+                    self.model.leave_form();
                 } else if self.model.enrol.open && self.model.busy.is_none() {
                     self.model.close_enrol();
                 } else {
@@ -468,6 +550,9 @@ impl Manager {
                 // A pairing string is secret: once it's in the field, clear it from the clipboard.
                 if id == FieldId::Pairing && pasted.is_some_and(|t| t.trim().starts_with("dh1.")) {
                     cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+                }
+                if edit.changed {
+                    this.model.typing();
                 }
                 if edit.handled {
                     cx.stop_propagation();
@@ -982,7 +1067,7 @@ impl Manager {
         let head = self
             .head(
                 "Pages",
-                "Each page is one subscription on the display, in this order. Changes reach displays on their next check.",
+                "Every page on the hub, in the order displays show them. Changes reach displays on their next check.",
                 m,
                 cx,
             )
@@ -1050,7 +1135,7 @@ impl Manager {
                 i + 1,
                 r.title,
                 r.quality,
-                r.source,
+                r.origin,
                 r.freshness
             );
             let key_id = id.clone();
@@ -1098,23 +1183,26 @@ impl Manager {
                                     .child(ui::tag(r.quality, MUTED))
                                     .when(r.stale, |d| d.child(ui::tag("Stale", TEXT))),
                             )
-                            .child(ui::label(&format!(
-                                "{} · {} · {}",
-                                r.service, r.source, r.freshness
-                            )))
+                            .child(ui::label(&format!("{} · {} · {}", r.kind, r.origin, r.freshness)))
                             .when_some(r.note.clone(), |d, note| {
                                 d.child(ui::p_muted(note).text_size(px(14.0)))
                             })
-                            .when(!r.metrics.is_empty(), |d| {
-                                d.child(div().flex().flex_wrap().gap(px(20.0)).pt(px(4.0)).children(
-                                    r.metrics.iter().map(|mt| {
-                                        div().min_w(px(240.0)).flex_1().child(ui::meter(
-                                            &mt.label,
-                                            mt.used_percent,
-                                            &mt.resets,
-                                        ))
-                                    }),
-                                ))
+                            .when(r.shown != Shown::Empty, |d| {
+                                let wide = matches!(r.shown, Shown::Meter(_));
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .when(wide, |d| d.flex_row().flex_wrap().gap(px(20.0)))
+                                        .when(!wide, |d| d.flex_col().gap(px(4.0)))
+                                        .pt(px(4.0))
+                                        .children(shown_view(&r.shown).into_iter().map(|bar| {
+                                            if wide {
+                                                div().min_w(px(240.0)).flex_1().child(bar)
+                                            } else {
+                                                bar
+                                            }
+                                        })),
+                                )
                             }),
                     )
                     .child(
@@ -1129,10 +1217,10 @@ impl Manager {
                     .into_any_element(),
             );
         }
-        let count = format!("{n} of {MAX_PAGES}");
+        let count = format!("{n} of {HUB_PAGE_LIMIT}");
         let list_panel = ui::with_ticks(ui::panel(Some(("On the display", &count)), m).child(
             if list.is_empty() {
-                ui::body(m).child(ui::p_muted("No pages yet. Add your first one here."))
+                ui::body(m).child(ui::p_muted("No pages yet. Add your first one from a template."))
             } else {
                 div().flex().flex_col().children(list)
             },
@@ -1220,67 +1308,234 @@ impl Manager {
             )
     }
 
+    /// Runs `f` on the template form in one of the two places a form can be.
+    fn with_form(&mut self, slot: FormSlot, f: impl FnOnce(&mut crate::forms::TemplateForm)) {
+        let form = match slot {
+            FormSlot::Add => self.model.add.form.as_mut(),
+            FormSlot::Edit => self.model.edit.as_mut().and_then(|e| e.form.as_mut()),
+        };
+        if let Some(form) = form {
+            f(form);
+        }
+    }
+
     fn add_panel(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let services: Vec<(Service, &str)> = Service::ALL.iter().map(|s| (*s, s.default_title())).collect();
-        let service = self.choice(
-            "svc",
-            "Subscription",
-            &services,
-            self.model.add.service,
+        if let Some(setup) = self.model.add.setup.clone() {
+            return self.setup_panel(&setup, m, cx);
+        }
+        if self.model.add.form.is_some() {
+            return self.add_form_panel(m, window, cx);
+        }
+        self.template_picker(m, cx)
+    }
+
+    /// The templates to choose from.
+    fn template_picker(&mut self, m: Metrics, cx: &mut Context<Self>) -> Div {
+        let enabled = self.model.busy.is_none() && self.model.can_add_page();
+        let templates: Vec<(String, String)> = self
+            .model
+            .add
+            .templates
+            .iter()
+            .map(|t| (t.name.clone(), t.description.clone()))
+            .collect();
+        let mut body = ui::body(m).child(ui::p_muted(
+            "Pick the kind of page to add. A short form follows, and you can change the answers later.",
+        ));
+        for (i, (name, description)) in templates.into_iter().enumerate() {
+            let pick = self.button(
+                format!("template-{i}"),
+                &name,
+                Kind::Secondary,
+                enabled,
+                cx,
+                move |this, _, _| this.model.pick_template(i),
+            );
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap(px(6.0))
+                    .pt(px(10.0))
+                    .border_t_1()
+                    .border_color(c(LINE))
+                    .child(pick)
+                    .child(ui::p_muted(description).text_size(px(14.0))),
+            );
+        }
+        if !self.model.can_add_page() {
+            body = body.child(ui::p_muted(format!(
+                "The hub holds at most {HUB_PAGE_LIMIT} pages. Remove one to add another."
+            )));
+        }
+        ui::with_ticks(ui::panel(Some(("Add from template", "")), m).child(body))
+    }
+
+    /// The chosen template's form, and the buttons to add the pages or go back.
+    fn add_form_panel(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let Some(form) = self.model.add.form.clone() else {
+            return div();
+        };
+        let fields = self.form_fields(FormSlot::Add, window, cx);
+        let busy = self.model.busy.is_some();
+        let add = self.button(
+            "add-pages",
+            "Add page",
+            Kind::Primary,
+            !busy,
             cx,
-            |this, v| {
-                this.model.add.service = v;
-                if !sources_for(v).contains(&this.model.add.source) {
-                    this.model.add.source = Source::Manual;
+            |this, _, cx| {
+                let op = this.model.submit_add();
+                this.run(op, cx);
+            },
+        );
+        let back = self.button("add-back", "Back", Kind::Quiet, !busy, cx, |this, _, _| {
+            this.model.leave_form()
+        });
+        let mut body = ui::body(m)
+            .child(ui::p_muted(form.template.description.clone()))
+            .child(fields);
+        if let Some(e) = form.error.clone() {
+            body = body.child(form_error(&e));
+        }
+        ui::with_ticks(
+            ui::panel(Some((&form.template.name, "Esc to go back")), m)
+                .child(body.child(div().flex().gap(px(8.0)).child(add).child(back))),
+        )
+    }
+
+    /// The fields of a template's form: a box for text and numbers, buttons for choices.
+    fn form_fields(&mut self, slot: FormSlot, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let form = match slot {
+            FormSlot::Add => self.model.add.form.clone(),
+            FormSlot::Edit => self.model.edit.as_ref().and_then(|e| e.form.clone()),
+        };
+        let mut out = div().flex().flex_col().gap(px(16.0));
+        let Some(form) = form else { return out };
+        for (i, setting) in form.template.settings.iter().enumerate() {
+            let hint = form.hint(i);
+            let optional = !form.required(i) && setting.default.is_none();
+            let label = if optional && matches!(form.inputs[i], Input::Text(_) | Input::Number(_)) {
+                format!("{} (optional)", setting.label)
+            } else {
+                setting.label.clone()
+            };
+            let id = format!("{slot:?}-s{i}");
+            let element = match &form.inputs[i] {
+                Input::Text(_) | Input::Number(_) => {
+                    self.field(FieldId::Form(slot, i), &label, &hint, window, cx)
+                }
+                Input::Choice(_) => {
+                    let options = form.options(i);
+                    let labels: Vec<(usize, &str)> = options
+                        .iter()
+                        .enumerate()
+                        .map(|(n, o)| (n, o.label.as_str()))
+                        .collect();
+                    let current = options.iter().position(|o| o.chosen).unwrap_or(usize::MAX);
+                    let group = self.choice(&id, &label, &labels, current, cx, move |this, n| {
+                        this.with_form(slot, |f| {
+                            if let Some(o) = f.options(i).get(n) {
+                                let value = o.value.clone();
+                                f.pick(i, &value);
+                            }
+                        })
+                    });
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(group)
+                        .when(!hint.is_empty(), |d| {
+                            d.child(ui::p_muted(hint.clone()).text_size(px(14.0)))
+                        })
+                }
+                Input::Multi(_) => {
+                    let mut row = div().flex().flex_wrap().gap(px(8.0));
+                    for (n, o) in form.options(i).into_iter().enumerate() {
+                        let toggle = self.toggle(&format!("{id}-{n}"), &o.label, o.chosen, cx, move |this| {
+                            this.with_form(slot, |f| {
+                                if let Some(o) = f.options(i).get(n) {
+                                    let value = o.value.clone();
+                                    f.toggle(i, &value);
+                                }
+                            })
+                        });
+                        row = row.child(toggle);
+                    }
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(ui::label(&label))
+                        .child(row)
+                        .when(!hint.is_empty(), |d| {
+                            d.child(ui::p_muted(hint.clone()).text_size(px(14.0)))
+                        })
+                }
+                Input::YesNo(yes) => {
+                    let group = self.choice(
+                        &id,
+                        &label,
+                        &[(true, "Yes"), (false, "No")],
+                        *yes,
+                        cx,
+                        move |this, v| this.with_form(slot, |f| f.set_yes_no(i, v)),
+                    );
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .child(group)
+                        .when(!hint.is_empty(), |d| {
+                            d.child(ui::p_muted(hint.clone()).text_size(px(14.0)))
+                        })
+                }
+            };
+            out = out.child(element);
+        }
+        out
+    }
+
+    /// What to do once by hand after adding: the command, with a Copy button.
+    fn setup_panel(&mut self, setup: &model::SetupNote, m: Metrics, cx: &mut Context<Self>) -> Div {
+        let command = setup.command.clone();
+        let copy = self.button(
+            "setup-copy",
+            if setup.copied { "Copied" } else { "Copy command" },
+            Kind::Primary,
+            true,
+            cx,
+            move |this, _, cx| {
+                if let Some(text) = this.model.copy_setup() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             },
         );
-        let sources: Vec<(Source, &str)> = sources_for(self.model.add.service)
-            .into_iter()
-            .map(|s| (s, model::source_label(s)))
-            .collect();
-        let source = self.choice(
-            "src",
-            "Figures",
-            &sources,
-            self.model.add.source,
-            cx,
-            |this, v| this.model.add.source = v,
-        );
-        let placeholder = format!("Leave empty for {}", self.model.add.service.default_title());
-        let title = self.field(
-            FieldId::AddTitle,
-            "Title on the display",
-            &placeholder,
-            window,
-            cx,
-        );
-        let can = self.model.busy.is_none() && self.model.can_add_page();
-        let add = self.button("add-page", "Add page", Kind::Primary, can, cx, |this, _, cx| {
-            let op = this.model.add_page();
-            this.run(op, cx);
+        let done = self.button("setup-done", "Done", Kind::Secondary, true, cx, |this, _, _| {
+            this.model.finish_setup()
         });
-        let explain = match self.model.add.source {
-            Source::Manual => {
-                "You type in the figures from the provider's own usage page. They show as MANUAL."
-            }
-            Source::Demo => {
-                "Sample figures for trying a display out. They always show as DEMO, never as real usage."
-            }
-            Source::Helper => {
-                "The PC helper sends what Claude Code or Codex reports on a PC where you're signed in. Set it up \
-                 in Settings. They show as REPORTED."
-            }
-            _ => "The page shows as unavailable until figures arrive.",
-        };
         ui::with_ticks(
-            ui::panel(Some(("Add a page", "")), m).child(
+            ui::panel(Some(("One more step", "")), m).child(
                 ui::body(m)
-                    .child(service)
-                    .child(source)
-                    .child(ui::p_muted(explain))
-                    .child(title)
-                    .child(div().flex().child(add)),
+                    .child(ui::p(setup.help.clone()))
+                    .child(
+                        div()
+                            .id("setup-command")
+                            .role(Role::Group)
+                            .aria_label(SharedString::from(format!("Command to run: {command}")))
+                            .p(px(12.0))
+                            .border_1()
+                            .border_color(c(MUTED))
+                            .bg(c(BLACK))
+                            .child(ui::data(command)),
+                    )
+                    .child(ui::p_muted(
+                        "Open a terminal on the Pi (for example over SSH), paste the command and press Enter. The \
+                         page stays empty until the helper has run.",
+                    ))
+                    .child(div().flex().flex_wrap().gap(px(8.0)).child(copy).child(done)),
             ),
         )
     }
@@ -1289,53 +1544,75 @@ impl Manager {
         let Some(e) = self.model.edit.as_ref() else {
             return div();
         };
-        let (service, source, windows) = (
-            e.service,
+        let (has_title, has_form, source, typed_in, template_id, choices, kind, feed, can_edit) = (
+            e.has_title_box(),
+            e.form.is_some(),
             e.source,
-            e.metrics.iter().map(|x| x.window).collect::<Vec<_>>(),
+            e.effective_source() == Source::Manual,
+            e.template_id.clone(),
+            e.source_choices(),
+            e.kind.clone(),
+            e.feed.clone(),
+            e.content.is_some(),
         );
-        let title = self.field(FieldId::EditTitle, "Title on the display", "", window, cx);
-        let sources: Vec<(Source, &str)> = sources_for(service)
-            .into_iter()
-            .map(|s| (s, model::source_label(s)))
-            .collect();
-        let pick = self.choice("edit-src", "Figures", &sources, source, cx, |this, v| {
-            if let Some(e) = this.model.edit.as_mut() {
-                e.source = v;
+        let effective = e.effective_source();
+        let mut body = ui::body(m).child(ui::label(&format!(
+            "{} · {}",
+            shown::kind_label(&kind),
+            shown::origin_text(effective, feed.as_deref())
+        )));
+        if has_title {
+            body = body.child(self.field(FieldId::EditTitle, "Title on the display", "", window, cx));
+        }
+        if has_form {
+            let fields = self.form_fields(FormSlot::Edit, window, cx);
+            body = body.child(fields);
+            if let Some(err) = self
+                .model
+                .edit
+                .as_ref()
+                .and_then(|e| e.form.as_ref())
+                .and_then(|f| f.error.clone())
+            {
+                body = body.child(form_error(&err));
             }
-        });
-        let mut body = ui::body(m)
-            .child(ui::label(service.default_title()))
-            .child(title)
-            .child(pick);
-        if source == Source::Manual {
-            for (i, w) in windows.iter().enumerate() {
-                let pct = self.field(FieldId::EditPercent(i), "Used, %", "", window, cx);
-                let resets = self.field(FieldId::EditResets(i), "Resets in", "", window, cx);
-                body = body.child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .pt(px(8.0))
-                        .border_t_1()
-                        .border_color(c(LINE))
-                        .child(ui::h3(w.label()))
-                        .child(
-                            div()
-                                .flex()
-                                .gap(px(8.0))
-                                .child(div().w(px(120.0)).child(pct))
-                                .child(div().flex_1().min_w_0().child(resets)),
-                        ),
-                );
+        } else {
+            if let Some(t) = template_id {
+                body = body.child(ui::p_muted(format!(
+                    "This page was made from the template {t}, which this app doesn't have, so its settings can't \
+                     be changed here."
+                )));
             }
-            body = body
-                .child(ui::p_muted(
-                    "Leave a share empty if you don't know it: displays show it as unknown, never as zero. Reset \
-                     times look like 3 h 20 min.",
-                ))
-                .child(self.field(FieldId::EditNote, "Note on the display (optional)", "", window, cx));
+            let labels: Vec<(Source, &str)> = choices.iter().map(|s| (*s, model::source_label(*s))).collect();
+            let pick = self.choice(
+                "edit-src",
+                "Content comes from",
+                &labels,
+                source,
+                cx,
+                |this, v| {
+                    if let Some(e) = this.model.edit.as_mut() {
+                        e.source = v;
+                    }
+                },
+            );
+            body = body.child(pick);
+        }
+        if typed_in && can_edit {
+            body = body.child(self.content_editor(window, cx));
+        } else {
+            let why = match (effective, can_edit) {
+                (Source::Helper, _) => Some("A helper fills this page, so there is nothing to type in here."),
+                (Source::Demo, _) => Some("This page shows sample content, so there is nothing to type in here."),
+                (Source::Manual, false) => Some(
+                    "This page's own display design draws it, and only its helper can fill it, so there is nothing \
+                     to type in here.",
+                ),
+                _ => None,
+            };
+            if let Some(why) = why {
+                body = body.child(ui::p_muted(why));
+            }
         }
         let busy = self.model.busy.is_some();
         let save = self.button("edit-save", "Save", Kind::Primary, !busy, cx, |this, _, cx| {
@@ -1349,6 +1626,170 @@ impl Manager {
             ui::panel(Some(("Edit page", "Esc to cancel")), m)
                 .child(body.child(div().flex().gap(px(8.0)).child(save).child(cancel))),
         )
+    }
+
+    /// The boxes for typing in a page's content, by its shape.
+    fn content_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let Some(shape) = self.model.edit.as_ref().and_then(|e| e.content.clone()) else {
+            return div();
+        };
+        let mut out = div().flex().flex_col().gap(px(12.0));
+        match &shape.shape {
+            Shape::UsageMeter { rows, .. } => {
+                for (i, row) in rows.iter().enumerate() {
+                    let pct = self.field(FieldId::MeterPercent(i), "Used, %", "", window, cx);
+                    let resets = self.field(FieldId::MeterResets(i), "Resets in", "", window, cx);
+                    out = out.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .pt(px(8.0))
+                            .border_t_1()
+                            .border_color(c(LINE))
+                            .child(ui::h3(row.window.map_or("", |w| w.label())))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(8.0))
+                                    .child(div().w(px(120.0)).child(pct))
+                                    .child(div().flex_1().min_w_0().child(resets)),
+                            ),
+                    );
+                }
+                out = out.child(ui::p_muted(
+                    "Leave a share empty if you don't know it: displays show it as unknown, never as zero. Reset \
+                     times look like 3 h 20 min.",
+                ));
+            }
+            Shape::Meter { rows } => {
+                let n = rows.len();
+                for i in 0..n {
+                    let name = self.field(FieldId::MeterLabel(i), "Bar name", "", window, cx);
+                    let pct = self.field(FieldId::MeterPercent(i), "Used, %", "", window, cx);
+                    let resets = self.field(FieldId::MeterResets(i), "Resets in (optional)", "", window, cx);
+                    let remove = self.button(
+                        format!("meter-remove-{i}"),
+                        "Remove bar",
+                        Kind::Quiet,
+                        n > 1,
+                        cx,
+                        move |this, _, _| {
+                            if let Some(c) = this.model.edit.as_mut().and_then(|e| e.content.as_mut()) {
+                                c.remove_row(i);
+                            }
+                        },
+                    );
+                    out = out.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .pt(px(8.0))
+                            .border_t_1()
+                            .border_color(c(LINE))
+                            .child(name)
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(8.0))
+                                    .child(div().w(px(120.0)).child(pct))
+                                    .child(div().flex_1().min_w_0().child(resets)),
+                            )
+                            .child(div().flex().child(remove)),
+                    );
+                }
+                let add = self.button(
+                    "meter-add",
+                    "Add a bar",
+                    Kind::Secondary,
+                    shape.can_add_row(),
+                    cx,
+                    |this, _, _| {
+                        if let Some(c) = this.model.edit.as_mut().and_then(|e| e.content.as_mut()) {
+                            c.add_row();
+                        }
+                    },
+                );
+                out = out.child(div().flex().child(add)).child(ui::p_muted(
+                    "Leave a share empty if you don't know it: displays show it as unknown, never as zero.",
+                ));
+            }
+            Shape::BigNumber { .. } => {
+                out = out
+                    .child(self.field(
+                        FieldId::BigValue,
+                        "Value",
+                        "Leave empty if you don't know: displays show a dash.",
+                        window,
+                        cx,
+                    ))
+                    .child(self.field(
+                        FieldId::BigUnit,
+                        "Unit (optional)",
+                        "Such as °C or kW. Up to 8 characters.",
+                        window,
+                        cx,
+                    ))
+                    .child(self.field(FieldId::BigCaption, "Caption (optional)", "", window, cx));
+            }
+            Shape::Text { .. } => {
+                out = out.child(self.field(FieldId::TextBody, "Text", "Up to 280 characters.", window, cx));
+            }
+            Shape::List { rows } => {
+                let n = rows.len();
+                for i in 0..n {
+                    let text = self.field(FieldId::ListText(i), "Item", "", window, cx);
+                    let detail = self.field(FieldId::ListDetail(i), "Detail (optional)", "", window, cx);
+                    let remove = self.button(
+                        format!("list-remove-{i}"),
+                        "Remove item",
+                        Kind::Quiet,
+                        true,
+                        cx,
+                        move |this, _, _| {
+                            if let Some(c) = this.model.edit.as_mut().and_then(|e| e.content.as_mut()) {
+                                c.remove_row(i);
+                            }
+                        },
+                    );
+                    out = out.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .pt(px(8.0))
+                            .border_t_1()
+                            .border_color(c(LINE))
+                            .child(text)
+                            .child(detail)
+                            .child(div().flex().child(remove)),
+                    );
+                }
+                let add = self.button(
+                    "list-add",
+                    "Add an item",
+                    Kind::Secondary,
+                    shape.can_add_row(),
+                    cx,
+                    |this, _, _| {
+                        if let Some(c) = this.model.edit.as_mut().and_then(|e| e.content.as_mut()) {
+                            c.add_row();
+                        }
+                    },
+                );
+                out = out.child(div().flex().child(add)).child(ui::p_muted(
+                    "Up to eight items, each up to 48 characters. A display shows them in this order.",
+                ));
+            }
+        }
+        out.child(self.field(
+            FieldId::EditNote,
+            "Note on the display (optional)",
+            "",
+            window,
+            cx,
+        ))
     }
 
     fn displays(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
@@ -1965,6 +2406,22 @@ impl Render for Manager {
     }
 }
 
+/// A message about the form's answers, under the form.
+fn form_error(text: &str) -> Stateful<Div> {
+    div()
+        .id("form-error")
+        .role(Role::Alert)
+        .aria_label(SharedString::from(text.to_string()))
+        .flex()
+        .gap(px(10.0))
+        .items_start()
+        .p(px(12.0))
+        .border_1()
+        .border_color(c(BEAK))
+        .child(ui::tag("Check", BEAK))
+        .child(div().flex_1().min_w_0().child(ui::p(text.to_string())))
+}
+
 fn stat_panel(value: String, caption: &str, m: Metrics) -> impl IntoElement {
     ui::with_ticks(
         ui::panel(None, m)
@@ -2074,26 +2531,45 @@ fn field_canvas(
     .h_full()
 }
 
-/// The page's figures in the manager's preview. The manager draws meters, and says so for any
-/// other kind rather than guess how a display would draw it.
+/// The page's content in the manager's preview: what a display would show, as far as the manager
+/// can draw it. A custom kind is drawn by its display's own design, so the manager only says so.
 fn preview_body(page: &hub_protocol::Page, generated_at: hub_protocol::Timestamp) -> Vec<gpui::Div> {
     match page.content() {
-        Ok(Some(hub_protocol::PageContent::Meter(m))) => m
-            .items
+        Ok(Some(content)) => shown_view(&Shown::from_content(&content, Some(generated_at))),
+        Ok(None) => Vec::new(),
+        Err(cant) => cant.card_lines().iter().map(|l| ui::p_muted(*l)).collect(),
+    }
+}
+
+/// A page's content as the Pages list and the Overview draw it.
+fn shown_view(content: &Shown) -> Vec<gpui::Div> {
+    match content {
+        Shown::Empty => Vec::new(),
+        Shown::Meter(rows) => rows
             .iter()
-            .map(|it| {
-                ui::meter(
-                    &it.label,
-                    it.percent,
-                    &model::resets_text(it.resets_at, Some(generated_at)),
-                )
+            .map(|r| ui::meter(&r.label, r.used_percent, &r.resets))
+            .collect(),
+        Shown::BigNumber { value, caption } => {
+            let mut out = vec![ui::data(value.clone()).text_size(px(34.0)).line_height(px(40.0))];
+            if let Some(c) = caption {
+                out.push(ui::p_muted(c.clone()).text_size(px(14.0)));
+            }
+            out
+        }
+        Shown::Text(t) => vec![ui::p(t.clone())],
+        Shown::List(lines) => lines
+            .iter()
+            .map(|l| {
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(ui::p(l.text.clone()))
+                    .when_some(l.detail.clone(), |d, x| d.child(ui::p_muted(x)))
             })
             .collect(),
-        Ok(None) => Vec::new(),
-        Ok(Some(_)) => vec![ui::p_muted(format!(
-            "A {} page. The manager previews meters only.",
-            page.kind
-        ))],
-        Err(cant) => cant.card_lines().iter().map(|l| ui::p_muted(*l)).collect(),
+        Shown::Custom => vec![ui::p_muted(shown::CUSTOM_CARD)],
+        Shown::Unreadable => vec![ui::p_muted("What this page holds can't be read.")],
     }
 }
