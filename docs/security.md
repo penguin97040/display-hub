@@ -16,7 +16,7 @@
 | An unknown or unpaired display | Yes | It has no credential, so it gets nothing. Enrolment needs a short-lived, single-use secret from an admin. |
 | A lost or stolen display | Yes | Revoke it in the manager. Its token stops working immediately. It never held provider credentials. |
 | Stolen manager configuration | Yes | The admin token lives in the OS credential store, never a plain file. `hubd admin revoke` and `revoke-all` on the Pi cut it off. |
-| A hub, app or network that offers hostile firmware | Yes | Displays install only packages signed by a key they already hold, for their own board, at or above their security floor; the hub only stores and passes packages on, and never signs ([firmware-updates.md](firmware-updates.md), "Threat model"). |
+| A hub, app or network that offers hostile firmware | Yes | Displays install only packages signed by a key they already hold, for their own board, at or above their security floor; the hub only stores and passes packages on, and never signs. An attempt budget on each display (five downloads, then one per four hours of its own running time) stops a hostile hub wearing out its flash ([firmware-updates.md](firmware-updates.md), "Threat model"). |
 | Malformed or oversized requests and responses | Yes | Body limits, timeouts, a concurrency cap, strict validation and bounded text. |
 | Accidental exposure of keys in logs, Git or fixtures | Yes | Credentials sit in redacting types. Request logs record no headers or queries. A test asserts no token reaches the logs. The Git ignore rules and pre-commit checks cover the rest. |
 | Someone with root on the Pi, or an unlocked PC | Partly | Documented below. Out of reach of software alone. |
@@ -130,8 +130,9 @@ What it doesn't stop: a helper can reach other devices on your network, as any p
 - Before TLS starts, it closes connections from anything except private, link-local and loopback addresses.
 - IPv6 is off by default. When it is on, only link-local and unique local sources are accepted, never global addresses, because a home router's IPv6 firewall can't be relied on.
 - The systemd unit allows the service only local addresses too (`IPAddressAllow=`), and `deploy/raspberry-pi/nftables-display-hub.conf` can drop other sources before they reach it. There is no UPnP and no port forwarding.
-- **Request limits:** request bodies are limited (2 KiB for displays, 16 KiB for admin, 16 MiB for a firmware upload, which is streamed to disk). Requests time out after 10 seconds (15 minutes for a firmware upload or download), TLS handshakes after 10 seconds, and headers after 10 seconds. At most 128 connections and 64 requests are handled at once.
-- **Firmware downloads:** only to a display with an open offer for that package, at most 2 at once across the hub and 6 starts per display per hour.
+- **Request limits:** request bodies are limited (2 KiB for displays, 16 KiB for admin, 16 MiB for a firmware upload, which is streamed to disk). Requests time out after 10 seconds (15 minutes for a firmware upload or download, and an upload that sends nothing for 60 seconds is dropped), TLS handshakes after 10 seconds, and headers after 10 seconds. At most 128 connections and 64 requests are handled at once.
+- **Firmware downloads:** only to a display with an open offer for that package, one at a time for each display, at most 2 at once across the hub and 6 starts per display per hour.
+- **Firmware uploads:** a publisher's upload may make room only by removing that publisher's own packages, and each publisher has at most 64 MiB of packages. The same release signed again (the same signer and manifest bytes) is kept as one package, since an ECDSA signature can be changed without the key. Signer labels claiming to be the official firmware are refused.
 - **Rate limits:** failed sign-ins are limited to 20 a minute per address. Pairing and enrolment attempts are limited to 10 per 10 minutes per address. A 128-bit code can't be guessed within those limits.
 
 ## Recovery

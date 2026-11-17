@@ -53,7 +53,7 @@ Schemas: `enrol-request.schema.json` and `enrol-response.schema.json`.
 
 This is optional and authenticated. Its body has the same four `device` fields as enrolment (`heartbeat.schema.json`). The hub records at most one a minute, keeping only these fields and the time last seen, which the desktop manager shows. Send one after start-up and then hourly. The answer is `204`.
 
-Firmware that supports signed updates adds an optional `firmware` member to the `device` object, in enrolment, every heartbeat and the USB `hello`: its trusted key ids, security floor and spare partition size (see [Signed firmware updates](#signed-firmware-updates)). A hub that finds the member malformed ignores it and keeps the rest of the report. A heartbeat naming the version a display has been offered also tells the hub the update installed, if the display's own report was lost.
+Firmware that supports signed updates adds an optional `firmware` member to the `device` object, in enrolment, every heartbeat and the USB `hello`: its trusted key ids, security floor, spare partition size and, optionally, what is left of its attempt budget (see [Signed firmware updates](#signed-firmware-updates)). A hub that finds the member malformed ignores it and keeps the rest of the report. A heartbeat naming the version a display has been offered also tells the hub the update installed, if the display's own report was lost, unless a `rolled_back` or `failed` report for that offer arrives later. So new firmware on its trial boot sends no heartbeat until it is marked good.
 
 ## `GET /v1/health`
 
@@ -295,7 +295,7 @@ The desktop manager gives a display everything it needs in one JSON document (`p
 | `hub.trust_anchors` | One or two `{certificate_pem, spki_sha256}`. |
 | `enrolment.secret`, `enrolment.expires_at` | The one-time secret for `/v1/device/enrol`, valid for 10 minutes. |
 | `wifi` | `{ssid, password}` or `null`. A 2.4 GHz network; the password is empty for an open network. |
-| `firmware` | Optional: `{"trusted_keys": [1 to 3 public keys], "security_counter": n}`, from the package the app just installed over USB. A display with no keys takes them; one that already has keys accepts the bundle only if it names the same set or leaves the member out. See [Signed firmware updates](#signed-firmware-updates). |
+| `firmware` | Optional: `{"trusted_keys": [1 to 3 public keys], "security_counter": n}`, from the package the app just installed over USB. A display checks each key is a valid P-256 point before storing anything, and refuses the bundle (`invalid_bundle`) otherwise. A display with no keys takes them; one that already has keys accepts the bundle only if it names the same set or leaves the member out. Accepting a bundle refills the display's attempt budget. See [Signed firmware updates](#signed-firmware-updates). |
 
 The bundle is secret while it's valid. Keep the hub details and Wi-Fi settings, use the secret once, then discard it. **Never store provider credentials on a display.** None are ever sent.
 
@@ -327,10 +327,12 @@ The full design, with the package format, what a display must check and the thre
 **What a display reports.** The `firmware` member of its `device` object:
 
 ```json
-"firmware": { "key_ids": ["<64 hex digits>"], "security_floor": 3, "slot_bytes": 3145728 }
+"firmware": { "key_ids": ["<64 hex digits>"], "security_floor": 3, "slot_bytes": 3145728, "attempts_left": 5 }
 ```
 
-`key_ids` (0 to 3, no repeats) are the SHA-256 of each trusted public key, `security_floor` the highest security counter it has confirmed, and `slot_bytes` the size of its spare app partition. The hub uses them only to warn the owner before an offer the display would refuse, and to show what the display trusts.
+`key_ids` (0 to 3, no repeats) are the SHA-256 of each trusted public key, `security_floor` the highest security counter it has confirmed, and `slot_bytes` the size of its spare app partition. `attempts_left` is optional, and worth sending: what is left of the display's attempt budget, 0 to 5. The hub uses them only to warn the owner before an offer the display would refuse, and to show what the display trusts and whether an update will have to wait. It never refuses an offer because `attempts_left` is 0.
+
+**The attempt budget.** A display tries at most five downloads at once, and earns one back for each four hours of its own running time, measured with a monotonic timer that starts at zero at every start (never a date, and never the hub's time). An attempt's result, a restart and anything from the network leave the budget alone; only a provisioning bundle accepted over USB, or **Install firmware**, refills it. With no attempts left, a display doesn't request the download and doesn't report: the offer stays open. A display never acts on the offer it last acted on, and a refusal from the offer alone (`no_trusted_keys`, `too_large`) costs nothing. [docs/firmware-updates.md](firmware-updates.md), "Limits on trying", has the exact rules.
 
 **The offer.** `firmware_update` in the snapshot (above). `size` is the length of the *update form*, at most 137 + 4096 + 8 MiB bytes. An offer lasts at most 24 hours, and a display has at most one.
 
@@ -338,9 +340,9 @@ The full design, with the package format, what a display must check and the thre
 
 - `not_found` (404): this display has no open offer for that package;
 - `rate_limited` (429): this display has started 6 downloads in the last hour;
-- `unavailable` (503): the hub is already sending 2 downloads.
+- `unavailable` (503): this display is already downloading, or the hub is already sending 2 downloads.
 
-The request has its own 15-minute time limit, in place of the usual 10 seconds.
+The request has its own 15-minute time limit, in place of the usual 10 seconds. A display gives up on a download that sends nothing for 30 seconds or takes more than 15 minutes, by its monotonic timer.
 
 **`POST /v1/device/firmware/report`.** Authenticated; `204`. Body (`firmware-report.schema.json`):
 
@@ -356,11 +358,11 @@ The request has its own 15-minute time limit, in place of the usual 10 seconds.
 | `failed` | `download`, `image_hash` or `flash` |
 | `rolled_back` | none |
 
-Send `downloading` as the download starts and a final report when the offer is settled, repeating a final report until the hub answers. A final report for an offer already settled is answered `204` and changes nothing. `not_found` (404) means the display has no offer with that id. The hub records a state or reason it doesn't know as a failure.
+Send `downloading` as the download starts and a final report when the offer is settled, repeating a final report until the hub answers. `firmware_version` is the version running when the report is sent, and a final report's version becomes the display's version on the hub. New firmware on its trial boot sends no report, and doesn't act on offers, until it is marked good; its check-in is a request that doesn't name the new version, such as fetching the snapshot. A final report for an offer already settled is answered `204` and changes nothing. `not_found` (404) means the display has no offer with that id. The hub records a state or reason it doesn't know as a failure.
 
-**Provisioning and USB.** The bundle's optional `firmware` member, and the USB error code `firmware_keys_locked` (above).
+**Provisioning and USB.** The bundle's optional `firmware` member, and the USB error code `firmware_keys_locked` (above). A bundle naming a key that isn't a valid P-256 point is answered `invalid_bundle`.
 
-**Admin and publisher routes.** These are for the app and the signing tool, not displays; [docs/firmware-updates.md](firmware-updates.md) lists them. A publisher token (`dhp_…`) may only upload and list packages.
+**Admin and publisher routes.** These are for the app and the signing tool, not displays; [docs/firmware-updates.md](firmware-updates.md) lists them. A publisher token (`dhp_…`) may only upload and list packages, may make room only by removing its own packages, and has 64 MiB of packages at most.
 
 ## Compatibility
 
@@ -383,4 +385,4 @@ The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.l
 - `crates/hub-protocol/tests/conformance.rs` shows the exact expectation for each file.
 - **`protocol/v1/vectors/`** has 57 language-neutral cases: a hub response and how long it has been held, in; what the display must do and show, out. That covers every example above, each shape, cards, staleness, reset times, oversize and non-JSON bodies, and every error group. Port them to the firmware's unit tests ([vectors/README.md](../protocol/v1/vectors/README.md)).
 - USB messages have `usb.schema.json` and examples in `examples/usb/`.
-- The firmware report has `firmware-report.schema.json` and examples in `examples/device/`, beside a heartbeat and a bundle with their `firmware` members. The display's side of signed updates gets vectors of its own under `protocol/v1/firmware/` when the simulator implements it.
+- The firmware report has `firmware-report.schema.json` and examples in `examples/device/`, beside a heartbeat and a bundle with their `firmware` members. The display's side of signed updates has vectors of its own under `protocol/v1/firmware/`: package checks, the attempt budget, the trial boot and provisioning bundles, as the reference display does them ([firmware/README.md](../protocol/v1/firmware/README.md)).

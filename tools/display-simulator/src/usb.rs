@@ -88,20 +88,22 @@ pub fn answer<P: Read + Write>(port: &mut P, dir: &Path) -> std::io::Result<Opti
                     } else if !problems.is_empty() {
                         reply(port, &refuse(UsbErrorCode::InvalidBundle, &problems.join("; ")))?;
                     } else {
-                        // "What each action may change": keys already held can't be replaced here.
+                        // "What each action may change": keys already held can't be replaced here,
+                        // and a key that isn't a valid point is never stored.
                         let keys = firmware::store::keys(dir)
                             .map(|k| firmware::store::bundle_keys(&k, bundle.firmware.as_ref()));
                         match keys {
                             Err(e) => reply(port, &refuse(UsbErrorCode::StorageFailed, &e.to_string()))?,
-                            Ok(Err(locked)) => reply(
-                                port,
-                                &refuse(UsbErrorCode::FirmwareKeysLocked, &locked.to_string()),
-                            )?,
+                            Ok(Err(e @ firmware::store::BundleRefused::KeysLocked)) => {
+                                reply(port, &refuse(UsbErrorCode::FirmwareKeysLocked, &e.to_string()))?
+                            }
+                            Ok(Err(e @ firmware::store::BundleRefused::NotAPoint)) => {
+                                reply(port, &refuse(UsbErrorCode::InvalidBundle, &e.to_string()))?
+                            }
                             Ok(Ok(new_keys)) => {
-                                let saved = store_bundle(dir, &bundle).and_then(|()| match &new_keys {
-                                    Some(k) => firmware::store::set_keys(dir, k),
-                                    None => Ok(()),
-                                });
+                                // Accepting a bundle over USB also refills the attempt budget.
+                                let saved = store_bundle(dir, &bundle)
+                                    .and_then(|()| firmware::store::bundle_accepted(dir, new_keys.as_ref()));
                                 match saved {
                                     Err(e) => {
                                         reply(port, &refuse(UsbErrorCode::StorageFailed, &e.to_string()))?

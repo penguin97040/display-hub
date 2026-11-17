@@ -28,8 +28,8 @@ impl std::fmt::Debug for State {
 }
 
 /// What the display in `dir` says about itself: its running firmware's version, and its trusted
-/// keys, floor and spare slot (`firmware::store::device_info`). A state folder that can't be read
-/// reports a factory board.
+/// keys, floor, spare slot and attempts left (`firmware::store::device_info`). A state folder that
+/// can't be read reports a factory board.
 pub fn device_info(dir: &Path) -> DeviceInfo {
     crate::firmware::store::device_info(dir).unwrap_or_else(|e| {
         eprintln!("display-simulator: couldn't read the firmware state: {e}");

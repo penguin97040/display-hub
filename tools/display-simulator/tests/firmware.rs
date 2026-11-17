@@ -1,6 +1,6 @@
 //! Signed firmware updates end to end: the simulated display against a real hub over pinned HTTPS on
-//! loopback, sharing one fake clock, so every wait is tested without waiting
-//! (`docs/firmware-updates.md`, "What the simulator must test"). Every package is signed with a key
+//! loopback. The hub has a fake wall clock and the display a fake running-time timer, so every wait
+//! is tested without waiting (`docs/firmware-updates.md`, "What the simulator must test"). Every package is signed with a key
 //! made here, in memory, and never kept.
 
 use std::path::{Path, PathBuf};
@@ -8,8 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use display_simulator::firmware::install::Failure;
+use display_simulator::firmware::rules::Budget;
 use display_simulator::firmware::store::{self, NextStart, SlotName, SlotState};
-use display_simulator::firmware::{Acted, Firmware, Limits, Started, TrialOutcome};
+use display_simulator::firmware::{Acted, FakeUptime, Firmware, Limits, Started, TrialOutcome};
 use display_simulator::{paired, usb};
 use firmware_package::header::signed_prefix;
 use firmware_package::limits::{HEADER_LEN, OFFSET_PUBLIC_KEY, OFFSET_SIGNATURE};
@@ -17,9 +18,7 @@ use firmware_package::{build_and_sign, hex, Built, Refusal, Release, SigningKey}
 use hub_client::{ClientError, HubClient};
 use hub_core::FakeClock;
 use hub_protocol::firmware::{BundleFirmware, FirmwareUpdate};
-use hub_protocol::limits::{
-    FIRMWARE_LONG_WAIT_SECONDS, FIRMWARE_OFFER_LIFETIME_SECONDS, FIRMWARE_RETRY_WAIT_SECONDS,
-};
+use hub_protocol::limits::FIRMWARE_OFFER_LIFETIME_SECONDS;
 use hub_protocol::pairing::PairingString;
 use hub_protocol::ErrorCode;
 use hubd::api::Hub;
@@ -32,7 +31,10 @@ const SLOT: u64 = 1024 * 1024;
 
 struct Rig {
     dir: tempfile::TempDir,
+    /// The hub's wall clock.
     clock: FakeClock,
+    /// The displays' running time.
+    uptime: FakeUptime,
     hub: Arc<Hub>,
     port: u16,
     admin: String,
@@ -83,6 +85,7 @@ impl Rig {
         Rig {
             dir,
             clock,
+            uptime: FakeUptime::new(),
             hub,
             port,
             admin,
@@ -115,7 +118,7 @@ impl Rig {
             security_counter: floor,
         });
         let state = paired::enrol(&bundle, &dir).await.unwrap();
-        let mut fw = Firmware::open(&dir, Arc::new(self.clock.clone())).unwrap();
+        let mut fw = Firmware::open(&dir, Arc::new(self.uptime.clone())).unwrap();
         fw.limits = Limits {
             stall: Duration::from_secs(5),
             total: Duration::from_secs(30),
@@ -315,8 +318,8 @@ async fn an_update_installs_proves_itself_and_is_marked_good() {
 }
 
 /// Cases 30, 31 and 36, a crash on start, and case 26: an update that doesn't prove itself rolls
-/// back, and the old firmware reports `rolled_back` with its keys and floor as they were. After three
-/// failures in a row the next attempt waits six hours.
+/// back, and the old firmware reports `rolled_back` with its keys and floor as they were. Each
+/// attempt spends one from the budget, whatever its result, and an install gives nothing back.
 #[tokio::test]
 async fn updates_that_dont_prove_themselves_roll_back() {
     let r = Rig::start().await;
@@ -343,9 +346,12 @@ async fn updates_that_dont_prove_themselves_roll_back() {
         "the hub is up; the switch keeps the firmware from it"
     );
     assert_eq!(sim.fw.check_in_with(&reached).unwrap(), TrialOutcome::Waiting);
-    r.clock.advance(299);
+    // The hub's clock moving doesn't end the trial: only the display's own running time does.
+    r.clock.advance(3600);
     assert_eq!(sim.fw.tick().unwrap(), TrialOutcome::Waiting);
-    r.clock.advance(1);
+    r.uptime.advance(299);
+    assert_eq!(sim.fw.tick().unwrap(), TrialOutcome::Waiting);
+    r.uptime.advance(1);
     assert_eq!(
         sim.fw.tick().unwrap(),
         TrialOutcome::RolledBack(Started::RolledBack {
@@ -359,7 +365,6 @@ async fn updates_that_dont_prove_themselves_roll_back() {
     assert_eq!(r.offer_state(&sim).await, ("rolled_back".into(), None));
 
     // Case 31: a restart during the trial boot.
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64);
     r.offer(&sim, &id).await;
     assert!(matches!(sim.act().await, Acted::Restarted(Started::Trial { .. })));
     assert_eq!(
@@ -373,7 +378,6 @@ async fn updates_that_dont_prove_themselves_roll_back() {
     assert_eq!(r.offer_state(&sim).await.0, "rolled_back");
 
     // New firmware that crashes before it can check in.
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64);
     r.offer(&sim, &id).await;
     sim.fw.switches.next_start = NextStart::Fails;
     assert_eq!(
@@ -384,25 +388,23 @@ async fn updates_that_dont_prove_themselves_roll_back() {
     );
     unchanged(&sim);
     assert_eq!(r.offer_state(&sim).await.0, "rolled_back");
-    assert_eq!(store::record(&sim.dir).unwrap().failures_in_row, 3);
-
-    // Case 26: three failures in a row, so the next attempt waits six hours from the last.
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64);
+    // Case 26: three attempts, three spent. The restarts and rollbacks gave nothing back, and the
+    // display says so.
+    assert_eq!(store::record(&sim.dir).unwrap().budget().attempts_left, 2);
+    assert_eq!(
+        paired::device_info(&sim.dir).firmware.unwrap().attempts_left,
+        Some(2)
+    );
     r.offer(&sim, &id).await;
-    let Acted::Waiting { seconds } = sim.act().await else {
-        panic!("expected a wait")
-    };
-    assert_eq!(seconds, FIRMWARE_LONG_WAIT_SECONDS - FIRMWARE_RETRY_WAIT_SECONDS);
-    r.clock.advance(seconds as i64);
     assert!(matches!(sim.act().await, Acted::Restarted(Started::Trial { .. })));
     let result = sim.poll().await;
     assert!(matches!(
         sim.fw.check_in_with(&result).unwrap(),
         TrialOutcome::MarkedGood { .. }
     ));
-    // Marked good at last: the key_set replaces the keys, and the count starts again.
+    // Marked good at last: the key_set replaces the keys, and the install doesn't refill the budget.
     assert_eq!(sim.keys().key_ids(), [new.public_key().key_id().to_hex()]);
-    assert_eq!(store::record(&sim.dir).unwrap().failures_in_row, 0);
+    assert_eq!(store::record(&sim.dir).unwrap().budget().attempts_left, 1);
     r.stop().await;
 }
 
@@ -449,12 +451,14 @@ async fn a_power_cut_during_the_download_is_reported_as_a_failed_download() {
             .len(),
         10_000
     );
-    // The offer id was saved before the download, so the next start knows.
+    // The offer id was saved with the spent attempt before the download, so the next start knows.
     let record = store::record(&sim.dir).unwrap();
     assert_eq!(record.attempt.unwrap().offer_id, offer_id);
+    assert_eq!(record.last_offer_id.as_deref(), Some(offer_id.as_str()));
+    assert_eq!(record.attempts_left, 4);
 
     // Power back on, with the hub unreachable at first: the report waits.
-    let mut fw = Firmware::open(&sim.dir, Arc::new(r.clock.clone())).unwrap();
+    let mut fw = Firmware::open(&sim.dir, Arc::new(r.uptime.clone())).unwrap();
     assert_eq!(fw.switches, store::Switches::default(), "a switch applies once");
     assert_eq!(
         fw.boot().unwrap(),
@@ -481,9 +485,9 @@ async fn a_power_cut_during_the_download_is_reported_as_a_failed_download() {
     r.stop().await;
 }
 
-/// Case 45, with cases 21, 24, 25 and 27 over the network: a compromised hub serving altered bytes
-/// for a genuine package. The display refuses every one, writes nothing it hasn't verified, and the
-/// limits on trying hold.
+/// Case 45, with cases 21, 24, 25, 26 and 27 over the network: a compromised hub serving altered
+/// bytes for a genuine package. The display refuses every one, writes nothing it hasn't verified,
+/// and the attempt budget holds whatever the hub's clock says.
 #[tokio::test]
 async fn a_compromised_hub_serving_tampered_packages_is_refused() {
     let r = Rig::start().await;
@@ -526,26 +530,16 @@ async fn a_compromised_hub_serving_tampered_packages_is_refused() {
         "nothing written"
     );
     nothing_installed(&sim);
-    // Case 24: the same offer seen again does nothing.
+    // Case 24: the same offer seen again does nothing, and costs nothing.
     assert_eq!(sim.fw.on_offer(&sim.state, &offer).await.unwrap(), Acted::Ignored);
-
-    // Case 25: a new offer straight away waits ten minutes from the last attempt.
-    r.offer(&sim, &id).await;
-    assert_eq!(
-        sim.act().await,
-        Acted::Waiting {
-            seconds: FIRMWARE_RETRY_WAIT_SECONDS
-        }
-    );
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64 - 1);
-    assert_eq!(sim.act().await, Acted::Waiting { seconds: 1 });
-    r.clock.advance(1);
+    assert_eq!(store::record(&sim.dir).unwrap().attempts_left, 4);
 
     // Case 21: one byte of the image changed. It is written, fails its hash and is abandoned.
     tamper(&|b| {
         let last = b.len() - 1;
         b[last] ^= 0x01;
     });
+    r.offer(&sim, &id).await;
     assert_eq!(sim.act().await, Acted::Failed(Failure::ImageHash));
     assert_eq!(
         r.offer_state(&sim).await,
@@ -556,21 +550,18 @@ async fn a_compromised_hub_serving_tampered_packages_is_refused() {
     nothing_installed(&sim);
 
     // Another key in the header.
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64);
     tamper(&|b| {
         b[OFFSET_PUBLIC_KEY..OFFSET_SIGNATURE].copy_from_slice(stranger.public_key().as_bytes());
     });
     r.offer(&sim, &id).await;
     assert_eq!(sim.act().await, Acted::Refused(Refusal::UntrustedKey));
     // A package the stranger signed in full, put in the genuine one's place.
-    r.clock.advance(FIRMWARE_LONG_WAIT_SECONDS as i64);
     let theirs = build_and_sign(&stranger, &release("6.6.6", 9), &image(40_000, 1)).unwrap();
     assert_eq!(theirs.bytes.len(), original.len());
     tamper(&|b| b.copy_from_slice(&theirs.bytes));
     r.offer(&sim, &id).await;
     assert_eq!(sim.act().await, Acted::Refused(Refusal::UntrustedKey));
     // The genuine bytes signed again without the fixed text, as if for some other purpose.
-    r.clock.advance(FIRMWARE_LONG_WAIT_SECONDS as i64);
     let manifest = &original[HEADER_LEN..HEADER_LEN + built.checked.header.manifest_len as usize];
     let prefix = signed_prefix(built.checked.header.manifest_len, &maker.public_key());
     let bare = maker.sign(&[prefix.as_slice(), manifest].concat()).unwrap();
@@ -578,13 +569,23 @@ async fn a_compromised_hub_serving_tampered_packages_is_refused() {
     r.offer(&sim, &id).await;
     assert_eq!(sim.act().await, Acted::Refused(Refusal::BadSignature));
     nothing_installed(&sim);
-    assert_eq!(store::record(&sim.dir).unwrap().failures_in_row, 5);
+    assert_eq!(store::record(&sim.dir).unwrap().attempts_left, 0);
 
-    // The genuine file again: installed.
-    r.clock.advance(FIRMWARE_LONG_WAIT_SECONDS as i64);
+    // Case 25: five attempts spent, so the genuine file now waits. Nothing is requested or reported,
+    // and the offer stays open. The hub's clock moving forward changes nothing.
     std::fs::write(&stored, &original).unwrap();
     r.offer(&sim, &id).await;
+    assert_eq!(sim.act().await, Acted::Waiting { seconds: 4 * 3600 });
+    assert_eq!(r.offer_state(&sim).await, ("offered".into(), None));
+    r.clock.advance(2 * 3600);
+    assert_eq!(sim.act().await, Acted::Waiting { seconds: 4 * 3600 });
+    // Four hours of the display's own running earn one attempt.
+    r.uptime.advance(4 * 3600 - 1);
+    assert_eq!(sim.fw.tick().unwrap(), TrialOutcome::NotInTrial);
+    assert_eq!(sim.act().await, Acted::Waiting { seconds: 1 });
+    r.uptime.advance(1);
     assert!(matches!(sim.act().await, Acted::Restarted(Started::Trial { .. })));
+    assert_eq!(store::record(&sim.dir).unwrap().attempts_left, 0);
     r.stop().await;
 }
 
@@ -619,7 +620,6 @@ async fn keys_change_only_through_a_release_marked_good() {
     sim.fw.send_report(&sim.state).await.unwrap();
 
     // Case 35: a key_set leaving out the key that signed it, with a higher counter.
-    r.clock.advance(FIRMWARE_RETRY_WAIT_SECONDS as i64);
     let mut rel = release("2.0.0", 5);
     rel.key_set = Some(vec![recovery.public_key(), new.public_key()]);
     let id = r
@@ -797,6 +797,13 @@ async fn install_firmware_wipes_everything_and_the_bundle_sets_the_keys() {
     rel.key_set = Some(vec![maker.public_key(), recovery.public_key()]);
     let built = build_and_sign(&maker, &rel, &image(10_000, 9)).unwrap();
 
+    // A display that has spent its attempts gets them all back: the record is erased with the rest.
+    let mut spent = store::record(&sim.dir).unwrap();
+    spent.set_budget(Budget {
+        attempts_left: 0,
+        credit_hours: 2,
+    });
+    store::set_record(&sim.dir, &spent).unwrap();
     std::fs::write(sim.dir.join("notes.txt"), "not the display's").unwrap();
     store::install_firmware(&sim.dir, &built.checked, &built.bytes).unwrap();
     assert!(
@@ -814,6 +821,7 @@ async fn install_firmware_wipes_everything_and_the_bundle_sets_the_keys() {
         "the board is the hardware"
     );
     assert_eq!(store::record(&sim.dir).unwrap(), store::Record::default());
+    assert_eq!(store::record(&sim.dir).unwrap().budget(), Budget::FULL);
     let mut names: Vec<_> = std::fs::read_dir(&sim.dir)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -937,6 +945,11 @@ mod over_usb {
         assert_eq!(device.firmware.as_ref().unwrap().key_ids.len(), 2);
 
         // Case 39: after a factory reset, different keys are refused and the same set is accepted.
+        // Accepting any bundle refills the attempt budget; a refused one leaves it alone.
+        let empty = Budget {
+            attempts_left: 0,
+            credit_hours: 1,
+        };
         for (sent, answer) in [
             (
                 bundle(Some((&[&stranger], 0))),
@@ -950,10 +963,18 @@ mod over_usb {
             (bundle(None), Ok(())),
         ] {
             paired::reset(&fresh).unwrap();
+            let mut record = store::record(&fresh).unwrap();
+            record.set_budget(empty);
+            store::set_record(&fresh, &record).unwrap();
             let got = session(&fresh, &[provision(sent)]);
+            let budget = store::record(&fresh).unwrap().budget();
             match answer {
-                Ok(()) => assert_eq!(got, [FromDisplay::Provisioned]),
+                Ok(()) => {
+                    assert_eq!(got, [FromDisplay::Provisioned]);
+                    assert_eq!(budget, Budget::FULL);
+                }
                 Err(code) => {
+                    assert_eq!(budget, empty);
                     assert!(
                         matches!(&got[0], FromDisplay::Error { code: c, .. } if *c == code),
                         "{got:?}"
@@ -971,5 +992,101 @@ mod over_usb {
             [FromDisplay::Provisioned]
         );
         assert_eq!(store::keys(&bare).unwrap(), store::KeyStore::default());
+
+        // A key that isn't a valid P-256 point is never stored: the bundle is refused.
+        let odd = tmp.path().join("odd");
+        let mut b = bundle(Some((&[&maker], 3)));
+        let mut not_a_point = maker.public_key();
+        not_a_point.0[64] ^= 0x01;
+        assert!(!not_a_point.is_valid_point());
+        b.firmware
+            .as_mut()
+            .unwrap()
+            .trusted_keys
+            .push(not_a_point.to_hex());
+        let got = session(&odd, &[provision(b)]);
+        assert!(
+            matches!(
+                &got[0],
+                FromDisplay::Error {
+                    code: UsbErrorCode::InvalidBundle,
+                    ..
+                }
+            ),
+            "{got:?}"
+        );
+        assert!(!usb::is_provisioned(&odd));
+        assert_eq!(store::keys(&odd).unwrap(), store::KeyStore::default());
     }
+}
+
+/// Case 24 and the budget: an offer refused from the offer alone (here, too large for the spare
+/// slot) spends nothing and writes nothing. It is remembered until the next start only.
+#[tokio::test]
+async fn a_refusal_before_any_request_spends_and_writes_nothing() {
+    let r = Rig::start().await;
+    let maker = key();
+    let mut sim = r.display("desk", &[&maker], 0).await;
+    let update = store::folder(&sim.dir).join("update.json");
+    let before = std::fs::read(&update).ok();
+    let huge = FirmwareUpdate {
+        offer_id: "ab".repeat(16),
+        package_id: "cd".repeat(32),
+        size: SLOT + 137 + 4096 + 1,
+    };
+    assert_eq!(
+        sim.fw.on_offer(&sim.state, &huge).await.unwrap(),
+        Acted::Refused(Refusal::TooLarge)
+    );
+    assert_eq!(sim.fw.on_offer(&sim.state, &huge).await.unwrap(), Acted::Ignored);
+    assert_eq!(std::fs::read(&update).ok(), before, "nothing written");
+    assert_eq!(store::record(&sim.dir).unwrap().budget(), Budget::FULL);
+    // After a restart it is refused again, still for nothing.
+    sim.fw.boot().unwrap();
+    assert_eq!(
+        sim.fw.on_offer(&sim.state, &huge).await.unwrap(),
+        Acted::Refused(Refusal::TooLarge)
+    );
+    assert_eq!(std::fs::read(&update).ok(), before);
+    r.stop().await;
+}
+
+/// A record written before the attempt budget existed: its old members are ignored and the budget
+/// reads as full, as on a display that has never tried.
+#[test]
+fn an_old_update_record_reads_with_a_full_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old = json!({
+        "last_offer_id": "ab".repeat(16),
+        "attempt": null,
+        "pending": null,
+        "last_result": null,
+        "last_attempt_at": NOW,
+        "failures_in_row": 3,
+    });
+    std::fs::create_dir_all(store::folder(tmp.path())).unwrap();
+    std::fs::write(
+        store::folder(tmp.path()).join("update.json"),
+        serde_json::to_vec(&old).unwrap(),
+    )
+    .unwrap();
+    let record = store::record(tmp.path()).unwrap();
+    assert_eq!(record.budget(), Budget::FULL);
+    assert_eq!(record.last_offer_id, Some("ab".repeat(16)));
+    // A damaged budget is brought into range.
+    let mut damaged = old.clone();
+    damaged["attempts_left"] = json!(0);
+    damaged["credit_hours"] = json!(40);
+    std::fs::write(
+        store::folder(tmp.path()).join("update.json"),
+        serde_json::to_vec(&damaged).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store::record(tmp.path()).unwrap().budget(),
+        Budget {
+            attempts_left: 0,
+            credit_hours: 3
+        }
+    );
 }

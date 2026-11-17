@@ -4,18 +4,20 @@
 //! - [`store`] is what the display keeps: two app slots, the OTA data, the trusted keys and floor,
 //!   and the update record.
 //! - [`install`] is steps 1 to 9 for one download, pushed a piece at a time.
-//! - [`rules`] are the time-based rules (one attempt per offer, the waits, the trial boot), as pure
-//!   functions of the record and the time.
+//! - [`rules`] are the rules on trying (the attempt budget, the offer last acted on, the trial
+//!   boot), as pure functions of the record and the display's running time.
 //! - [`Firmware`] puts them together against a real hub: acting on an offer, the restart, the trial
 //!   boot, rolling back and reporting.
 //! - [`vectors`] turns the document's test list into language-neutral conformance vectors.
 //!
-//! Every wait is measured by an injected [`Clock`], and the two download time limits are
-//! [`Limits`], so tests never wait for real.
+//! Every wait is measured by an injected [`Uptime`], a monotonic timer that starts at zero at every
+//! start, never by the wall clock or the hub's time. The two download time limits are [`Limits`].
+//! Tests move both, so they never wait for real.
 
 pub mod install;
 pub mod rules;
 pub mod store;
+pub mod uptime;
 pub mod vectors;
 
 use std::fs::File;
@@ -26,14 +28,14 @@ use std::time::Duration;
 
 use firmware_package::{Display, Manifest, PublicKey, Refusal};
 use hub_client::ClientError;
-use hub_core::Clock;
 use hub_protocol::firmware::{FirmwareReport, FirmwareUpdate, ReportState};
 use hub_protocol::limits::{FIRMWARE_DOWNLOAD_STALL_SECONDS, FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS};
 
 use crate::paired;
 use install::{Ended, Failure, Flash, FlashError, Installer, Progress};
-use rules::{decide, CheckIn, Decision, Trial, TrialStep};
+use rules::{decide, CheckIn, Decision, Meter, Trial, TrialStep};
 use store::{Attempt, NextStart, Outcome, Pending, SlotName, SlotState, Switches};
+pub use uptime::{FakeUptime, SystemUptime, Uptime};
 
 /// The two time limits on a download. Tests shorten them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,9 +71,10 @@ pub enum Started {
 /// What came of an offer in a snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Acted {
-    /// Already acted on.
+    /// The offer last acted on, or one refused before any request since this start.
     Ignored,
-    /// Too soon after the last attempt.
+    /// No attempts left: the offer is left open and nothing is reported. `seconds` is how much more
+    /// running earns the next attempt.
     Waiting {
         seconds: u64,
     },
@@ -97,12 +100,21 @@ pub enum TrialOutcome {
 
 pub struct Firmware {
     state: PathBuf,
-    clock: Arc<dyn Clock>,
+    uptime: Arc<dyn Uptime>,
+    /// The timer's reading at this start. Running time is counted from here, so it is zero at every
+    /// start.
+    started: Duration,
+    /// Running time not yet saved as a credit hour. Lost at a restart.
+    meter: Meter,
     pub limits: Limits,
     pub switches: Switches,
     trial: Option<Trial>,
     /// The firmware on trial can't reach the hub (a test switch).
     trial_no_hub: bool,
+    /// The last offer refused before anything was requested (`no_trusted_keys`, `too_large`), and
+    /// whether the hub has answered its report. Kept in memory only, until the next start: such a
+    /// refusal spends nothing, so nothing about it is written.
+    refused_early: Option<Outcome>,
 }
 
 fn io_other(e: impl std::fmt::Display) -> std::io::Error {
@@ -110,21 +122,41 @@ fn io_other(e: impl std::fmt::Display) -> std::io::Error {
 }
 
 impl Firmware {
-    /// The display whose state is in `state`, with its test switches from `switches.json`. Call
-    /// [`Firmware::boot`] before anything else.
-    pub fn open(state: &Path, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
+    /// The display whose state is in `state`, with its test switches from `switches.json`, timing
+    /// itself with `uptime`. Call [`Firmware::boot`] before anything else.
+    pub fn open(state: &Path, uptime: Arc<dyn Uptime>) -> std::io::Result<Self> {
+        let started = uptime.elapsed();
         Ok(Self {
             state: state.to_path_buf(),
-            clock,
+            uptime,
+            started,
+            meter: Meter::at_start(),
             limits: Limits::default(),
             switches: store::switches(state)?,
             trial: None,
             trial_no_hub: false,
+            refused_early: None,
         })
     }
 
     pub fn in_trial(&self) -> bool {
         self.trial.is_some()
+    }
+
+    /// Seconds since this start, by the monotonic timer.
+    fn running_seconds(&self) -> u64 {
+        self.uptime.elapsed().saturating_sub(self.started).as_secs()
+    }
+
+    /// Counts running time towards the attempt budget, saving each credit hour it adds. While the
+    /// budget is full, nothing is counted or written.
+    fn count_running_time(&mut self) -> std::io::Result<()> {
+        let mut record = store::record(&self.state)?;
+        if let Some((budget, _hours)) = self.meter.count(record.budget(), self.running_seconds()) {
+            record.set_budget(budget);
+            store::set_record(&self.state, &record)?;
+        }
+        Ok(())
     }
 
     fn save_switches(&self) -> std::io::Result<()> {
@@ -136,6 +168,10 @@ impl Firmware {
     /// reset before it was marked good) is marked invalid and the other slot started instead. The
     /// firmware that runs then settles whatever the update record says it left unfinished.
     pub fn boot(&mut self) -> std::io::Result<Started> {
+        // A start: the timer begins again at zero, and whatever was only in memory is gone.
+        self.started = self.uptime.elapsed();
+        self.meter = Meter::at_start();
+        self.refused_early = None;
         self.trial = None;
         self.trial_no_hub = false;
         let mut ota = store::ota(&self.state)?;
@@ -186,7 +222,7 @@ impl Firmware {
         let version = store::running_version(&self.state)?;
         if on_trial {
             self.trial = Some(Trial {
-                started_at: self.clock.now(),
+                started_at: self.running_seconds(),
             });
             return Ok(Started::Trial { version });
         }
@@ -220,7 +256,7 @@ impl Firmware {
         Ok(Started::Normal { version })
     }
 
-    /// Records a final result to report, and counts it.
+    /// Records a final result to report. It never changes the attempt budget.
     fn settle(
         &self,
         record: &mut store::Record,
@@ -228,11 +264,6 @@ impl Firmware {
         state: ReportState,
         reason: Option<hub_protocol::firmware::ReportReason>,
     ) {
-        if state == ReportState::Installed {
-            record.failures_in_row = 0;
-        } else {
-            record.failures_in_row = record.failures_in_row.saturating_add(1);
-        }
         record.last_result = Some(Outcome {
             offer_id: offer_id.to_string(),
             state,
@@ -293,7 +324,7 @@ impl Firmware {
         } else {
             result
         };
-        match trial.check_in(self.clock.now(), result) {
+        match trial.check_in(self.running_seconds(), result) {
             TrialStep::Waiting => Ok(TrialOutcome::Waiting),
             TrialStep::MarkGood => self.mark_good(),
             TrialStep::RollBack => self.roll_back(),
@@ -308,40 +339,61 @@ impl Firmware {
         })
     }
 
-    /// Time passing: a trial boot that hasn't reached the hub in five minutes rolls back.
+    /// Time passing: running time is counted towards the attempt budget, and a trial boot that
+    /// hasn't reached the hub in five minutes rolls back.
     pub fn tick(&mut self) -> std::io::Result<TrialOutcome> {
+        self.count_running_time()?;
         let Some(trial) = self.trial else {
             return Ok(TrialOutcome::NotInTrial);
         };
-        match trial.tick(self.clock.now()) {
+        match trial.tick(self.running_seconds()) {
             TrialStep::RollBack => self.roll_back(),
             _ => Ok(TrialOutcome::Waiting),
         }
     }
 
-    /// Sends the last final report if the hub hasn't answered it yet. Any answer at all settles it;
-    /// only a failure to reach the hub leaves it to send again. Returns whether one is still waiting.
+    /// Sends the last final report if the hub hasn't answered it yet: the one in the update record,
+    /// then a refusal made before any request. Any answer at all settles it; only a failure to reach
+    /// the hub leaves it to send again. Returns whether one is still waiting.
+    ///
+    /// Nothing is sent while new firmware is on trial: a report names the running version, and that
+    /// version hasn't been marked good yet.
     pub async fn send_report(&mut self, hub: &paired::State) -> std::io::Result<bool> {
         let mut record = store::record(&self.state)?;
-        let Some(outcome) = record.last_result.clone().filter(|o| !o.answered) else {
-            return Ok(false);
-        };
+        let waiting = record.last_result.clone().filter(|o| !o.answered);
+        let early = self.refused_early.clone().filter(|o| !o.answered);
+        if self.in_trial() {
+            return Ok(waiting.is_some() || early.is_some());
+        }
+        if let Some(outcome) = waiting {
+            if !self.report_final(hub, &outcome).await? {
+                return Ok(true);
+            }
+            if let Some(o) = record.last_result.as_mut() {
+                o.answered = true;
+            }
+            store::set_record(&self.state, &record)?;
+        }
+        if let Some(outcome) = early {
+            if !self.report_final(hub, &outcome).await? {
+                return Ok(true);
+            }
+            if let Some(o) = self.refused_early.as_mut() {
+                o.answered = true;
+            }
+        }
+        Ok(false)
+    }
+
+    /// Sends one final report. Returns whether the hub answered it.
+    async fn report_final(&self, hub: &paired::State, outcome: &Outcome) -> std::io::Result<bool> {
         let report = FirmwareReport {
             offer_id: outcome.offer_id.clone(),
             state: outcome.state,
             reason: outcome.reason,
             firmware_version: Some(store::running_version(&self.state)?),
         };
-        match paired::firmware_report(hub, &report).await {
-            Err(e) if e.is_connection() => Ok(true),
-            _ => {
-                if let Some(o) = record.last_result.as_mut() {
-                    o.answered = true;
-                }
-                store::set_record(&self.state, &record)?;
-                Ok(false)
-            }
-        }
+        Ok(!matches!(paired::firmware_report(hub, &report).await, Err(e) if e.is_connection()))
     }
 
     /// Acts on the offer in a snapshot ("Checks before installing" and "Limits on trying").
@@ -349,21 +401,23 @@ impl Firmware {
         if self.in_trial() || self.send_report(hub).await? {
             return Ok(Acted::Busy);
         }
-        let now = self.clock.now();
-        let mut record = store::record(&self.state)?;
-        match decide(&record, &offer.offer_id, now) {
-            Decision::Ignore => return Ok(Acted::Ignored),
-            Decision::Wait { seconds } => return Ok(Acted::Waiting { seconds }),
-            Decision::Attempt => {}
+        if self
+            .refused_early
+            .as_ref()
+            .is_some_and(|o| o.offer_id == offer.offer_id)
+        {
+            return Ok(Acted::Ignored);
         }
-        // The offer id is saved before anything is requested, so a restart still knows about it.
-        record.last_offer_id = Some(offer.offer_id.clone());
-        record.last_attempt_at = Some(now);
-        record.attempt = Some(Attempt {
-            offer_id: offer.offer_id.clone(),
-            started_at: now,
-        });
-        store::set_record(&self.state, &record)?;
+        self.count_running_time()?;
+        let mut record = store::record(&self.state)?;
+        let decision = decide(
+            &record,
+            &offer.offer_id,
+            self.meter.uncounted(self.running_seconds()),
+        );
+        if decision == Decision::Ignore {
+            return Ok(Acted::Ignored);
+        }
 
         let keys = store::keys(&self.state)?;
         let trusted: Vec<PublicKey> = keys.keys();
@@ -375,10 +429,36 @@ impl Firmware {
             security_floor: keys.security_floor,
             slot_bytes: board.slot_bytes,
         };
-        let result = match Installer::before_request(&display, offer.size) {
-            Err(r) => Err(Ended::Refused(r)),
-            Ok(()) => self.download(hub, offer, display).await?,
+        // Steps 1 and 2 need nothing from the hub. A refusal here spends nothing, and nothing is
+        // written: it is remembered, and reported, only until the next start.
+        if let Err(r) = Installer::before_request(&display, offer.size) {
+            let (state, reason) = Ended::Refused(r).report().expect("not a power cut");
+            self.refused_early = Some(Outcome {
+                offer_id: offer.offer_id.clone(),
+                state,
+                reason: Some(reason),
+                answered: false,
+            });
+            self.send_report(hub).await?;
+            return Ok(Acted::Refused(r));
+        }
+        match decision {
+            Decision::Wait { seconds } => return Ok(Acted::Waiting { seconds }),
+            Decision::Ignore | Decision::Attempt => {}
+        }
+        // One attempt spent: the reduced budget and the offer id are saved in a single write, before
+        // anything is requested, so a restart still knows about it.
+        let Some(budget) = record.budget().spend() else {
+            return Ok(Acted::Waiting { seconds: 0 });
         };
+        record.set_budget(budget);
+        record.last_offer_id = Some(offer.offer_id.clone());
+        record.attempt = Some(Attempt {
+            offer_id: offer.offer_id.clone(),
+        });
+        store::set_record(&self.state, &record)?;
+
+        let result = self.download(hub, offer, display).await?;
         let manifest = match result {
             Ok(m) => m,
             Err(Ended::PowerCut) => return Ok(Acted::PowerCut),

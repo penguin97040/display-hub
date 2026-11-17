@@ -20,10 +20,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use display_simulator::firmware::install::Failure;
 use display_simulator::firmware::store::{self, KeyStore, SlotName, SlotState};
-use display_simulator::firmware::{Acted, Firmware, Limits, Started};
+use display_simulator::firmware::{Acted, FakeUptime, Firmware, Limits, Started};
 use display_simulator::paired;
 use firmware_package::{build_and_sign, Built, Refusal, Release, SigningKey};
-use hub_core::FakeClock;
 use hub_protocol::firmware::{FirmwareReport, FirmwareUpdate, ReportReason, ReportState};
 use hub_protocol::provisioning::{HubLocation, TrustAnchor, HUB_SERVER_NAME};
 use tokio::sync::oneshot;
@@ -162,8 +161,8 @@ impl Rig {
         }
     }
 
-    fn firmware(&self, clock: &FakeClock) -> Firmware {
-        let mut fw = Firmware::open(self.dir.path(), Arc::new(clock.clone())).unwrap();
+    fn firmware(&self, uptime: &FakeUptime) -> Firmware {
+        let mut fw = Firmware::open(self.dir.path(), Arc::new(uptime.clone())).unwrap();
         fw.limits = Limits {
             stall: Duration::from_millis(300),
             total: Duration::from_secs(2),
@@ -238,15 +237,15 @@ fn offer(n: u32, form: &[u8]) -> FirmwareUpdate {
 async fn the_display_gives_up_on_or_refuses_whatever_a_hostile_hub_sends() {
     let maker = key();
     let r = Rig::start(&[&maker], 2).await;
-    let clock = FakeClock::parse("2026-11-17T09:00:00Z");
-    let mut fw = r.firmware(&clock);
+    let uptime = FakeUptime::new();
+    let mut fw = r.firmware(&uptime);
     let built = package(&maker, "1.2.0", 2);
     let form = built.bytes.clone();
     let len = form.len() as u64;
     let mut n = 0;
     let mut next = || {
-        // Far enough apart that the waits between attempts never apply.
-        clock.advance(7 * 3600);
+        // Four hours of running between attempts earns each one back, so the budget never runs out.
+        uptime.advance(4 * 3600);
         n += 1;
         offer(n, &form)
     };
@@ -337,7 +336,7 @@ async fn the_display_gives_up_on_or_refuses_whatever_a_hostile_hub_sends() {
         stall: false,
     });
     n += 1;
-    clock.advance(7 * 3600);
+    uptime.advance(4 * 3600);
     assert_eq!(
         fw.on_offer(&r.state, &offer(n, &theirs)).await.unwrap(),
         Acted::Refused(Refusal::UntrustedKey)
@@ -353,7 +352,7 @@ async fn the_display_gives_up_on_or_refuses_whatever_a_hostile_hub_sends() {
         stall: false,
     });
     n += 1;
-    clock.advance(7 * 3600);
+    uptime.advance(4 * 3600);
     assert_eq!(
         fw.on_offer(&r.state, &offer(n, &old)).await.unwrap(),
         Acted::Refused(Refusal::Downgrade)
@@ -368,7 +367,7 @@ async fn the_display_gives_up_on_or_refuses_whatever_a_hostile_hub_sends() {
         stall: false,
     });
     n += 1;
-    clock.advance(7 * 3600);
+    uptime.advance(4 * 3600);
     assert!(matches!(
         fw.on_offer(&r.state, &offer(n, &form)).await.unwrap(),
         Acted::Restarted(Started::Trial { .. })
@@ -380,8 +379,8 @@ async fn the_display_gives_up_on_or_refuses_whatever_a_hostile_hub_sends() {
 async fn a_failed_write_is_reported_as_flash_and_nothing_boots() {
     let maker = key();
     let r = Rig::start(&[&maker], 0).await;
-    let clock = FakeClock::parse("2026-11-17T09:00:00Z");
-    let mut fw = r.firmware(&clock);
+    let uptime = FakeUptime::new();
+    let mut fw = r.firmware(&uptime);
     let form = package(&maker, "1.2.0", 1).bytes;
     r.serve(Script {
         content_length: Some(form.len() as u64),

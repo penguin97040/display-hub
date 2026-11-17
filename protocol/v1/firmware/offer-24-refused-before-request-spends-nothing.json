@@ -1,0 +1,56 @@
+{
+  "format": "display-hub.firmware-conformance",
+  "version": 1,
+  "name": "offer-24-refused-before-request-spends-nothing",
+  "cases": [
+    24,
+    25
+  ],
+  "description": "An offer refused from the offer alone (too_large or no_trusted_keys) spends nothing and is written nowhere: it is remembered only until the next start, then refused again.",
+  "keys": {
+    "maker": "04231bb59c7e74a57928e01c513c95565d50fe784fcd923835098ea4dd0117d295e17bb75305deb59bd51e848da5df7a6cbff4720be2693234b07e3ce7569c7e3e",
+    "new": "04faa855ace02d62555c3ce723a66cb053755774be332b6500d883f55fb2acd7b9990cee5014751ea00912e349b1f7fc37e3752a75899968d3e4e527141bd7dd3f",
+    "recovery": "045b0a7631a951bfbc3bc90b2b108597bfaa18d345ea271d26e7249e00c5f7c894abc30246b1a63631399954f5a684eef99c87a5bb6fc56746ee7517319916da25",
+    "retired": "04c68356a333f0d803b291a6cef5f89df4d7a983b4c265a4ce4490817bfc4491aa8c709d4679ef5538a1d7c7bb8c4a3d8f6cf90f48281209568c70e6a850d808a7",
+    "stranger": "04fa6ef1aabb0c5ceae7caa765ad9a01747eb95a18ef02e90eaa690ce87720ea2304f82e4b64986c5b4c5aa22289edab6ee209a3322ace80b4bab96b05640cbf79"
+  },
+  "kind": "offer",
+  "before": {
+    "attempts_left": 1,
+    "credit_hours": 0,
+    "last_offer_id": "00000000000000000000000000000001"
+  },
+  "events": [
+    {
+      "event": "offer",
+      "offer_id": "00000000000000000000000000000002",
+      "outcome": "refused_before_request"
+    },
+    {
+      "event": "offer",
+      "offer_id": "00000000000000000000000000000002",
+      "outcome": "refused_before_request"
+    },
+    {
+      "event": "restart"
+    },
+    {
+      "event": "offer",
+      "offer_id": "00000000000000000000000000000002",
+      "outcome": "refused_before_request"
+    }
+  ],
+  "expect": {
+    "actions": [
+      "refuse_without_request",
+      "ignore",
+      "refuse_without_request"
+    ],
+    "saves": 0,
+    "after": {
+      "attempts_left": 1,
+      "credit_hours": 0,
+      "last_offer_id": "00000000000000000000000000000001"
+    }
+  }
+}

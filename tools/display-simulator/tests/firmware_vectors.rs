@@ -196,8 +196,37 @@ fn key_behaviours_hold() {
         (expect.trusted_keys, expect.security_floor),
         (vec!["maker".to_string(), "recovery".into()], 3)
     );
-    let Test::Offer { expect, .. } = get("offer-26-third-failure-waits-six-hours") else {
+    // The budget: nothing written while full, a successful install gives nothing back, and each new
+    // offer id costs one.
+    let Test::Offer { expect, .. } = get("offer-25-nothing-written-while-full") else {
         panic!()
     };
-    assert_eq!(expect.wait_seconds, Some(5 * 3600));
+    assert_eq!((expect.saves, expect.after.attempts_left), (0, 5));
+    let Test::Offer { expect, .. } = get("offer-26-install-does-not-refill") else {
+        panic!()
+    };
+    assert_eq!(expect.after.attempts_left, 0);
+    let Test::Offer { expect, .. } = get("offer-26-new-offer-ids-each-cost-one") else {
+        panic!()
+    };
+    assert_eq!((expect.saves, expect.after.attempts_left), (3, 2));
+    let Test::Offer { expect, .. } = get("offer-25-restart-loses-uncounted-time") else {
+        panic!()
+    };
+    assert_eq!(
+        (expect.actions.as_slice(), expect.after.credit_hours),
+        (["wait".to_string()].as_slice(), 3)
+    );
+    // A key_set that drops a trusted key needs a higher counter.
+    let Test::Package { expect, .. } = get("package-35-key-set-drops-a-key-at-equal-counter") else {
+        panic!()
+    };
+    assert_eq!(expect.reason.as_deref(), Some("downgrade"));
+    let Test::Provision { expect, .. } = get("provision-40-key-not-a-point-refused") else {
+        panic!()
+    };
+    assert_eq!(
+        (expect.answer.as_deref(), expect.trusted_keys.len()),
+        (Some("invalid_bundle"), 0)
+    );
 }

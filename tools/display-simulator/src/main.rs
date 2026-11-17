@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use display_simulator::firmware::store::NextStart;
-use display_simulator::firmware::{self, Acted, Firmware, Started, TrialOutcome};
+use display_simulator::firmware::{self, Acted, Firmware, Started, SystemUptime, TrialOutcome};
 use display_simulator::render::screen;
 use display_simulator::{paired, ClockJitter, Device, Link};
 use hub_client::HubClient;
@@ -200,6 +200,8 @@ fn target(conn: &Connection) -> Result<(Target, Option<PathBuf>), ExitCode> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // This process starting is the display starting: its running time begins at zero here.
+    let uptime = SystemUptime::new();
     let cli = Cli::parse();
     let clock = SystemClock;
     match cli.command {
@@ -319,7 +321,7 @@ async fn main() -> ExitCode {
             };
             let mut device = Device::new(cache, Box::new(ClockJitter::default()));
             let mut updates = match (&hub, &conn.state) {
-                (Target::Paired(_), Some(dir)) => match Firmware::open(dir, Arc::new(SystemClock)) {
+                (Target::Paired(_), Some(dir)) => match Firmware::open(dir, Arc::new(uptime)) {
                     Ok(mut fw) => match fw.boot() {
                         Ok(started) => {
                             println!("{}", started_text(&started));
@@ -431,26 +433,32 @@ async fn act_on_updates(
     result: &Result<hub_protocol::Snapshot, hub_client::ClientError>,
     offer: Option<&hub_protocol::firmware::FirmwareUpdate>,
 ) -> std::io::Result<()> {
-    if fw.in_trial() {
-        let outcome = match fw.check_in_with(result)? {
-            TrialOutcome::Waiting => fw.tick()?,
-            other => other,
-        };
-        match outcome {
-            TrialOutcome::MarkedGood { version } => {
-                println!("Firmware {version} reached the hub and is now marked good.")
-            }
-            TrialOutcome::RolledBack(s) => println!("{}", started_text(&s)),
-            TrialOutcome::Waiting | TrialOutcome::NotInTrial => {}
+    // The poll was the trial boot's check-in, if there is one. Then time passing: the trial's five
+    // minutes, and running time towards the attempt budget.
+    let checked_in = if fw.in_trial() {
+        fw.check_in_with(result)?
+    } else {
+        TrialOutcome::NotInTrial
+    };
+    let outcome = match checked_in {
+        TrialOutcome::Waiting | TrialOutcome::NotInTrial => fw.tick()?,
+        other => other,
+    };
+    match outcome {
+        TrialOutcome::MarkedGood { version } => {
+            println!("Firmware {version} reached the hub and is now marked good.")
         }
+        TrialOutcome::RolledBack(s) => println!("{}", started_text(&s)),
+        TrialOutcome::Waiting | TrialOutcome::NotInTrial => {}
     }
     fw.send_report(state).await?;
     if let Some(offer) = offer {
         match fw.on_offer(state, offer).await? {
             Acted::Ignored | Acted::Busy => {}
-            Acted::Waiting { seconds } => {
-                println!("A firmware update is offered; waiting {seconds} s before trying.")
-            }
+            Acted::Waiting { seconds } => println!(
+                "A firmware update is offered, but this display has no download attempts left. It earns the next after {} more minutes of running.",
+                seconds.div_ceil(60)
+            ),
             Acted::Refused(r) => println!("Refused the offered firmware ({r}). Nothing was written."),
             Acted::Failed(f) => println!(
                 "The firmware update failed ({}). The old firmware is still running.",
@@ -640,7 +648,22 @@ fn show_firmware(state: &std::path::Path) -> Result<(), String> {
             if r.answered { "" } else { ", not yet reported" }
         );
     }
-    println!("Failures in a row: {}", record.failures_in_row);
+    let budget = record.budget();
+    if budget.is_full() {
+        println!(
+            "Download attempts left: {} of {}",
+            budget.attempts_left,
+            firmware::rules::FULL_BUDGET
+        );
+    } else {
+        println!(
+            "Download attempts left: {} of {} ({} of {} hours of running counted towards the next)",
+            budget.attempts_left,
+            firmware::rules::FULL_BUDGET,
+            budget.credit_hours,
+            firmware::rules::CREDIT_HOURS_PER_ATTEMPT
+        );
+    }
     let mut on = Vec::new();
     match switches.next_start {
         NextStart::Normal => {}

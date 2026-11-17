@@ -60,12 +60,7 @@ pub const FIRMWARE_DOWNLOAD_WINDOW_SECONDS: u64 = 3600;
 pub const FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS: u64 = 15 * 60;
 /// A display gives up on a download that sends nothing for this long.
 pub const FIRMWARE_DOWNLOAD_STALL_SECONDS: u64 = 30;
-/// The least time a display leaves between download attempts, and after
-/// [`FIRMWARE_FAILURES_BEFORE_LONG_WAIT`] failures in a row, the least before the next.
-pub const FIRMWARE_RETRY_WAIT_SECONDS: u64 = 10 * 60;
-pub const FIRMWARE_FAILURES_BEFORE_LONG_WAIT: u32 = 3;
-pub const FIRMWARE_LONG_WAIT_SECONDS: u64 = 6 * 3600;
-/// The largest `attempts_left` a display reports in its `firmware` member.
+/// The largest `attempts_left` a display reports in its `firmware` member: its full attempt budget.
 pub const MAX_FIRMWARE_ATTEMPTS_LEFT: u32 = 5;
 /// New firmware rolls back unless it reaches the hub within this long of its trial boot.
 pub const FIRMWARE_TRIAL_SECONDS: u64 = 5 * 60;

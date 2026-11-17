@@ -7,7 +7,7 @@
 //! | `slot-a.bin`, `slot-b.bin` | The two app partitions. Absent until something is written there. |
 //! | `otadata.json` | ESP-IDF's OTA data: which slot boots, which is running, and each slot's state and version. |
 //! | `keys.json` | The trusted keys and the security floor: an NVS namespace of their own. |
-//! | `update.json` | The update record: the last offer acted on, any attempt in progress, what is waiting for a trial boot to succeed, the last result, and the failure count. |
+//! | `update.json` | The update record: the last offer acted on, the attempt budget, any attempt in progress, what is waiting for a trial boot to succeed, and the last result. |
 //! | `switches.json` | Test switches, for trying failures by hand. A real display has none. |
 //!
 //! A factory reset (`paired::reset`) erases the hub details beside this folder and leaves all of it.
@@ -19,10 +19,10 @@ use std::path::{Path, PathBuf};
 use firmware_package::{CheckedPackage, PublicKey};
 use hub_protocol::device::DeviceInfo;
 use hub_protocol::firmware::{BundleFirmware, FirmwareInfo, ReportReason, ReportState};
-use hub_protocol::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use super::rules::Budget;
 use crate::paired::write_private;
 
 /// What every simulated display reports as its device type and hardware revision.
@@ -238,12 +238,11 @@ pub fn running_version(state: &Path) -> std::io::Result<String> {
     })
 }
 
-/// An attempt that has begun: the offer id is saved before the download is requested, so a restart
-/// or power cut part-way still knows about it.
+/// An attempt that has begun: saved with the reduced budget before the download is requested, so
+/// a restart or power cut part-way still knows about it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub offer_id: String,
-    pub started_at: Timestamp,
 }
 
 /// An installed image waiting for its trial boot to succeed.
@@ -268,17 +267,58 @@ pub struct Outcome {
     pub answered: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// The update record.
+///
+/// A record from before the attempt budget has `last_attempt_at` and `failures_in_row` instead of
+/// `attempts_left` and `credit_hours`. The old members are ignored and the budget reads as full,
+/// as on a display that has never tried: the same as a fresh display, and at most five attempts
+/// once, so it can't be used to wear the flash.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
-    /// The last offer acted on. Seeing it again does nothing: one attempt per offer.
+    /// The last offer acted on. Seeing it again does nothing.
     pub last_offer_id: Option<String>,
+    /// The attempt budget: 0 to 5 attempts left, and 0 to 3 credit hours towards the next. Read it
+    /// with [`Record::budget`], which brings a damaged value into range.
+    #[serde(default = "full_budget")]
+    pub attempts_left: u32,
+    #[serde(default)]
+    pub credit_hours: u32,
     pub attempt: Option<Attempt>,
     pub pending: Option<Pending>,
     pub last_result: Option<Outcome>,
-    /// When the last attempt began, for the waits between attempts.
-    pub last_attempt_at: Option<Timestamp>,
-    /// Attempts in a row that didn't end installed.
-    pub failures_in_row: u32,
+}
+
+fn full_budget() -> u32 {
+    Budget::FULL.attempts_left
+}
+
+impl Default for Record {
+    /// A display that has never tried: a full budget.
+    fn default() -> Self {
+        Self {
+            last_offer_id: None,
+            attempts_left: Budget::FULL.attempts_left,
+            credit_hours: Budget::FULL.credit_hours,
+            attempt: None,
+            pending: None,
+            last_result: None,
+        }
+    }
+}
+
+impl Record {
+    pub fn budget(&self) -> Budget {
+        Budget {
+            attempts_left: self.attempts_left,
+            credit_hours: self.credit_hours,
+        }
+        .normalised()
+    }
+
+    pub fn set_budget(&mut self, budget: Budget) {
+        self.attempts_left = budget.attempts_left;
+        self.credit_hours = budget.credit_hours;
+    }
 }
 
 pub fn record(state: &Path) -> std::io::Result<Record> {
@@ -342,7 +382,7 @@ pub fn device_info(state: &Path) -> std::io::Result<DeviceInfo> {
             key_ids: keys.key_ids(),
             security_floor: keys.security_floor,
             slot_bytes: board(state)?.slot_bytes,
-            attempts_left: None,
+            attempts_left: Some(record(state)?.budget().attempts_left),
         }),
     })
 }
@@ -358,48 +398,75 @@ pub fn after_good(store: &KeyStore, security_counter: u32, key_set: Option<&[Str
 
 /// Why a provisioning bundle's firmware section was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct KeysLocked;
+pub enum BundleRefused {
+    /// The display already trusts a different set of keys (`firmware_keys_locked`).
+    KeysLocked,
+    /// A key isn't a valid P-256 point (`invalid_bundle`). Nothing is stored.
+    NotAPoint,
+}
 
-impl std::fmt::Display for KeysLocked {
+impl std::fmt::Display for BundleRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(
-            "this display already trusts a different set of firmware keys; only Install firmware can change them",
-        )
+        f.write_str(match self {
+            Self::KeysLocked => {
+                "this display already trusts a different set of firmware keys; only Install firmware can change them"
+            }
+            Self::NotAPoint => "firmware.trusted_keys holds a key that isn't a valid P-256 public key",
+        })
     }
 }
 
 /// What a provisioning bundle's `firmware` section does to the key store ("What each action may
-/// change"): a display with keys keeps them and its floor, and refuses a bundle naming a different
-/// set; a display with none takes the bundle's keys and floor, if it has any. `Ok(None)` means
-/// nothing changes.
+/// change"): every key must be a valid P-256 point, or the bundle is refused; a display with keys
+/// keeps them and its floor, and refuses a bundle naming a different set; a display with none takes
+/// the bundle's keys and floor, if it has any. `Ok(None)` means the keys don't change.
 pub fn bundle_keys(
     store: &KeyStore,
     bundle: Option<&BundleFirmware>,
-) -> Result<Option<KeyStore>, KeysLocked> {
-    match bundle {
-        None => Ok(None),
-        Some(b) if !store.trusted_keys.is_empty() => {
-            if store.same_set(&b.trusted_keys) {
-                Ok(None)
-            } else {
-                Err(KeysLocked)
-            }
-        }
-        Some(b) => Ok(Some(KeyStore {
-            trusted_keys: b.trusted_keys.clone(),
-            security_floor: b.security_counter,
-        })),
+) -> Result<Option<KeyStore>, BundleRefused> {
+    let Some(b) = bundle else {
+        return Ok(None);
+    };
+    let valid = |k: &String| PublicKey::from_hex(k).is_some_and(|k| k.is_valid_point());
+    if !b.trusted_keys.iter().all(valid) {
+        return Err(BundleRefused::NotAPoint);
     }
+    if !store.trusted_keys.is_empty() {
+        return if store.same_set(&b.trusted_keys) {
+            Ok(None)
+        } else {
+            Err(BundleRefused::KeysLocked)
+        };
+    }
+    Ok(Some(KeyStore {
+        trusted_keys: b.trusted_keys.clone(),
+        security_floor: b.security_counter,
+    }))
 }
 
-/// Applies a provisioning bundle's `firmware` section to the display in `state`.
+/// What accepting a bundle over USB changes, once [`bundle_keys`] has allowed it: the keys, if they
+/// change, and the attempt budget, back to full. Nothing is written for a budget that is full already.
+pub fn bundle_accepted(state: &Path, new_keys: Option<&KeyStore>) -> std::io::Result<()> {
+    if let Some(k) = new_keys {
+        set_keys(state, k)?;
+    }
+    let mut record = record(state)?;
+    if (record.attempts_left, record.credit_hours) != (Budget::FULL.attempts_left, Budget::FULL.credit_hours)
+    {
+        record.set_budget(Budget::FULL);
+        set_record(state, &record)?;
+    }
+    Ok(())
+}
+
+/// Applies a provisioning bundle's `firmware` section to the display in `state`, and refills its
+/// attempt budget.
 pub fn accept_bundle(
     state: &Path,
     bundle: Option<&BundleFirmware>,
-) -> std::io::Result<Result<(), KeysLocked>> {
+) -> std::io::Result<Result<(), BundleRefused>> {
     match bundle_keys(&keys(state)?, bundle) {
-        Ok(Some(new)) => set_keys(state, &new).map(Ok),
-        Ok(None) => Ok(Ok(())),
+        Ok(new) => bundle_accepted(state, new.as_ref()).map(Ok),
         Err(e) => Ok(Err(e)),
     }
 }
@@ -433,8 +500,9 @@ const FLASH_FILES: [&str; 6] = [
 /// is written to the first app slot, which boots. The board's description is kept: it is the
 /// hardware, not what is in flash.
 ///
-/// The keys and floor are then set by the provisioning bundle the app sends next (see
-/// [`bundle_for`]), which a display with no keys accepts.
+/// The update record goes too, so the attempt budget is full again. The keys and floor are then set
+/// by the provisioning bundle the app sends next (see [`bundle_for`]), which a display with no keys
+/// accepts.
 pub fn install_firmware(state: &Path, package: &CheckedPackage, bytes: &[u8]) -> std::io::Result<()> {
     let board = board(state)?;
     let image_start = firmware_package::limits::HEADER_LEN + package.header.manifest_len as usize;

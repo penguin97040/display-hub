@@ -5,26 +5,36 @@
   "cases": [
     24
   ],
-  "description": "A new offer, an hour after one was refused: it acts on it.",
+  "description": "A new offer after one was refused: it spends an attempt and acts on it.",
   "keys": {
-    "maker": "04795c666d0cdda58bfb27c60b936bba8ad0c8801218dcb6d5f50a73c00a9904229fa366102a70677d0ca5410d6300b8273e102bba8920cef822483339734b7eb3",
-    "new": "0490299b1ed43fb649a8393bfed5f3aeca248477041ab04ea8e58cbf2f1b56f7c681909238409a049e9dcaba0e5433f448335e0f0ea9484f4df3de45d3b2a1a834",
-    "recovery": "049c4b8faad133bdb521d9e5f419343b0f5579d64ae71a88227b19d0b07b59c7d047f5f695a9671d01043223ac9cf38246e8d54f3e47cc9832b68efba12d918f30",
-    "retired": "040a886bdb7c9265d3cd3dbc45ace8780a97b7997bce57cb4a2cbf27d7124303275b37f6084e42d46ea3d09cbc0e049922e04db832a8b942ce21c549f94a6c070d",
-    "stranger": "04d60f588ff97c238828d8b662100faf6cdc3a873a57458203b81eb0ccc498d8518590614975395bf016774b5570df2ad3f95b46e6107ae5ab5d9319e40711849c"
+    "maker": "04231bb59c7e74a57928e01c513c95565d50fe784fcd923835098ea4dd0117d295e17bb75305deb59bd51e848da5df7a6cbff4720be2693234b07e3ce7569c7e3e",
+    "new": "04faa855ace02d62555c3ce723a66cb053755774be332b6500d883f55fb2acd7b9990cee5014751ea00912e349b1f7fc37e3752a75899968d3e4e527141bd7dd3f",
+    "recovery": "045b0a7631a951bfbc3bc90b2b108597bfaa18d345ea271d26e7249e00c5f7c894abc30246b1a63631399954f5a684eef99c87a5bb6fc56746ee7517319916da25",
+    "retired": "04c68356a333f0d803b291a6cef5f89df4d7a983b4c265a4ce4490817bfc4491aa8c709d4679ef5538a1d7c7bb8c4a3d8f6cf90f48281209568c70e6a850d808a7",
+    "stranger": "04fa6ef1aabb0c5ceae7caa765ad9a01747eb95a18ef02e90eaa690ce87720ea2304f82e4b64986c5b4c5aa22289edab6ee209a3322ace80b4bab96b05640cbf79"
   },
   "kind": "offer",
-  "record": {
-    "last_offer_id": "00000000000000000000000000000001",
-    "seconds_since_last_attempt": 3600,
-    "failures_in_row": 1
+  "before": {
+    "attempts_left": 4,
+    "credit_hours": 0,
+    "last_offer_id": "00000000000000000000000000000001"
   },
-  "offer": {
-    "offer_id": "00000000000000000000000000000002",
-    "size": 1000
-  },
+  "events": [
+    {
+      "event": "offer",
+      "offer_id": "00000000000000000000000000000002",
+      "outcome": "refused"
+    }
+  ],
   "expect": {
-    "action": "attempt",
-    "wait_seconds": null
+    "actions": [
+      "attempt"
+    ],
+    "saves": 1,
+    "after": {
+      "attempts_left": 3,
+      "credit_hours": 0,
+      "last_offer_id": "00000000000000000000000000000002"
+    }
   }
 }

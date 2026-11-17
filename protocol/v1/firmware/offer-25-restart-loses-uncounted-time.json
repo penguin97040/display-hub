@@ -1,0 +1,51 @@
+{
+  "format": "display-hub.firmware-conformance",
+  "version": 1,
+  "name": "offer-25-restart-loses-uncounted-time",
+  "cases": [
+    25
+  ],
+  "description": "3 hours 59 minutes of running, then a restart: three credit hours were saved, the 59 minutes were not, so there is still no attempt. A restart can only make a wait longer.",
+  "keys": {
+    "maker": "04231bb59c7e74a57928e01c513c95565d50fe784fcd923835098ea4dd0117d295e17bb75305deb59bd51e848da5df7a6cbff4720be2693234b07e3ce7569c7e3e",
+    "new": "04faa855ace02d62555c3ce723a66cb053755774be332b6500d883f55fb2acd7b9990cee5014751ea00912e349b1f7fc37e3752a75899968d3e4e527141bd7dd3f",
+    "recovery": "045b0a7631a951bfbc3bc90b2b108597bfaa18d345ea271d26e7249e00c5f7c894abc30246b1a63631399954f5a684eef99c87a5bb6fc56746ee7517319916da25",
+    "retired": "04c68356a333f0d803b291a6cef5f89df4d7a983b4c265a4ce4490817bfc4491aa8c709d4679ef5538a1d7c7bb8c4a3d8f6cf90f48281209568c70e6a850d808a7",
+    "stranger": "04fa6ef1aabb0c5ceae7caa765ad9a01747eb95a18ef02e90eaa690ce87720ea2304f82e4b64986c5b4c5aa22289edab6ee209a3322ace80b4bab96b05640cbf79"
+  },
+  "kind": "offer",
+  "before": {
+    "attempts_left": 0,
+    "credit_hours": 0,
+    "last_offer_id": "00000000000000000000000000000001"
+  },
+  "events": [
+    {
+      "event": "running",
+      "minutes": 239
+    },
+    {
+      "event": "restart"
+    },
+    {
+      "event": "running",
+      "minutes": 59
+    },
+    {
+      "event": "offer",
+      "offer_id": "00000000000000000000000000000002",
+      "outcome": "installed"
+    }
+  ],
+  "expect": {
+    "actions": [
+      "wait"
+    ],
+    "saves": 3,
+    "after": {
+      "attempts_left": 0,
+      "credit_hours": 3,
+      "last_offer_id": "00000000000000000000000000000001"
+    }
+  }
+}

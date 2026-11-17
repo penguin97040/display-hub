@@ -65,15 +65,37 @@ They come from the reference display (`tools/display-simulator`, `src/firmware/`
 
 Feed `body_hex` to your download code in pieces of any size, and check every boundary: the vectors' reference feeds 97 bytes at a time.
 
-## `offer`: whether to act on an offer at all
+## `offer`: the attempt budget, and which offers to act on
 
 ```json
-"record": { "last_offer_id": "<32 hex digits>", "seconds_since_last_attempt": 540, "failures_in_row": 0 },
-"offer": { "offer_id": "<32 hex digits>", "size": 1000 },
-"expect": { "action": "wait", "wait_seconds": 60 }
+"before": { "attempts_left": 0, "credit_hours": 0, "last_offer_id": "<32 hex digits>" },
+"events": [
+  { "event": "running", "minutes": 239 },
+  { "event": "offer", "offer_id": "<32 hex digits>", "outcome": "installed" },
+  { "event": "running", "minutes": 1 },
+  { "event": "offer", "offer_id": "<32 hex digits>", "outcome": "installed" }
+],
+"expect": {
+  "actions": ["wait", "attempt"], "saves": 5,
+  "after": { "attempts_left": 0, "credit_hours": 0, "last_offer_id": "<32 hex digits>" }
+}
 ```
 
-`record` is the display's update record: the last offer it acted on, how long ago its last attempt began (`null` for never), and how many attempts in a row didn't end `installed`. `action` is `ignore` (one attempt per offer), `wait` (at least 10 minutes between attempts, at least 6 hours after three failures in a row; `wait_seconds` is how much longer) or `attempt`.
+`before` is what the update record holds: attempts left (0 to 5), credit hours counted towards the next (0 to 3; always 0 with a full budget) and the offer last acted on. The display has just started, so its running time is zero. Then the `events` happen in order:
+
+| `event` | Meaning |
+|---|---|
+| `offer` | An offer in a snapshot. `outcome` is what acting on it would come to: `refused_before_request` (`no_trusted_keys` or `too_large`, decided from the offer alone), or an attempt's final result, `installed`, `refused`, `failed` or `rolled_back`. The result never changes the budget. |
+| `running` | The display keeps running for `minutes`, by its monotonic timer. Each full hour counted while the budget is below 5 is saved as a credit hour; the fourth turns into an attempt. |
+| `restart` | A restart or power cut. The timer starts again at zero: time not yet saved as a credit hour is lost, and so is the memory of a refusal before any request. |
+| `usb_bundle` | A provisioning bundle accepted over USB: the budget returns to 5. |
+| `clock_moves` | The display's idea of the date (`"clock": "date"`) or the hub's time in its snapshots (`"hub"`) jumps by `seconds`, either way. Nothing changes. |
+
+| `expect` | Meaning |
+|---|---|
+| `actions` | One for each `offer` event: `attempt` (one attempt spent, saved with the offer id in a single write, then the download requested), `refuse_without_request` (nothing spent or written), `ignore` (the offer last acted on, or one refused before any request since the last start) or `wait` (no attempts left: nothing requested, nothing reported, and the offer stays open). |
+| `saves` | How many times the display saves its budget: once for each attempt, each credit hour and each refill that changes it. Nothing else writes it, so a full budget means `0`. A display that saves a credit hour at each full hour gets exactly this count. |
+| `after` | The record afterwards. |
 
 ## `trial`: the trial boot
 
@@ -96,7 +118,7 @@ Feed `body_hex` to your download code in pieces of any size, and check every bou
 | Field | Meaning |
 |---|---|
 | `trial.starts` | `false`: the new firmware crashes before it can check in, so the board resets and rolls back. |
-| `trial.check_ins` | Authenticated check-ins over pinned TLS, by seconds since the trial boot began. `answer` is `success`, `no_answer`, or the hub's error code. Only `success`, `token_revoked` and `unknown_device` count as reaching the hub. |
+| `trial.check_ins` | Authenticated check-ins over pinned TLS, by seconds of the display's running time since the trial boot began (its monotonic timer, never a date or the hub's clock). A check-in doesn't name the new version: the trial firmware sends no heartbeat or report until it is marked good. `answer` is `success`, `no_answer`, or the hub's error code. Only `success`, `token_revoked` and `unknown_device` count as reaching the hub. |
 | `trial.restart_at_seconds` | The board restarts or loses power then, before it is marked good: the bootloader rolls back. |
 | `expect.outcome`, `at_seconds` | `marked_good`, or `rolled_back` (at 300 seconds if nothing else ends the trial first; an answer at 300 seconds or later is too late). |
 | `expect.report` | `installed` (sent by the new firmware) or `rolled_back` (sent by the old firmware when it finds the update record unfinished). |
@@ -110,16 +132,16 @@ Feed `body_hex` to your download code in pieces of any size, and check every bou
 "expect": { "answer": "firmware_keys_locked", "trusted_keys": ["maker", "recovery"], "security_floor": 3 }
 ```
 
-`action` is `bundle` (a provisioning bundle arrives over USB at a display that has been factory-reset or never set up; `bundle_firmware` is its `firmware` member, or `null`) or `factory_reset`. `answer` is the USB answer, `provisioned` or `firmware_keys_locked`, and `null` for a factory reset. A display with keys accepts a bundle naming the same set in any order, or none, and changes nothing; a display with none takes the bundle's keys and its counter as the floor.
+`action` is `bundle` (a provisioning bundle arrives over USB at a display that has been factory-reset or never set up; `bundle_firmware` is its `firmware` member, or `null`) or `factory_reset`. `answer` is the USB answer, `provisioned`, `firmware_keys_locked` or `invalid_bundle`, and `null` for a factory reset. A display checks first that every key in the bundle is a valid P-256 point, and refuses the bundle (`invalid_bundle`) storing nothing if one isn't; such a key can't be in `keys`, so the bundle writes it out in full as 130 hex digits instead of a name. A display with keys accepts a bundle naming the same set in any order, or none, and changes nothing; a display with none takes the bundle's keys and its counter as the floor. Accepting any bundle also refills the attempt budget (see the `offer` vectors).
 
 ## What's covered, and what isn't here
 
 | Cases | Where |
 |---|---|
 | 1 to 23: package checks | `package-01-…` to `package-23-…` |
-| 24 to 26: offers and limits | `offer-24-…` to `offer-26-…` |
+| 24 to 26: the offer last acted on, and the attempt budget | `offer-24-…` to `offer-26-…` |
 | 29 to 32: the trial boot | `trial-29-…` to `trial-32-…` |
-| 34 to 37: keys | `package-34-…`, `package-35-…`, `trial-34-…`, `trial-36-…`, `package-37-…` |
-| 38 to 40: factory reset and bundles | `provision-38-…` to `provision-40-…` |
+| 34 to 37: keys, including a `key_set` that drops a trusted key without raising the counter | `package-34-…`, `package-35-…`, `trial-34-…`, `trial-36-…`, `package-37-…` |
+| 38 to 40: factory reset and bundles, including a key that isn't a valid point | `provision-38-…` to `provision-40-…` |
 
 Case 33 (a power cut during the download) is about what survives a restart, so it is tested end to end in `tools/display-simulator/tests/firmware.rs` rather than here. Cases 27, 28 and 41 to 46 are the hub's part, tested against the real hub in `apps/hubd/tests/firmware.rs` and the simulator's tests. A display only needs to know that a hub may send it anything; the `package` vectors are what it does about that.

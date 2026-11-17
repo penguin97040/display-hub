@@ -6,7 +6,8 @@
 //! display must do. Four kinds:
 //!
 //! - `package`: an offer and the download's response, through steps 1 to 9;
-//! - `offer`: whether to act on an offer, from the update record and the time ("Limits on trying");
+//! - `offer`: the attempt budget and the offer last acted on, through a series of events ("Limits on
+//!   trying");
 //! - `trial`: a trial boot's check-ins, and whether the new firmware is marked good or rolls back;
 //! - `provision`: a provisioning bundle's firmware section, or a factory reset, and the keys after.
 //!
@@ -26,12 +27,12 @@ use firmware_package::limits::{
 use firmware_package::{hex, Display, PublicKey, SigningKey};
 use hub_protocol::firmware::{BundleFirmware, ReportReason};
 use hub_protocol::limits::FIRMWARE_TRIAL_SECONDS;
-use hub_protocol::{ErrorCode, Timestamp};
+use hub_protocol::ErrorCode;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::install::{attempt_in_memory, AfterBody, Ended};
-use super::rules::{decide, CheckIn, Decision, Trial, TrialStep};
+use super::rules::{decide, Budget, CheckIn, Decision, Meter, Trial, TrialStep};
 use super::store::{self, KeyStore, Record};
 
 pub const FORMAT: &str = "display-hub.firmware-conformance";
@@ -45,8 +46,6 @@ const FLOOR: u32 = 3;
 /// A small spare slot, so the limits are easy to reach.
 const SLOT_BYTES: u64 = 64 * 1024;
 const IMAGE_LEN: usize = 512;
-/// When the `offer` vectors' offers arrive. Any time would do.
-const NOW: &str = "2026-11-17T09:00:00Z";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vector {
@@ -72,8 +71,8 @@ pub enum Test {
         expect: PackageExpect,
     },
     Offer {
-        record: RecordState,
-        offer: Offer,
+        before: BudgetState,
+        events: Vec<Event>,
         expect: OfferExpect,
     },
     Trial {
@@ -142,22 +141,47 @@ pub struct KeysAfter {
     pub trusted_keys: Vec<String>,
 }
 
+/// The attempt budget and the offer last acted on, as the update record keeps them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct RecordState {
-    /// The last offer acted on.
+pub struct BudgetState {
+    /// 0 to 5.
+    pub attempts_left: u32,
+    /// Full hours of running counted towards the next attempt, 0 to 3.
+    pub credit_hours: u32,
     pub last_offer_id: Option<String>,
-    /// How long ago the last attempt began. `null`: there has never been one.
-    pub seconds_since_last_attempt: Option<u64>,
-    /// Attempts in a row that didn't end `installed`.
-    pub failures_in_row: u32,
+}
+
+/// One thing that happens to the display, in order.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum Event {
+    /// An offer in a snapshot. `outcome` is what would come of acting on it: `refused_before_request`
+    /// (`no_trusted_keys` or `too_large`, decided from the offer alone), or the final result of an
+    /// attempt (`installed`, `refused`, `failed`, `rolled_back`), which never changes the budget.
+    Offer { offer_id: String, outcome: String },
+    /// The display keeps running this long, by its monotonic timer.
+    Running { minutes: u64 },
+    /// The display restarts, or loses power and comes back. Its timer starts again at zero.
+    Restart,
+    /// A provisioning bundle is accepted over USB.
+    UsbBundle,
+    /// The display's idea of the date (`date`) or the hub's time in its snapshots (`hub`) jumps by
+    /// this many seconds, either way.
+    ClockMoves { clock: String, seconds: i64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OfferExpect {
-    /// `ignore` (acted on already), `wait` (look again later) or `attempt`.
-    pub action: String,
-    /// For `wait`: how much longer, at least.
-    pub wait_seconds: Option<u64>,
+    /// For each `offer` event in turn: `attempt` (one attempt spent, then the download requested),
+    /// `refuse_without_request` (refused from the offer alone; nothing spent), `ignore` (the offer
+    /// last acted on, or one refused before any request since the last start) or `wait` (no attempts
+    /// left: nothing requested and nothing reported, and the offer stays open).
+    pub actions: Vec<String>,
+    /// How many times the display saves its budget: once for each attempt spent, each credit hour
+    /// counted, and each refill that changes it. Nothing else writes it.
+    pub saves: u32,
+    /// The budget and the offer last acted on, afterwards.
+    pub after: BudgetState,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -246,6 +270,19 @@ fn key_hex<'a>(keys: &'a BTreeMap<String, String>, name: &str) -> Result<&'a Str
 
 fn resolve(keys: &BTreeMap<String, String>, names: &[String]) -> Result<Vec<String>, String> {
     names.iter().map(|n| key_hex(keys, n).cloned()).collect()
+}
+
+/// Key names, or a key written out in full as 130 hex digits: how a bundle names a key that isn't
+/// a valid point, which `keys` can't hold.
+fn resolve_or_written_out(keys: &BTreeMap<String, String>, names: &[String]) -> Result<Vec<String>, String> {
+    names
+        .iter()
+        .map(|n| match keys.get(n) {
+            Some(k) => Ok(k.clone()),
+            None if n.len() == 130 && hex::decode(n).is_some() => Ok(n.clone()),
+            None => Err(format!("names a key {n:?} that isn't in `keys`")),
+        })
+        .collect()
 }
 
 fn names(keys: &BTreeMap<String, String>, hexes: &[String]) -> Vec<String> {
@@ -341,34 +378,98 @@ fn package_expect(
     })
 }
 
-fn now() -> Timestamp {
-    Timestamp::parse(NOW).expect("a valid time")
-}
+const OUTCOMES: [&str; 5] = [
+    "refused_before_request",
+    "installed",
+    "refused",
+    "failed",
+    "rolled_back",
+];
 
-fn offer_expect(record: &RecordState, offer: &Offer) -> OfferExpect {
-    let now = now();
-    let r = Record {
-        last_offer_id: record.last_offer_id.clone(),
-        last_attempt_at: record
-            .seconds_since_last_attempt
-            .map(|s| now.plus_seconds(-(s as i64))),
-        failures_in_row: record.failures_in_row,
+fn offer_expect(before: &BudgetState, events: &[Event]) -> Result<OfferExpect, String> {
+    let mut record = Record {
+        last_offer_id: before.last_offer_id.clone(),
         ..Record::default()
     };
-    match decide(&r, &offer.offer_id, now) {
-        Decision::Ignore => OfferExpect {
-            action: "ignore".into(),
-            wait_seconds: None,
-        },
-        Decision::Wait { seconds } => OfferExpect {
-            action: "wait".into(),
-            wait_seconds: Some(seconds),
-        },
-        Decision::Attempt => OfferExpect {
-            action: "attempt".into(),
-            wait_seconds: None,
-        },
+    record.set_budget(Budget {
+        attempts_left: before.attempts_left,
+        credit_hours: before.credit_hours,
+    });
+    if record.budget()
+        != (Budget {
+            attempts_left: before.attempts_left,
+            credit_hours: before.credit_hours,
+        })
+    {
+        return Err("`before` is outside 0-5 attempts and 0-3 credit hours".into());
     }
+    let mut meter = Meter::at_start();
+    let mut uptime = 0u64;
+    // A refusal before any request is remembered in memory only, until the next start.
+    let mut refused_early: Option<String> = None;
+    let mut saves = 0;
+    let mut actions = Vec::new();
+    for e in events {
+        match e {
+            Event::Running { minutes } => {
+                uptime += minutes * 60;
+                if let Some((b, hours)) = meter.count(record.budget(), uptime) {
+                    record.set_budget(b);
+                    saves += hours;
+                }
+            }
+            Event::Restart => {
+                uptime = 0;
+                meter = Meter::at_start();
+                refused_early = None;
+            }
+            Event::UsbBundle => {
+                if record.budget() != Budget::FULL {
+                    record.set_budget(Budget::FULL);
+                    saves += 1;
+                }
+            }
+            Event::ClockMoves { clock, .. } => {
+                if clock != "date" && clock != "hub" {
+                    return Err(format!("clock {clock:?} is neither date nor hub"));
+                }
+            }
+            Event::Offer { offer_id, outcome } => {
+                if !OUTCOMES.contains(&outcome.as_str()) {
+                    return Err(format!("outcome {outcome:?} isn't one of {OUTCOMES:?}"));
+                }
+                let decision = decide(&record, offer_id, meter.uncounted(uptime));
+                let action = if decision == Decision::Ignore || refused_early.as_deref() == Some(offer_id) {
+                    "ignore"
+                } else if outcome == "refused_before_request" {
+                    refused_early = Some(offer_id.clone());
+                    "refuse_without_request"
+                } else if let Decision::Wait { .. } = decision {
+                    "wait"
+                } else {
+                    let spent = record
+                        .budget()
+                        .spend()
+                        .ok_or("decided to attempt with none left")?;
+                    record.set_budget(spent);
+                    record.last_offer_id = Some(offer_id.clone());
+                    saves += 1;
+                    "attempt"
+                };
+                actions.push(action.to_string());
+            }
+        }
+    }
+    let b = record.budget();
+    Ok(OfferExpect {
+        actions,
+        saves,
+        after: BudgetState {
+            attempts_left: b.attempts_left,
+            credit_hours: b.credit_hours,
+            last_offer_id: record.last_offer_id,
+        },
+    })
 }
 
 fn check_in(answer: &str) -> Result<CheckIn, String> {
@@ -388,8 +489,8 @@ fn trial_expect(
     before: &TrialBefore,
     events: &TrialEvents,
 ) -> Result<TrialExpect, String> {
-    let start = now();
-    let trial = Trial { started_at: start };
+    // Seconds by the monotonic timer, from the trial boot's start.
+    let trial = Trial { started_at: 0 };
     let mut check_ins = events.check_ins.clone();
     check_ins.sort_by_key(|c| c.at_seconds);
     let rolled_back = |at: u64| -> Result<TrialExpect, String> {
@@ -409,7 +510,7 @@ fn trial_expect(
         if let Some(r) = events.restart_at_seconds.filter(|r| *r <= c.at_seconds) {
             return rolled_back(r);
         }
-        let at = start.plus_seconds(c.at_seconds as i64);
+        let at = c.at_seconds;
         if trial.tick(at) == TrialStep::RollBack {
             return rolled_back(FIRMWARE_TRIAL_SECONDS);
         }
@@ -461,14 +562,15 @@ fn provision_expect(
                 .as_ref()
                 .map(|b| -> Result<BundleFirmware, String> {
                     Ok(BundleFirmware {
-                        trusted_keys: resolve(keys, &b.trusted_keys)?,
+                        trusted_keys: resolve_or_written_out(keys, &b.trusted_keys)?,
                         security_counter: b.security_counter,
                     })
                 })
                 .transpose()?;
             match store::bundle_keys(&store, bundle.as_ref()) {
                 Ok(new) => (Some("provisioned".to_string()), new.unwrap_or(store)),
-                Err(_) => (Some("firmware_keys_locked".to_string()), store),
+                Err(store::BundleRefused::KeysLocked) => (Some("firmware_keys_locked".to_string()), store),
+                Err(store::BundleRefused::NotAPoint) => (Some("invalid_bundle".to_string()), store),
             }
         }
         other => return Err(format!("action {other:?} is neither bundle nor factory_reset")),
@@ -521,10 +623,10 @@ pub fn reference(v: &Vector) -> Result<Vector, String> {
             offer: offer.clone(),
             response: response.clone(),
         },
-        Test::Offer { record, offer, .. } => Test::Offer {
-            expect: offer_expect(record, offer),
-            record: record.clone(),
-            offer: offer.clone(),
+        Test::Offer { before, events, .. } => Test::Offer {
+            expect: offer_expect(before, events)?,
+            before: before.clone(),
+            events: events.clone(),
         },
         Test::Trial { before, trial, .. } => Test::Trial {
             expect: trial_expect(&v.keys, before, trial)?,
@@ -1123,89 +1225,212 @@ fn package_cases(k: &Keys) -> Vec<Pkg> {
         signed(&k.retired, &manifest("1.2.0", 4)),
         refused("untrusted_key"),
     ));
+    // Added after the others, so their offer ids stay as they were.
+    let text = serde_json::to_string(&manifest("1.2.0", 4))
+        .expect("json")
+        .replacen('{', r#"{"summary":"Another summary","#, 1);
+    out.push(pkg(
+        "package-14-repeated-member-name",
+        &[14],
+        "A correctly signed manifest in which one member name (summary) appears twice. Displays, the hub, the app and the tool all refuse it.",
+        both(),
+        form(&k.maker, text.as_bytes(), &image(), true),
+        refused("bad_format"),
+    ));
+    let mut m = manifest("1.2.1", FLOOR);
+    m["key_set"] = json!([k.hex("maker"), k.hex("recovery"), k.hex("new")]);
+    out.push(pkg(
+        "package-34-key-set-only-adds-at-equal-counter",
+        &[34],
+        "A key_set that keeps every key the display trusts and adds one, at a counter equal to the floor: installed. Only leaving a key out needs a higher counter.",
+        both(),
+        signed(&k.maker, &m),
+        installed(),
+    ));
+    let mut m = manifest("1.2.1", FLOOR);
+    m["key_set"] = json!([k.hex("maker")]);
+    out.push(pkg(
+        "package-35-key-set-drops-a-key-at-equal-counter",
+        &[35],
+        "A correctly signed key_set that leaves out the recovery key the display trusts, at a counter equal to the floor: a downgrade. Otherwise a same-counter release could take back a key a later one gave, or bring back one it removed.",
+        both(),
+        signed(&k.maker, &m),
+        refused("downgrade"),
+    ));
+    let mut m = manifest("1.3.0", FLOOR + 1);
+    m["key_set"] = json!([k.hex("maker")]);
+    out.push(pkg(
+        "package-35-key-set-drops-a-key-with-raised-counter",
+        &[35],
+        "The same key_set with the counter raised above the floor: installed, and once marked good the display trusts only the maker key.",
+        both(),
+        signed(&k.maker, &m),
+        installed(),
+    ));
     out
 }
 
-/// Name, cases, description, the record before, the offer's number and what the document says.
-type OfferCase = (
-    &'static str,
-    Vec<u32>,
-    &'static str,
-    RecordState,
-    u32,
-    &'static str,
-);
+struct OfferCase {
+    name: &'static str,
+    cases: Vec<u32>,
+    description: &'static str,
+    before: BudgetState,
+    events: Vec<Event>,
+    /// What the document says each offer comes to.
+    actions: Vec<&'static str>,
+}
 
 fn offer_cases() -> Vec<OfferCase> {
-    let rec = |last: Option<u32>, since: Option<u64>, failures: u32| RecordState {
+    let budget = |attempts_left, credit_hours, last: Option<u32>| BudgetState {
+        attempts_left,
+        credit_hours,
         last_offer_id: last.map(offer_id),
-        seconds_since_last_attempt: since,
-        failures_in_row: failures,
+    };
+    let offer = |n: u32, outcome: &str| Event::Offer {
+        offer_id: offer_id(n),
+        outcome: outcome.into(),
+    };
+    let running = |minutes| Event::Running { minutes };
+    let case = |name, cases: &[u32], description, before, events, actions| OfferCase {
+        name,
+        cases: cases.to_vec(),
+        description,
+        before,
+        events,
+        actions,
     };
     vec![
-        (
+        case(
             "offer-24-first-offer",
-            vec![24],
-            "The first offer a display has seen: it acts on it.",
-            rec(None, None, 0),
-            1,
-            "attempt",
+            &[24],
+            "The first offer a display has seen, with a full budget: it spends one attempt and acts on it, saving the budget and the offer id together.",
+            budget(5, 0, None),
+            vec![offer(1, "installed")],
+            vec!["attempt"],
         ),
-        (
+        case(
             "offer-24-same-offer-after-refusal",
-            vec![24],
-            "The offer refused an hour ago is in the snapshot again: nothing happens. One attempt per offer.",
-            rec(Some(1), Some(3600), 1),
-            1,
-            "ignore",
+            &[24],
+            "The offer it last acted on, refused, is in the snapshot again: nothing happens, and nothing is spent.",
+            budget(4, 0, Some(1)),
+            vec![offer(1, "refused")],
+            vec!["ignore"],
         ),
-        (
+        case(
             "offer-24-new-offer-after-refusal",
-            vec![24],
-            "A new offer, an hour after one was refused: it acts on it.",
-            rec(Some(1), Some(3600), 1),
-            2,
-            "attempt",
+            &[24],
+            "A new offer after one was refused: it spends an attempt and acts on it.",
+            budget(4, 0, Some(1)),
+            vec![offer(2, "refused")],
+            vec!["attempt"],
         ),
-        (
-            "offer-25-within-ten-minutes",
-            vec![25],
-            "A new offer nine minutes after the last attempt: it waits another minute.",
-            rec(Some(2), Some(540), 0),
-            3,
-            "wait",
+        case(
+            "offer-24-refused-before-request-spends-nothing",
+            &[24, 25],
+            "An offer refused from the offer alone (too_large or no_trusted_keys) spends nothing and is written nowhere: it is remembered only until the next start, then refused again.",
+            budget(1, 0, Some(1)),
+            vec![
+                offer(2, "refused_before_request"),
+                offer(2, "refused_before_request"),
+                Event::Restart,
+                offer(2, "refused_before_request"),
+            ],
+            vec!["refuse_without_request", "ignore", "refuse_without_request"],
         ),
-        (
-            "offer-25-after-ten-minutes",
-            vec![25],
-            "A new offer ten minutes after the last attempt: it acts on it.",
-            rec(Some(2), Some(600), 0),
-            3,
-            "attempt",
+        case(
+            "offer-25-no-attempts-left-waits",
+            &[25],
+            "No attempts left: it doesn't request the download, reports nothing and leaves the offer open, however often the offer is seen.",
+            budget(0, 0, Some(1)),
+            vec![offer(2, "installed"), running(30), offer(2, "installed")],
+            vec!["wait", "wait"],
         ),
-        (
-            "offer-26-third-failure-waits-six-hours",
-            vec![26],
-            "Three failures in a row, the last an hour ago: the next attempt waits until six hours have passed.",
-            rec(Some(3), Some(3600), 3),
-            4,
-            "wait",
+        case(
+            "offer-25-four-hours-give-one-attempt",
+            &[25],
+            "With none left, 3 hours 59 minutes of running isn't enough; the fourth full hour earns one attempt, and the offer still open is acted on.",
+            budget(0, 0, Some(1)),
+            vec![running(239), offer(2, "installed"), running(1), offer(2, "installed")],
+            vec!["wait", "attempt"],
         ),
-        (
-            "offer-26-after-six-hours",
-            vec![26],
-            "Three failures in a row, the last six hours ago: it acts on the next offer.",
-            rec(Some(3), Some(6 * 3600), 3),
-            4,
-            "attempt",
+        case(
+            "offer-25-restart-loses-uncounted-time",
+            &[25],
+            "3 hours 59 minutes of running, then a restart: three credit hours were saved, the 59 minutes were not, so there is still no attempt. A restart can only make a wait longer.",
+            budget(0, 0, Some(1)),
+            vec![running(239), Event::Restart, running(59), offer(2, "installed")],
+            vec!["wait"],
         ),
-        (
-            "offer-26-two-failures",
-            vec![26],
-            "Two failures in a row, the last ten minutes ago: only the usual wait applies.",
-            rec(Some(3), Some(600), 2),
-            4,
-            "attempt",
+        case(
+            "offer-25-usb-bundle-refills",
+            &[25],
+            "A provisioning bundle accepted over USB returns the budget to five.",
+            budget(0, 2, Some(1)),
+            vec![offer(2, "installed"), Event::UsbBundle, offer(2, "installed")],
+            vec!["wait", "attempt"],
+        ),
+        case(
+            "offer-25-nothing-written-while-full",
+            &[25],
+            "With a full budget, two days of running, a restart, a bundle and a date change count nothing and write nothing.",
+            budget(5, 0, Some(1)),
+            vec![
+                running(48 * 60),
+                Event::Restart,
+                running(5 * 60),
+                Event::UsbBundle,
+                Event::ClockMoves {
+                    clock: "date".into(),
+                    seconds: 30 * 86400,
+                },
+                offer(1, "installed"),
+            ],
+            vec!["ignore"],
+        ),
+        case(
+            "offer-26-install-does-not-refill",
+            &[26],
+            "A successful install doesn't give the attempt back, and nor does any other result: after the last attempt, the next offer waits.",
+            budget(1, 0, Some(1)),
+            vec![offer(2, "installed"), offer(3, "installed")],
+            vec!["attempt", "wait"],
+        ),
+        case(
+            "offer-26-clock-changes-nothing",
+            &[26],
+            "The display's date jumping a year forward, and the hub's time jumping a day, change nothing: the budget runs on the display's own running time only.",
+            budget(0, 1, Some(1)),
+            vec![
+                Event::ClockMoves {
+                    clock: "date".into(),
+                    seconds: 365 * 86400,
+                },
+                Event::ClockMoves {
+                    clock: "hub".into(),
+                    seconds: 86400,
+                },
+                offer(2, "installed"),
+                Event::ClockMoves {
+                    clock: "date".into(),
+                    seconds: -86400,
+                },
+                offer(2, "installed"),
+            ],
+            vec!["wait", "wait"],
+        ),
+        case(
+            "offer-26-new-offer-ids-each-cost-one",
+            &[26],
+            "Offers A, B, A: each new id costs an attempt, whatever the hub calls it. Only the offer last acted on is ignored, so a hub inventing ids gains nothing beyond the budget.",
+            budget(5, 0, None),
+            vec![
+                offer(1, "installed"),
+                offer(1, "installed"),
+                offer(2, "failed"),
+                offer(1, "rolled_back"),
+                offer(1, "rolled_back"),
+            ],
+            vec!["attempt", "ignore", "attempt", "attempt", "ignore"],
         ),
     ]
 }
@@ -1326,6 +1551,10 @@ type ProvisionCase = (
     Option<&'static str>,
 );
 
+/// 130 hex digits in the form of a public key, `04`, X = 1, Y = 1, which isn't on the curve.
+const NOT_A_POINT: &str = "040000000000000000000000000000000000000000000000000000000000000001\
+0000000000000000000000000000000000000000000000000000000000000001";
+
 fn provision_cases() -> Vec<ProvisionCase> {
     vec![
         (
@@ -1387,6 +1616,16 @@ fn provision_cases() -> Vec<ProvisionCase> {
             "bundle",
             Some((vec!["maker", "recovery"], FLOOR)),
             Some("provisioned"),
+        ),
+        (
+            "provision-40-key-not-a-point-refused",
+            vec![40],
+            "A bundle naming a key that is 130 hex digits starting 04 but isn't a point on P-256 (written out in full, as `keys` holds only valid ones): refused with invalid_bundle, and nothing is stored.",
+            vec![],
+            0,
+            "bundle",
+            Some((vec!["maker", NOT_A_POINT], FLOOR)),
+            Some("invalid_bundle"),
         ),
         (
             "provision-40-no-keys-to-a-display-with-none",
@@ -1457,28 +1696,30 @@ pub fn generate() -> Result<Vec<Vector>, String> {
         }
         out.push(v);
     }
-    for (name, cases, description, record, offer, action) in offer_cases() {
+    for c in offer_cases() {
         let v = reference(&vector(
-            name,
-            cases,
-            description,
+            c.name,
+            c.cases,
+            c.description,
             Test::Offer {
-                record,
-                offer: Offer {
-                    offer_id: offer_id(offer),
-                    size: 1000,
-                },
+                before: c.before,
+                events: c.events,
                 expect: OfferExpect {
-                    action: String::new(),
-                    wait_seconds: None,
+                    actions: Vec::new(),
+                    saves: 0,
+                    after: BudgetState {
+                        attempts_left: 0,
+                        credit_hours: 0,
+                        last_offer_id: None,
+                    },
                 },
             },
         ))?;
         if let Test::Offer { expect, .. } = &v.test {
-            if expect.action != action {
+            if expect.actions != c.actions {
                 return Err(format!(
-                    "{name}: the document says {action}, the reference gives {}",
-                    expect.action
+                    "{}: the document says {:?}, the reference gives {:?}",
+                    c.name, c.actions, expect.actions
                 ));
             }
         }

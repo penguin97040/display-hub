@@ -1,6 +1,6 @@
 # Signed firmware updates
 
-**Status: a design, written 17/11/2026 (UTC). Nothing here is built yet.** It is the specification for step 5 of the plan: the first install from the app over USB, then signed updates through the hub. Names, limits and message shapes may still change until the simulator tests exist; after that, this document changes only together with them.
+**Status: built in step 5, 17/11/2026 (UTC).** This is the specification for the first install from the app over USB and for signed updates through the hub. The hub, the app and the signing tool follow it, and the display simulator (`tools/display-simulator`) is the reference display: it follows every MUST below, and the vectors in `protocol/v1/firmware/` are what it does. This document now changes only together with the simulator and its vectors.
 
 This document is for makers who write display firmware, and for anyone reviewing the design. It uses MUST, SHOULD and MAY in their usual specification sense. Each **judgement call** is marked as one, with the alternative that was turned down.
 
@@ -11,6 +11,7 @@ This document is for makers who write display firmware, and for anyone reviewing
 - An update reaches a display only through the hub, over the same pinned HTTPS connection the display already uses. The hub stores packages and passes them on. **The display decides.** It checks the signature with a key it already holds, checks that the package is for its board, checks that it isn't an old release with known holes, and only then writes anything to flash.
 - The hub, the app and the network are therefore not trusted with the question "is this firmware genuine?". A hub that has been taken over can hold updates back, or offer a genuine release at a moment the owner didn't choose, but it cannot make a display run firmware its maker didn't sign.
 - If new firmware doesn't start properly and reach the hub within five minutes, the display returns to the previous version by itself.
+- A display rations its own tries: an **attempt budget** of five downloads, earned back one at a time by four hours of its own running time. Nothing a hub sends refills it, so a hostile hub can't wear out the display's flash.
 
 | Who | Holds | Can do | Cannot do |
 |---|---|---|---|
@@ -32,6 +33,7 @@ This document is for makers who write display firmware, and for anyone reviewing
 | Security floor | The highest security counter a display has confirmed. It refuses any package below it. |
 | Offer | The hub telling one display "install this package". Made when the owner presses **Update**. |
 | Trial boot | The first start of newly installed firmware, before it has proved itself. |
+| Attempt budget | How many more downloads a display will try (0 to 5), and the hours of running it has counted towards the next (0 to 3). See [Limits on trying](#limits-on-trying). |
 
 ## Cryptography
 
@@ -130,7 +132,7 @@ The manifest is signed **as bytes**, and verified as the same bytes before anyth
 Rules for the JSON itself:
 
 - one object, UTF-8, no byte-order mark, at most 4096 bytes, nested no deeper than four levels;
-- no member name appears twice in an object;
+- no member name appears twice in an object, at any level. This is one rule for everyone: a display (`bad_format`), the hub, the app and the tool all refuse such a manifest;
 - numbers are whole, written without a sign, fraction or exponent;
 - a field that isn't listed above is ignored, so the format can grow. A change that an older display must not ignore gets a new format version in the header instead.
 
@@ -155,7 +157,7 @@ Anything that isn't a display checks a package in this order, reading it as a st
 1. The length is at least 139 bytes and at most 16 MiB.
 2. The header: magic, format version, algorithm, `manifest_len`, and a public key that is a valid P-256 point.
 3. The signature verifies with the public key in the header.
-4. The manifest parses and every rule above holds. Unlike a display, these checkers refuse a repeated member name outright.
+4. The manifest parses and every rule above holds, a repeated member name included.
 5. With `usb_install`: `app_offset` and every part lie inside `min_flash_bytes`, and no two regions overlap (the app image counts as a region).
 6. The file length is exactly header + manifest + image + parts.
 7. The SHA-256 of the image, and of each part, matches the manifest.
@@ -170,7 +172,7 @@ Passing these checks means the package is **well formed and consistent with the 
 |---|---|
 | Trusted keys (0 to 3 public keys) | Public, so they need no secrecy. Kept in an NVS namespace of their own. |
 | Security floor | One number. Kept with the keys. |
-| Update record | The last offer id acted on, its package's version and security counter, any `key_set` waiting to be applied, and the last result. Small. |
+| Update record | The last offer id acted on, the attempt budget, its package's version and security counter, any `key_set` waiting to be applied, and the last result. Small. |
 
 A **factory reset** on the device erases the hub details, Wi-Fi settings and token, as today. It MUST NOT erase the trusted keys or the security floor. Those belong to the firmware's maker, not to the hub the display happens to be paired with.
 
@@ -188,6 +190,7 @@ A display acts on an offer (see [Protocol additions](#protocol-additions)) by re
    - `device_type` MUST equal the display's own (`wrong_device_type`).
    - `hardware_revisions` MUST contain the display's own (`wrong_hardware`).
    - `security_counter` MUST be at least the display's security floor (`downgrade`).
+   - A `key_set` that leaves out any key the display trusts now MUST have a `security_counter` strictly above the floor (`downgrade`). A `key_set` that keeps every trusted key, and only adds, needs no higher counter.
    - `image_size` MUST fit the spare app partition, and `137 + manifest_len + image_size` MUST equal the `Content-Length` (`too_large`, `bad_format`).
 8. **Download and hash.** Only now open the spare partition (`esp_ota_begin`) and write the image as it arrives, hashing it. Read exactly `image_size` bytes and no more. The SHA-256 MUST equal `image_sha256`, or the display abandons the partition (`esp_ota_abort`) and reports `image_hash`.
 9. **Finish.** `esp_ota_end` checks that the image is a valid app image (`flash`, if it or any write fails). Save the update record, set the new partition as the one to boot (`esp_ota_set_boot_partition`) and restart.
@@ -196,10 +199,20 @@ A display MUST use the same pinned TLS settings for the download as for everythi
 
 ### Limits on trying
 
-- A display MUST act on a given `offer_id` at most once: one attempt per offer. It writes the offer id to its update record before it requests the download, so it still knows after a restart or a power cut. Trying again takes a new offer (the owner presses **Update** again).
-- It MUST leave at least 10 minutes between download attempts, and after three failures in a row, at least 6 hours (or until it is next restarted by its owner). Every attempt can erase and write a partition, and flash wears out; these limits stop a faulty or hostile hub wearing it down.
-- It MUST give up on a download that sends nothing for 30 seconds, or takes more than 15 minutes in all (`download`). Downloads are not resumed: the next attempt starts again from the beginning.
+Every attempt can erase and rewrite the spare app partition, and flash wears out. These rules bound how often that can happen, whatever a hub does.
+
+- **The attempt budget.** A display keeps an attempt budget in its update record: a whole number of attempts left, from 0 to 5, starting at 5, and a count of **credit hours**, from 0 to 3.
+- **Spending it.** An attempt is any request for a download. Before it requests one, a display MUST have at least one attempt left, and MUST save the reduced budget and the `offer_id` in a single write. With none left, it MUST NOT request the download; it leaves the offer open and reports nothing.
+- **The offer last acted on.** A display MUST NOT act on the `offer_id` it last acted on. A refusal made before any request (`no_trusted_keys`, `too_large`) spends nothing, and is remembered only until the display restarts.
+- **Earning it back.** While the budget is below 5, the display MUST count the time it has been running with a monotonic timer that starts at zero on every start (`esp_timer_get_time`). For each full hour counted, it adds one credit hour and saves it. At 4 credit hours, it adds one attempt and returns the credit hours to 0. Time not yet saved is lost at a restart, so a restart can only lengthen a wait. While the budget is 5, nothing is counted or written.
+- **Nothing else changes it.** The budget MUST NOT be changed by the result of an attempt, by a restart, by the display's idea of the date, or by anything received from the hub or the network. It returns to 5 only when the display accepts a provisioning bundle over USB, or is erased by **Install firmware**. A maker MAY add a physical button action that does the same.
+- **Time limits.** A display MUST give up on a download that sends nothing for 30 seconds, or takes more than 15 minutes in all (`download`), measured with the same monotonic timer. Downloads are not resumed: the next attempt starts again from the beginning.
+- A display SHOULD report `attempts_left` in its `firmware` object (see [What a display reports](#what-a-display-reports)), so the app can say why an update is waiting.
 - It SHOULD show that it is updating, and SHOULD keep showing its pages until the restart.
+
+There is no list of recent offer ids to keep: the budget bounds the wear whatever ids a hub invents. Offers A, B, A cost one attempt each.
+
+**Why a budget, not waits between attempts (judgement call).** An earlier draft had at most one attempt per offer and 10 minutes between attempts, 6 hours after three failures. That left a hole: a hostile hub can make as many offers as it likes, and by offering a genuine release (which installs, so never counts as a failure) it could force a partition rewrite every 10 minutes, for good. Espressif's FAQ gives about 100,000 erase cycles as typical for the flash on its modules, which at that pace is under two years. The budget gives at most five attempts at once and then one every four hours of running: at most 6 a day sustained, so the same flash lasts decades. Counting running time on the display's own timer, rather than dates, means nothing the hub says (its time in the snapshot, or a date it serves) can make the budget refill faster. The cost is that an owner who presses **Update** more than five times in a few hours waits for the next attempt; the app shows `attempts_left`, and a USB bundle refills it at once.
 
 ### The trial boot, and when new firmware counts as good
 
@@ -207,10 +220,11 @@ Firmware MUST be built with ESP-IDF's app rollback (`CONFIG_BOOTLOADER_APP_ROLLB
 
 New firmware, on its trial boot (`esp_ota_get_state_partition` reports `ESP_OTA_IMG_PENDING_VERIFY`):
 
-1. MUST start its screen and storage, join Wi-Fi, and make an authenticated request to the hub over pinned TLS.
-2. MUST mark itself good (`esp_ota_mark_app_valid_cancel_rollback`) as soon as the hub answers that request with success, or with an error from the "set up again" group (`token_revoked`, `unknown_device`): rolling back wouldn't fix those.
-3. MUST otherwise give up after **5 minutes** and roll back (`esp_ota_mark_app_invalid_rollback_and_reboot`).
-4. Once marked good, and only then, MUST raise the security floor to the new release's `security_counter` if that is higher, replace the trusted keys with the release's `key_set` if it had one, clear the update record's pending parts, and report `installed`.
+1. MUST start its screen and storage, join Wi-Fi, and make an authenticated request to the hub over pinned TLS. This check-in SHOULD be a request that doesn't claim the new version is running, such as fetching the snapshot (the simulator's check-in is its poll, `GET /v1/device/snapshot`).
+2. MUST NOT act on offers, and MUST NOT send a heartbeat, a firmware report or any other message naming the new version, until it is marked good. The hub counts a heartbeat naming the offered version as the update installed.
+3. MUST mark itself good (`esp_ota_mark_app_valid_cancel_rollback`) as soon as the hub answers that request with success, or with an error from the "set up again" group (`token_revoked`, `unknown_device`): rolling back wouldn't fix those.
+4. MUST otherwise give up after **5 minutes** and roll back (`esp_ota_mark_app_invalid_rollback_and_reboot`). The five minutes MUST be measured with the monotonic timer from the start of the trial boot, never from a date or the hub's clock.
+5. Once marked good, and only then, MUST raise the security floor to the new release's `security_counter` if that is higher, replace the trusted keys with the release's `key_set` if it had one, clear the update record's pending parts, and report `installed`.
 
 The previous firmware, when it finds itself running again with an update record it didn't finish, MUST drop the pending `key_set`, leave the floor alone, and report `rolled_back`.
 
@@ -219,7 +233,7 @@ The previous firmware, when it finds itself running again with an update record 
 ### Downgrades and replays
 
 - The **security counter** decides, not the version text. A display accepts any correctly signed package for its board whose counter is at or above its floor. An older *version* with the same counter is allowed, so an owner can go back to the last release after a bad one. The app asks for confirmation first.
-- A maker MUST raise the counter in any release that fixes a security hole, and in any release whose `key_set` removes a key. Once a display has confirmed that release, every earlier one is refused for good, however it is delivered.
+- A maker MUST raise the counter in any release that fixes a security hole, and in any release whose `key_set` removes a key. A display enforces the second: a `key_set` that leaves out any key it trusts, at a counter equal to its floor, is refused as a `downgrade`. Without that, a release at the same counter could take back a key that a later one added, or a replay could bring back one a later release removed. Once a display has confirmed a release, every earlier one with a lower counter is refused for good, however it is delivered.
 - The floor is kept in ordinary flash (NVS), not in eFuses. See the next section for why.
 
 ### Secure Boot, flash encryption and eFuse anti-rollback
@@ -245,7 +259,7 @@ hub-firmware keygen --out my-displays.dhkey
 ```
 
 - The key is created on the maker's computer from the operating system's random source. It never leaves that computer, and it is never sent to a hub, an app or a display.
-- **The key file is always protected by a passphrase**, asked for on the terminal and never taken from the command line. The file holds the public key in the clear, and the private key (PKCS#8) encrypted with AES-256-GCM under a key derived from the passphrase with PBKDF2-HMAC-SHA256 (600,000 rounds, a random 16-byte salt). The tool refuses a passphrase shorter than 12 characters. The file is created readable by its owner only.
+- **The key file is always protected by a passphrase**, asked for on the terminal and never taken from the command line. The file holds the public key in the clear, and the private key (PKCS#8) encrypted with AES-256-GCM under a key derived from the passphrase with PBKDF2-HMAC-SHA256 (600,000 rounds, a random 16-byte salt). The tool refuses a passphrase shorter than 12 characters. The file is created readable by its owner only, on Windows, macOS and Linux alike: on Windows it gets a protected access list that names only the current user.
 - `keygen` prints the fingerprint. **Publish the fingerprint** where your users will see it (your README, your release page): it is how they check a first install.
 - **Make two keys.** One is for everyday signing. The other is a **recovery key**: make it, note its fingerprint, copy its file to two offline places (a USB stick in a drawer, a password manager), and don't use it. Name both in `key_set` from your very first release, so every display trusts both from its first install.
 - A key file is never committed to a repository, and a CI system should not hold one unless the maker accepts that whoever controls the CI can sign.
@@ -267,10 +281,10 @@ hub-firmware keygen --out my-displays.dhkey
 
 There are exactly two ways.
 
-1. **A signed release with a `key_set`.** The release is signed by a key the display already trusts. After the release has been installed and marked good, the display replaces its whole set of trusted keys with the `key_set`. A `key_set` may leave out the key that signed it, which is how a key is retired.
+1. **A signed release with a `key_set`.** The release is signed by a key the display already trusts. After the release has been installed and marked good, the display replaces its whole set of trusted keys with the `key_set`. A `key_set` may leave out the key that signed it, which is how a key is retired. A `key_set` that leaves out any key the display trusts needs a security counter strictly above the display's floor, or it is refused (`downgrade`); one that only adds keys does not.
 2. **A first install over USB**, which erases the display and starts again (next section).
 
-Nothing else changes them: not the hub, not the app over the network, not a factory reset, not a provisioning bundle sent to a display that already has keys.
+Nothing else changes them: not the hub, not the app over the network, not a factory reset, not a provisioning bundle sent to a display that already has keys. A display with no keys (after a fresh flash, or set up without them) takes keys from any provisioning bundle sent over USB, without an erase. That needs a cable in the display, which is physical access (see [Secure Boot](#secure-boot-flash-encryption-and-efuse-anti-rollback)).
 
 **Judgement call: key changes ride inside firmware releases.** There is no separate "key change statement". It would be one more signed format to parse, and it would add no safety: firmware runs with full control of the display, so whoever can sign firmware a display accepts can already change its keys. Carrying the new set in the manifest makes that honest and keeps it tied to a release that has proved it starts.
 
@@ -284,7 +298,7 @@ Nothing else changes them: not the hub, not the app over the network, not a fact
    - *Official Display Hub firmware*, when the key is one built into the app itself; or
    - *Signed by a maker this app doesn't know*, with the fingerprint, and the instruction to compare it with the fingerprint the maker publishes. The owner must confirm.
 
-   The name comes from the app or from the owner, never from the package: a package can't name itself.
+   The name comes from the app or from the owner, never from the package: a package can't name itself. The app also lists **every key in the package's `key_set`**, each with its fingerprint, not only the signer's, because those are the keys the display will trust. It shows the package's `device_type` and `summary` only as the maker's own text, set apart (in quotes, under "The maker says"), and never in the app's own voice.
 4. The app connects to the chip's built-in loader, checks the chip is the one in `usb_install.chip` and that the flash is at least `min_flash_bytes`, **erases the whole flash**, and writes each part and the app image at its offset, as raw bytes.
 5. The display restarts. The app sends the provisioning bundle, which now carries the trusted keys: the package's `key_set` if it has one, otherwise the one key that signed it. It also carries the package's security counter as the starting floor.
 6. The display enrols with the hub as usual.
@@ -293,13 +307,13 @@ Nothing else changes them: not the hub, not the app over the network, not a fact
 
 ### What each action may change
 
-| Action | Hub details, Wi-Fi, token | Trusted keys | Security floor |
-|---|---|---|---|
-| **Install firmware** from the app (USB, erases everything) | Erased, then set by the bundle | Erased, then set from the package | Erased, then set from the package |
-| **Factory reset** on the device | Erased | Kept | Kept |
-| **Provisioning bundle** over USB to a reset display that has keys | Set | Unchanged. A bundle naming a different set of keys is refused (`firmware_keys_locked`). A bundle naming the same set, or none, is accepted. | Unchanged |
-| **Provisioning bundle** to a display with no keys | Set | Set from the bundle, if it has any | Set from the bundle |
-| A signed update over Wi-Fi | Unchanged | Replaced by its `key_set`, if it has one, once marked good | Raised, once marked good |
+| Action | Hub details, Wi-Fi, token | Trusted keys | Security floor | Attempt budget |
+|---|---|---|---|---|
+| **Install firmware** from the app (USB, erases everything) | Erased, then set by the bundle | Erased, then set from the package | Erased, then set from the package | Full (the record is erased) |
+| **Factory reset** on the device | Erased | Kept | Kept | Kept |
+| **Provisioning bundle** over USB to a reset display that has keys | Set | Unchanged. A bundle naming a different set of keys is refused (`firmware_keys_locked`). A bundle naming the same set, or none, is accepted. | Unchanged | Refilled to 5 |
+| **Provisioning bundle** to a display with no keys | Set | Set from the bundle, if it has any | Set from the bundle | Refilled to 5 |
+| A signed update over Wi-Fi | Unchanged | Replaced by its `key_set`, if it has one, once marked good | Raised, once marked good | Unchanged (an attempt's result never changes it) |
 
 So a display that is already set up can be given new keys only by wiping it with **Install firmware**, and a factory reset followed by a cable can point a display at another hub (as today) but can't change whose firmware it accepts. Someone with a cable can always wipe the display and install their own firmware; that is physical access, and it is outside what this design defends (see [Secure Boot](#secure-boot-flash-encryption-and-efuse-anti-rollback)).
 
@@ -313,7 +327,10 @@ The hub stores, offers and serves. It holds no signing key, never signs, never a
 
 - An upload is streamed to a temporary file in the hub's data folder, never held in memory, and checked as [above](#checking-a-package-hub-app-and-tool), signature included. A package that fails is deleted and refused with the reason. This is defence in depth, and catches damaged files early; **a display never relies on it.**
 - A stored package is a file named by its package id, readable only by the service, plus one row describing it. Uploading the same file twice is harmless.
-- **Limits:** at most 3 packages for each `device_type` and 256 MiB of packages in all. When a fourth arrives for a device type, the hub removes that type's lowest version that isn't on offer to any display. An upload that would pass 256 MiB, or leave less than 64 MiB free on the disk, is refused.
+- **The same release, signed again, is the same release.** A package with the same signer and byte-for-byte the same manifest as a stored one has the same image and parts, and differs only in its signature. ECDSA signatures are malleable (anyone can turn one valid signature into another), so the package id alone doesn't name a release. The hub answers `200` with the stored package's description and keeps the stored file.
+- **Limits:** at most 3 packages for each `device_type` and 256 MiB of packages in all. When a fourth arrives for a device type, the hub removes that type's lowest version that isn't on offer to any display, and the upload's answer names the package it removed (`evicted`). An upload that would pass 256 MiB, or leave less than 64 MiB free on the disk, is refused.
+- **Publishers:** a publisher's upload may make room only by removing that publisher's own packages, never one an admin or another publisher uploaded, and each publisher's packages are capped at 64 MiB in all.
+- An upload that sends nothing for 60 seconds is dropped.
 - Packages are not included in `hubd backup`: they are large, and can be uploaded again. After a restore, the hub forgets any package whose file is missing.
 
 ### Who may upload
@@ -337,19 +354,20 @@ The hub stores, offers and serves. It holds no signing key, never signs, never a
 - Pinned TLS and the display's token, like every device request. The hub serves a package only to a display that has an open offer for it; anything else is `not_found`.
 - The answer is the update form, with an exact `Content-Length`, no compression and no chunked encoding.
 - **Not resumable (judgement call).** Range requests are ignored. An image is a few megabytes on a local network, an interrupted download simply starts again, and resuming would add state and parsing to both ends.
-- At most 2 downloads at once across the hub (`unavailable` otherwise), and at most 6 download starts per display per hour (`rate_limited`). The request has its own 15-minute time limit, in place of the hub's usual 10 seconds.
+- At most one download at a time for each display and 2 at once across the hub (`unavailable` otherwise), and at most 6 download starts per display per hour (`rate_limited`). The request has its own 15-minute time limit, in place of the hub's usual 10 seconds, and a download that is still running at that limit loses its connection.
 
 ### Results
 
-The hub records what each display reports about an offer and shows it to admins. A report is a claim by the display, authenticated by its token. The hub also notices a display's next heartbeat naming the offered version, and counts that as installed if the report itself was lost. Offers, results, uploads and deletions go in the audit log.
+The hub records what each display reports about an offer and shows it to admins. A report is a claim by the display, authenticated by its token, and a final report's `firmware_version` becomes the display's stored version. The hub also notices a display's next heartbeat naming the offered version, and counts that as installed if the report itself was lost, but only until a `rolled_back` or `failed` report for the offer arrives: that report overrules the inference, since the heartbeat may have come from a trial boot. Offers, results, uploads, removals and deletions go in the audit log.
 
 ## The app's part
 
 - **Upload:** choose a package file, or drop it on the window. The app checks it first, then sends it to the hub.
-- **Who signed it:** every package and every display shows a signer as a name and a fingerprint. The name is *Official Display Hub firmware* for keys built into the app, or the label the owner gave that key at a first install, or *Unknown maker*. Labels are kept on the hub for convenience, so they are only as trustworthy as the hub; the fingerprint is what counts, and the display's own keys are what decide.
-- **Update available:** shown for a display when the hub holds a package for its device type and hardware revision, signed by a key the display reports trusting, with a higher version. Versions are compared as three numbers; with the numbers equal, a version with a pre-release tag is older than one without.
+- **Who signed it:** every package and every display shows a signer as a name and a fingerprint. The name is *Official Display Hub firmware* for keys built into the app, or the label the owner gave that key at a first install, or *Unknown maker*. Labels come from the hub, so the app words them as the hub's name for the key ("your hub calls this key …"), never as a fact; they are only as trustworthy as the hub. The hub refuses a label that claims to be the official firmware. The fingerprint is what counts, and the display's own keys are what decide.
+- **The maker's own words:** a package's `device_type` and `summary` are written by whoever signed it. The app shows them set apart as the maker's text, never in its own voice, and at a first install lists every key in `key_set` with its fingerprint.
+- **Update available:** shown for a display when the hub holds a package for its device type and hardware revision, signed by a key the display reports trusting, with a higher version. Versions are compared as three numbers; with the numbers equal, a version with a pre-release tag is older than one without. The headline is the newest full release; a pre-release is the headline only when the display already runs one or no newer full release exists. Other choices are listed below it.
 - **Update:** the button names the version, the signer and the summary. Going to an older version, or to a pre-release, asks for a second confirmation and says why.
-- **Progress and results:** *Waiting for the display to check in* (it acts at its next poll, within five minutes by default), *Downloading*, *Restarting*, then *Updated to 1.2.0*; or a plain sentence for each failure. A rollback reads: *The update didn't start properly, so the display went back to 1.1.0. Nothing was lost.*
+- **Progress and results:** *Waiting for the display to check in* (it acts at its next poll, within five minutes by default), *Downloading*, *Restarting*, then *Updated to 1.2.0*; or a plain sentence for each failure. When the display reports `attempts_left` of 0, the app says the update will wait until the display has earned another attempt (up to four hours of running), or until it is set up again over USB. A rollback reads: *The update didn't start properly, so the display went back to 1.1.0. Nothing was lost.*
 - **Install firmware:** the first install over USB, as [above](#install-firmware-in-the-app).
 
 The app never holds a signing key. Signing is done with `hub-firmware`, by whoever makes the firmware.
@@ -381,11 +399,12 @@ All of these are additions to protocol v1. Older displays ignore the new fields,
 "firmware": {
   "key_ids": ["<64 hex digits>", "<64 hex digits>"],
   "security_floor": 3,
-  "slot_bytes": 3145728
+  "slot_bytes": 3145728,
+  "attempts_left": 5
 }
 ```
 
-`key_ids` are the display's trusted keys (0 to 3), `security_floor` its floor, and `slot_bytes` the size of its spare app partition. The hub stores them with the other device fields and uses them only for the courtesy checks and for what the app shows.
+`key_ids` are the display's trusted keys (0 to 3), `security_floor` its floor, `slot_bytes` the size of its spare app partition, and `attempts_left` (optional, 0 to 5) what is left of its attempt budget. The hub stores them with the other device fields and uses them only for the courtesy checks and for what the app shows. It never refuses an offer because `attempts_left` is 0: the display earns attempts back by itself.
 
 ### The offer, in the snapshot
 
@@ -421,7 +440,7 @@ Authenticated; the answer is `204`. A display sends one when it starts downloadi
 | `failed` | Something went wrong after the checks. The old firmware is still running. | `download`, `image_hash`, `flash` |
 | `rolled_back` | The new firmware didn't prove itself, and the display went back. | — |
 
-`firmware_version` is what the display is running when it sends the report. The hub treats a state or reason it doesn't know as a failure, and shows it as such.
+`firmware_version` is what the display is running when it sends the report, and the hub stores it as the display's version. The hub treats a state or reason it doesn't know as a failure, and shows it as such. New firmware on its trial boot sends no report: `installed` comes once it is marked good.
 
 ### The provisioning bundle and USB
 
@@ -434,22 +453,22 @@ The bundle gains one optional member:
 }
 ```
 
-`trusted_keys` holds 1 to 3 public keys, with no repeats. A display follows the table in [What each action may change](#what-each-action-may-change). The USB exchange gains one error code, `firmware_keys_locked`: the display already trusts a different set of keys, and only **Install firmware** can change them. An older manager reads it as an unrecognised error and shows the message.
+`trusted_keys` holds 1 to 3 public keys, with no repeats. A display MUST check that each one is a valid P-256 point before storing anything, and refuse the whole bundle (`invalid_bundle`) otherwise. It then follows the table in [What each action may change](#what-each-action-may-change). Accepting any bundle over USB refills the attempt budget. The USB exchange gains one error code, `firmware_keys_locked`: the display already trusts a different set of keys, and only **Install firmware** can change them. An older manager reads it as an unrecognised error and shows the message.
 
 ### Admin and publisher routes
 
 | Route | Who | Does |
 |---|---|---|
-| `POST /v1/admin/firmware` | Admin | Uploads a package: the raw file as the body, with a `Content-Length` of at most 16 MiB. `201` with the package's description; `200` if the hub already had it. |
+| `POST /v1/admin/firmware` | Admin | Uploads a package: the raw file as the body, with a `Content-Length` of at most 16 MiB. `201` with the package's description, and `evicted` naming any package removed to make room; `200` if the hub already had it, or the same release signed again. An upload that sends nothing for 60 seconds is dropped. |
 | `GET /v1/admin/firmware` | Admin | Every package: id, device type, hardware revisions, version, security counter, summary, signer key id and label, size, whether it can be used for a USB install, when and by whom it was uploaded, and which displays it is on offer to. |
 | `GET /v1/admin/firmware/{package_id}/file` | Admin | The whole package, so the app can do a USB install from a package the hub holds. |
 | `DELETE /v1/admin/firmware/{package_id}` | Admin | Removes a package and cancels its open offers. |
 | `PUT /v1/admin/devices/{id}/firmware-update` | Admin | `{"package_id": …}`: makes the offer (the **Update** button). `DELETE` cancels it. |
 | `GET /v1/admin/devices` | Admin | Each display gains `firmware`: what it reported, its open or last offer with its state, reason and times, the best package available for it, and `auto_update`. |
-| `GET /v1/admin/firmware/signers`, `PUT`, `DELETE …/signers/{key_id}` | Admin | The owner's labels for signing keys. |
+| `GET /v1/admin/firmware/signers`, `PUT`, `DELETE …/signers/{key_id}` | Admin | The owner's labels for signing keys. A label claiming to be the official firmware is refused (`bad_request`). |
 | `GET`, `POST /v1/admin/publishers`, `DELETE /v1/admin/publishers/{id}` | Admin | Publishers: list, invite, revoke. |
 | `POST /v1/publisher/pair` | — | Exchanges a publisher string's secret for a publisher token. |
-| `POST`, `GET /v1/publisher/firmware` | Publisher | Upload and list, as the admin routes. |
+| `POST`, `GET /v1/publisher/firmware` | Publisher | Upload and list, as the admin routes. An upload may make room only by removing the publisher's own packages, and each publisher's packages are capped at 64 MiB. |
 
 ## Threat model
 
@@ -465,11 +484,11 @@ The bundle gains one optional member:
 | **An interrupted download or a power cut** | — | The image goes to the spare partition; the running firmware is untouched until the image is complete and its hash matches. A power cut while writing leaves the old firmware booting. A power cut during the trial boot rolls back. The next attempt starts from the beginning. |
 | **A wrong-board image** | Offer firmware built for another display. | The signed manifest names the device type and hardware revisions, and the display compares both with its own, exactly. The hub and app check too, earlier. At a USB install the app checks the chip. ESP-IDF also validates the app image before accepting it. If a wrong image still got through, it would fail its trial boot and roll back. |
 | **Replaying an old signed image** | Offer a genuine but older release with a known hole. | The security floor: once a display has confirmed a release with a higher counter, older ones are refused. **Left over:** releases with the *same* counter can be swapped freely, so makers must raise it for every security fix. A full USB wipe resets the floor (physical access). |
-| **A hostile hub wearing out flash** | Offer again and again. | One attempt per offer, at least 10 minutes between attempts, 6 hours after three failures, and no flash write before the signature and manifest checks pass. |
+| **A hostile hub wearing out flash** | Offer again and again, with new offer ids, including a genuine release that installs each time. | The attempt budget: at most five attempts at once, then one for each four hours of the display's own running time, whatever the hub sends, its clock or the result. That is at most 6 partition rewrites a day sustained (Espressif's FAQ gives about 100,000 erase cycles as typical). A refusal before any request writes nothing, and nothing is written to flash before the signature and manifest checks pass. **Left over:** a hostile hub can spend the budget, so an owner's genuine update may wait up to four hours of running (or a USB bundle); the budget record itself is written at most a few times an hour while it refills. |
 
 ## What the simulator must test
 
-`tools/display-simulator` is the reference display. It will keep two "partitions" as files, a trusted-key store, a floor and an update record in its state folder, and follow every MUST above. The cases below become language-neutral vectors under `protocol/v1/firmware/` (a package, the display's state before, and the expected outcome), so firmware can port them to unit tests. Test packages are signed with throwaway keys made for the purpose; their private halves are not kept or published.
+`tools/display-simulator` is the reference display. It keeps two "partitions" as files, a trusted-key store, a floor and an update record (with the attempt budget) in its state folder, and follows every MUST above. It measures the budget, the trial boot and the download limits with its own running time, which starts at zero at every start (a new process is a new start), never with the wall clock. The cases below are language-neutral vectors under `protocol/v1/firmware/` (a package, the display's state before, and the expected outcome), so firmware can port them to unit tests. Test packages are signed with throwaway keys made for the purpose; their private halves are not kept or published.
 
 **Package checks (display).** Each ends with the old firmware running and nothing written unless stated.
 
@@ -486,7 +505,7 @@ The bundle gains one optional member:
 11. A valid signature made with the right key over the same bytes **without** the fixed text in front. → `bad_signature`
 12. A display with no trusted keys. → `no_trusted_keys`
 13. Signed by the display's second trusted key: installed.
-14. Manifest that isn't JSON; one missing each required field in turn; a number written as a string; a negative or fractional `image_size`. → `bad_format`
+14. Manifest that isn't JSON; one missing each required field in turn; a number written as a string; a negative or fractional `image_size`; a repeated member name. → `bad_format`
 15. A manifest with unknown extra fields: installed.
 16. `device_type` differing by one character, and by letter case. → `wrong_device_type`
 17. `hardware_revisions` without this display's revision; and with it as a prefix of a longer string. → `wrong_hardware`
@@ -499,9 +518,9 @@ The bundle gains one optional member:
 
 **Offers and limits.**
 
-24. The same `offer_id` seen again after a refusal: nothing happens.
-25. A new offer inside 10 minutes of the last attempt: it waits.
-26. Three failures in a row: the next attempt waits 6 hours.
+24. The same `offer_id` seen again after a refusal: nothing happens. A refusal before any request spends nothing, writes nothing and is forgotten at a restart.
+25. The attempt budget: with none left, the display requests nothing, reports nothing and leaves the offer open; four counted hours give one attempt; 3 hours 59 minutes and then a restart give none; a USB bundle refills it to 5; nothing is written while it is full.
+26. What doesn't change the budget: a successful install (no refill), the date or the hub's time moving, and new offer ids (offers A, B, A cost one attempt each; only the last one acted on is ignored).
 27. A download for a package that isn't on offer to this display: `not_found` from the hub.
 28. An offer older than 24 hours: gone from the snapshot.
 
@@ -515,13 +534,15 @@ The bundle gains one optional member:
 
 **Keys.**
 
-34. A release with a `key_set` adding a key: after it is marked good, the new key is trusted.
-35. A release with a `key_set` removing the key that signed it: afterwards that key is refused.
+34. A release with a `key_set` adding a key: after it is marked good, the new key is trusted. One that only adds keys, at a counter equal to the floor: installed.
+35. A release with a `key_set` removing the key that signed it: afterwards that key is refused. A `key_set` leaving out a trusted key at a counter equal to the floor → `downgrade`; with the counter raised: installed.
 36. A release with a `key_set` that then rolls back: keys unchanged.
 37. A replay of an earlier release, after a key-removing release with a higher counter. → `downgrade`
 38. Factory reset: keys and floor kept.
 39. A bundle with different keys to a display that has keys. → `firmware_keys_locked`. With the same keys, or none: accepted.
-40. A bundle with keys to a display that has none: keys and floor set.
+40. A bundle with keys to a display that has none: keys and floor set. A bundle with a key that isn't a valid P-256 point → `invalid_bundle`, nothing stored.
+
+Trial vectors give check-in times in seconds of the display's running time since the trial boot began.
 
 **Hub and app (tested against the real hub).**
 
@@ -550,6 +571,7 @@ Checked on 17/11/2026 (UTC), against official sources only.
 | The app description block sits at a fixed offset in an app image and holds the version. | [ESP-IDF 5.5, app image format](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/api-reference/system/app_image_format.html) |
 | `ring` 0.17 signs and verifies fixed-length P-256 signatures, uses a random nonce, takes the public key as an uncompressed point, and makes PKCS#8 keys. | [`ring::signature`](https://docs.rs/ring/0.17.14/ring/signature/index.html), [`EcdsaKeyPair`](https://docs.rs/ring/0.17.14/ring/signature/struct.EcdsaKeyPair.html) |
 | `espflash` 4.7 can report the chip and flash size, erase the flash, and write raw bytes at an address. | [`espflash::flasher::Flasher`](https://docs.rs/espflash/latest/espflash/flasher/struct.Flasher.html) |
+| Flash typically lasts about 100,000 erase cycles per sector, varying by flash chip, and NVS suits small, infrequent writes. | [ESP-FAQ, NVS](https://docs.espressif.com/projects/esp-faq/en/latest/software-framework/storage/nvs.html), [ESP-IDF, file system considerations](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/file-system-considerations.html) |
 
 **Why ESP-IDF's own signed-update mode isn't used.** It checks a new app against the single key built into the running app, in Espressif's own signature block. This design needs the key to come from the first install, more than one key, and a manifest that names the board and the security counter.
 
