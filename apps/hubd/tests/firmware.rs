@@ -14,6 +14,7 @@ use hub_protocol::pairing::PairingString;
 use hub_protocol::ErrorCode;
 use hubd::api::Hub;
 use hubd::config::Config;
+use hubd::firmware::FirmwareTimeLimits;
 use tokio::sync::oneshot;
 
 const NOW: &str = "2026-11-17T09:00:00Z";
@@ -29,11 +30,16 @@ struct Running {
 
 impl Running {
     async fn start(dir: &Path, clock: &FakeClock) -> Running {
+        Self::start_with(dir, clock, FirmwareTimeLimits::default()).await
+    }
+
+    /// A hub whose firmware transfers have other time limits.
+    async fn start_with(dir: &Path, clock: &FakeClock, limits: FirmwareTimeLimits) -> Running {
         let config = Config {
             data_dir: dir.to_path_buf(),
             ..Config::default()
         };
-        let hub = hubd::open_hub(config, Arc::new(clock.clone())).unwrap();
+        let hub = hubd::open_hub_with_firmware_time_limits(config, Arc::new(clock.clone()), limits).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = oneshot::channel();
@@ -459,6 +465,61 @@ async fn offers_are_refused_when_the_display_would_refuse_them() {
         ("offered", "1.2.0")
     );
     assert!(audit(&r.hub).iter().any(|l| l.starts_with("firmware_offered ")));
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn a_package_that_drops_a_trusted_key_is_only_offered_with_a_higher_counter() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let maker = key();
+    let retired = key();
+    // A release that keeps only the maker's key, at counter 3.
+    let mut rel = release("1.2.0", 3);
+    rel.key_set = Some(vec![maker.public_key()]);
+    let pkg = c
+        .upload_firmware(
+            &admin,
+            build_and_sign(&maker, &rel, &image(5000, 9)).unwrap().bytes,
+        )
+        .await
+        .unwrap()
+        .0;
+    let maker_id = maker.public_key().key_id().to_hex();
+    assert_eq!(pkg.key_set, Some(vec![maker_id.clone()]));
+    let listed = c.firmware_packages(&admin).await.unwrap();
+    assert_eq!(listed[0].key_set, Some(vec![maker_id.clone()]));
+
+    let both = |floor| FirmwareInfo {
+        key_ids: vec![maker_id.clone(), retired.public_key().key_id().to_hex()],
+        security_floor: floor,
+        slot_bytes: 1 << 20,
+        attempts_left: None,
+    };
+    // At the display's floor, dropping a key it trusts is a downgrade: not offered, not available.
+    let (at_floor, _) = r.display(&admin, "At floor", REV, Some(both(3))).await;
+    let e = c
+        .offer_firmware(&admin, &at_floor, &pkg.package_id)
+        .await
+        .unwrap_err();
+    assert_eq!((status(&e), code(&e)), (409, Some(ErrorCode::Conflict)));
+    assert!(e.to_string().contains("stop the display trusting"), "{e}");
+    // Above it, the key is retired as the maker meant.
+    let (below, _) = r.display(&admin, "Below", REV, Some(both(2))).await;
+    let views = c.displays(&admin).await.unwrap();
+    let available = |id: &str| {
+        views
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.firmware.as_ref())
+            .and_then(|f| f.available_package_id.clone())
+    };
+    assert_eq!(available(&at_floor), None);
+    assert_eq!(available(&below), Some(pkg.package_id.clone()));
+    c.offer_firmware(&admin, &below, &pkg.package_id).await.unwrap();
     r.stop().await;
 }
 
@@ -1330,36 +1391,98 @@ async fn read_head<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> String {
     String::from_utf8(head).unwrap()
 }
 
+/// The largest package there is: far more than the sockets between the hub and a test can hold, so
+/// a download a test stops reading stays under way.
+fn largest(k: &SigningKey, version: &str) -> Built {
+    build_and_sign(
+        k,
+        &release(version, 1),
+        &image(firmware_package::limits::MAX_IMAGE_SIZE as usize, 7),
+    )
+    .unwrap()
+}
+
+/// Starts a download on a raw connection that then stops reading, and returns it once the hub has
+/// answered.
+async fn stalled_download(
+    r: &Running,
+    token: &str,
+    package_id: &str,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    use tokio::io::AsyncWriteExt;
+    let mut s = raw(r, Some(8192)).await;
+    s.write_all(
+        format!(
+            "GET /v1/device/firmware/{package_id} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    let head = read_head(&mut s).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    s
+}
+
+/// Reads a connection until it ends, or for at most a minute, and returns what arrived.
+async fn read_to_end<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> Option<u64> {
+    use tokio::io::AsyncReadExt;
+    let mut got = 0u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n as u64,
+            }
+        }
+    })
+    .await
+    .ok()
+    .map(|()| got)
+}
+
 #[tokio::test]
-async fn one_download_at_a_time_for_each_display() {
+async fn a_new_download_from_a_display_takes_over_from_its_last() {
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
     let r = Running::start(dir.path(), &clock).await;
     let admin = r.admin().await;
     let c = r.client();
     let k = key();
-    let pkg = c
-        .upload_firmware(&admin, package(&k, "1.2.0", 1).bytes)
-        .await
-        .unwrap()
-        .0;
+    let big = largest(&k, "2.0.0");
+    let form = big.checked.update_form_len();
+    let pkg = c.upload_firmware(&admin, big.bytes).await.unwrap().0;
     let (desk, token) = r
-        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 1 << 20)))
+        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 16 << 20)))
         .await;
     let (other, other_token) = r
-        .display(&admin, "Other", REV, Some(trusting(&k, 0, 1 << 20)))
+        .display(&admin, "Other", REV, Some(trusting(&k, 0, 16 << 20)))
         .await;
     c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
     c.offer_firmware(&admin, &other, &pkg.package_id).await.unwrap();
-    // While Desk's download is being sent, Desk can't start another; Other can.
-    r.hub.downloading.lock().unwrap().insert(desk.clone());
-    let e = c.firmware_download(&token, &pkg.package_id).await.unwrap_err();
-    assert_eq!((status(&e), code(&e)), (503, Some(ErrorCode::Unavailable)));
-    assert!(e.to_string().contains("already downloading"), "{e}");
-    c.firmware_download(&other_token, &pkg.package_id).await.unwrap();
-    r.hub.downloading.lock().unwrap().remove(&desk);
-    c.firmware_download(&token, &pkg.package_id).await.unwrap();
-    assert!(r.hub.downloading.lock().unwrap().is_empty());
+
+    // Desk's first download stalls: its Wi-Fi dropped without the connection closing.
+    let mut first = stalled_download(&r, &token, &pkg.package_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 1);
+    // Other downloads meanwhile, with the hub's other slot.
+    let got = c.firmware_download(&other_token, &pkg.package_id).await.unwrap();
+    assert_eq!(got.bytes.len() as u64, form);
+    // Desk tries again: the new download is served in full, and the stalled one is closed.
+    let got = c.firmware_download(&token, &pkg.package_id).await.unwrap();
+    assert_eq!(got.bytes.len() as u64, form);
+    let cut = read_to_end(&mut first)
+        .await
+        .expect("the stalled connection was left open");
+    assert!(
+        cut < form,
+        "{cut} of {form} bytes: the stalled download wasn't cut off"
+    );
+    // Nothing is left held, and each start counted.
+    assert!(!r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.downloads_under_way(), 0);
     assert_eq!(
         r.hub.download_slots.available_permits(),
         hub_protocol::limits::MAX_CONCURRENT_FIRMWARE_DOWNLOADS
@@ -1379,25 +1502,17 @@ fn open_handles_to(path: &Path) -> usize {
 
 #[tokio::test]
 async fn a_display_that_stops_reading_loses_its_connection_at_the_time_limit() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
-    let r = Running::start(dir.path(), &clock).await;
-    r.hub
-        .set_firmware_time_limits(hubd::firmware::FirmwareTimeLimits {
-            download: std::time::Duration::from_secs(2),
-            ..Default::default()
-        });
+    let limits = FirmwareTimeLimits {
+        download: std::time::Duration::from_secs(2),
+        ..Default::default()
+    };
+    let r = Running::start_with(dir.path(), &clock, limits).await;
     let admin = r.admin().await;
     let c = r.client();
     let k = key();
-    // The largest image: far more than the sockets between the hub and this test can hold.
-    let big = build_and_sign(
-        &k,
-        &release("2.0.0", 1),
-        &image(firmware_package::limits::MAX_IMAGE_SIZE as usize, 7),
-    )
-    .unwrap();
+    let big = largest(&k, "2.0.0");
     let form = big.checked.update_form_len();
     let pkg = c.upload_firmware(&admin, big.bytes).await.unwrap().0;
     let (desk, token) = r
@@ -1405,18 +1520,7 @@ async fn a_display_that_stops_reading_loses_its_connection_at_the_time_limit() {
         .await;
     c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
 
-    let mut s = raw(&r, Some(8192)).await;
-    s.write_all(
-        format!(
-            "GET /v1/device/firmware/{} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {token}\r\n\r\n",
-            pkg.package_id
-        )
-        .as_bytes(),
-    )
-    .await
-    .unwrap();
-    let head = read_head(&mut s).await;
-    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let mut s = stalled_download(&r, &token, &pkg.package_id).await;
     // The display stops reading. Its download is under way, holding a slot, its turn and the file.
     let file = dir
         .path()
@@ -1425,31 +1529,20 @@ async fn a_display_that_stops_reading_loses_its_connection_at_the_time_limit() {
         .canonicalize()
         .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    assert!(r.hub.downloading.lock().unwrap().contains(&desk));
+    assert!(r.hub.is_downloading(&desk));
     assert_eq!(r.hub.download_slots.available_permits(), 1);
     #[cfg(target_os = "linux")]
     assert_eq!(open_handles_to(&file), 1);
     // Past the limit, the hub has let go of all three while the display still isn't reading: the
     // connection was dropped, since the body was never asked for more.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-    assert!(r.hub.downloading.lock().unwrap().is_empty());
+    assert_eq!(r.hub.downloads_under_way(), 0);
     assert_eq!(r.hub.download_slots.available_permits(), 2);
     #[cfg(target_os = "linux")]
     assert_eq!(open_handles_to(&file), 0, "the file is still open");
     let _ = &file;
     // What was already sent arrives, then the stream ends early.
-    let mut got = 0u64;
-    let mut buf = vec![0u8; 64 * 1024];
-    let ended = tokio::time::timeout(std::time::Duration::from_secs(60), async {
-        loop {
-            match s.read(&mut buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(n) => got += n as u64,
-            }
-        }
-    })
-    .await;
-    assert!(ended.is_ok(), "the connection was left open");
+    let got = read_to_end(&mut s).await.expect("the connection was left open");
     assert!(got < form, "{got} of {form} bytes: the download wasn't cut off");
     r.stop().await;
 }
@@ -1459,16 +1552,15 @@ async fn an_upload_that_sends_nothing_is_dropped_before_the_overall_limit() {
     use tokio::io::AsyncWriteExt;
     let dir = tempfile::tempdir().unwrap();
     let clock = FakeClock::parse(NOW);
-    let r = Running::start(dir.path(), &clock).await;
     assert_eq!(
-        r.hub.firmware_time_limits().upload_idle,
+        FirmwareTimeLimits::default().upload_idle,
         std::time::Duration::from_secs(60)
     );
-    r.hub
-        .set_firmware_time_limits(hubd::firmware::FirmwareTimeLimits {
-            upload_idle: std::time::Duration::from_secs(1),
-            ..Default::default()
-        });
+    let limits = FirmwareTimeLimits {
+        upload_idle: std::time::Duration::from_secs(1),
+        ..Default::default()
+    };
+    let r = Running::start_with(dir.path(), &clock, limits).await;
     let admin = r.admin().await;
     let k = key();
     let built = package(&k, "1.2.0", 1);

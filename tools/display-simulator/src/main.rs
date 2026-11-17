@@ -45,12 +45,15 @@ impl Target {
         }
     }
 
-    async fn heartbeat(&self, dir: Option<&std::path::Path>) {
+    /// Sends a heartbeat when paired with a state folder. True if the hub took it.
+    async fn heartbeat(&self, dir: Option<&std::path::Path>) -> bool {
         if let (Target::Paired(s), Some(dir)) = (self, dir) {
-            if let Err(e) = paired::heartbeat(s, &paired::device_info(dir)).await {
-                eprintln!("display-simulator: heartbeat not sent: {e}");
+            match paired::heartbeat(s, &paired::device_info(dir)).await {
+                Ok(_) => return true,
+                Err(e) => eprintln!("display-simulator: heartbeat not sent: {e}"),
             }
         }
+        false
     }
 }
 
@@ -341,6 +344,9 @@ async fn main() -> ExitCode {
             };
             let mut polls = 0;
             let mut last_heartbeat: Option<std::time::Instant> = None;
+            // The attempts left as the hub last heard them: a change is reported straight away, so
+            // the app doesn't show a pause late or keep showing it after the display has recovered.
+            let mut reported_attempts: Option<u32> = None;
             loop {
                 let result = hub.poll().await;
                 let offer = result.as_ref().ok().and_then(|s| s.firmware_update.clone());
@@ -356,11 +362,19 @@ async fn main() -> ExitCode {
                 }
                 // Not while on trial: the hub counts a heartbeat naming the new version as installed,
                 // and the firmware hasn't been marked good yet.
+                let attempts = conn
+                    .state
+                    .as_deref()
+                    .and_then(|d| display_simulator::firmware::store::record(d).ok())
+                    .map(|r| r.budget().attempts_left);
                 if matches!(device.link, Link::Online { .. })
                     && !updates.as_ref().is_some_and(Firmware::in_trial)
-                    && last_heartbeat.is_none_or(|t| t.elapsed().as_secs() >= 3600)
+                    && (last_heartbeat.is_none_or(|t| t.elapsed().as_secs() >= 3600)
+                        || (attempts.is_some() && attempts != reported_attempts))
                 {
-                    hub.heartbeat(conn.state.as_deref()).await;
+                    if hub.heartbeat(conn.state.as_deref()).await {
+                        reported_attempts = attempts;
+                    }
                     last_heartbeat = Some(std::time::Instant::now());
                 }
                 if let Some(max) = max_wait {

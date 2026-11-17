@@ -228,9 +228,8 @@ pub enum Outcome {
     Installed {
         after: AfterFlash,
         refresh: Option<Refresh>,
-        /// Why the owner's name for the maker's key wasn't saved on the hub, if it wasn't. The
-        /// install still counts.
-        label_failed: Option<ClientError>,
+        /// What became of the owner's name for the maker's key. The install counts either way.
+        label: MakerName,
     },
 }
 
@@ -812,6 +811,20 @@ pub struct Model {
     /// The keys from an install whose setup details weren't sent, for the next Add a display to
     /// the same port.
     pub pending_firmware: Option<PendingKeys>,
+    /// Whether the hub's firmware lists could be read at the last refresh.
+    firmware_lists: ListsState,
+}
+
+/// Whether the hub's firmware lists could be read, and if not, whether the owner has been told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ListsState {
+    #[default]
+    Readable,
+    /// They couldn't be read at the last refresh, and the notice hasn't been shown yet: another
+    /// notice was showing.
+    Failing,
+    /// They couldn't be read, and the notice was shown once.
+    Told,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -865,6 +878,7 @@ impl Model {
             install_copied: false,
             fw: FirmwareUi::default(),
             pending_firmware: None,
+            firmware_lists: ListsState::Readable,
         }
     }
 
@@ -1603,10 +1617,12 @@ impl Model {
             return None;
         }
         // Keys from an install go only to the port it was installed through: on any other port
-        // they would make an unrelated display trust that maker.
+        // they would make an unrelated display trust that maker, so they are dropped once the send
+        // starts.
         if self.pending_firmware.as_ref().is_some_and(|p| p.port != port) {
+            let op = self.send_usb_without_keys(port, bundle, Some(false))?;
             self.pending_firmware = None;
-            return self.send_usb_without_keys(port, bundle, Some(false));
+            return Some(op);
         }
         let keys = self.pending_firmware.as_ref().map(|p| p.include);
         let bundle = self.bundle_with_pending(bundle);
@@ -1624,9 +1640,11 @@ impl Model {
         )
     }
 
+    /// Saves the setup details to a file. Keys waiting from an install never go in it: they go
+    /// only over USB, to the port the firmware was installed through, and a file could reach any
+    /// display.
     pub fn save_bundle(&mut self, path: PathBuf) -> Option<Op> {
         let bundle = self.enrol.bundle.clone()?;
-        let bundle = self.bundle_with_pending(bundle);
         self.start(Busy::SavingFile, Op::SaveBundle { path, bundle })
     }
 
@@ -1751,16 +1769,26 @@ impl Model {
                     .and_then(|l| l.firmware.clone())
                     .unwrap_or_default(),
             );
-            let why = guidance::from_client(&e, Doing::Other, &self.address());
-            self.notice = Some(Guidance {
-                tone: Tone::Problem,
-                title: "Couldn't read the firmware lists".into(),
-                detail: format!(
-                    "{}. {} The Firmware screen shows what the hub held when it last answered.",
-                    why.title, why.detail
-                ),
-                next: Next::None,
-            });
+            // Said once each time the lists stop being readable, not at every refresh while they
+            // stay so, and never over a notice the owner hasn't dismissed.
+            if self.firmware_lists != ListsState::Told {
+                self.firmware_lists = ListsState::Failing;
+                if self.notice.is_none() {
+                    let why = guidance::from_client(&e, Doing::Other, &self.address());
+                    self.notice = Some(Guidance {
+                        tone: Tone::Problem,
+                        title: "Couldn't read the firmware lists".into(),
+                        detail: format!(
+                            "{}. {} The Firmware screen shows what the hub held when it last answered.",
+                            why.title, why.detail
+                        ),
+                        next: Next::None,
+                    });
+                    self.firmware_lists = ListsState::Told;
+                }
+            }
+        } else {
+            self.firmware_lists = ListsState::Readable;
         }
         if let EnrolStage::Waiting { .. } = self.enrol.stage {
             if let Some(d) = r.displays.iter().find(|d| !self.enrol.known.contains(&d.id)) {
@@ -1967,8 +1995,8 @@ impl Model {
             Ok(Outcome::Installed {
                 after,
                 refresh,
-                label_failed,
-            }) => self.take_installed(after, refresh, label_failed, now),
+                label,
+            }) => self.take_installed(after, refresh, label, now),
             Err(f) => self.failed(f, busy, now),
         }
     }

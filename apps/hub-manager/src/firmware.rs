@@ -71,17 +71,8 @@ pub fn fingerprint(key_id: &str) -> String {
         .join("-")
 }
 
-/// Whether the owner may not call a key this: the name the app keeps for keys built into it, or
-/// anything claiming to be official Display Hub firmware. Compared ignoring case, spacing and
-/// punctuation, as the hub compares it (the hub refuses it too).
-pub fn reserved_label(label: &str) -> bool {
-    let plain: String = label
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    plain == "officialdisplayhubfirmware" || (plain.contains("official") && plain.contains("displayhub"))
-}
+/// Whether the owner may not call a key this, as the hub compares it (the hub refuses it too).
+pub use firmware_package::label::reserved_label;
 
 /// Names a key: official keys first, then the owner's label, then "Unknown maker".
 pub fn signer(key_id: &str, labels: &[SignerView]) -> Signer {
@@ -263,8 +254,9 @@ impl DisplayFirmware {
 }
 
 /// Whether a package passes the checks the app can make for a display, by its last report: the
-/// same device type and hardware revision, a key it trusts, at or above its floor, and small enough
-/// for its spare space. The hub and the display check again.
+/// same device type and hardware revision, a key it trusts, at or above its floor, not dropping a
+/// key it trusts without a higher counter, and small enough for its spare space. The hub and the
+/// display check again.
 pub fn accepts(d: &DisplayView, p: &FirmwarePackageView) -> bool {
     let Some(info) = &d.device else { return false };
     let Some(fw) = &info.firmware else { return false };
@@ -272,6 +264,12 @@ pub fn accepts(d: &DisplayView, p: &FirmwarePackageView) -> bool {
         && p.hardware_revisions.contains(&info.hardware_revision)
         && fw.key_ids.contains(&p.signer_key_id)
         && p.security_counter >= fw.security_floor
+        && !firmware_package::drops_key_unraised(
+            p.key_set.as_deref(),
+            &fw.key_ids,
+            p.security_counter,
+            fw.security_floor,
+        )
         && p.image_size <= fw.slot_bytes
 }
 
@@ -725,6 +723,7 @@ pub(crate) mod tests {
             update_size: 900,
             image_size: 700,
             usb_install: true,
+            key_set: None,
             uploaded_at: ts("2026-11-17T09:00:00Z"),
             uploaded_by_role: "admin".into(),
             uploaded_by: "a".into(),
@@ -866,21 +865,33 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fingerprints_match_the_package_library_and_official_names_are_reserved() {
+    fn a_package_that_drops_a_trusted_key_needs_a_higher_counter() {
+        // The display trusts k and j at floor 2.
+        let d = display(Some(vec!["k", "j"]), "1.4.0", None);
+        let mut keeps = package("a", "1.3.0", "k");
+        keeps.key_set = Some(vec!["k".repeat(64), "j".repeat(64)]);
+        let mut drops = package("b", "1.2.0", "k");
+        drops.key_set = Some(vec!["k".repeat(64)]);
+        let mut raised = package("c", "1.5.0", "k");
+        raised.key_set = Some(vec!["k".repeat(64)]);
+        raised.security_counter = 3;
+        assert!(accepts(&d, &keeps));
+        assert!(
+            !accepts(&d, &drops),
+            "an older release at the same counter that drops j"
+        );
+        assert!(accepts(&d, &raised));
+        let f = display_firmware(&d, Some(&[keeps, drops, raised]), &[], None);
+        assert_eq!(f.available.unwrap().version, "1.5.0");
+        let others: Vec<_> = f.others.iter().map(|o| o.version.as_str()).collect();
+        assert_eq!(others, ["1.3.0"]);
+    }
+
+    #[test]
+    fn fingerprints_match_the_package_library() {
         let key = SigningKey::generate().unwrap().0;
         let id = key.public_key().key_id();
         assert_eq!(fingerprint(&id.to_hex()), id.fingerprint());
-        for bad in [
-            "Official Display Hub firmware",
-            "official display-hub firmware",
-            "OFFICIAL  DISPLAY HUB",
-            "Display Hub (official)",
-        ] {
-            assert!(reserved_label(bad), "{bad}");
-        }
-        for ok in ["Kea Displays", "Official Kea firmware", "Display Hub fan club"] {
-            assert!(!reserved_label(ok), "{ok}");
-        }
     }
 
     #[test]

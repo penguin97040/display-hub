@@ -331,15 +331,25 @@ pub fn same_release<'a>(
         })
 }
 
-/// What the owner may not call a signing key: the name the app keeps for keys built into it.
-/// Compared ignoring case, spacing and punctuation.
-pub fn reserved_label(label: &str) -> bool {
-    let plain: String = label
-        .chars()
-        .filter(|c| c.is_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect();
-    plain == "officialdisplayhubfirmware" || (plain.contains("official") && plain.contains("displayhub"))
+/// The key ids of each stored package's `key_set`, by package id, for the packages that have one.
+pub type KeySets = std::collections::HashMap<String, Vec<String>>;
+
+/// The key ids of a stored package's `key_set`, read from the manifest in its file, which passed
+/// every check when it was uploaded. `None` if it has no `key_set`, or if the file can't be read
+/// (then it can't be sent either, and tidying drops its row).
+pub fn key_set(dir: &Path, package_id: &str) -> Option<Vec<String>> {
+    let (_, manifest) = signed_part(&package_path(dir, package_id))?;
+    let m = firmware_package::Manifest::parse(&manifest).ok()?;
+    m.key_set
+        .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect())
+}
+
+/// [`key_set`] for each of `packages`.
+pub fn key_sets(dir: &Path, packages: &[PackageRow]) -> KeySets {
+    packages
+        .iter()
+        .filter_map(|p| key_set(dir, &p.id).map(|ks| (p.id.clone(), ks)))
+        .collect()
 }
 
 /// A row for a package that passed `firmware_package::check`.
@@ -377,6 +387,7 @@ pub fn package_view(
     p: &PackageRow,
     labels: &std::collections::HashMap<String, String>,
     offered_to: Vec<String>,
+    key_set: Option<Vec<String>>,
 ) -> FirmwarePackageView {
     FirmwarePackageView {
         package_id: p.id.clone(),
@@ -392,6 +403,7 @@ pub fn package_view(
         update_size: p.update_size,
         image_size: p.image_size,
         usb_install: p.usb_install,
+        key_set,
         uploaded_at: p.uploaded_at,
         uploaded_by_role: p.uploaded_by_role.as_str().to_string(),
         uploaded_by: p.uploaded_by.clone(),
@@ -421,7 +433,8 @@ pub fn offer_view(o: &OfferRow, now: Timestamp) -> FirmwareOfferView {
 /// The courtesy checks before an offer: by the display's own last report, would it refuse this
 /// package? A plain sentence if so. The display repeats every check; these only save a pointless
 /// download and say why.
-pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String> {
+/// `key_set` is the package's, from [`key_set`].
+pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow, key_set: Option<&[String]>) -> Result<(), String> {
     let Some(info) = info else {
         return Err(
             "This display hasn't reported itself to the hub yet. Wait for it to check in, then try again."
@@ -466,6 +479,14 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String>
             fw.security_floor, p.security_counter
         ));
     }
+    if firmware_package::drops_key_unraised(key_set, &fw.key_ids, p.security_counter, fw.security_floor) {
+        return Err(format!(
+            "This package would stop the display trusting one of its firmware keys without a higher \
+             security counter (this package's counter is {}, and the display's floor is {}), so it would \
+             refuse it. Offer a newer release from the same maker.",
+            p.security_counter, fw.security_floor
+        ));
+    }
     if p.image_size > fw.slot_bytes {
         return Err(format!(
             "This firmware is {} bytes, too big for the display's spare space of {} bytes.",
@@ -476,11 +497,15 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String>
 }
 
 /// The newest package that passes the courtesy checks for a display and is newer than what it runs.
-pub fn best_package<'a>(info: Option<&DeviceInfo>, packages: &'a [PackageRow]) -> Option<&'a PackageRow> {
+pub fn best_package<'a>(
+    info: Option<&DeviceInfo>,
+    packages: &'a [PackageRow],
+    key_sets: &KeySets,
+) -> Option<&'a PackageRow> {
     let current = info.map(|i| i.firmware_version.as_str());
     packages
         .iter()
-        .filter(|p| courtesy(info, p).is_ok())
+        .filter(|p| courtesy(info, p, key_sets.get(&p.id).map(Vec::as_slice)).is_ok())
         .filter(
             |p| match current.and_then(|c| compare_versions(&p.firmware_version, c)) {
                 Some(o) => o == Ordering::Greater,
@@ -617,29 +642,6 @@ mod tests {
             .collect();
         let one_more = row("n", "t99", "1.0.0", 1, None);
         assert_eq!(plan_room(&big, &one_more, &none, None), Err(NoRoom::StoreFull));
-    }
-
-    #[test]
-    fn the_official_name_is_reserved() {
-        for bad in [
-            "Official Display Hub firmware",
-            "official display hub firmware",
-            "OFFICIAL-DISPLAY-HUB-FIRMWARE",
-            "Official  Display Hub  Firmware.",
-            "officialdisplayhubfirmware",
-            "Display Hub (official)",
-            "The official DisplayHub build",
-        ] {
-            assert!(reserved_label(bad), "{bad}");
-        }
-        for ok in [
-            "Kiwi Displays",
-            "Display Hub fan",
-            "Officially Kiwi",
-            "Hub firmware",
-        ] {
-            assert!(!reserved_label(ok), "{ok}");
-        }
     }
 
     #[test]

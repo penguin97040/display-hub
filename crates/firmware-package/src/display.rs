@@ -45,6 +45,23 @@ impl std::fmt::Display for Refusal {
     }
 }
 
+/// The dropped-key rule of step 7: a `key_set` that leaves out any key the display trusts retires
+/// that key, and a maker must raise the security counter above the display's floor to do it.
+/// Without the rule, a replay of an older release at the same counter could bring back a key a later
+/// release removed. True when a package breaks the rule, so a display refuses it as a `downgrade`.
+///
+/// The keys can be anything that names them one to one: a display compares its stored public keys,
+/// and the hub and the app the key ids a display reports. The hub and the app use this to avoid
+/// offering a package the display would refuse; the display's own check is the one that counts.
+pub fn drops_key_unraised<K: PartialEq>(
+    key_set: Option<&[K]>,
+    trusted: &[K],
+    security_counter: u32,
+    security_floor: u32,
+) -> bool {
+    key_set.is_some_and(|set| trusted.iter().any(|k| !set.contains(k)) && security_counter <= security_floor)
+}
+
 /// What a display knows about itself.
 #[derive(Clone, Copy, Debug)]
 pub struct Display<'a> {
@@ -129,14 +146,13 @@ impl Display<'_> {
         if m.security_counter < self.security_floor {
             return Err(Refusal::Downgrade);
         }
-        // A key_set that drops a key this display trusts retires that key, and a maker must raise
-        // the counter to do it. Without that rule, a replay of an older release at the same counter
-        // could bring back a key a later release removed.
-        if let Some(set) = &m.key_set {
-            let drops_a_key = self.trusted_keys.iter().any(|k| !set.contains(k));
-            if drops_a_key && m.security_counter <= self.security_floor {
-                return Err(Refusal::Downgrade);
-            }
+        if drops_key_unraised(
+            m.key_set.as_deref(),
+            self.trusted_keys,
+            m.security_counter,
+            self.security_floor,
+        ) {
+            return Err(Refusal::Downgrade);
         }
         if m.image_size > self.slot_bytes {
             return Err(Refusal::TooLarge);
@@ -156,5 +172,26 @@ impl Display<'_> {
     ) -> Result<Manifest, Refusal> {
         let h = self.check_header(header)?;
         self.check_manifest(&h, manifest, content_length)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_set_that_drops_a_trusted_key_needs_a_higher_counter() {
+        let trusted = ["a", "b"];
+        // No key_set changes nothing.
+        assert!(!drops_key_unraised(None, &trusted, 3, 3));
+        // Keeping every trusted key, with or without more, is fine at the floor.
+        assert!(!drops_key_unraised(Some(&["a", "b"][..]), &trusted, 3, 3));
+        assert!(!drops_key_unraised(Some(&["b", "a", "c"][..]), &trusted, 3, 3));
+        // Dropping one needs a counter above the floor.
+        assert!(drops_key_unraised(Some(&["a"][..]), &trusted, 3, 3));
+        assert!(drops_key_unraised(Some(&["a", "c"][..]), &trusted, 2, 3));
+        assert!(!drops_key_unraised(Some(&["a"][..]), &trusted, 4, 3));
+        // A display that trusts nothing drops nothing.
+        assert!(!drops_key_unraised(Some(&["a"][..]), &[] as &[&str], 0, 0));
     }
 }

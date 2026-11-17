@@ -939,7 +939,7 @@ impl Manager {
             (
                 format!(
                     "This display will trust keys from {} from the firmware just installed on {}. They are sent \
-                     only to {}.",
+                     only to {} over USB, never in a saved file: Save as a file leaves them out.",
                     keys.join("; "),
                     p.port,
                     p.port

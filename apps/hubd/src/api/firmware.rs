@@ -287,9 +287,10 @@ async fn upload(
             if dest.is_file() {
                 // Uploading the same file twice is harmless.
                 let offered = s.offered_to(now)?.remove(&existing.id).unwrap_or_default();
+                let key_set = shelf::key_set(&dir, &existing.id);
                 return Ok((
                     StatusCode::OK,
-                    shelf::package_view(&existing, &labels(s)?, offered),
+                    shelf::package_view(&existing, &labels(s)?, offered, key_set),
                 ));
             }
             // A row whose file went missing: start again.
@@ -299,9 +300,10 @@ async fn upload(
         // The same release signed again is the same release: the stored file stays.
         if let Some(existing) = shelf::same_release(&dir, &stored, &checked) {
             let offered = s.offered_to(now)?.remove(&existing.id).unwrap_or_default();
+            let key_set = shelf::key_set(&dir, &existing.id);
             return Ok((
                 StatusCode::OK,
-                shelf::package_view(existing, &labels(s)?, offered),
+                shelf::package_view(existing, &labels(s)?, offered, key_set),
             ));
         }
         let on_offer = s.packages_on_offer(now)?;
@@ -348,7 +350,12 @@ async fn upload(
             ),
         )?;
         let kept = s.firmware_package(&row.id)?.unwrap_or(row);
-        let mut view = shelf::package_view(&kept, &labels(s)?, Vec::new());
+        let key_set = checked
+            .manifest
+            .key_set
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect());
+        let mut view = shelf::package_view(&kept, &labels(s)?, Vec::new(), key_set);
         view.evicted = evicted;
         Ok((StatusCode::CREATED, view))
     })
@@ -362,6 +369,7 @@ async fn upload(
 
 async fn list(hub: &AppState, with_offers: bool) -> Result<Json<Vec<FirmwarePackageView>>, ApiError> {
     let now = hub.clock.now();
+    let dir = hub.firmware_dir();
     let views = db(hub, move |s| {
         let labels = labels(s)?;
         let mut offered = if with_offers {
@@ -371,7 +379,10 @@ async fn list(hub: &AppState, with_offers: bool) -> Result<Json<Vec<FirmwarePack
         };
         Ok(s.firmware_packages()?
             .iter()
-            .map(|p| shelf::package_view(p, &labels, offered.remove(&p.id).unwrap_or_default()))
+            .map(|p| {
+                let offered = offered.remove(&p.id).unwrap_or_default();
+                shelf::package_view(p, &labels, offered, shelf::key_set(&dir, &p.id))
+            })
             .collect())
     })
     .await?;
@@ -411,7 +422,7 @@ pub(super) async fn package_file(
     let pkg = db(&hub, move |s| s.firmware_package(&id))
         .await?
         .ok_or_else(no_package)?;
-    serve_file(&hub, &pkg, pkg.size, None, None).await
+    serve_file(&hub, &pkg, pkg.size, None).await
 }
 
 pub(super) async fn delete_package(
@@ -460,11 +471,13 @@ pub(super) async fn put_offer(
     }
     let now = hub.clock.now();
     let h = hub.clone();
+    let dir = hub.firmware_dir();
     let offer = db_api(&hub, move |s| {
         let row = s.device(&device)?.ok_or_else(ApiError::not_found)?;
         let pkg = s.firmware_package(&req.package_id)?.ok_or_else(no_package)?;
         let info = h.latest_info(&device, row.info);
-        shelf::courtesy(info.as_ref(), &pkg).map_err(conflict)?;
+        let key_set = shelf::key_set(&dir, &pkg.id);
+        shelf::courtesy(info.as_ref(), &pkg, key_set.as_deref()).map_err(conflict)?;
         let id: String = crate::secret::random_bytes::<16>()
             .iter()
             .map(|b| format!("{b:02x}"))
@@ -520,6 +533,7 @@ pub(super) async fn delete_offer(
 pub(super) fn display_firmware(
     infos: &[(String, Option<DeviceInfo>, bool)],
     packages: &[PackageRow],
+    key_sets: &shelf::KeySets,
     offers: &HashMap<String, OfferRow>,
     now: Timestamp,
 ) -> HashMap<String, DisplayFirmware> {
@@ -531,7 +545,8 @@ pub(super) fn display_firmware(
                 DisplayFirmware {
                     reported: info.as_ref().and_then(|i| i.firmware.clone()),
                     offer: offers.get(id).map(|o| shelf::offer_view(o, now)),
-                    available_package_id: shelf::best_package(info.as_ref(), packages).map(|p| p.id.clone()),
+                    available_package_id: shelf::best_package(info.as_ref(), packages, key_sets)
+                        .map(|p| p.id.clone()),
                     auto_update: *auto_update,
                 },
             )
@@ -577,7 +592,7 @@ pub(super) async fn put_signer(
     }
     let label = clean_title(&req.label)
         .ok_or_else(|| ApiError::bad_request("The label needs some printable text."))?;
-    if shelf::reserved_label(&label) {
+    if firmware_package::label::reserved_label(&label) {
         return Err(ApiError::bad_request(
             "That name is kept for firmware whose key is built into the app, so a label can't use it. \
              Name the key after its maker instead.",
@@ -771,51 +786,96 @@ pub(super) async fn device_download(
         ));
     }
     hub.download_starts.hit(device.clone(), t);
-    // One download at a time for each display, and a few across the hub.
-    let Some(turn) = DisplayTurn::take(&hub.downloading, &device) else {
-        return Err(ApiError::unavailable(
-            "This display is already downloading firmware. Try again when that download ends.",
-        ));
-    };
+    // One download at a time for each display: a new one takes over from the last, whose
+    // connection is closed. A display only asks again once it has given up on its last download,
+    // so one still held is on a connection that died without saying so.
+    let held = Arc::new(Mutex::new(Held {
+        close: close.map(|c| c.0),
+        ..Held::default()
+    }));
+    let (turn, before) = DisplayTurn::take(&hub.downloading, &device, &held);
+    if let Some(before) = before.upgrade() {
+        tracing::info!(%device, "a new firmware download replaces this display's last one");
+        before.lock().unwrap_or_else(|e| e.into_inner()).supersede();
+    }
+    // And a few across the hub.
     let Ok(slot) = hub.download_slots.clone().try_acquire_owned() else {
         return Err(ApiError::unavailable(
             "The hub is already sending firmware to other displays. Try again later.",
         ));
     };
+    {
+        let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        if h.superseded {
+            // Another download from this display began in the moment since.
+            return Err(ApiError::unavailable(
+                "This display started another firmware download, which replaces this one.",
+            ));
+        }
+        h.permit = Some(DownloadPermit {
+            _slot: slot,
+            _turn: turn,
+        });
+    }
     tracing::info!(%device, package = %pkg.id, "sending firmware");
-    let permit = DownloadPermit {
-        _slot: slot,
-        _turn: turn,
-    };
-    serve_file(&hub, &pkg, pkg.update_size, Some(permit), close.map(|c| c.0)).await
+    serve_file(&hub, &pkg, pkg.update_size, Some(held)).await
 }
 
-/// A display's turn to download: while it is held, that display can't start another download.
+/// The displays being sent a download now, each with what its download holds.
+pub(super) type Downloading = Arc<Mutex<HashMap<String, std::sync::Weak<Mutex<Held>>>>>;
+
+impl Hub {
+    /// Whether a firmware download to this display is under way.
+    pub fn is_downloading(&self, device: &str) -> bool {
+        self.downloading
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(device)
+    }
+
+    /// How many displays are being sent a firmware download now.
+    pub fn downloads_under_way(&self) -> usize {
+        self.downloading.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+/// A display's turn to download: while it is held, the display is downloading.
 struct DisplayTurn {
     device: String,
-    downloading: Arc<Mutex<std::collections::HashSet<String>>>,
+    downloading: Downloading,
+    held: std::sync::Weak<Mutex<Held>>,
 }
 
 impl DisplayTurn {
-    /// The display's turn, unless it is downloading already.
-    fn take(downloading: &Arc<Mutex<std::collections::HashSet<String>>>, device: &str) -> Option<Self> {
-        let fresh = downloading
+    /// The display's turn, for the download that `held` belongs to, and what its last download held
+    /// if it is still under way (an empty `Weak` if not).
+    fn take(
+        downloading: &Downloading,
+        device: &str,
+        held: &Arc<Mutex<Held>>,
+    ) -> (Self, std::sync::Weak<Mutex<Held>>) {
+        let held = Arc::downgrade(held);
+        let before = downloading
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(device.to_string());
-        fresh.then(|| Self {
+            .insert(device.to_string(), held.clone())
+            .unwrap_or_default();
+        let turn = Self {
             device: device.to_string(),
             downloading: downloading.clone(),
-        })
+            held,
+        };
+        (turn, before)
     }
 }
 
 impl Drop for DisplayTurn {
     fn drop(&mut self) {
-        self.downloading
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.device);
+        let mut d = self.downloading.lock().unwrap_or_else(|e| e.into_inner());
+        // Only this download's own turn: a newer one may have taken over.
+        if d.get(&self.device).is_some_and(|h| h.ptr_eq(&self.held)) {
+            d.remove(&self.device);
+        }
     }
 }
 
@@ -826,14 +886,17 @@ struct DownloadPermit {
 }
 
 /// What a running download holds, shared by its body and its watchdog. Emptied when the download
-/// ends, by whichever of the two gets there first.
+/// ends, by whichever of the two gets there first, or when a newer download from the same display
+/// takes over.
 #[derive(Default)]
-struct Held {
+pub(super) struct Held {
     permit: Option<DownloadPermit>,
     /// The connection the download is on, to close if it runs past its time limit.
     close: Option<CloseConnection>,
     /// Dropped as the download ends, which tells the watchdog to stop waiting.
     done: Option<tokio::sync::oneshot::Sender<()>>,
+    /// A newer download from the same display has taken over.
+    superseded: bool,
 }
 
 impl Held {
@@ -841,6 +904,16 @@ impl Held {
         self.permit.take();
         self.close.take();
         self.done.take();
+    }
+
+    /// Ends this download for a newer one from the same display: closes its connection and lets go
+    /// of its slot and turn.
+    fn supersede(&mut self) {
+        self.superseded = true;
+        if let Some(c) = &self.close {
+            c.close();
+        }
+        self.release();
     }
 }
 
@@ -852,8 +925,7 @@ async fn serve_file(
     hub: &AppState,
     pkg: &PackageRow,
     len: u64,
-    permit: Option<DownloadPermit>,
-    close: Option<CloseConnection>,
+    held: Option<Arc<Mutex<Held>>>,
 ) -> Result<Response, ApiError> {
     let path = shelf::package_path(&hub.firmware_dir(), &pkg.id);
     let file = match tokio::fs::File::open(&path).await {
@@ -876,13 +948,9 @@ async fn serve_file(
     }
     let limit = hub.firmware_time_limits().download;
     // Only a display's download has anything for a watchdog to release.
-    let held = permit.map(|permit| {
+    if let Some(held) = &held {
         let (done, finished) = tokio::sync::oneshot::channel::<()>();
-        let held = Arc::new(Mutex::new(Held {
-            permit: Some(permit),
-            close,
-            done: Some(done),
-        }));
+        held.lock().unwrap_or_else(|e| e.into_inner()).done = Some(done);
         let watchdog = held.clone();
         tokio::spawn(async move {
             tokio::select! {
@@ -899,14 +967,13 @@ async fn serve_file(
                 _ = finished => {}
             }
         });
-        held
-    });
+    }
     let body = FileBody {
         file,
         remaining: len,
         deadline: tokio::time::Instant::now() + limit,
         held,
-        buf: vec![0u8; shelf::STREAM_CHUNK_BYTES],
+        buf: None,
     };
     Ok((
         [
@@ -918,14 +985,15 @@ async fn serve_file(
         .into_response())
 }
 
-/// A file's first bytes as a body of exactly known length, read a piece at a time through one
-/// buffer.
+/// A file's first bytes as a body of exactly known length, read a piece at a time. Each piece is
+/// read into its own buffer, which is handed over as the frame without copying; a buffer made for a
+/// read that had to wait is kept for the next try.
 struct FileBody {
     file: tokio::fs::File,
     remaining: u64,
     deadline: tokio::time::Instant,
     held: Option<Arc<Mutex<Held>>>,
-    buf: Vec<u8>,
+    buf: Option<Vec<u8>>,
 }
 
 impl FileBody {
@@ -959,8 +1027,10 @@ impl HttpBody for FileBody {
             this.release();
             return Poll::Ready(Some(Err(std::io::ErrorKind::TimedOut.into())));
         }
-        let want = this.remaining.min(this.buf.len() as u64) as usize;
-        let mut read = ReadBuf::new(&mut this.buf[..want]);
+        let want = this.remaining.min(shelf::STREAM_CHUNK_BYTES as u64) as usize;
+        let buf = this.buf.get_or_insert_with(|| vec![0u8; want]);
+        let want = want.min(buf.len());
+        let mut read = ReadBuf::new(&mut buf[..want]);
         match Pin::new(&mut this.file).poll_read(cx, &mut read) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
@@ -969,7 +1039,9 @@ impl HttpBody for FileBody {
                 if n == 0 {
                     return Poll::Ready(Some(Err(std::io::ErrorKind::UnexpectedEof.into())));
                 }
-                let chunk = Bytes::copy_from_slice(read.filled());
+                let mut filled = this.buf.take().unwrap_or_default();
+                filled.truncate(n);
+                let chunk = Bytes::from(filled);
                 this.remaining -= n as u64;
                 if this.remaining == 0 {
                     // Every byte is handed over: the slot is free for the next download now, not

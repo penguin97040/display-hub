@@ -41,6 +41,15 @@ pub enum OpenError {
 
 /// Opens the database and TLS identity in `config.data_dir`, creating both only for a new hub.
 pub fn open_hub(config: Config, clock: Arc<dyn Clock>) -> Result<Arc<Hub>, OpenError> {
+    open_hub_with_firmware_time_limits(config, clock, Default::default())
+}
+
+/// [`open_hub`] with other time limits for firmware transfers, for tests that can't wait 15 minutes.
+pub fn open_hub_with_firmware_time_limits(
+    config: Config,
+    clock: Arc<dyn Clock>,
+    firmware_limits: firmware::FirmwareTimeLimits,
+) -> Result<Arc<Hub>, OpenError> {
     std::fs::create_dir_all(&config.data_dir).map_err(|source| OpenError::DataDir {
         path: config.data_dir.clone(),
         source,
@@ -69,7 +78,13 @@ pub fn open_hub(config: Config, clock: Arc<dyn Clock>) -> Result<Arc<Hub>, OpenE
         })?;
     }
     let store = Store::open(&db_path)?;
-    Ok(Hub::new(store, Arc::new(identity), clock, config))
+    Ok(Hub::with_firmware_time_limits(
+        store,
+        Arc::new(identity),
+        clock,
+        config,
+        firmware_limits,
+    ))
 }
 
 /// Serves the hub over HTTPS until `shutdown` resolves, then writes buffered state.

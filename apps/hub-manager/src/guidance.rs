@@ -499,7 +499,7 @@ pub fn offer_words(
             let again = try_again(retry);
             let why = match r {
                 ReportReason::Download => {
-                    format!("The download didn't finish. Check the display's Wi-Fi. {again}")
+                    format!("The download didn't finish: the hub may have been busy, or the display's Wi-Fi dropped. {again}")
                 }
                 ReportReason::ImageHash => {
                     format!("The firmware arrived damaged, so the display threw it away. {again}")

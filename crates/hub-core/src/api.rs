@@ -326,6 +326,11 @@ pub struct FirmwarePackageView {
     pub image_size: u64,
     /// Whether it has what a first install over USB needs.
     pub usb_install: bool,
+    /// The key ids (64 hex digits each) of the keys its manifest's `key_set` names: the keys a
+    /// display trusts once it has installed it. `None` when it has no `key_set` (a display keeps
+    /// the keys it has), or from a hub that doesn't say.
+    #[serde(default)]
+    pub key_set: Option<Vec<String>>,
     pub uploaded_at: Timestamp,
     /// `admin` or `publisher`, with that credential's id and label.
     pub uploaded_by_role: String,

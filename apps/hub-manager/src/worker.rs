@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::firmware::{self, Board, Loaded};
 use crate::model::{
-    AddFailure, AfterFlash, Failure, InstallJob, Op, Outcome, PackageSource, PortInfo, Refresh, Shelf,
+    AddFailure, AfterFlash, Failure, InstallJob, MakerName, Op, Outcome, PackageSource, PortInfo, Refresh,
+    Shelf,
 };
 use crate::settings::{self, SavedHub};
 use os_secrets::TokenStore;
@@ -486,17 +487,22 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             })
             .await;
             let after = after.map_err(Failure::Install)?;
-            // The owner's name for the maker's key, once the display trusts it. A failure here
-            // doesn't undo the install: the model says so, and the name can be set on the Firmware
-            // screen.
-            let mut label_failed = None;
-            if let (AfterFlash::Sent(_), Some((key_id, label))) = (&after, &job.label) {
-                label_failed = s.client.set_signer_label(&s.token, key_id, label).await.err();
-            }
+            // The owner's name for the maker's key, after any install the hub can be told about,
+            // whether or not the setup details went: the hub keeps it by key id, so it is harmless
+            // before a display trusts the key. A failure here doesn't undo the install: the model
+            // says so, and the name can be set on the Firmware screen.
+            let label = match &job.label {
+                None => MakerName::Done,
+                Some(_) if !after.hub_reachable() => MakerName::Unreachable,
+                Some((key_id, label)) => match s.client.set_signer_label(&s.token, key_id, label).await {
+                    Ok(_) => MakerName::Done,
+                    Err(e) => MakerName::Failed(e),
+                },
+            };
             Ok(Outcome::Installed {
                 after,
                 refresh: refresh_after(&s).await,
-                label_failed,
+                label,
             })
         }
     }
@@ -1134,7 +1140,7 @@ mod install_tests {
         let stop = Arc::new(AtomicBool::new(false));
         let path = display_on_pty(state.clone(), stop.clone());
         m.close_install();
-        install(&mut m, &ctx, package(&stranger, None), &path, "").await;
+        install(&mut m, &ctx, package(&stranger, None), &path, "Weka Works").await;
         let n = m.notice.as_ref().unwrap();
         assert_eq!(
             n.title,
@@ -1151,6 +1157,13 @@ mod install_tests {
             store::keys(&state).unwrap(),
             keys,
             "nothing changed on the display"
+        );
+        // The owner's name for the stranger's key is saved all the same: the hub keeps it by key
+        // id, whether or not any display trusts the key.
+        assert!(!n.detail.contains("wasn't saved"), "{}", n.detail);
+        assert_eq!(
+            m.signer(&stranger.public_key().key_id().to_hex()).name(),
+            "Weka Works"
         );
         stop.store(true, Ordering::Relaxed);
 

@@ -80,6 +80,26 @@ pub enum AfterFlash {
     Usb { error: UsbError, bundle: Box<Bundle> },
 }
 
+impl AfterFlash {
+    /// Whether the hub could be reached after the flash: only a failure to reach it at all says it
+    /// couldn't.
+    pub fn hub_reachable(&self) -> bool {
+        !matches!(self, AfterFlash::Hub(e) if e.is_connection())
+    }
+}
+
+/// What became of the owner's name for the maker's key, after an install.
+#[derive(Debug, Default)]
+pub enum MakerName {
+    /// There was no name to save, or it was saved.
+    #[default]
+    Done,
+    /// The hub refused it, or the request failed.
+    Failed(ClientError),
+    /// Not tried: the hub couldn't be reached after the install.
+    Unreachable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InstallStage {
     /// Choose a package.
@@ -822,13 +842,14 @@ impl Model {
         Some(op)
     }
 
-    /// After an install: send the setup details, or say what to do next. `label_failed` says why
-    /// the owner's name for the maker's key wasn't saved, if it wasn't.
+    /// After an install: send the setup details, or say what to do next. `label` says what became
+    /// of the owner's name for the maker's key; whichever way the install ended, the notice says if
+    /// it wasn't saved.
     pub(super) fn take_installed(
         &mut self,
         after: AfterFlash,
         refresh: Option<Refresh>,
-        label_failed: Option<ClientError>,
+        label: MakerName,
         now: Instant,
     ) {
         let port = match &self.fw.install.stage {
@@ -852,6 +873,7 @@ impl Model {
             .unwrap_or_default();
         let name = clean_title(self.fw.install.name.trimmed()).unwrap_or_default();
         let maker = clean_title(self.fw.install.maker.trimmed()).unwrap_or_default();
+        let unsaved = self.maker_not_saved(&maker, label);
         self.take_refresh_opt(refresh, now);
         // The Displays screen watches for the new display, as after an ordinary setup.
         self.enrol = super::Enrol {
@@ -873,16 +895,7 @@ impl Model {
                      checks in with the hub; the Displays screen updates when it does.",
                     shown.device.device_type, shown.device.firmware_version
                 );
-                if let Some(e) = label_failed {
-                    let why =
-                        crate::guidance::from_client(&e, crate::guidance::Doing::Naming, &self.address());
-                    detail.push_str(&format!(
-                        " The name \"{maker}\" for the maker's key wasn't saved on the hub ({}: {}). You can name \
-                         the key on the Firmware screen, under Makers' keys.",
-                        why.title.to_lowercase(),
-                        why.detail.trim_end_matches('.')
-                    ));
-                }
+                detail.push_str(&unsaved);
                 self.notice = Some(Guidance::done(
                     format!("Installed {title} on the display on {port}"),
                     detail,
@@ -904,7 +917,7 @@ impl Model {
                     title: "The firmware is installed, but the setup details weren't sent".into(),
                     detail: format!(
                         "{}: {} Under Displays, Add a display has them ready to send again to {port}, with the \
-                         firmware's keys.",
+                         firmware's keys.{unsaved}",
                         why.title, why.detail
                     ),
                     next: Next::None,
@@ -924,13 +937,34 @@ impl Model {
                     title: "The firmware is installed, but the hub couldn't make setup details".into(),
                     detail: format!(
                         "{}. {} Set the display up under Displays, Add a display, and send the details to {port}: \
-                         the app adds the firmware's keys.",
+                         the app adds the firmware's keys.{unsaved}",
                         why.title, why.detail
                     ),
                     next: why.next,
                 });
                 self.section = super::Section::Displays;
             }
+        }
+    }
+
+    /// The sentence for a notice when the owner's name for the maker's key wasn't saved, with a
+    /// space before it; empty if it was, or there was none.
+    fn maker_not_saved(&self, maker: &str, label: MakerName) -> String {
+        let later = "You can name the key on the Firmware screen, under Makers' keys";
+        match label {
+            MakerName::Done => String::new(),
+            MakerName::Failed(e) => {
+                let why = crate::guidance::from_client(&e, crate::guidance::Doing::Naming, &self.address());
+                format!(
+                    " The name \"{maker}\" for the maker's key wasn't saved on the hub ({}: {}). {later}.",
+                    why.title.to_lowercase(),
+                    why.detail.trim_end_matches('.')
+                )
+            }
+            MakerName::Unreachable => format!(
+                " The name \"{maker}\" for the maker's key wasn't saved either, as the hub couldn't be reached. \
+                 {later}, once the hub answers."
+            ),
         }
     }
 
@@ -1054,6 +1088,7 @@ mod tests {
             update_size: 1_400_000,
             image_size: 1_395_000,
             usb_install: true,
+            key_set: None,
             uploaded_at: ts("2026-11-10T19:00:00Z"),
             uploaded_by_role: "admin".into(),
             uploaded_by: "a".into(),
@@ -1481,6 +1516,37 @@ mod tests {
     }
 
     #[test]
+    fn the_firmware_lists_notice_is_shown_once_a_spell_and_never_over_another() {
+        let failing = |m: &Model| {
+            let mut r = m.last.clone().unwrap();
+            r.firmware = None;
+            r.firmware_error = Some(std::sync::Arc::new(ClientError::Timeout));
+            r
+        };
+        let title = |m: &Model| m.notice.as_ref().map(|n| n.title.clone());
+        let lists = "Couldn't read the firmware lists".to_string();
+        let (mut m, now) = with_firmware();
+        let readable = m.last.clone().unwrap();
+        // Another notice is showing: it stays, and the failure is told once it has been dismissed.
+        m.notice = Some(Guidance::done("Saved", "Something else."));
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m).as_deref(), Some("Saved"));
+        m.notice = None;
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m), Some(lists.clone()));
+        // Dismissed: the next failing refreshes don't bring it back.
+        m.notice = None;
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m), None);
+        // Readable again, then failing again: told again.
+        m.finish(Ok(Outcome::Refreshed(Some(readable))), now);
+        assert_eq!(m.firmware_lists, super::super::ListsState::Readable);
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m), Some(lists));
+    }
+
+    #[test]
     fn a_refused_offer_or_upload_gets_a_title_that_says_what_it_was() {
         let conflict = |msg: &str| {
             Failure::Client(ClientError::Status {
@@ -1759,7 +1825,7 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Sent(usb_display()),
                 refresh: None,
-                label_failed: None,
+                label: MakerName::Done,
             }),
             now,
         );
@@ -1790,7 +1856,7 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Sent(usb_display()),
                 refresh: None,
-                label_failed: Some(refused),
+                label: MakerName::Failed(refused),
             }),
             now,
         );
@@ -1804,6 +1870,66 @@ mod tests {
             n.detail
         );
         assert!(n.detail.contains("nope"), "{}", n.detail);
+    }
+
+    #[test]
+    fn a_maker_name_not_saved_is_reported_whichever_way_the_install_ended() {
+        let refused = || ClientError::Status {
+            status: 409,
+            body: Some(hub_protocol::ErrorBody::new(
+                hub_protocol::ErrorCode::Conflict,
+                "nope",
+            )),
+        };
+        // The setup details weren't taken over USB, and the hub refused the name.
+        let (mut m, now) = connected(vec![]);
+        m.last.as_mut().unwrap().firmware = Some(Shelf::default());
+        running(&mut m);
+        m.fw.install.maker.set("Kea Displays");
+        let bundle: Bundle = serde_json::from_str(include_str!(
+            "../../../../protocol/v1/examples/device/provisioning-bundle.json"
+        ))
+        .unwrap();
+        m.finish(
+            Ok(Outcome::Installed {
+                after: AfterFlash::Usb {
+                    error: UsbError::FirmwareKeysLocked,
+                    bundle: Box::new(bundle),
+                },
+                refresh: None,
+                label: MakerName::Failed(refused()),
+            }),
+            now,
+        );
+        let d = &m.notice.as_ref().unwrap().detail;
+        assert!(
+            d.contains("The name \"Kea Displays\" for the maker's key wasn't saved on the hub")
+                && d.contains("nope"),
+            "{d}"
+        );
+        // The hub couldn't be reached at all, so the name wasn't tried.
+        let (mut m, now) = connected(vec![]);
+        m.last.as_mut().unwrap().firmware = Some(Shelf::default());
+        running(&mut m);
+        m.fw.install.maker.set("Kea Displays");
+        let after = AfterFlash::Hub(ClientError::Timeout);
+        assert!(!after.hub_reachable());
+        m.finish(
+            Ok(Outcome::Installed {
+                after,
+                refresh: None,
+                label: MakerName::Unreachable,
+            }),
+            now,
+        );
+        let d = &m.notice.as_ref().unwrap().detail;
+        assert!(
+            d.contains("The name \"Kea Displays\" for the maker's key wasn't saved either, as the hub couldn't be reached"),
+            "{d}"
+        );
+        // A hub that answered with a refusal can still be told the name.
+        assert!(AfterFlash::Hub(refused()).hub_reachable());
+        assert!(AfterFlash::Sent(usb_display()).hub_reachable());
     }
 
     #[test]
@@ -1836,7 +1962,7 @@ mod tests {
                     bundle: Box::new(bundle),
                 },
                 refresh: None,
-                label_failed: None,
+                label: MakerName::Done,
             }),
             now,
         );
@@ -1874,7 +2000,7 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Hub(ClientError::Timeout),
                 refresh: None,
-                label_failed: None,
+                label: MakerName::Done,
             }),
             now,
         );
@@ -1922,7 +2048,7 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Hub(ClientError::Timeout),
                 refresh: None,
-                label_failed: None,
+                label: MakerName::Done,
             }),
             now,
         );
@@ -1969,6 +2095,20 @@ mod tests {
         }
         m.finish(Ok(Outcome::Sent(usb_display())), Instant::now());
         assert!(m.pending_keys().is_none(), "done with once sent");
+
+        // Busy: nothing is sent to the other port, and the keys still wait.
+        let (mut m, _) = keys_waiting();
+        m.busy = Some(Busy::SavingFile);
+        assert!(m.send_usb("COM9").is_none());
+        assert_eq!(m.pending_keys().unwrap().port, "COM5");
+
+        // Saved to a file: never with the keys, which keep waiting for COM5.
+        let (mut m, _) = keys_waiting();
+        match m.save_bundle(PathBuf::from("setup.json")) {
+            Some(Op::SaveBundle { bundle, .. }) => assert!(bundle.firmware.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(m.pending_keys().unwrap().include);
 
         // Cancelling Add a display drops them; so does starting another install.
         let (mut m, _) = keys_waiting();
