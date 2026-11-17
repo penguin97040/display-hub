@@ -7,10 +7,12 @@ members = [
     "crates/os-secrets",
     "crates/usage",
     "crates/templates",
+    "crates/firmware-package",
     "apps/hubd",
     "apps/hub-manager",
     "apps/hub-send",
     "apps/usage-helper",
+    "apps/hub-firmware",
     "tools/display-simulator",
 ]
 
@@ -32,6 +34,7 @@ hub-client = { path = "crates/hub-client" }
 os-secrets = { path = "crates/os-secrets" }
 usage = { path = "crates/usage" }
 hub-templates = { path = "crates/templates" }
+firmware-package = { path = "crates/firmware-package" }
 
 # GPUI: a crates.io snapshot of Zed's GPUI. 0.3.11 matches md-viewer, so the vendored Windows backend applies.
 gpui = { package = "gpui-pre", version = "=0.3.11" }
@@ -76,6 +79,8 @@ dirs = "=6.0.0"
 jsonschema = { version = "=0.61.1", default-features = false }
 tempfile = "=3.27.0"
 url = "=2.5.8"
+# Turning off terminal echo for the signing tool's passphrase prompt on Windows. Already in the lock.
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [profile.release]
 lto = "thin"
