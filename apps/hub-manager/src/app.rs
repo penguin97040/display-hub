@@ -25,6 +25,8 @@ use crate::ui::{self, c, Metrics};
 use crate::worker::{self, Ctx};
 use usage::Service;
 
+mod firmware_view;
+
 const MAC: bool = cfg!(target_os = "macos");
 
 type HoverListener = Box<dyn Fn(&bool, &mut Window, &mut App)>;
@@ -58,6 +60,13 @@ pub enum FieldId {
     Ssid,
     Password,
     OtherPort,
+    InstallName,
+    InstallSsid,
+    InstallPassword,
+    InstallPort,
+    InstallMaker,
+    SignerLabel,
+    PublisherLabel,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,7 +133,11 @@ impl Manager {
     fn run(&mut self, op: Option<Op>, cx: &mut Context<Self>) {
         cx.notify();
         let Some(op) = op else { return };
+        let installing = matches!(op, Op::Install(_));
         let handle = worker::spawn(worker::execute(self.ctx.clone(), op));
+        if installing {
+            self.watch_install(cx);
+        }
         cx.spawn(async move |this, cx| {
             let result = handle
                 .await
@@ -135,6 +148,7 @@ impl Manager {
                 let op = this
                     .model
                     .first_scan()
+                    .or_else(|| this.model.first_install_scan())
                     .or_else(|| this.model.save_guide_if_pending());
                 this.run(op, cx);
                 cx.notify();
@@ -247,6 +261,13 @@ impl Manager {
             FieldId::Ssid => &mut m.enrol.ssid,
             FieldId::Password => &mut m.enrol.password,
             FieldId::OtherPort => &mut m.enrol.other_port,
+            FieldId::InstallName => &mut m.fw.install.name,
+            FieldId::InstallSsid => &mut m.fw.install.ssid,
+            FieldId::InstallPassword => &mut m.fw.install.password,
+            FieldId::InstallPort => &mut m.fw.install.other_port,
+            FieldId::InstallMaker => &mut m.fw.install.maker,
+            FieldId::SignerLabel => &mut m.fw.label_edit.as_mut()?.field,
+            FieldId::PublisherLabel => &mut m.fw.publisher_label,
         })
     }
 
@@ -273,6 +294,16 @@ impl Manager {
                 let port = self.model.enrol.other_port.text.clone();
                 self.model.send_usb(&port)
             }
+            FieldId::InstallName
+            | FieldId::InstallSsid
+            | FieldId::InstallPassword
+            | FieldId::InstallMaker
+            | FieldId::InstallPort => {
+                let port = self.model.fw.install.other_port.text.clone();
+                self.model.ask_install(&port)
+            }
+            FieldId::SignerLabel => self.model.save_label(),
+            FieldId::PublisherLabel => self.model.create_publisher(),
         };
         self.run(op, cx);
     }
@@ -288,7 +319,7 @@ impl Manager {
         let md = &e.keystroke.modifiers;
         let command = if MAC { md.platform } else { md.control };
         if command && !md.shift {
-            if let Some(i) = ["1", "2", "3", "4"].iter().position(|n| *n == k) {
+            if let Some(i) = ["1", "2", "3", "4", "5"].iter().position(|n| *n == k) {
                 if self.model.connected() {
                     self.go(Section::ALL[i], cx);
                 }
@@ -311,6 +342,10 @@ impl Manager {
                     self.model.confirm_no();
                 } else if self.model.edit.is_some() {
                     self.model.edit = None;
+                } else if self.model.fw.label_edit.is_some() {
+                    self.model.cancel_label();
+                } else if self.model.fw.install.open && self.model.busy.is_none() {
+                    self.model.close_install();
                 } else if self.model.add.setup.is_some() {
                     self.model.finish_setup();
                 } else if self.model.add.form.is_some() {
@@ -2056,6 +2091,7 @@ impl Manager {
             let ticks = self
                 .tick_panel(&d.id, &d.name, cx)
                 .unwrap_or_else(|| div().child(ui::p_muted("Update the hub to choose pages here.")));
+            let firmware = self.display_firmware_block(&d.id, cx);
             rows.push(
                 div()
                     .id(ElementId::Name(format!("display-{}", d.id).into()))
@@ -2087,6 +2123,7 @@ impl Manager {
                             .child(remove),
                     )
                     .child(ticks)
+                    .children(firmware)
                     .into_any_element(),
             );
         }
@@ -2478,7 +2515,7 @@ impl Manager {
                          The app makes no requests except to your hub, and collects nothing.",
                     ))
                     .child(div().flex().flex_col().gap(px(4.0)).child(ui::label("Keys")).child(ui::p_muted(
-                        "Tab moves between controls. Enter or Space activates. Ctrl+1 to 4 switch sections, Ctrl+R \
+                        "Tab moves between controls. Enter or Space activates. Ctrl+1 to 5 switch sections, Ctrl+R \
                          refreshes, Alt+Up and Alt+Down move a page, Esc cancels.",
                     ))),
             ),
@@ -2781,6 +2818,7 @@ impl Render for Manager {
                 Section::Overview => self.overview(m, cx),
                 Section::Pages => self.pages(m, window, cx),
                 Section::Displays => self.displays(m, window, cx),
+                Section::Firmware => self.firmware(m, window, cx),
                 Section::Settings => self.settings(m, cx),
             };
             content.extend(screen);

@@ -8,7 +8,7 @@ You don't need the Raspberry Pi for this. `hubd` also runs on Windows, on your o
 
 From a checkout of this repository, either:
 
-- **The ready-made executables** in `dist\`, if someone has built them there (they're ignored by Git): `hub-manager.exe`, `hubd.exe`, `display-simulator.exe`, `hub-send.exe`, `usage-helper.exe` and `usage-helper-sync.exe`. They come from `cargo build --release --target x86_64-pc-windows-gnu` on Linux, and compile their shaders the first time the manager starts.
+- **The ready-made executables** in `dist\`, if someone has built them there (they're ignored by Git): `hub-manager.exe`, `hubd.exe`, `display-simulator.exe`, `hub-firmware.exe`, `hub-send.exe`, `usage-helper.exe` and `usage-helper-sync.exe`. They come from `cargo build --release --target x86_64-pc-windows-gnu` on Linux, and compile their shaders the first time the manager starts.
 - **Or build them yourself**, with Rust and the Visual Studio Build Tools ("Desktop development with C++") installed:
 
   ```powershell
@@ -55,7 +55,7 @@ Start `dist\hub-manager.exe`. Check each of these, and note anything that differ
 | 7a | **Add from template** again: **Big number**, **Short text**, **List**, **Meter**, then **Pi status** | Each appears with its kind named ("Big number", "Short text", "List", "Meter"). **Edit** lets you type in its content, and the list and the Overview draw it. Pi status offers a command with a **Copy** button; paste it into Notepad to check it, and it starts with `sudo display-hub-helper add pi-status`. The hub holds up to 50 pages. |
 | 8 | Move pages with the arrow buttons, then Tab to a page's button and press **Alt+↑** or **Alt+↓** | The order changes and stays changed after **Refresh**. |
 | 9 | Remove a page | A check screen asks first. Esc keeps the page. |
-| 10 | Keyboard only: Tab and Shift+Tab, Enter and Space, Ctrl+1 to Ctrl+4, Esc | A 2 px orange frame shows around whatever has focus. Every control can be reached and used. |
+| 10 | Keyboard only: Tab and Shift+Tab, Enter and Space, Ctrl+1 to Ctrl+5, Esc | A 2 px orange frame shows around whatever has focus. Every control can be reached and used. |
 | 11 | Resize the window from wide to about 720 px | Two columns become one; nothing is cut off or runs off the side. |
 | 12 | Windows display scale at 150 % (Settings, System, Display) | Text stays sharp and nothing overlaps. |
 | 13 | Turn on **Narrator** (Ctrl+Win+Enter) and Tab around | Buttons, tabs, fields and headings are read by name, and the message along the bottom is read when it appears. |
@@ -117,8 +117,84 @@ Only if you use Claude Code or Codex on this PC. [providers.md](providers.md) ha
 
 Also check, anywhere in the manager: a hover highlight follows the pointer and never stays lit after the pointer leaves.
 
+## 7. Firmware: Update, then Install firmware
+
+[firmware-updates.md](firmware-updates.md) is the design. These steps use a throwaway signing key, made here and deleted afterwards. Never use it for real firmware.
+
+### Update, with the simulated display
+
+Make a key. It asks for a passphrase of at least 12 characters:
+
+```powershell
+.\dist\hub-firmware.exe keygen --out test.dhkey
+```
+
+Any small file will do as the "app image" for the simulator (it warns that the file isn't an ESP-IDF image, which is expected). Sign two versions of `README.md`:
+
+```powershell
+.\dist\hub-firmware.exe sign --key test.dhkey --image README.md --device-type llm-usage-display --hardware simulated --version 1.0.0 --security-counter 1 --out v1.0.0.dhfw
+```
+
+```powershell
+.\dist\hub-firmware.exe sign --key test.dhkey --image README.md --device-type llm-usage-display --hardware simulated --version 1.1.0 --security-counter 1 --summary "A test release." --out v1.1.0.dhfw
+```
+
+Put 1.0.0 on a fresh simulated display, as Install firmware would. It then trusts the test key:
+
+```powershell
+.\dist\display-simulator.exe firmware install --state sim-fw --package v1.0.0.dhfw
+```
+
+Set it up as in section 3 (**Add a display**, **Save as a file**), then enrol it:
+
+```powershell
+.\dist\display-simulator.exe enrol --bundle display-setup.dhbundle.json --state sim-fw
+```
+
+| | Do | Expect |
+|---|---|---|
+| 1 | **Firmware** (Ctrl+4): **Add a firmware file**, choose `v1.1.0.dhfw` | "Added llm-usage-display 1.1.0 to the hub", signed by "Unknown maker" with a fingerprint like `3f9a-01c2-…`. It is listed with its size and "Updates only". |
+| 2 | Choose a file that isn't a package (any `.txt`) | "This firmware file failed its checks". Nothing reaches the hub. |
+| 3 | Under **Makers' keys**, **Name it**: type `Test maker`, press Enter | The package and the display now say "Test maker". |
+| 4 | **Displays**: the display's card | Under "Firmware": 1.0.0, "Accepts updates signed by Test maker (…)", and **Update available** with **Update to 1.1.0**. |
+| 5 | **Update to 1.1.0** | A check screen naming 1.1.0, Test maker, its fingerprint and "A test release." Confirm it. The card says "Waiting for the display to check in". |
+| 6 | Run the poll command below | Within about 15 seconds the card goes through "Downloading 1.1.0" to "Updated to 1.1.0". |
+| 7 | Sign a `1.2.0-beta.1` the same way and add it, then press **Update to 1.2.0-beta.1** on the card | Two check screens: the second says it's a pre-release and asks "Install it anyway?". **Keep it** on the second leaves everything as it was. |
+| 8 | The card also offers **Install 1.0.0**, if `v1.0.0.dhfw` is added too | Two check screens: the second says 1.0.0 is older and why going back is allowed. |
+| 9 | Confirm an update, then **Cancel update** on the card before polling | "The update to … was cancelled". |
+
+```powershell
+.\dist\display-simulator.exe poll --state sim-fw --max-wait 5
+```
+
+Stop it with Ctrl+C once the card says "Updated to 1.1.0".
+
+### Install firmware, with the real board
+
+This erases the board completely. The firmware repository doesn't speak the USB setup exchange or hold firmware keys yet, so for now this checks the flashing half: the last step is expected to say the setup details weren't sent.
+
+Build the display firmware with ESP-IDF as usual (`idf.py build`). From its `build` folder you need `bootloader\bootloader.bin`, `partition_table\partition-table.bin` and the app's `.bin`. On the ESP32-S3 the bootloader goes at `0x0`, the partition table at `0x8000` and the app at `0x10000` (check `idf.py build`'s last lines, which print the offsets). Sign them into one package. Use `waveshare-amoled-1.8-v1` or `-v2`, as marked on the back of the board:
+
+```powershell
+.\dist\hub-firmware.exe sign --key test.dhkey --image <app>.bin --device-type llm-usage-display --hardware waveshare-amoled-1.8-v1 --version 0.9.0 --security-counter 0 --usb-part bootloader@0x0=bootloader.bin --usb-part partition-table@0x8000=partition-table.bin --app-offset 0x10000 --chip esp32s3 --min-flash 0x1000000 --out board.dhfw
+```
+
+| | Do | Expect |
+|---|---|---|
+| 1 | Plug the board in with a data cable. **Firmware**, **Install firmware**, **Choose a file**, `board.dhfw` | The package, "For an esp32s3 board with at least 16 MB of flash", and an orange box: "Signed by a maker this app doesn't know", the fingerprint, and the instruction to compare it. |
+| 2 | Leave the Wi-Fi network empty and choose **Erase and install on COMx** | "Enter the Wi-Fi network's name". Nothing happens to the board. |
+| 3 | Fill in the Wi-Fi details, choose **Erase and install on COMx** | A check screen repeating the fingerprint and that everything is erased. **Keep it** leaves the board alone. |
+| 4 | Confirm with **Erase and install** | "Connecting", "Erasing the whole flash" (up to a couple of minutes for 16 MB), then "Writing" each part with a percentage, then "Restarting". |
+| 5 | Watch the board | It restarts into the firmware you built, as after `idf.py flash`. |
+| 6 | Wait for the app | For now, "The firmware is installed, but the setup details weren't sent", and **Displays** has them ready to send again. Once the firmware speaks the USB exchange, it says "Installed …" instead and the display checks in. |
+| 7 | Open a serial monitor on the board's port, then try to install | "COMx is busy", saying to close the other program. Nothing is written. |
+| 8 | If step 4 says "The board didn't start its loader" | Unplug the cable, hold **BOOT** while you plug it back in, let go, and try again. |
+| 9 | Change `--chip` to `esp32` and sign again, then try to install it | "This firmware is for a different chip … the board on COMx is an esp32s3". Nothing is written. |
+
+Delete `test.dhkey`, the `.dhfw` files and `sim-fw\` afterwards.
+
 ## Reporting back
 
 Say which rows matched, which didn't, and what you saw instead. A screenshot (Win+Shift+S) helps with anything visual. **Copy diagnostics** in Settings gives a summary with no credentials in it.
 
-Delete `hub-test\`, `hub-other\` and `sim-test\` afterwards.
+Delete `hub-test\`, `hub-other\`, `sim-test\` and `sim-fw\` afterwards.

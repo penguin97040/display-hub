@@ -32,6 +32,9 @@ use crate::guidance::{self, Doing, Guidance, Next, Tone};
 use crate::settings::SavedHub;
 use crate::shown::{kind_label, origin_text, Shown};
 
+mod updates;
+pub use updates::*;
+
 /// The most pages the hub holds. Each display shows at most its first ten ticked ones. This is the
 /// hub's own limit (`hubd::store::MAX_STORED_PAGES`); a test keeps the two equal, and the hub
 /// refuses a page past its limit whatever this says.
@@ -46,14 +49,16 @@ pub enum Section {
     Overview,
     Pages,
     Displays,
+    Firmware,
     Settings,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Overview,
         Section::Pages,
         Section::Displays,
+        Section::Firmware,
         Section::Settings,
     ];
 
@@ -62,6 +67,7 @@ impl Section {
             Section::Overview => "Overview",
             Section::Pages => "Pages",
             Section::Displays => "Displays",
+            Section::Firmware => "Firmware",
             Section::Settings => "Settings",
         }
     }
@@ -78,6 +84,8 @@ pub struct Refresh {
     /// For each display (by id), the ids of the pages ticked on it. A display removed while this was
     /// being gathered has no entry, and isn't in `displays` either.
     pub ticks: HashMap<String, Vec<String>>,
+    /// Firmware packages, signer names and publishers. `None` from a hub without signed updates.
+    pub firmware: Option<Shelf>,
 }
 
 /// A serial port a display might be on.
@@ -140,6 +148,38 @@ pub enum Op {
         bundle: Bundle,
     },
     Forget,
+    /// Checks a firmware file here, then uploads it.
+    UploadFirmware {
+        path: PathBuf,
+    },
+    RemoveFirmware {
+        id: String,
+    },
+    /// The Update button.
+    OfferFirmware {
+        display: String,
+        package: String,
+    },
+    CancelOffer {
+        display: String,
+    },
+    /// The owner's name for a signing key; `None` removes it.
+    SetSignerLabel {
+        key_id: String,
+        label: Option<String>,
+    },
+    NewPublisher {
+        label: String,
+    },
+    RevokePublisher {
+        id: String,
+    },
+    /// Reads and checks a package for a USB install.
+    LoadPackage {
+        from: PackageSource,
+    },
+    /// Install firmware over USB, then send the setup details.
+    Install(Box<InstallJob>),
 }
 
 #[derive(Debug)]
@@ -171,6 +211,21 @@ pub enum Outcome {
     Sent(UsbDisplay),
     Saved(PathBuf),
     Forgotten,
+    Uploaded {
+        package: Box<hub_core::api::FirmwarePackageView>,
+        /// `false` when the hub already had it.
+        new: bool,
+        refresh: Option<Refresh>,
+    },
+    PublisherInvite {
+        invite: hub_core::api::PublisherInvite,
+        refresh: Option<Refresh>,
+    },
+    PackageLoaded(Box<crate::firmware::Loaded>),
+    Installed {
+        after: AfterFlash,
+        refresh: Option<Refresh>,
+    },
 }
 
 /// The page that couldn't be added, and why.
@@ -190,6 +245,11 @@ pub enum Failure {
     Settings(String),
     Usb(hub_client::usb::UsbError),
     File(String),
+    /// A file to read that couldn't be.
+    ReadFile(String),
+    /// A firmware package that failed this app's checks, in words.
+    Package(String),
+    Install(crate::firmware::InstallError),
 }
 
 /// What is running, for the busy label and to know what a failure meant.
@@ -213,6 +273,12 @@ pub enum Busy {
     SavingFile,
     SavingGuide,
     Forgetting,
+    Uploading,
+    /// Reading a package for a USB install.
+    Loading,
+    Installing {
+        port: String,
+    },
 }
 
 impl Busy {
@@ -228,16 +294,57 @@ impl Busy {
             Busy::SavingFile => "Saving the file",
             Busy::SavingGuide => "Saving",
             Busy::Forgetting => "Forgetting the hub",
+            Busy::Uploading => "Uploading firmware",
+            Busy::Loading => "Checking the package",
+            Busy::Installing { .. } => "Installing firmware",
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Confirm {
-    RemovePage { id: String, title: String },
-    RevokeDisplay { id: String, name: String },
-    RevokeHelper { id: String, label: String },
+    RemovePage {
+        id: String,
+        title: String,
+    },
+    RevokeDisplay {
+        id: String,
+        name: String,
+    },
+    RevokeHelper {
+        id: String,
+        label: String,
+    },
     Forget,
+    RemovePackage {
+        id: String,
+        title: String,
+        detail: String,
+    },
+    /// Update a display. `second` is the further question for an older version or a pre-release.
+    Update {
+        display: String,
+        package: String,
+        title: String,
+        detail: String,
+        second: Option<(String, String)>,
+    },
+    UpdateAgain {
+        display: String,
+        package: String,
+        title: String,
+        detail: String,
+    },
+    RevokePublisher {
+        id: String,
+        label: String,
+    },
+    /// Install firmware over USB, which erases the display.
+    Install {
+        port: String,
+        title: String,
+        detail: String,
+    },
 }
 
 impl Confirm {
@@ -262,6 +369,19 @@ impl Confirm {
                     .into(),
                 "Remove helper",
             ),
+            Confirm::RemovePackage { title, detail, .. } => {
+                (format!("Remove {title}?"), detail.clone(), "Remove package")
+            }
+            Confirm::Update { title, detail, .. } => (title.clone(), detail.clone(), "Update"),
+            Confirm::UpdateAgain { title, detail, .. } => (title.clone(), detail.clone(), "Install anyway"),
+            Confirm::RevokePublisher { label, .. } => (
+                format!("Remove the publisher {label}?"),
+                "Its credential stops working straight away, so it can't add packages any more. Packages it added \
+                 stay on the hub."
+                    .into(),
+                "Remove publisher",
+            ),
+            Confirm::Install { title, detail, .. } => (title.clone(), detail.clone(), "Erase and install"),
             Confirm::Forget => (
                 "Forget this hub?".into(),
                 "This PC deletes its credential and the hub's details. The hub keeps working. To cut this PC off on \
@@ -641,6 +761,10 @@ pub struct Model {
     guide_save_pending: Option<bool>,
     /// The install command was put on the clipboard.
     pub install_copied: bool,
+    /// The Firmware screen.
+    pub fw: FirmwareUi,
+    /// The keys from an install whose setup details weren't made, for the next Add a display.
+    pub pending_firmware: Option<hub_protocol::firmware::BundleFirmware>,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -692,6 +816,8 @@ impl Model {
             guide_dismissed: false,
             guide_save_pending: None,
             install_copied: false,
+            fw: FirmwareUi::default(),
+            pending_firmware: None,
         }
     }
 
@@ -840,6 +966,8 @@ impl Model {
     pub fn refresh_due(&mut self, now: Instant) -> Option<Op> {
         let every = if matches!(self.enrol.stage, EnrolStage::Waiting { .. }) {
             WATCH_EVERY
+        } else if self.watching_offers(now) {
+            FIRMWARE_WATCH_EVERY
         } else {
             REFRESH_EVERY
         };
@@ -1379,6 +1507,35 @@ impl Model {
         hosts
     }
 
+    /// The port a display should use: the one this PC reaches the hub on is known to work; the
+    /// hub's own idea is the fallback.
+    pub fn bundle_port(&self) -> u16 {
+        match (self.hub.as_ref(), self.last.as_ref().map(|r| r.status.port)) {
+            (Some(h), _) => h.port,
+            (None, Some(p)) if p != 0 => p,
+            _ => 8443,
+        }
+    }
+
+    /// The `dh1.` string that pairs a helper or publisher with this hub, from an invite's secret.
+    fn invite_string(&self, secret: &str) -> Option<String> {
+        use base64::Engine;
+        let h = self.hub.as_ref()?;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(secret)
+            .ok()?;
+        let secret: [u8; 16] = raw.try_into().ok()?;
+        Some(
+            PairingString {
+                host: h.host.clone(),
+                port: h.port,
+                spki_sha256: h.pin()?,
+                secret,
+            }
+            .encode(),
+        )
+    }
+
     pub fn list_ports(&mut self) -> Option<Op> {
         self.start(Busy::Ports, Op::ListPorts)
     }
@@ -1482,6 +1639,22 @@ impl Model {
                 self.start(Busy::Saving { done }, Op::RevokeHelper { id })
             }
             Confirm::Forget => self.start(Busy::Forgetting, Op::Forget),
+            Confirm::RemovePackage { id, title, .. } => {
+                let done = format!("Removed {title} from the hub.");
+                self.start(Busy::Saving { done }, Op::RemoveFirmware { id })
+            }
+            Confirm::Update {
+                display,
+                package,
+                second,
+                ..
+            } => self.confirm_update(display, package, second),
+            Confirm::UpdateAgain { display, package, .. } => self.offer(display, package),
+            Confirm::RevokePublisher { id, label } => {
+                let done = format!("Removed the publisher {label}.");
+                self.start(Busy::Saving { done }, Op::RevokePublisher { id })
+            }
+            Confirm::Install { port, .. } => self.start_install(port),
         }
     }
 
@@ -1599,15 +1772,10 @@ impl Model {
                 self.take_refresh_opt(refresh, now);
                 let wifi = wifi_of(&self.enrol.ssid, &self.enrol.password).ok().flatten();
                 self.enrol.password.clear();
-                // The port this PC reaches the hub on is known to work; the hub's own idea is the fallback.
-                let port = match (self.hub.as_ref(), self.last.as_ref().map(|r| r.status.port)) {
-                    (Some(h), _) => h.port,
-                    (None, Some(p)) if p != 0 => p,
-                    _ => 8443,
-                };
+                let port = self.bundle_port();
                 match hub_client::provisioning::bundle(&grant, self.bundle_hosts(), port, wifi) {
                     Ok(b) => {
-                        self.enrol.bundle = Some(b);
+                        self.enrol.bundle = Some(self.bundle_with_pending(b));
                         self.enrol.stage = EnrolStage::Ready;
                         self.enrol.known = self.displays().iter().map(|d| d.id.clone()).collect();
                     }
@@ -1623,23 +1791,7 @@ impl Model {
             }
             Ok(Outcome::HelperInvite { invite, refresh }) => {
                 self.take_refresh_opt(refresh, now);
-                let string = self.hub.as_ref().and_then(|h| {
-                    use base64::Engine;
-                    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .decode(&invite.secret)
-                        .ok()?;
-                    let secret: [u8; 16] = raw.try_into().ok()?;
-                    Some(
-                        PairingString {
-                            host: h.host.clone(),
-                            port: h.port,
-                            spki_sha256: h.pin()?,
-                            secret,
-                        }
-                        .encode(),
-                    )
-                });
-                match string {
+                match self.invite_string(&invite.secret) {
                     Some(s) => {
                         self.helper.string = Some(Zeroizing::new(s));
                         self.helper.expires_at = Some(invite.expires_at);
@@ -1658,8 +1810,13 @@ impl Model {
             Ok(Outcome::Ports(p)) => {
                 self.enrol.ports = p;
                 self.enrol.scanned = true;
+                self.fw.install.scanned = true;
             }
             Ok(Outcome::Sent(display)) => {
+                // Any keys waiting from an install went with these setup details.
+                if self.enrol.bundle.as_ref().is_some_and(|b| b.firmware.is_some()) {
+                    self.pending_firmware = None;
+                }
                 let port = match busy {
                     Some(Busy::Sending { port }) => port,
                     _ => String::new(),
@@ -1693,6 +1850,20 @@ impl Model {
                     "Paste a new pairing string to connect again.",
                 ));
             }
+            Ok(Outcome::Uploaded {
+                package,
+                new,
+                refresh,
+            }) => {
+                self.take_refresh_opt(refresh, now);
+                self.uploaded(&package, new);
+            }
+            Ok(Outcome::PublisherInvite { invite, refresh }) => {
+                self.take_refresh_opt(refresh, now);
+                self.take_publisher_invite(invite);
+            }
+            Ok(Outcome::PackageLoaded(loaded)) => self.take_loaded(*loaded),
+            Ok(Outcome::Installed { after, refresh }) => self.take_installed(after, refresh, now),
             Err(f) => self.failed(f, busy, now),
         }
     }
@@ -1726,7 +1897,24 @@ impl Model {
                 next: Next::None,
             },
             Failure::Usb(e) => guidance::from_usb(e),
+            Failure::ReadFile(d) => Guidance {
+                tone: Tone::Problem,
+                title: "Couldn't read the file".into(),
+                detail: d.clone(),
+                next: Next::None,
+            },
+            Failure::Package(d) => guidance::from_package(d),
+            Failure::Install(e) => {
+                let port = match &busy {
+                    Some(Busy::Installing { port }) => port.clone(),
+                    _ => String::new(),
+                };
+                guidance::from_install(e, &port)
+            }
         };
+        if matches!(busy, Some(Busy::Installing { .. })) {
+            self.install_failed();
+        }
         if g.next == Next::PairAgain && self.hub.is_some() {
             self.needs_pairing = true;
         }
@@ -1915,7 +2103,7 @@ mod tests {
     use hub_core::StoredContent;
     use serde_json::json;
 
-    fn ts(s: &str) -> Timestamp {
+    pub(super) fn ts(s: &str) -> Timestamp {
         Timestamp::parse(s).unwrap()
     }
 
@@ -1948,7 +2136,7 @@ mod tests {
         p
     }
 
-    fn refresh(pages: Vec<PageView>) -> Refresh {
+    pub(super) fn refresh(pages: Vec<PageView>) -> Refresh {
         Refresh {
             status: HubStatus {
                 version: "0.1.0".into(),
@@ -1978,10 +2166,11 @@ mod tests {
             },
             helpers: vec![],
             ticks: Default::default(),
+            firmware: None,
         }
     }
 
-    fn connected(pages: Vec<PageView>) -> (Model, Instant) {
+    pub(super) fn connected(pages: Vec<PageView>) -> (Model, Instant) {
         let hub = SavedHub::new(
             "192.168.1.20",
             8443,
@@ -3336,6 +3525,7 @@ mod helper_string_tests {
             },
             helpers: vec![],
             ticks: Default::default(),
+            firmware: None,
         };
         m.finish(
             Ok(Outcome::HelperInvite {

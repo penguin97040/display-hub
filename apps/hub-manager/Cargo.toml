@@ -23,6 +23,8 @@ tokio.workspace = true
 zeroize.workspace = true
 base64.workspace = true
 serialport.workspace = true
+espflash.workspace = true
+firmware-package.workspace = true
 os-secrets.workspace = true
 dirs.workspace = true
 time = { workspace = true, features = ["local-offset"] }

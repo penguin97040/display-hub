@@ -4,6 +4,8 @@
 mod app;
 mod assets;
 mod field;
+mod firmware;
+mod flasher;
 mod forms;
 mod guidance;
 mod model;

@@ -12,7 +12,10 @@ use hub_protocol::pairing::hex;
 use hub_protocol::provisioning::Bundle;
 use zeroize::Zeroizing;
 
-use crate::model::{AddFailure, Failure, Op, Outcome, PortInfo, Refresh};
+use crate::firmware::{self, Board, Loaded};
+use crate::model::{
+    AddFailure, AfterFlash, Failure, InstallJob, Op, Outcome, PackageSource, PortInfo, Refresh, Shelf,
+};
 use crate::settings::{self, SavedHub};
 use os_secrets::TokenStore;
 
@@ -43,19 +46,32 @@ struct Session {
     token: Arc<Zeroizing<String>>,
 }
 
+/// Makes the board on a serial port, for a first install. Tests put a fake one in.
+pub type Boards = Arc<dyn Fn(&str) -> Box<dyn Board> + Send + Sync>;
+
 /// What the worker needs: where to keep things, and the current connection.
 pub struct Ctx {
     pub store: Arc<dyn TokenStore>,
     pub settings_dir: PathBuf,
     session: Mutex<Option<Session>>,
+    boards: Boards,
 }
 
 impl Ctx {
     pub fn new(store: Arc<dyn TokenStore>, settings_dir: PathBuf) -> Arc<Self> {
+        Self::with_boards(
+            store,
+            settings_dir,
+            Arc::new(|port: &str| Box::new(crate::flasher::EspBoard::new(port)) as Box<dyn Board>),
+        )
+    }
+
+    pub fn with_boards(store: Arc<dyn TokenStore>, settings_dir: PathBuf, boards: Boards) -> Arc<Self> {
         Arc::new(Self {
             store,
             settings_dir,
             session: Mutex::new(None),
+            boards,
         })
     }
 
@@ -122,7 +138,85 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         preview,
         helpers,
         ticks,
+        firmware: shelf(s).await,
     })
+}
+
+/// The firmware lists. A hub without signed updates doesn't have them, which isn't a failure.
+async fn shelf(s: &Session) -> Option<Shelf> {
+    let t = s.token.as_str();
+    let (packages, signers, publishers) = tokio::try_join!(
+        s.client.firmware_packages(t),
+        s.client.firmware_signers(t),
+        s.client.publishers(t),
+    )
+    .ok()?;
+    Some(Shelf {
+        packages,
+        signers,
+        publishers,
+    })
+}
+
+/// Reads a whole package file, refusing one too large to be a package before reading it.
+fn read_package(path: &Path) -> Result<Vec<u8>, Failure> {
+    let fail = |e: std::io::Error| Failure::ReadFile(format!("{}: {e}", path.display()));
+    let len = std::fs::metadata(path).map_err(fail)?.len();
+    if len > hub_protocol::limits::MAX_FIRMWARE_PACKAGE_BYTES {
+        return Err(Failure::Package(format!(
+            "the file is {len} bytes, more than a package can be"
+        )));
+    }
+    std::fs::read(path).map_err(fail)
+}
+
+fn check_package(bytes: Vec<u8>) -> Result<Loaded, Failure> {
+    Loaded::check(bytes).map_err(|e| Failure::Package(e.to_string()))
+}
+
+/// After a first install the board restarts, and a board with the chip's own USB disappears from the
+/// PC and comes back. Opens the port again until the display answers, for up to 40 seconds.
+pub fn send_after_install(
+    port: &str,
+    bundle: &Bundle,
+) -> Result<hub_client::usb::UsbDisplay, hub_client::usb::UsbError> {
+    use hub_client::usb::UsbError;
+    let deadline = std::time::Instant::now() + Duration::from_secs(40);
+    std::thread::sleep(Duration::from_millis(1500));
+    loop {
+        match send_usb(port, bundle) {
+            Err(UsbError::Port(_) | UsbError::NoAnswer) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_secs(1))
+            }
+            r => return r,
+        }
+    }
+}
+
+/// The provisioning half of a first install, once the board has restarted and the port is free:
+/// setup details from the hub, with the package's keys, sent over USB.
+fn provision_installed(rt: &tokio::runtime::Handle, s: &Session, job: &InstallJob) -> AfterFlash {
+    let grant = match rt.block_on(s.client.new_enrolment(&s.token, &job.name)) {
+        Ok(g) => g,
+        Err(e) => return AfterFlash::Hub(e),
+    };
+    let mut bundle =
+        match hub_client::provisioning::bundle(&grant, job.hosts.clone(), job.hub_port, job.wifi.clone()) {
+            Ok(b) => b,
+            Err(e) => return AfterFlash::Hub(hub_client::ClientError::Invalid(e)),
+        };
+    bundle.firmware = Some(job.firmware.clone());
+    let problems = bundle.problems();
+    if !problems.is_empty() {
+        return AfterFlash::Hub(hub_client::ClientError::Invalid(problems.join("; ")));
+    }
+    match send_after_install(&job.port, &bundle) {
+        Ok(d) => AfterFlash::Sent(d),
+        Err(error) => AfterFlash::Usb {
+            error,
+            bundle: Box::new(bundle),
+        },
+    }
 }
 
 /// The refresh that follows a change. The change is already made, so a refresh that fails must not
@@ -291,6 +385,97 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
                 .map_err(Failure::Settings)?;
             *ctx.session.lock().unwrap() = None;
             Ok(Outcome::Forgotten)
+        }
+        Op::UploadFirmware { path } => {
+            let s = ctx.session()?;
+            let bytes = blocking(move || read_package(&path)).await?;
+            // Checked here first, so a damaged file is explained without a round trip.
+            let bytes = blocking(move || check_package(bytes).map(|l| l.bytes)).await?;
+            let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|b| (*b).clone());
+            let (package, new) = s.client.upload_firmware(&s.token, bytes).await.map_err(c)?;
+            Ok(Outcome::Uploaded {
+                package: Box::new(package),
+                new,
+                refresh: refresh_after(&s).await,
+            })
+        }
+        Op::RemoveFirmware { id } => {
+            let s = ctx.session()?;
+            s.client.delete_firmware(&s.token, &id).await.map_err(c)?;
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
+        }
+        Op::OfferFirmware { display, package } => {
+            let s = ctx.session()?;
+            s.client
+                .offer_firmware(&s.token, &display, &package)
+                .await
+                .map_err(c)?;
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
+        }
+        Op::CancelOffer { display } => {
+            let s = ctx.session()?;
+            s.client
+                .cancel_firmware_offer(&s.token, &display)
+                .await
+                .map_err(c)?;
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
+        }
+        Op::SetSignerLabel { key_id, label } => {
+            let s = ctx.session()?;
+            match label {
+                Some(l) => s.client.set_signer_label(&s.token, &key_id, &l).await.map(|_| ()),
+                None => s.client.remove_signer_label(&s.token, &key_id).await,
+            }
+            .map_err(c)?;
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
+        }
+        Op::NewPublisher { label } => {
+            let s = ctx.session()?;
+            let invite = s.client.new_publisher(&s.token, &label).await.map_err(c)?;
+            Ok(Outcome::PublisherInvite {
+                invite,
+                refresh: refresh_after(&s).await,
+            })
+        }
+        Op::RevokePublisher { id } => {
+            let s = ctx.session()?;
+            s.client.revoke_publisher(&s.token, &id).await.map_err(c)?;
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
+        }
+        Op::LoadPackage { from } => {
+            let bytes = match from {
+                PackageSource::File(path) => blocking(move || read_package(&path)).await?,
+                PackageSource::Hub(id) => {
+                    let s = ctx.session()?;
+                    s.client.firmware_file(&s.token, &id).await.map_err(c)?
+                }
+            };
+            let loaded = blocking(move || check_package(bytes)).await?;
+            Ok(Outcome::PackageLoaded(Box::new(loaded)))
+        }
+        Op::Install(job) => {
+            // Paired first: nothing is erased for a PC that can't then make setup details.
+            let s = ctx.session()?;
+            let board = (ctx.boards)(&job.port);
+            let rt = tokio::runtime::Handle::current();
+            let session = s.clone();
+            let (after, job) = blocking(move || {
+                let after = firmware::install(board, &job.loaded, &job.plan, &job.progress, || {
+                    provision_installed(&rt, &session, &job)
+                });
+                (after, job)
+            })
+            .await;
+            let after = after.map_err(Failure::Install)?;
+            // The owner's name for the maker's key, once the display trusts it. A failure here
+            // doesn't undo the install; the name can be set on the Firmware screen.
+            if let (AfterFlash::Sent(_), Some((key_id, label))) = (&after, &job.label) {
+                let _ = s.client.set_signer_label(&s.token, key_id, label).await;
+            }
+            Ok(Outcome::Installed {
+                after,
+                refresh: refresh_after(&s).await,
+            })
         }
     }
 }
@@ -692,6 +877,250 @@ mod tests {
         assert!(store.load(&saved.token_account()).unwrap().is_none());
         assert_eq!(settings::load(&ctx.settings_dir).unwrap(), None);
         let _ = Outcome::Forgotten;
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod install_tests {
+    //! Install firmware through the model and the worker, against a real hub over pinned HTTPS and
+    //! the simulated display on a pseudo-terminal: the flash goes through a fake board (the
+    //! simulator's own `firmware install`), and the provisioning half is the real one.
+
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use display_simulator::firmware::store;
+    use display_simulator::{paired, usb};
+    use firmware_package::{build_and_sign, Release, SigningKey, UsbLayout, UsbPartFile};
+    use hub_core::FakeClock;
+    use hub_protocol::pairing::PairingString;
+    use serialport::SerialPort;
+
+    use super::*;
+    use crate::firmware::{BoardError, BoardInfo};
+    use crate::model::{EnrolStage, InstallStage, Model};
+    use os_secrets::MemoryStore;
+
+    /// Stands in for the board: "writing" is the simulator's own first install, done at restart.
+    /// With `wipe` off it leaves the display as it was, as a board that didn't really take the
+    /// firmware would.
+    struct SimBoard {
+        state: PathBuf,
+        loaded: Loaded,
+        wipe: bool,
+    }
+
+    impl Board for SimBoard {
+        fn connect(&mut self) -> Result<BoardInfo, BoardError> {
+            Ok(BoardInfo {
+                chip: "esp32s3".into(),
+                flash_bytes: 16 << 20,
+                secure_download: false,
+            })
+        }
+        fn erase_all(&mut self) -> Result<(), BoardError> {
+            Ok(())
+        }
+        fn write(&mut self, _: u32, bytes: &[u8], progress: &mut dyn FnMut(u64)) -> Result<(), BoardError> {
+            progress(bytes.len() as u64);
+            Ok(())
+        }
+        fn restart(self: Box<Self>) -> Result<(), BoardError> {
+            if self.wipe {
+                store::install_firmware(&self.state, &self.loaded.checked, &self.loaded.bytes)
+                    .map_err(|e| BoardError::Other(e.to_string()))?;
+            }
+            Ok(())
+        }
+    }
+
+    fn package(key: &SigningKey, key_set: Option<Vec<firmware_package::PublicKey>>) -> Loaded {
+        let release = Release {
+            device_type: store::DEVICE_TYPE.into(),
+            hardware_revisions: vec![store::HARDWARE_REVISION.into()],
+            firmware_version: "2.0.0".into(),
+            security_counter: 3,
+            summary: Some("The first signed release.".into()),
+            key_set,
+            usb_install: Some(UsbLayout {
+                chip: "esp32s3".into(),
+                min_flash_bytes: 4 << 20,
+                app_offset: 0x10000,
+                parts: vec![UsbPartFile {
+                    name: "bootloader".into(),
+                    offset: 0,
+                    bytes: vec![7; 100],
+                }],
+            }),
+        };
+        let built = build_and_sign(key, &release, &[3; 4000]).unwrap();
+        Loaded::check(built.bytes).unwrap()
+    }
+
+    /// The display end of a pty, answering until `stop` is set.
+    fn display_on_pty(state: PathBuf, stop: Arc<AtomicBool>) -> String {
+        let (mut master, slave) = serialport::TTYPort::pair().unwrap();
+        let path = slave.name().unwrap();
+        drop(slave);
+        std::thread::spawn(move || {
+            // Like a real port, it stays open after a bundle is accepted (the display refuses any
+            // more), until the test is done with it.
+            while !stop.load(Ordering::Relaxed) {
+                let _ = usb::answer(&mut master, &state);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        path
+    }
+
+    async fn run(model: &mut Model, ctx: &Arc<Ctx>, op: Option<Op>) {
+        let result = execute(ctx.clone(), op.expect("an operation")).await;
+        model.finish(result, Instant::now());
+    }
+
+    /// Picks the package, fills in the details, confirms and runs the install on `port`.
+    async fn install(m: &mut Model, ctx: &Arc<Ctx>, loaded: Loaded, port: &str, maker: &str) {
+        m.open_install();
+        m.finish(Ok(Outcome::PackageLoaded(Box::new(loaded))), Instant::now());
+        assert_eq!(m.fw.install.stage, InstallStage::Ready, "{:?}", m.notice);
+        m.fw.install.name.set("Kitchen");
+        m.fw.install.ssid.set("Home");
+        m.fw.install.maker.set(maker);
+        assert!(m.ask_install(port).is_none());
+        let op = m.confirm_yes();
+        assert!(matches!(op, Some(Op::Install(_))));
+        run(m, ctx, op).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn install_firmware_gives_a_display_its_makers_keys_and_a_locked_one_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("display");
+        let hub = hubd::open_hub(
+            hubd::config::Config {
+                data_dir: dir.path().join("hub"),
+                ..Default::default()
+            },
+            Arc::new(FakeClock::parse("2026-11-17T09:00:00Z")),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(hubd::serve_https(hub.clone(), listener, async {
+            let _ = rx.await;
+        }));
+        let pairing = PairingString {
+            host: "127.0.0.1".into(),
+            port,
+            spki_sha256: hub.identity.spki_sha256,
+            secret: hub.new_admin_pairing("test").unwrap(),
+        };
+
+        let maker = SigningKey::generate().unwrap().0;
+        let recovery = SigningKey::generate().unwrap().0;
+        let first = package(&maker, Some(vec![maker.public_key(), recovery.public_key()]));
+        let wipe = Arc::new(AtomicBool::new(true));
+        let boards: Boards = {
+            let (state, first, wipe) = (state.clone(), first.clone(), wipe.clone());
+            Arc::new(move |_port: &str| {
+                Box::new(SimBoard {
+                    state: state.clone(),
+                    loaded: first.clone(),
+                    wipe: wipe.load(Ordering::Relaxed),
+                }) as Box<dyn Board>
+            })
+        };
+        let ctx = Ctx::with_boards(Arc::new(MemoryStore::default()), dir.path().join("pc"), boards);
+        let mut m = Model::new(None, "Desk PC");
+        m.pairing.set(&pairing.encode());
+        let op = m.submit_pairing();
+        run(&mut m, &ctx, op).await;
+        assert!(m.connected(), "{:?}", m.notice);
+        assert!(m.shelf().is_some(), "this hub lists firmware");
+
+        // A display with no keys takes the package's key set and its security counter.
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = display_on_pty(state.clone(), stop.clone());
+        install(&mut m, &ctx, first.clone(), &path, "Kea Displays").await;
+        assert!(
+            matches!(m.fw.install.stage, InstallStage::Done { .. }),
+            "{:?}",
+            m.notice
+        );
+        assert!(
+            m.notice
+                .as_ref()
+                .unwrap()
+                .title
+                .starts_with("Installed llm-usage-display 2.0.0"),
+            "{:?}",
+            m.notice
+        );
+        let keys = store::keys(&state).unwrap();
+        assert_eq!(
+            keys.trusted_keys,
+            [maker.public_key().to_hex(), recovery.public_key().to_hex()]
+        );
+        assert_eq!(keys.security_floor, 3);
+        assert_eq!(store::running_version(&state).unwrap(), "2.0.0");
+        // The owner's name for the key is on the hub now.
+        assert_eq!(
+            m.signer(&maker.public_key().key_id().to_hex()).name(),
+            "Kea Displays"
+        );
+
+        // The display enrols with what it was sent, and the Displays screen sees it join.
+        let mut bundle = usb::load_bundle(&state).expect("the display kept the setup details");
+        assert!(bundle.firmware.is_some());
+        bundle.hub.hosts.retain(|h| h == "127.0.0.1");
+        paired::enrol(&bundle, &state).await.unwrap();
+        assert!(matches!(m.enrol.stage, EnrolStage::Waiting { .. }));
+        let op = m.refresh();
+        run(&mut m, &ctx, op).await;
+        assert!(
+            matches!(&m.enrol.stage, EnrolStage::Joined { name } if name == "Kitchen"),
+            "{:?}",
+            m.enrol.stage
+        );
+        let id = m.displays()[0].id.clone();
+        let fw = m.display_firmware(&id, Instant::now()).unwrap();
+        assert!(matches!(fw.trust, crate::firmware::Trust::Keys(ref k) if k.len() == 2));
+        assert_eq!(fw.version.as_deref(), Some("2.0.0"));
+        stop.store(true, Ordering::Relaxed);
+
+        // Factory-reset, then an "install" that never reached the flash, of another maker's
+        // package: the display still trusts the first maker, refuses the keys, and the app says so
+        // in plain words.
+        paired::reset(&state).unwrap();
+        wipe.store(false, Ordering::Relaxed);
+        let stranger = SigningKey::generate().unwrap().0;
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = display_on_pty(state.clone(), stop.clone());
+        m.close_install();
+        install(&mut m, &ctx, package(&stranger, None), &path, "").await;
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(
+            n.title,
+            "The firmware is installed, but the setup details weren't sent"
+        );
+        assert!(
+            n.detail.contains("This display trusts another maker's firmware")
+                && n.detail
+                    .contains("Only Install firmware, which erases the display"),
+            "{}",
+            n.detail
+        );
+        assert_eq!(
+            store::keys(&state).unwrap(),
+            keys,
+            "nothing changed on the display"
+        );
+        stop.store(true, Ordering::Relaxed);
+
         let _ = tx.send(());
         server.await.unwrap().unwrap();
     }

@@ -70,6 +70,10 @@ toml = { version = "=1.2.1", default-features = false, features = ["parse", "ser
 libc = "=0.2.191"
 # libudev off: port listing falls back to sysfs on Linux, so no system library is needed.
 serialport = { version = "=4.10.1", default-features = false }
+# Writing firmware to an ESP32 over USB (the manager's Install firmware): the esp-rs project's
+# flasher, as a library only. The `serialport` feature is the flasher; the default `cli` and
+# `update-check` features (a terminal UI, and a call home for new versions) are left out.
+espflash = { version = "=4.7.0", default-features = false, features = ["serialport"] }
 zeroize = "=1.9.1"
 # The desktop manager's admin token lives in the OS credential store, never a plain file.
 keyring-core = "=1.0.1"
