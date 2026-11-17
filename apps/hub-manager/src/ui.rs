@@ -134,6 +134,48 @@ pub fn data(text: impl Into<SharedString>) -> Div {
         .child(text.into())
 }
 
+/// A command to type or paste. It wraps only between words, each one whole with a
+/// fixed gap after it, so no space is ever lost or moved at a line end (a person typing it gets it right).
+pub fn command(text: &str) -> Div {
+    let mut row = div()
+        .flex()
+        .flex_wrap()
+        .font_family(FONT_MONO)
+        .text_size(px(15.0))
+        .line_height(px(15.0 * 1.4))
+        // No ligatures: "--run" must read as two hyphens, not one long dash that crowds its space.
+        .font_features(FontFeatures(Arc::new(vec![
+            ("calt".to_string(), 0),
+            ("liga".to_string(), 0),
+        ])))
+        .text_color(c(TEXT));
+    for word in text.split(' ') {
+        // A long path may break after a "/", so it never runs past the box. The pieces sit flush;
+        // only the word's end gets the gap.
+        let pieces = command_pieces(word);
+        let last = pieces.len() - 1;
+        for (i, piece) in pieces.into_iter().enumerate() {
+            let piece = div().whitespace_nowrap().child(piece);
+            // The gap is one mono space (0.6 em), a margin rather than a trailing space, which a
+            // line end would drop.
+            row = row.child(if i == last {
+                piece.mr(px(15.0 * 0.6))
+            } else {
+                piece
+            });
+        }
+    }
+    row
+}
+
+/// `word` split after each "/" when it is long enough to need it, keeping every character.
+fn command_pieces(word: &str) -> Vec<String> {
+    if word.chars().count() <= 24 {
+        return vec![word.to_string()];
+    }
+    word.split_inclusive('/').map(str::to_string).collect()
+}
+
 /// `.stat-big` with its label underneath.
 pub fn stat(value: impl Into<SharedString>, caption: &str) -> Div {
     div()
@@ -344,4 +386,19 @@ pub fn pattern() -> impl IntoElement {
     .top_0()
     .left_0()
     .size_full()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::command_pieces;
+
+    #[test]
+    fn a_long_path_breaks_after_slashes_and_keeps_every_character() {
+        let path = "/usr/local/share/display-hub/helpers/pi-status";
+        let pieces = command_pieces(path);
+        assert_eq!(pieces.concat(), path);
+        assert!(pieces.len() > 1 && pieces[..pieces.len() - 1].iter().all(|p| p.ends_with('/')));
+        assert_eq!(command_pieces("--run"), ["--run"]);
+        assert_eq!(command_pieces("display-hub-helper"), ["display-hub-helper"]);
+    }
 }

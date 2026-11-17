@@ -388,6 +388,11 @@ async fn a_display_only_ever_acts_as_itself() {
     c.heartbeat(&a, &info("board-a")).await.unwrap();
     let displays = c.displays(&admin).await.unwrap();
     let get = |id: &str| displays.iter().find(|d| d.id == id).unwrap().clone();
+    assert_eq!(
+        get(&a_id).pages,
+        Some(Vec::new()),
+        "the hub says what each display shows: nothing, as there are no pages"
+    );
     assert_eq!(get(&a_id).device.unwrap().hardware_revision, "board-a");
     assert_eq!(
         get(&b_id).device.unwrap().hardware_revision,

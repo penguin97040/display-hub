@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use fill::number_text;
 pub use hub_core::Settings;
 
 /// The largest template file read.

@@ -77,6 +77,10 @@ pub(crate) fn answer(f: &Field, v: &Value) -> Result<Option<Value>, String> {
                 out.push(Value::String(s.to_string()));
             }
             let n = out.len() as f64;
+            if f.required && out.is_empty() {
+                let least = f.min.unwrap_or(0.0).max(1.0);
+                return Err(format!("Choose at least {} for {label}.", count(least)));
+            }
             if let Some(lo) = f.min.filter(|lo| n < *lo) {
                 return Err(format!("Choose at least {} for {label}.", count(lo)));
             }
@@ -108,7 +112,8 @@ fn number_value(n: f64) -> Value {
     }
 }
 
-fn number_text(n: f64) -> String {
+/// A number as plain text: whole numbers without a decimal point.
+pub fn number_text(n: f64) -> String {
     number_value(n).to_string()
 }
 

@@ -443,3 +443,39 @@ fn the_example_in_the_docs_works_as_it_says() {
         ))
     );
 }
+
+#[test]
+fn a_required_multi_choice_refuses_an_empty_list() {
+    let t = Template::parse(
+        r#"{
+  "id": "picks/1", "name": "Picks", "description": "Some picks.",
+  "settings": [
+    { "key": "shows", "label": "Shows", "type": "multi_choice", "required": true,
+      "options": [ { "value": "a", "label": "A" }, { "value": "b", "label": "B" } ] }
+  ],
+  "pages": [ { "title": "Picks", "kind": "text", "source": "manual", "when": { "shows": "a" } } ]
+}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        t.make_pages(&answers(json!({"shows": []}))).unwrap_err(),
+        "Choose at least 1 option for Shows."
+    );
+    assert!(t.make_pages(&answers(json!({"shows": ["a"]}))).is_ok());
+
+    let two = Template::parse(
+        r#"{
+  "id": "picks/2", "name": "Picks", "description": "Some picks.",
+  "settings": [
+    { "key": "shows", "label": "Shows", "type": "multi_choice", "required": true, "min": 2,
+      "options": [ { "value": "a", "label": "A" }, { "value": "b", "label": "B" } ] }
+  ],
+  "pages": [ { "title": "Picks", "kind": "text", "source": "manual", "when": { "shows": "a" } } ]
+}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        two.make_pages(&answers(json!({"shows": []}))).unwrap_err(),
+        "Choose at least 2 options for Shows."
+    );
+}

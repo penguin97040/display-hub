@@ -384,19 +384,7 @@ impl HubClient {
         token: &str,
         new: &NewSubscription,
     ) -> Result<SubscriptionView, ClientError> {
-        let page = self.add_page(token, &new.to_new_page()).await?;
-        if new.source == Source::Demo {
-            return match self.set_demo(token, &page.id, new.service).await {
-                Ok(view) => Ok(view),
-                Err(e) => {
-                    // Don't leave a page with no figures behind. If this fails too, the first error is
-                    // the one worth reporting.
-                    let _ = self.remove_page(token, &page.id).await;
-                    Err(e)
-                }
-            };
-        }
-        as_usage(page)
+        as_usage(self.add_page_with_samples(token, &new.to_new_page()).await?)
     }
 
     /// Gives a demo usage page its service's sample figures.

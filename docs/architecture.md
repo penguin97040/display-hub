@@ -51,7 +51,7 @@ Everything under `/v1/admin/` needs an admin token from `hubd pair-admin`, excep
 | `GET`, `PATCH`, `DELETE /v1/admin/pages/{id}` | One page; change its title, source, stale time or settings (a new source drops what was stored, and the helper rule above applies; new settings replace the old, and `{}` removes them); remove it. The kind and template can't change. Pages without a template or settings list without those fields. |
 | `PUT /v1/admin/pages/order` | The new order, naming every page once. |
 | `PUT /v1/admin/pages/{id}/content` | What a manual or demo page shows: `data` in its kind's shape, and a note, stored as `manual` or `demo` after the page's source. It is checked as the hub checks a page before sending it (the kind's rules and the 3072-byte page cap), and a refusal says which rule broke. A meter with no items (`{"items": []}`) is also accepted, and shows as "No figures yet". The page must keep its source until the write happens. |
-| `GET /v1/admin/devices` | The displays. `DELETE /v1/admin/devices/{id}` revokes one and clears its ticks. |
+| `GET /v1/admin/devices` | The displays, each with `pages`: the ids of the pages it shows, in page order, read for all displays in one extra query (an older hub leaves `pages` out, and the manager then doesn't offer the tick list). `DELETE /v1/admin/devices/{id}` revokes one and clears its ticks. |
 | `GET`, `PUT /v1/admin/devices/{id}/pages` | The pages a display shows, as `{"ids": [...]}`. Order doesn't matter: displays share the page order. |
 | `POST /v1/admin/enrolments` | A one-time secret to set up a display. |
 | `GET /v1/admin/preview-snapshot` | The snapshot a display would get now. With `?display=<id>`, that display's; without, the first 10 of all pages. |

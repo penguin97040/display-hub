@@ -146,21 +146,25 @@ pub enum Op {
 pub enum Outcome {
     Paired {
         hub: SavedHub,
-        refresh: Refresh,
+        refresh: Option<Refresh>,
     },
-    Refreshed(Refresh),
+    /// A refresh, or a change followed by one. After a change the refresh may be `None` (it failed
+    /// but the change was made), and the next ordinary refresh brings the lists up to date.
+    Refreshed(Option<Refresh>),
     /// Pages were added. `failed` is set when one of them wasn't, and the ones after it weren't tried.
     Added {
-        refresh: Refresh,
+        /// `None` when the list couldn't be read again afterwards: the pages are on the hub, so the
+        /// next ordinary refresh brings the list up to date.
+        refresh: Option<Refresh>,
         failed: Option<AddFailure>,
     },
     Enrolment {
         grant: EnrolmentGrant,
-        refresh: Refresh,
+        refresh: Option<Refresh>,
     },
     HelperInvite {
         invite: HelperInvite,
-        refresh: Refresh,
+        refresh: Option<Refresh>,
     },
     GuideSaved,
     Ports(Vec<PortInfo>),
@@ -326,6 +330,8 @@ pub struct EditPage {
     pub can_demo: bool,
     /// An editor for typed-in content, for the four shapes.
     pub content: Option<ContentEdit>,
+    /// What the last save found wrong with the typed-in content, shown under the editor.
+    pub content_error: Option<String>,
 }
 
 impl EditPage {
@@ -366,6 +372,8 @@ impl EditPage {
 enum EditError {
     /// About the settings form: shown under it.
     Form(String),
+    /// About typed-in content: shown under its editor.
+    Content(String),
     /// About anything else: shown as a message.
     Notice(Guidance),
 }
@@ -388,7 +396,16 @@ fn pick_page(made: Vec<NewPage>, kind: &str, feed: &Option<String>, title: &str)
         .into_iter()
         .filter(|p| p.kind == kind && p.feed == *feed)
         .collect();
-    match same.iter().position(|p| p.title == title) {
+    // New pages are numbered when a title is taken ("Temp 2"), so match the title without that too.
+    let unnumbered = title
+        .rsplit_once(' ')
+        .filter(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+        .map(|(base, _)| base);
+    let at = same
+        .iter()
+        .position(|p| p.title == title)
+        .or_else(|| unnumbered.and_then(|base| same.iter().position(|p| p.title == base)));
+    match at {
         Some(at) => Some(same.swap_remove(at)),
         None if same.is_empty() => None,
         None => Some(same.remove(0)),
@@ -445,16 +462,14 @@ fn plan_edit(e: &EditPage, page: &PageView, hub_now: Option<Timestamp>) -> Resul
         if let Some(editor) = &e.content {
             let stored =
                 page.source == Source::Manual && page.content.as_ref().is_some_and(|c| c.data.is_some());
-            // A page with nothing typed in yet and a blank editor stays as it is.
-            if stored || !editor.is_blank() {
-                let built = editor.build(hub_now).map_err(|p| {
-                    EditError::Notice(Guidance {
-                        tone: Tone::Problem,
-                        title: p.title,
-                        detail: p.detail,
-                        next: Next::None,
-                    })
-                })?;
+            // Content is only rebuilt when something was typed (the boxes show rounded text, so
+            // rebuilding an untouched page would alter it), or when the page's content now comes
+            // from the editor. A page with nothing typed in yet and a blank editor stays as it is.
+            let rebuild = editor.is_edited() || page.source != Source::Manual;
+            if rebuild && (stored || !editor.is_blank()) {
+                let built = editor
+                    .build(hub_now)
+                    .map_err(|p| EditError::Content(format!("{}. {}", p.title, p.detail)))?;
                 let unchanged = page.source == Source::Manual
                     && page
                         .content
@@ -543,6 +558,8 @@ pub struct PageRow {
 pub struct TickRow {
     pub id: String,
     pub title: String,
+    /// What the page is, in words ("Big number"), to tell pages with one title apart.
+    pub kind: String,
     pub ticked: bool,
     /// Ticked, but past the first ten, so the display doesn't show it yet.
     pub waiting: bool,
@@ -620,6 +637,8 @@ pub struct Model {
     pub helper: HelperForm,
     /// The person closed the setup checklist (kept in `manager.json`).
     pub guide_dismissed: bool,
+    /// A change to the above that couldn't be saved yet because another operation was running.
+    guide_save_pending: Option<bool>,
     /// The install command was put on the clipboard.
     pub install_copied: bool,
 }
@@ -671,6 +690,7 @@ impl Model {
                 ..HelperForm::default()
             },
             guide_dismissed: false,
+            guide_save_pending: None,
             install_copied: false,
         }
     }
@@ -742,11 +762,20 @@ impl Model {
         self.set_guide(false)
     }
 
+    /// Shows or hides the checklist at once and saves the choice: now, or as soon as the operation
+    /// running has finished, so it is never lost.
     fn set_guide(&mut self, dismissed: bool) -> Option<Op> {
+        self.guide_dismissed = dismissed;
+        self.guide_save_pending = Some(dismissed);
+        self.save_guide_if_pending()
+    }
+
+    /// Saves a checklist choice that had to wait, once nothing else is running.
+    pub fn save_guide_if_pending(&mut self) -> Option<Op> {
         if self.busy.is_some() {
             return None;
         }
-        self.guide_dismissed = dismissed;
+        let dismissed = self.guide_save_pending.take()?;
         self.start(Busy::SavingGuide, Op::SaveGuide { dismissed })
     }
 
@@ -890,7 +919,7 @@ impl Model {
     /// Checks the form and adds the pages it makes.
     pub fn submit_add(&mut self) -> Option<Op> {
         let form = self.add.form.as_mut()?;
-        let pages = match form.check() {
+        let mut pages = match form.check() {
             Ok(p) => p,
             Err(e) => {
                 form.error = Some(e);
@@ -899,6 +928,12 @@ impl Model {
         };
         form.error = None;
         let setup = form.template.setup.clone();
+        // Pages with the same title can't be told apart in the lists, so a new one gets a number.
+        let mut taken: Vec<String> = self.pages().iter().map(|p| p.title.clone()).collect();
+        for p in &mut pages {
+            p.title = unique_title(&p.title, &taken);
+            taken.push(p.title.clone());
+        }
         if let Some(g) = self.page_limit_problem(pages.len()) {
             self.notice = Some(g);
             return None;
@@ -916,11 +951,11 @@ impl Model {
         self.start(Busy::Adding { done, setup }, Op::AddPages { pages })
     }
 
-    /// The command to put on the clipboard, and a note that it was copied.
-    pub fn copy_setup(&mut self) -> Option<String> {
-        let s = self.add.setup.as_mut()?;
-        s.copied = true;
-        Some(s.command.clone())
+    /// Notes that the setup command was copied (the button puts it on the clipboard).
+    pub fn copy_setup(&mut self) {
+        if let Some(s) = self.add.setup.as_mut() {
+            s.copied = true;
+        }
     }
 
     /// Done with the setup step: back to the list of templates.
@@ -936,6 +971,9 @@ impl Model {
         }
         if let Some(f) = self.edit.as_mut().and_then(|e| e.form.as_mut()) {
             f.error = None;
+        }
+        if let Some(e) = self.edit.as_mut() {
+            e.content_error = None;
         }
     }
 
@@ -982,6 +1020,7 @@ impl Model {
         title.set(&p.title);
         self.edit = Some(EditPage {
             content: ContentEdit::for_page(&p, hub_now),
+            content_error: None,
             id: p.id,
             kind: p.kind,
             feed: p.feed,
@@ -1016,6 +1055,12 @@ impl Model {
                 }
                 return None;
             }
+            Err(EditError::Content(msg)) => {
+                if let Some(e) = self.edit.as_mut() {
+                    e.content_error = Some(msg);
+                }
+                return None;
+            }
             Err(EditError::Notice(g)) => return self.problem(g),
         };
         let done = format!("Saved {}. {}", plan.title, self.next_poll_text());
@@ -1029,6 +1074,24 @@ impl Model {
         )?;
         self.edit = None;
         Some(op)
+    }
+
+    /// The note under a page on the Overview. The hub's "no source" wording is for displays; here
+    /// it says what the page is waiting for, by where its content comes from.
+    pub fn preview_note(&self, page: &hub_protocol::Page) -> Option<String> {
+        let note = page.note.clone()?;
+        if note != hub_core::build::NO_SOURCE_NOTE {
+            return Some(note);
+        }
+        let source = self.pages().iter().find(|p| p.id == page.id).map(|p| p.source);
+        Some(
+            match source {
+                Some(Source::Manual) => "Nothing typed in yet",
+                Some(Source::None) => "No source chosen yet",
+                _ => return Some(note),
+            }
+            .to_string(),
+        )
     }
 
     pub fn page_rows(&self, now: Instant) -> Vec<PageRow> {
@@ -1097,7 +1160,8 @@ impl Model {
 
     /// Which displays show a page, as the Pages list words it. `None` when there are no displays.
     pub fn on_displays_text(&self, page: &str) -> Option<String> {
-        if self.displays().is_empty() {
+        // Nothing to say with no displays, or when the hub doesn't say what its displays show.
+        if self.displays().is_empty() || self.displays().iter().all(|d| self.shown_ids(&d.id).is_none()) {
             return None;
         }
         let names: Vec<&str> = self
@@ -1143,6 +1207,7 @@ impl Model {
                 TickRow {
                     id: p.id.clone(),
                     title: p.title.clone(),
+                    kind: crate::shown::kind_label(&p.kind),
                     ticked: is_on,
                     waiting: is_on && seen > MAX_PAGES,
                     can_change: is_on || ticked < MAX_PAGES,
@@ -1426,6 +1491,14 @@ impl Model {
 
     // ---- answers ------------------------------------------------------------------------------------
 
+    /// Takes a refresh that may be missing. If it is, one is due at once.
+    fn take_refresh_opt(&mut self, r: Option<Refresh>, now: Instant) {
+        match r {
+            Some(r) => self.take_refresh(r, now),
+            None => self.refreshed_at = None,
+        }
+    }
+
     fn take_refresh(&mut self, r: Refresh, now: Instant) {
         if let EnrolStage::Waiting { .. } = self.enrol.stage {
             if let Some(d) = r.displays.iter().find(|d| !self.enrol.known.contains(&d.id)) {
@@ -1462,14 +1535,14 @@ impl Model {
                 self.hub = Some(hub);
                 self.needs_pairing = false;
                 self.section = Section::Overview;
-                self.take_refresh(refresh, now);
+                self.take_refresh_opt(refresh, now);
                 self.notice = Some(Guidance::done(
                     "Paired",
                     "This PC can now manage your hub. The checklist on the Overview shows what's left to do.",
                 ));
             }
             Ok(Outcome::Refreshed(r)) => {
-                self.take_refresh(r, now);
+                self.take_refresh_opt(r, now);
                 if let Some(Busy::Saving { done }) =
                     busy.filter(|b| !matches!(b, Busy::Saving { done } if done.is_empty()))
                 {
@@ -1481,8 +1554,19 @@ impl Model {
             }
             Ok(Outcome::Added { refresh, failed }) => {
                 let old: Vec<String> = self.pages().iter().map(|p| p.id.clone()).collect();
-                let held = self.held_back(&old, &refresh);
-                self.take_refresh(refresh, now);
+                let held = match refresh {
+                    Some(r) => {
+                        let held = self.held_back(&old, &r);
+                        self.take_refresh(r, now);
+                        held
+                    }
+                    None => {
+                        // The form closes either way, so pressing Add again can't double what was
+                        // added; a refresh is due at once.
+                        self.refreshed_at = None;
+                        String::new()
+                    }
+                };
                 self.add.form = None;
                 match (failed, busy) {
                     (None, Some(Busy::Adding { done, setup })) => {
@@ -1512,7 +1596,7 @@ impl Model {
                 }
             }
             Ok(Outcome::Enrolment { grant, refresh }) => {
-                self.take_refresh(refresh, now);
+                self.take_refresh_opt(refresh, now);
                 let wifi = wifi_of(&self.enrol.ssid, &self.enrol.password).ok().flatten();
                 self.enrol.password.clear();
                 // The port this PC reaches the hub on is known to work; the hub's own idea is the fallback.
@@ -1538,7 +1622,7 @@ impl Model {
                 }
             }
             Ok(Outcome::HelperInvite { invite, refresh }) => {
-                self.take_refresh(refresh, now);
+                self.take_refresh_opt(refresh, now);
                 let string = self.hub.as_ref().and_then(|h| {
                     use base64::Engine;
                     let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1649,6 +1733,9 @@ impl Model {
         // A reorder shown early is put back by the next refresh.
         if matches!(busy, Some(Busy::Saving { .. } | Busy::Adding { .. })) {
             self.refreshed_at = None;
+        } else if busy == Some(Busy::Refreshing) {
+            // A refresh that failed for any reason waits its turn before the next, never every tick.
+            self.refreshed_at = Some(now);
         }
         self.notice = Some(g);
     }
@@ -1754,6 +1841,23 @@ pub fn parse_percent(s: &str) -> Result<Option<f64>, ()> {
         return Ok(None);
     }
     s.parse::<f64>().ok().and_then(clean_percent).map(Some).ok_or(())
+}
+
+/// A title no page on the hub has yet: "Big number" becomes "Big number 2", then "Big number 3".
+fn unique_title(title: &str, taken: &[String]) -> String {
+    let used = |t: &str| taken.iter().any(|x| x.to_lowercase() == t.to_lowercase());
+    if !used(title) {
+        return title.to_string();
+    }
+    (2..)
+        .map(|n| {
+            let tail = format!(" {n}");
+            let room = MAX_TITLE_LEN.saturating_sub(tail.chars().count());
+            let base: String = title.chars().take(room).collect();
+            format!("{}{tail}", base.trim_end())
+        })
+        .find(|t| !used(t))
+        .expect("an endless count finds one")
 }
 
 /// "3 h 20 min", "2d 4h", "45m". Empty means unknown. At most 31 days.
@@ -1886,7 +1990,7 @@ mod tests {
         );
         let mut m = Model::new(Some(hub), "Desk PC");
         let now = Instant::now();
-        m.finish(Ok(Outcome::Refreshed(refresh(pages))), now);
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(pages)))), now);
         (m, now)
     }
 
@@ -1969,7 +2073,7 @@ mod tests {
         assert!(m.submit_add().is_none(), "one operation at a time");
         m.finish(
             Ok(Outcome::Added {
-                refresh: refresh(vec![page("x", Source::Manual)]),
+                refresh: Some(refresh(vec![page("x", Source::Manual)])),
                 failed: None,
             }),
             now,
@@ -2035,7 +2139,7 @@ mod tests {
         );
         m.finish(
             Ok(Outcome::Added {
-                refresh: refresh(vec![page("pi-status", Source::Helper)]),
+                refresh: Some(refresh(vec![page("pi-status", Source::Helper)])),
                 failed: None,
             }),
             now,
@@ -2043,7 +2147,7 @@ mod tests {
         let setup = m.add.setup.clone().expect("a setup step");
         assert!(setup.command.starts_with("sudo display-hub-helper add pi-status"));
         assert!(setup.help.contains("Raspberry Pi") && !setup.copied);
-        assert_eq!(m.copy_setup().as_deref(), Some(setup.command.as_str()));
+        m.copy_setup();
         assert!(m.add.setup.as_ref().unwrap().copied);
         m.finish_setup();
         assert!(m.add.setup.is_none() && m.add.form.is_none());
@@ -2056,7 +2160,7 @@ mod tests {
         assert!(m.submit_add().is_some());
         m.finish(
             Ok(Outcome::Added {
-                refresh: refresh(vec![page("a", Source::Manual)]),
+                refresh: Some(refresh(vec![page("a", Source::Manual)])),
                 failed: Some(AddFailure {
                     added: 1,
                     total: 3,
@@ -2076,6 +2180,23 @@ mod tests {
         assert!(m.submit_add().is_some());
         m.finish(Err(Failure::Client(ClientError::Timeout)), now);
         assert!(m.add.form.is_some());
+    }
+
+    #[test]
+    fn pages_added_but_the_list_not_read_back_close_the_form_and_refresh_soon() {
+        let (mut m, now) = connected(vec![]);
+        pick(&mut m, "short-text/1");
+        assert!(m.submit_add().is_some());
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: None,
+                failed: None,
+            }),
+            now,
+        );
+        assert!(m.add.form.is_none(), "closed, so Add can't be pressed again");
+        assert_eq!(m.notice.as_ref().map(|n| n.tone), Some(Tone::Done));
+        assert!(m.refresh_due(now).is_some(), "the list catches up at once");
     }
 
     fn typed_in(id: &str, kind: &str, data: serde_json::Value) -> PageView {
@@ -2111,7 +2232,23 @@ mod tests {
         assert_eq!(rows[0].resets_in.text, "2 h");
         rows[1].percent.set("abc");
         assert!(m.save_edit(now).is_none());
-        assert!(m.notice.as_ref().unwrap().title.contains("0 to 100"));
+        assert!(
+            m.edit
+                .as_ref()
+                .unwrap()
+                .content_error
+                .as_deref()
+                .unwrap()
+                .contains("0 to 100"),
+            "shown under the editor, not along the bottom"
+        );
+        assert!(m.notice.is_none());
+        m.typing();
+        assert!(
+            m.edit.as_ref().unwrap().content_error.is_none(),
+            "clears on the next change"
+        );
+        m.save_edit(now);
         let Some(crate::forms::ContentEdit {
             shape: crate::forms::Shape::UsageMeter { rows, .. },
             ..
@@ -2138,6 +2275,169 @@ mod tests {
     }
 
     #[test]
+    fn a_title_only_edit_keeps_content_that_the_boxes_show_rounded_or_not_at_all() {
+        let mut meter = typed_in(
+            "tank",
+            "meter",
+            json!({"items":[
+                {"id":"a","label":"Soon","percent":10.0,"resets_at":"2026-11-10T20:00:30Z"},
+                {"id":"b","label":"Later","percent":20.0,"resets_at":"2026-11-10T22:00:45Z"},
+                {"id":"c","label":"Gone","percent":30.0,"resets_at":"2026-11-10T10:00:00Z"}]}),
+        );
+        meter.title = "Tank".into();
+        let big = typed_in(
+            "big",
+            "big_number",
+            json!({"value": 1234.56789, "decimals": 2, "unit": "m"}),
+        );
+        let whole = typed_in("whole", "big_number", json!({"value": 5.0, "decimals": 0}));
+        let (mut m, now) = connected(vec![meter, big, whole]);
+        for id in ["tank", "big", "whole"] {
+            m.begin_edit(id, now);
+            m.edit.as_mut().unwrap().title.set("Renamed");
+            let Some(Op::SaveEdit { content, .. }) = m.save_edit(now) else {
+                panic!("{id}: save")
+            };
+            assert!(
+                content.is_none(),
+                "{id}: nothing typed, so the content isn't touched"
+            );
+            m.finish(Ok(Outcome::Refreshed(Some(refresh(m.pages().to_vec())))), now);
+        }
+        // A sub-minute reset reads as something the box takes back.
+        m.begin_edit("tank", now);
+        let Some(crate::forms::ContentEdit {
+            shape: crate::forms::Shape::Meter { rows },
+            ..
+        }) = m.edit.as_mut().unwrap().content.as_mut()
+        else {
+            panic!()
+        };
+        assert_eq!(rows[0].resets_in.text, "1 min");
+        assert!(rows[2].resets_in.text.is_empty(), "a past time can't be shown");
+        rows[0].percent.set("11");
+        let Some(Op::SaveEdit { content: Some(c), .. }) = m.save_edit(now) else {
+            panic!("save")
+        };
+        let items = c.data.unwrap()["items"].clone();
+        assert_eq!(items[0]["percent"], 11.0);
+        assert_eq!(
+            items[0]["resets_at"], "2026-11-10T20:00:30Z",
+            "the stored time is kept"
+        );
+        assert_eq!(items[1]["resets_at"], "2026-11-10T22:00:45Z");
+        assert!(
+            items[2]["resets_at"].is_null(),
+            "a reset already past means nothing, so it is dropped once the bar is edited"
+        );
+    }
+
+    #[test]
+    fn an_empty_typed_in_page_says_nothing_is_typed_in_on_the_overview() {
+        let (m, _) = connected(vec![page("a", Source::Manual), page("b", Source::None)]);
+        let hub_page = |id: &str, note: &str| hub_protocol::Page {
+            id: id.into(),
+            title: "T".into(),
+            kind: "text".into(),
+            data_quality: DataQuality::Unavailable,
+            updated_at: None,
+            stale_after_seconds: 3600,
+            note: Some(note.into()),
+            data: None,
+        };
+        let said = hub_core::build::NO_SOURCE_NOTE;
+        assert_eq!(
+            m.preview_note(&hub_page("a", said)).as_deref(),
+            Some("Nothing typed in yet")
+        );
+        assert_eq!(
+            m.preview_note(&hub_page("b", said)).as_deref(),
+            Some("No source chosen yet")
+        );
+        assert_eq!(m.preview_note(&hub_page("a", "Other")).as_deref(), Some("Other"));
+    }
+
+    #[test]
+    fn a_secret_from_the_hub_is_kept_when_the_refresh_after_it_failed() {
+        let (mut m, now) = connected(vec![]);
+        m.enrol.name.set("Desk");
+        let Some(Op::NewEnrolment { .. }) = m.create_setup() else {
+            panic!("enrol")
+        };
+        let grant = EnrolmentGrant {
+            secret: "s".repeat(22),
+            expires_at: ts("2026-11-10T20:10:00Z"),
+            identity: HubIdentity {
+                certificate_pem: "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n".into(),
+                spki_sha256: "ab".repeat(32),
+                server_name: hub_protocol::provisioning::HUB_SERVER_NAME.into(),
+            },
+        };
+        m.finish(Ok(Outcome::Enrolment { grant, refresh: None }), now);
+        assert!(m.enrol.bundle.is_some(), "the one-time setup details are shown");
+        assert!(m.refresh_due(now).is_some(), "and a refresh is due");
+    }
+
+    #[test]
+    fn a_refresh_that_fails_for_any_reason_waits_before_the_next() {
+        let (mut m, now) = connected(vec![]);
+        m.refreshed_at = None;
+        let Some(Op::Refresh) = m.refresh_due(now) else {
+            panic!("due")
+        };
+        m.finish(Err(Failure::File("odd".into())), now);
+        assert!(m.refresh_due(now + Duration::from_secs(1)).is_none(), "backs off");
+        assert!(m.refresh_due(now + REFRESH_EVERY).is_some());
+    }
+
+    #[test]
+    fn editing_a_numbered_page_matches_its_template_page() {
+        let made = |title: &str| NewPage {
+            title: title.into(),
+            kind: "text".into(),
+            source: Source::Manual,
+            feed: None,
+            id: None,
+            stale_after_seconds: None,
+            template: None,
+            settings: None,
+        };
+        let pick = |on: &str| {
+            pick_page(vec![made("Temp"), made("Humidity")], "text", &None, on)
+                .unwrap()
+                .title
+        };
+        assert_eq!(pick("Humidity"), "Humidity");
+        assert_eq!(
+            pick("Humidity 2"),
+            "Humidity",
+            "numbered when the title was taken"
+        );
+        assert_eq!(pick("Temp 12"), "Temp");
+        assert_eq!(pick("Renamed"), "Temp", "else the first, as before");
+    }
+
+    #[test]
+    fn a_new_page_with_a_title_already_on_the_hub_gets_a_number() {
+        let mut existing = page("a", Source::Manual);
+        existing.title = "Note".into();
+        let (mut m, _) = connected(vec![existing]);
+        pick(&mut m, "short-text/1");
+        let Some(Op::AddPages { pages }) = m.submit_add() else {
+            panic!("adds")
+        };
+        assert_eq!(pages[0].title, "Note 2");
+        assert_eq!(unique_title("Tank", &["tank".into()]), "Tank 2");
+        assert_eq!(unique_title("Tank", &["Tank".into(), "Tank 2".into()]), "Tank 3");
+        assert_eq!(unique_title("Tank", &[]), "Tank");
+        let long = "x".repeat(MAX_TITLE_LEN);
+        assert_eq!(
+            unique_title(&long, std::slice::from_ref(&long)).chars().count(),
+            MAX_TITLE_LEN
+        );
+    }
+
+    #[test]
     fn a_title_only_edit_of_typed_in_content_doesnt_resend_it() {
         let (mut m, now) = connected(vec![typed_in("t", "text", json!({"text": "Back at 3"}))]);
         m.begin_edit("t", now);
@@ -2153,7 +2453,7 @@ mod tests {
         assert!(m.edit.is_none());
 
         let again = refresh(vec![typed_in("t", "text", json!({"text": "Back at 3"}))]);
-        m.finish(Ok(Outcome::Refreshed(again)), now);
+        m.finish(Ok(Outcome::Refreshed(Some(again))), now);
         m.begin_edit("t", now);
         let Some(crate::forms::ContentEdit {
             shape: crate::forms::Shape::Text { text },
@@ -2431,7 +2731,7 @@ mod tests {
         assert!(m.notice.as_ref().unwrap().detail.contains("192.168.1.20:8443"));
         assert!(m.refresh_due(now).is_none(), "no instant retry loop");
         m.refresh_due(now + REFRESH_EVERY).unwrap();
-        m.finish(Ok(Outcome::Refreshed(refresh(vec![]))), now + REFRESH_EVERY);
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now + REFRESH_EVERY);
         assert!(m.notice.is_none(), "back online clears the problem");
 
         m.refresh().unwrap();
@@ -2473,7 +2773,7 @@ mod tests {
         m.finish(
             Ok(Outcome::Enrolment {
                 grant,
-                refresh: refresh(vec![]),
+                refresh: Some(refresh(vec![])),
             }),
             now,
         );
@@ -2510,8 +2810,9 @@ mod tests {
             enrolled_at: ts("2026-11-10T20:01:00Z"),
             last_seen_at: None,
             device: None,
+            pages: None,
         });
-        m.finish(Ok(Outcome::Refreshed(r)), now + WATCH_EVERY);
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now + WATCH_EVERY);
         assert_eq!(m.enrol.stage, EnrolStage::Joined { name: "Desk".into() });
         assert!(m.enrol.bundle.is_none(), "the used secret is dropped");
     }
@@ -2560,6 +2861,7 @@ mod tests {
             enrolled_at: ts("2026-11-10T19:00:00Z"),
             last_seen_at: None,
             device: None,
+            pages: None,
         }
     }
 
@@ -2575,7 +2877,7 @@ mod tests {
             r.displays.push(display(id, name));
             r.ticks.insert((*id).into(), ticked.clone());
         }
-        m.finish(Ok(Outcome::Refreshed(r)), now);
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
         (m, now)
     }
 
@@ -2702,7 +3004,7 @@ mod tests {
         let mut r = refresh(vec![page("p01", Source::Manual), page("p02", Source::Manual)]);
         r.displays.push(display("d1", "Kitchen"));
         r.ticks.insert("d1".into(), vec!["p01".into(), "p02".into()]);
-        m.finish(Ok(Outcome::Refreshed(r)), now);
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
         let v = m.tick_view("d1").unwrap();
         assert!(!v.dirty, "the hub now has what was asked for");
         assert_eq!(ticked_ids(&m, "d1"), ["p01", "p02"]);
@@ -2730,7 +3032,7 @@ mod tests {
         ]);
         r.displays.push(display("d1", "Kitchen"));
         r.ticks.insert("d1".into(), vec!["p01".into(), "p04".into()]);
-        m.finish(Ok(Outcome::Refreshed(r)), now);
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
         assert_eq!(m.tick_changes.len(), 1);
         assert_eq!(m.tick_changes["d1"].len(), 1);
         assert_eq!(
@@ -2749,6 +3051,8 @@ mod tests {
         m.toggle_tick("d9", "p01");
         assert!(m.tick_changes.is_empty());
         assert!(m.save_ticks("d9").is_none());
+        // With no display saying what it shows, the Pages list doesn't claim "Not on any display".
+        assert_eq!(m.on_displays_text("p01"), None);
     }
 
     #[test]
@@ -2798,7 +3102,7 @@ mod tests {
         });
         m.finish(
             Ok(Outcome::Added {
-                refresh: r,
+                refresh: Some(r),
                 failed: None,
             }),
             now,
@@ -2819,7 +3123,7 @@ mod tests {
         });
         m.finish(
             Ok(Outcome::Added {
-                refresh: r,
+                refresh: Some(r),
                 failed: None,
             }),
             now,
@@ -2906,11 +3210,30 @@ mod tests {
     }
 
     #[test]
-    fn closing_the_checklist_waits_while_something_else_is_running() {
-        let (mut m, _) = with_ticks(0, &[]);
+    fn closing_the_checklist_while_something_runs_applies_at_once_and_saves_afterwards() {
+        let (mut m, now) = with_ticks(0, &[]);
         m.busy = Some(Busy::Refreshing);
-        assert!(m.dismiss_guide().is_none());
-        assert!(!m.guide_dismissed, "nothing was saved, so nothing changes");
+        assert!(m.dismiss_guide().is_none(), "one operation at a time");
+        assert!(
+            m.guide_dismissed && m.guide_items().is_none(),
+            "hidden straight away"
+        );
+        assert!(m.save_guide_if_pending().is_none(), "still busy");
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now);
+        let Some(Op::SaveGuide { dismissed: true }) = m.save_guide_if_pending() else {
+            panic!("the choice is saved once the refresh is done")
+        };
+        m.finish(Ok(Outcome::GuideSaved), now);
+        assert!(m.save_guide_if_pending().is_none(), "saved once");
+        // Changing your mind while busy saves only the last choice.
+        m.busy = Some(Busy::Refreshing);
+        m.dismiss_guide();
+        m.show_guide_again();
+        m.busy = None;
+        assert!(matches!(
+            m.save_guide_if_pending(),
+            Some(Op::SaveGuide { dismissed: false })
+        ));
     }
 
     #[test]
@@ -3009,7 +3332,13 @@ mod helper_string_tests {
             helpers: vec![],
             ticks: Default::default(),
         };
-        m.finish(Ok(Outcome::HelperInvite { invite, refresh }), Instant::now());
+        m.finish(
+            Ok(Outcome::HelperInvite {
+                invite,
+                refresh: Some(refresh),
+            }),
+            Instant::now(),
+        );
         let s = m.helper.string.clone().expect("a string");
         // As shown: grouped with spaces, which the decoder ignores.
         let shown: String = s

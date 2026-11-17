@@ -151,6 +151,10 @@ pub struct DisplayView {
     pub enrolled_at: Timestamp,
     pub last_seen_at: Option<Timestamp>,
     pub device: Option<hub_protocol::device::DeviceInfo>,
+    /// The ids of the pages the display shows (its ticks), in the shared page order. Left out by a
+    /// hub that doesn't say, so the manager never reads that as "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<String>>,
 }
 
 /// `POST /v1/admin/enrolments`: asks for a one-time secret to set up a display.

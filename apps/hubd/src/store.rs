@@ -479,6 +479,8 @@ pub struct DeviceRow {
     pub enrolled_at: Timestamp,
     pub last_seen_at: Option<Timestamp>,
     pub info: Option<DeviceInfo>,
+    /// The ids of the pages the display shows (its ticks), in the shared page order.
+    pub pages: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -880,9 +882,38 @@ impl Store {
                 info: r
                     .get::<_, Option<String>>(4)?
                     .and_then(|s| serde_json::from_str(&s).ok()),
+                pages: Vec::new(),
             })
         })?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let mut devices: Vec<DeviceRow> = rows.collect::<Result<_, _>>()?;
+        // Every display's ticks in a second query (not one per display), in the shared page order.
+        let at: std::collections::HashMap<String, usize> = devices
+            .iter()
+            .enumerate()
+            .map(|(i, d)| (d.id.clone(), i))
+            .collect();
+        let mut st = conn.prepare(
+            "SELECT t.device_id, p.id FROM display_pages t JOIN pages p ON p.id = t.page_id
+             ORDER BY p.position, p.created_at",
+        )?;
+        let ticks = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for tick in ticks {
+            let (device, page) = tick?;
+            if let Some(&i) = at.get(&device) {
+                devices[i].pages.push(page);
+            }
+        }
+        Ok(devices)
+    }
+
+    /// How many displays are active, without reading their ticks.
+    pub fn device_count(&self) -> Result<usize, StoreError> {
+        let n: i64 =
+            self.conn()
+                .query_row("SELECT COUNT(*) FROM devices WHERE revoked_at IS NULL", [], |r| {
+                    r.get(0)
+                })?;
+        Ok(n as usize)
     }
 
     /// Revokes a display and its credentials. False if there was no such active display.
@@ -1816,6 +1847,24 @@ mod tests {
             Err(StoreError::Invalid(_))
         ));
         assert_eq!(ids("d-1"), ["c", "a"], "a refused change changes nothing");
+        // The device list carries every display's ticks, in the same order.
+        assert_eq!(store.device_count().unwrap(), 2);
+        let listed: Vec<(String, Vec<String>)> = store
+            .devices()
+            .unwrap()
+            .into_iter()
+            .map(|d| (d.id, d.pages))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("d-1".to_string(), vec!["c".to_string(), "a".to_string()]),
+                (
+                    "d-2".to_string(),
+                    vec!["c".to_string(), "b".to_string(), "a".to_string()]
+                ),
+            ]
+        );
         assert!(!store.set_display_pages("d-unknown", &[]).unwrap());
         assert!(store.set_display_pages("d-2", &[]).unwrap());
         assert!(ids("d-2").is_empty());

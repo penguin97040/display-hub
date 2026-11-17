@@ -10,7 +10,7 @@ use hub_protocol::limits::{
 use hub_protocol::shapes::{classify_kind, KindClass, KIND_BIG_NUMBER, KIND_LIST, KIND_METER, KIND_TEXT};
 use hub_protocol::text::sanitise_text;
 use hub_protocol::{BigNumber, DataQuality, List, ListItem, Meter, MeterItem, TextBlock, Timestamp};
-use hub_templates::{Field as Setting, FieldKind, Settings, Template, DEFAULT_TEXT_SETTING_LEN};
+use hub_templates::{number_text, Field as Setting, FieldKind, Settings, Template, DEFAULT_TEXT_SETTING_LEN};
 use serde_json::Value;
 use usage::{ManualFigures, ManualMetric, Service, Window};
 
@@ -200,9 +200,11 @@ impl TemplateForm {
         let mut parts: Vec<String> = s.help.iter().cloned().collect();
         match s.kind {
             FieldKind::Number => match (s.min, s.max) {
-                (Some(lo), Some(hi)) => parts.push(format!("From {} to {}.", plain(lo), plain(hi))),
-                (Some(lo), None) => parts.push(format!("At least {}.", plain(lo))),
-                (None, Some(hi)) => parts.push(format!("At most {}.", plain(hi))),
+                (Some(lo), Some(hi)) => {
+                    parts.push(format!("From {} to {}.", number_text(lo), number_text(hi)))
+                }
+                (Some(lo), None) => parts.push(format!("At least {}.", number_text(lo))),
+                (None, Some(hi)) => parts.push(format!("At most {}.", number_text(hi))),
                 (None, None) => {}
             },
             FieldKind::Text => parts.push(format!(
@@ -210,9 +212,11 @@ impl TemplateForm {
                 s.max_length.unwrap_or(DEFAULT_TEXT_SETTING_LEN)
             )),
             FieldKind::MultiChoice => match (s.min, s.max) {
-                (Some(lo), Some(hi)) => parts.push(format!("Choose {} to {}.", plain(lo), plain(hi))),
-                (Some(lo), None) => parts.push(format!("Choose at least {}.", plain(lo))),
-                (None, Some(hi)) => parts.push(format!("Choose at most {}.", plain(hi))),
+                (Some(lo), Some(hi)) => {
+                    parts.push(format!("Choose {} to {}.", number_text(lo), number_text(hi)))
+                }
+                (Some(lo), None) => parts.push(format!("Choose at least {}.", number_text(lo))),
+                (None, Some(hi)) => parts.push(format!("Choose at most {}.", number_text(hi))),
                 (None, None) => {}
             },
             _ => {}
@@ -226,14 +230,6 @@ impl TemplateForm {
             .settings
             .get(i)
             .is_some_and(|s| s.required && s.kind != FieldKind::YesNo)
-    }
-}
-
-fn plain(n: f64) -> String {
-    if n.fract() == 0.0 && n.abs() < 9.0e15 {
-        format!("{}", n as i64)
-    } else {
-        n.to_string()
     }
 }
 
@@ -301,6 +297,10 @@ pub struct MeterRow {
     pub label: Field,
     pub percent: Field,
     pub resets_in: Field,
+    /// The reset time stored on the hub and how it was written in the box, so an untouched box keeps
+    /// the stored time exactly (rounded text can't be turned back, and a time that couldn't be shown
+    /// must not be lost).
+    kept_reset: Option<(String, Timestamp)>,
 }
 
 impl MeterRow {
@@ -311,6 +311,7 @@ impl MeterRow {
             label: Field::new(MAX_LABEL_LEN * 4),
             percent: Field::new(6),
             resets_in: Field::new(24),
+            kept_reset: None,
         }
     }
 
@@ -324,10 +325,19 @@ impl MeterRow {
         if let Some(p) = percent {
             self.percent.set(&format_percent(p));
         }
-        if let (Some(at), Some(now)) = (resets_at, now) {
-            let left = now.seconds_until(at);
-            if left > 0 {
-                self.resets_in.set(&hub_core::freshness::short_duration(left));
+        if let Some(at) = resets_at {
+            if let Some(now) = now {
+                let left = now.seconds_until(at);
+                if left > 0 {
+                    // Under a minute reads as "1 min": the box takes d, h and min, not seconds.
+                    let shown = hub_core::freshness::short_duration(left.max(60));
+                    self.resets_in.set(&shown);
+                }
+            }
+            // Kept while it still means something: a reset already past is just dropped, so it can
+            // be cleared. With no hub clock there is no telling, so it is kept.
+            if now.is_none_or(|n| n.seconds_until(at) > 0) {
+                self.kept_reset = Some((self.resets_in.trimmed().to_string(), at));
             }
         }
     }
@@ -350,6 +360,14 @@ impl MeterRow {
             )
         })?;
         let resets_at = match parse_duration(self.resets_in.trimmed()) {
+            Ok(_)
+                if self
+                    .kept_reset
+                    .as_ref()
+                    .is_some_and(|(t, _)| t == self.resets_in.trimmed()) =>
+            {
+                self.kept_reset.as_ref().map(|(_, at)| *at)
+            }
             Ok(None) => None,
             Ok(Some(secs)) => now.map(|n| n.plus_seconds(secs)),
             Err(()) => return Err(problem(
@@ -407,6 +425,11 @@ pub enum Shape {
 pub struct ContentEdit {
     pub shape: Shape,
     pub note: Field,
+    /// A big number's stored value and places, with the text it loaded as: kept unless that box is
+    /// typed over, so editing the unit or caption never changes them.
+    kept_number: Option<(String, f64, Option<u8>)>,
+    /// The boxes' text as first filled; see [`ContentEdit::is_edited`].
+    original: Vec<String>,
 }
 
 impl ContentEdit {
@@ -422,6 +445,7 @@ impl ContentEdit {
         if classify_kind(&page.kind) != KindClass::Shape {
             return None;
         }
+        let mut big: Option<BigNumber> = None;
         let shape = match page.kind.as_str() {
             KIND_METER => {
                 let items = data
@@ -465,15 +489,16 @@ impl ContentEdit {
             }
             KIND_BIG_NUMBER => {
                 let b = data.and_then(|d| serde_json::from_value::<BigNumber>(d.clone()).ok());
+                // Long enough for any value as written (the smallest numbers run to over 300 digits).
                 let (mut value, mut unit, mut caption) = (
-                    Field::new(24),
+                    Field::new(400),
                     Field::new(MAX_UNIT_LEN * 4),
                     Field::new(MAX_CAPTION_LEN * 4),
                 );
+                big = b.clone();
                 if let Some(b) = b {
                     if let Some(v) = b.value {
-                        let places = usize::from(b.decimals.unwrap_or(0).min(3));
-                        value.set(&format!("{v:.places$}"));
+                        value.set(&number_as_written(v, b.decimals));
                     }
                     unit.set(b.unit.as_deref().unwrap_or(""));
                     caption.set(b.caption.as_deref().unwrap_or(""));
@@ -504,7 +529,49 @@ impl ContentEdit {
             }
             _ => return None,
         };
-        Some(ContentEdit { shape, note })
+        let mut edit = ContentEdit {
+            shape,
+            note,
+            kept_number: None,
+            original: Vec::new(),
+        };
+        if let (Shape::BigNumber { value, .. }, Some(b)) = (&edit.shape, &big) {
+            edit.kept_number = b.value.map(|v| (value.trimmed().to_string(), v, b.decimals));
+        }
+        edit.original = edit.texts();
+        Some(edit)
+    }
+
+    /// Every box's text, in a fixed order, for telling whether anything was typed.
+    fn texts(&self) -> Vec<String> {
+        let mut out = vec![self.note.text.clone()];
+        match &self.shape {
+            Shape::UsageMeter { rows, .. } | Shape::Meter { rows } => {
+                for r in rows {
+                    out.extend([
+                        r.label.text.clone(),
+                        r.percent.text.clone(),
+                        r.resets_in.text.clone(),
+                    ]);
+                }
+            }
+            Shape::BigNumber { value, unit, caption } => {
+                out.extend([value.text.clone(), unit.text.clone(), caption.text.clone()]);
+            }
+            Shape::Text { text } => out.push(text.text.clone()),
+            Shape::List { rows } => {
+                for r in rows {
+                    out.extend([r.text.text.clone(), r.detail.text.clone()]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether anything was changed since the editor was filled. If not, the page's content is left
+    /// as it is, never rebuilt from the text shown (which may be rounded).
+    pub fn is_edited(&self) -> bool {
+        self.texts() != self.original
     }
 
     /// Whether nothing at all has been entered. A page with no content yet and a blank editor keeps
@@ -608,7 +675,9 @@ impl ContentEdit {
                     .map_err(|e| problem("Those figures can't be saved", e));
             }
             Shape::Meter { rows } => meter_data(rows, now)?,
-            Shape::BigNumber { value, unit, caption } => big_number_data(value, unit, caption)?,
+            Shape::BigNumber { value, unit, caption } => {
+                big_number_data(value, unit, caption, self.kept_number.as_ref())?
+            }
             Shape::Text { text } => {
                 let t = checked_text(text.trimmed(), MAX_TEXT_LEN, "The text")?
                     .ok_or_else(|| problem("Type some text", "A text page needs something to say."))?;
@@ -625,9 +694,10 @@ impl ContentEdit {
 
 /// Plain text that must fit: tidied, but never cut. `None` when nothing is left.
 fn checked_text(s: &str, max: usize, what: &str) -> Result<Option<String>, EditProblem> {
-    // Tidied without cutting (the room is the text's own length), so a text that is too long is
+    // Tidied with room for the whole text (NFC can at most triple it), so a text that is too long is
     // refused, never silently shortened.
-    match sanitise_text(s, s.chars().count().max(1)) {
+    let room = s.chars().count().saturating_mul(3).saturating_add(1);
+    match sanitise_text(s, room) {
         None => Ok(None),
         Some(t) if t.chars().count() > max => Err(problem(
             format!("{what} is too long"),
@@ -689,11 +759,24 @@ fn fresh_id(label: &str, taken: &[MeterItem]) -> String {
     id
 }
 
-fn big_number_data(value: &Field, unit: &Field, caption: &Field) -> Result<Value, EditProblem> {
+fn big_number_data(
+    value: &Field,
+    unit: &Field,
+    caption: &Field,
+    kept: Option<&(String, f64, Option<u8>)>,
+) -> Result<Value, EditProblem> {
     let typed = value.trimmed();
     let (number, decimals) = if typed.is_empty() {
         (None, None)
+    } else if let Some((_, v, places)) = kept.filter(|(text, ..)| text == typed) {
+        (Some(*v), *places)
     } else {
+        if typed.contains(['e', 'E']) {
+            return Err(problem(
+                "Write the number out in full",
+                "Enter it with digits only, such as 1500 or 0.25, without an e.",
+            ));
+        }
         let n = typed
             .parse::<f64>()
             .ok()
@@ -705,8 +788,9 @@ fn big_number_data(value: &Field, unit: &Field, caption: &Field) -> Result<Value
                      dash, never as zero.",
                 )
             })?;
+        // Plain notation only (exponents are refused above), so what follows the point is the places.
         let places = typed.split_once('.').map_or(0, |(_, frac)| frac.len());
-        (Some(n), (places > 0).then_some(places.min(3) as u8))
+        (Some(n), Some(places.min(3) as u8))
     };
     let unit = checked_text(unit.trimmed(), MAX_UNIT_LEN, "The unit")?;
     let caption = checked_text(caption.trimmed(), MAX_CAPTION_LEN, "The caption")?;
@@ -717,6 +801,20 @@ fn big_number_data(value: &Field, unit: &Field, caption: &Field) -> Result<Value
         caption,
     })
     .expect("serialises"))
+}
+
+/// A stored value as it was written: all its digits, padded with zeros up to the stored places.
+fn number_as_written(v: f64, decimals: Option<u8>) -> String {
+    let mut s = format!("{v}");
+    let have = s.split_once('.').map_or(0, |(_, f)| f.len());
+    let want = usize::from(decimals.unwrap_or(0).min(3));
+    if want > have {
+        if have == 0 {
+            s.push('.');
+        }
+        s.push_str(&"0".repeat(want - have));
+    }
+    s
 }
 
 fn list_data(rows: &[ListRow]) -> Result<Value, EditProblem> {
@@ -930,6 +1028,124 @@ mod tests {
         };
         value.set("");
         assert!(e.build(None).unwrap().data.unwrap()["value"].is_null());
+    }
+
+    #[test]
+    fn a_stored_value_loads_as_written_and_places_round_trip() {
+        let load = |d: Value| {
+            let e = ContentEdit::for_page(&page("big_number", None, Some(d)), None).unwrap();
+            let Shape::BigNumber { value, .. } = &e.shape else {
+                panic!()
+            };
+            (value.text.clone(), e)
+        };
+        let (text, e) = load(json!({"value": 1234.56789, "decimals": 2}));
+        assert_eq!(text, "1234.56789");
+        assert!(!e.is_edited());
+        let (text, e) = load(json!({"value": 30.0, "decimals": 1}));
+        assert_eq!(text, "30.0");
+        assert_eq!(e.build(None).unwrap().data.unwrap()["decimals"], 1);
+        let (text, e) = load(json!({"value": 5.0, "decimals": 0}));
+        assert_eq!(text, "5");
+        assert_eq!(
+            e.build(None).unwrap().data.unwrap()["decimals"],
+            0,
+            "Some(0) stays Some(0)"
+        );
+    }
+
+    #[test]
+    fn editing_the_unit_keeps_the_stored_value_and_places() {
+        let p = page(
+            "big_number",
+            None,
+            Some(json!({"value": 1234.56789, "decimals": 2, "unit": "m"})),
+        );
+        let mut e = ContentEdit::for_page(&p, None).unwrap();
+        e.big_number_mut().unwrap().1.set("km");
+        let d = e.build(None).unwrap().data.unwrap();
+        assert_eq!(
+            (d["value"].as_f64(), d["decimals"].as_u64()),
+            (Some(1234.56789), Some(2))
+        );
+        assert_eq!(d["unit"], "km");
+        e.big_number_mut().unwrap().0.set("5.5");
+        assert_eq!(
+            e.build(None).unwrap().data.unwrap()["decimals"],
+            1,
+            "typed over: read afresh"
+        );
+    }
+
+    #[test]
+    fn a_very_small_value_loads_whole_and_a_past_reset_can_be_cleared() {
+        let tiny = 1.2345678901234567e-10_f64;
+        let p = page("big_number", None, Some(json!({"value": tiny, "decimals": 3})));
+        let e = ContentEdit::for_page(&p, None).unwrap();
+        let Shape::BigNumber { value, .. } = &e.shape else {
+            panic!()
+        };
+        assert_eq!(
+            value.text.parse::<f64>().unwrap(),
+            tiny,
+            "nothing cut off: {}",
+            value.text
+        );
+
+        let data = json!({"items":[{"id":"five-hour","label":"5 hours","percent":42.0,"resets_at":"2026-11-10T19:00:00Z"}]});
+        let p = page("meter", Some("claude-max"), Some(data));
+        let now = Some(ts("2026-11-10T20:00:00Z"));
+        let mut e = ContentEdit::for_page(&p, now).unwrap();
+        e.note.set("x");
+        let items = e.build(now).unwrap().data.unwrap()["items"].clone();
+        assert!(
+            items[0]["resets_at"].is_null(),
+            "a reset already past means nothing"
+        );
+    }
+
+    #[test]
+    fn an_exponent_is_refused_and_places_count_only_plain_digits() {
+        let mut e = ContentEdit::for_page(&page("big_number", None, None), None).unwrap();
+        e.big_number_mut().unwrap().0.set("1.5e3");
+        let err = e.build(None).unwrap_err();
+        assert!(err.title.contains("in full"), "{}", err.title);
+        e.big_number_mut().unwrap().0.set("1500");
+        assert_eq!(e.build(None).unwrap().data.unwrap()["decimals"], 0);
+    }
+
+    #[test]
+    fn text_that_grows_when_tidied_is_refused_not_cut() {
+        // U+0958 becomes two characters in NFC, so this is over the limit once tidied.
+        let long: String = "\u{0958}".repeat(MAX_UNIT_LEN);
+        let err = checked_text(&long, MAX_UNIT_LEN, "The unit").unwrap_err();
+        assert!(err.title.contains("too long"), "{}", err.title);
+        assert_eq!(
+            checked_text("kW", MAX_UNIT_LEN, "The unit").unwrap().as_deref(),
+            Some("kW")
+        );
+    }
+
+    #[test]
+    fn a_reset_that_cant_be_shown_is_kept_unless_typed_over() {
+        let data = json!({"items":[{"id":"five-hour","label":"5 hours","percent":42.0,"resets_at":"2026-11-10T22:00:00Z"}]});
+        let p = page("meter", Some("claude-max"), Some(data));
+        // No hub clock: the box is empty but the stored time survives a change to something else.
+        let mut e = ContentEdit::for_page(&p, None).unwrap();
+        let Shape::UsageMeter { rows, .. } = &mut e.shape else {
+            panic!()
+        };
+        assert_eq!(rows[0].resets_in.text, "");
+        rows[0].percent.set("50");
+        let items = e.build(None).unwrap().data.unwrap()["items"].clone();
+        assert_eq!(items[0]["resets_at"], "2026-11-10T22:00:00Z");
+        let Shape::UsageMeter { rows, .. } = &mut e.shape else {
+            panic!()
+        };
+        rows[0].resets_in.set("1 h");
+        let now = Some(ts("2026-11-10T20:00:00Z"));
+        let items = e.build(now).unwrap().data.unwrap()["items"].clone();
+        assert_eq!(items[0]["resets_at"], "2026-11-10T21:00:00Z");
     }
 
     #[test]

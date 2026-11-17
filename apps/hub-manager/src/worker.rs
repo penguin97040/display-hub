@@ -95,36 +95,13 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .expect("blocking work doesn't panic")
 }
 
-/// Each display's ticked pages, fetched side by side. A display removed since the list was read
-/// answers "not found": it is left out, so the answer matches what the hub has now.
-async fn ticks(
-    s: &Session,
-    displays: Vec<hub_core::api::DisplayView>,
-) -> Result<(Vec<hub_core::api::DisplayView>, HashMap<String, Vec<String>>), Failure> {
-    let mut tasks = tokio::task::JoinSet::new();
-    for d in &displays {
-        let (s, id) = (s.clone(), d.id.clone());
-        tasks.spawn(async move {
-            let found = s.client.display_pages(&s.token, &id).await;
-            (id, found)
-        });
-    }
-    let mut ticks = HashMap::new();
-    while let Some(done) = tasks.join_next().await {
-        let (id, found) = done.map_err(|e| Failure::File(format!("the worker stopped: {e}")))?;
-        match found {
-            Ok(ids) => {
-                ticks.insert(id, ids);
-            }
-            Err(hub_client::ClientError::Status { status: 404, .. }) => {}
-            Err(e) => return Err(Failure::Client(e)),
-        }
-    }
-    let displays = displays
-        .into_iter()
-        .filter(|d| ticks.contains_key(&d.id))
-        .collect();
-    Ok((displays, ticks))
+/// What each display shows, from the display list (the hub sends it with each display). A display
+/// the hub didn't say anything about is left out, so it is never read as having no pages ticked.
+fn ticks(displays: &[hub_core::api::DisplayView]) -> HashMap<String, Vec<String>> {
+    displays
+        .iter()
+        .filter_map(|d| Some((d.id.clone(), d.pages.clone()?)))
+        .collect()
 }
 
 async fn refresh(s: &Session) -> Result<Refresh, Failure> {
@@ -137,7 +114,7 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         s.client.helpers(t),
     )
     .map_err(Failure::Client)?;
-    let (displays, ticks) = ticks(s, displays).await?;
+    let ticks = ticks(&displays);
     Ok(Refresh {
         status,
         pages,
@@ -146,6 +123,13 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         helpers,
         ticks,
     })
+}
+
+/// The refresh that follows a change. The change is already made, so a refresh that fails must not
+/// turn its result into an error (a one-time secret would be thrown away, a form would stay open
+/// and be pressed again). It comes back as `None`, and the model marks a refresh as due.
+async fn refresh_after(s: &Session) -> Option<Refresh> {
+    refresh(s).await.ok()
 }
 
 pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
@@ -185,10 +169,10 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             *ctx.session.lock().unwrap() = Some(session.clone());
             Ok(Outcome::Paired {
                 hub,
-                refresh: refresh(&session).await?,
+                refresh: refresh_after(&session).await,
             })
         }
-        Op::Refresh => Ok(Outcome::Refreshed(refresh(&ctx.session()?).await?)),
+        Op::Refresh => Ok(Outcome::Refreshed(Some(refresh(&ctx.session()?).await?))),
         Op::AddPages { pages } => {
             let s = ctx.session()?;
             let total = pages.len();
@@ -209,8 +193,10 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
                     break;
                 }
             }
+            // The pages are on the hub now, so a refresh that fails must not fail the whole
+            // operation: the form would stay open and Add would make them twice.
             Ok(Outcome::Added {
-                refresh: refresh(&s).await?,
+                refresh: refresh_after(&s).await,
                 failed,
             })
         }
@@ -226,22 +212,22 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
                     .await
                     .map_err(c)?;
             }
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::RemovePage { id } => {
             let s = ctx.session()?;
             s.client.remove_page(&s.token, &id).await.map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::Reorder { ids } => {
             let s = ctx.session()?;
             s.client.reorder_pages(&s.token, ids).await.map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::RevokeDisplay { id } => {
             let s = ctx.session()?;
             s.client.revoke_display(&s.token, &id).await.map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::SetDisplayPages { display, ids } => {
             let s = ctx.session()?;
@@ -249,14 +235,14 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
                 .set_display_pages(&s.token, &display, ids)
                 .await
                 .map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::NewEnrolment { name } => {
             let s = ctx.session()?;
             let grant = s.client.new_enrolment(&s.token, &name).await.map_err(c)?;
             Ok(Outcome::Enrolment {
                 grant,
-                refresh: refresh(&s).await?,
+                refresh: refresh_after(&s).await,
             })
         }
         Op::NewHelper(new) => {
@@ -264,13 +250,13 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             let invite = s.client.new_helper(&s.token, &new).await.map_err(c)?;
             Ok(Outcome::HelperInvite {
                 invite,
-                refresh: refresh(&s).await?,
+                refresh: refresh_after(&s).await,
             })
         }
         Op::RevokeHelper { id } => {
             let s = ctx.session()?;
             s.client.revoke_helper(&s.token, &id).await.map_err(c)?;
-            Ok(Outcome::Refreshed(refresh(&s).await?))
+            Ok(Outcome::Refreshed(refresh_after(&s).await))
         }
         Op::SaveGuide { dismissed } => {
             let dir = ctx.settings_dir.clone();
@@ -450,6 +436,32 @@ mod tests {
         }
         let op = model.submit_add();
         run(model, ctx, op).await;
+    }
+
+    #[test]
+    fn ticks_come_from_the_display_list_and_an_older_hub_is_never_read_as_none_ticked() {
+        let at = hub_protocol::Timestamp::parse("2026-11-10T20:00:00Z").unwrap();
+        let display = |id: &str, pages: Option<Vec<String>>| hub_core::api::DisplayView {
+            id: id.into(),
+            name: id.into(),
+            enrolled_at: at,
+            last_seen_at: None,
+            device: None,
+            pages,
+        };
+        let shown = ticks(&[display("new", Some(vec!["a".into()])), display("old", None)]);
+        assert_eq!(
+            shown.get("new").map(Vec::as_slice),
+            Some(["a".to_string()].as_slice())
+        );
+        assert!(!shown.contains_key("old"), "no answer is not an empty list");
+        // An older hub's list has no `pages` at all.
+        let old: hub_core::api::DisplayView = serde_json::from_value(serde_json::json!({
+            "id": "d", "name": "D", "enrolled_at": "2026-11-10T20:00:00Z", "last_seen_at": null, "device": null
+        }))
+        .unwrap();
+        assert_eq!(old.pages, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("pages"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

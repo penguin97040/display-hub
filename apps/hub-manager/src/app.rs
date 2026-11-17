@@ -132,7 +132,10 @@ impl Manager {
             let _ = this.update(cx, |this, cx| {
                 this.model.finish(result, Instant::now());
                 // Setup details are ready: look for the display's USB port straight away.
-                let op = this.model.first_scan();
+                let op = this
+                    .model
+                    .first_scan()
+                    .or_else(|| this.model.save_guide_if_pending());
                 this.run(op, cx);
                 cx.notify();
             });
@@ -971,15 +974,17 @@ impl Manager {
         ]
     }
 
-    /// A command in its own box, with a Copy button under it.
+    /// A command in its own box, with a Copy button under it and any `extra` buttons beside that.
     fn command_box(
         &mut self,
         id: &str,
-        command: &'static str,
+        command: &str,
         copied: bool,
+        extra: Option<gpui::AnyElement>,
         cx: &mut Context<Self>,
         on_copy: impl Fn(&mut Self) + 'static,
     ) -> Div {
+        let text = command.to_string();
         let copy = self.button(
             id.to_string(),
             if copied { "Copied" } else { "Copy command" },
@@ -988,7 +993,7 @@ impl Manager {
             cx,
             move |this, _, cx| {
                 on_copy(this);
-                cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
             },
         );
         div()
@@ -1003,9 +1008,10 @@ impl Manager {
                     .p(px(12.0))
                     .border_1()
                     .border_color(c(MUTED))
-                    .child(ui::data(command)),
+                    .bg(c(BLACK))
+                    .child(ui::command(command)),
             )
-            .child(div().flex().child(copy))
+            .child(div().flex().flex_wrap().gap(px(8.0)).child(copy).children(extra))
     }
 
     /// Steps 1 and 2 of the first-run guide. Step 3, the pairing form, follows them.
@@ -1032,7 +1038,7 @@ impl Manager {
             ),
         );
         let copied = self.model.install_copied;
-        let command = self.command_box("install-copy", model::INSTALL_COMMAND, copied, cx, |this| {
+        let command = self.command_box("install-copy", model::INSTALL_COMMAND, copied, None, cx, |this| {
             this.model.copy_install();
         });
         let install = ui::with_ticks(
@@ -1070,7 +1076,6 @@ impl Manager {
         } else {
             format!("{done} of {total} done")
         };
-        let busy = self.model.busy.is_some();
         let mut rows = Vec::new();
         for (i, item) in items.iter().enumerate() {
             let go = item.go;
@@ -1122,7 +1127,7 @@ impl Manager {
             "guide-close",
             if all_done { "Finish" } else { "Hide this checklist" },
             if all_done { Kind::Primary } else { Kind::Quiet },
-            !busy,
+            true,
             cx,
             |this, _, cx| {
                 let op = this.model.dismiss_guide();
@@ -1218,7 +1223,7 @@ impl Manager {
                             )
                             .child(ui::h2(p.title.clone()))
                             .children(preview_body(p, r.preview.generated_at))
-                            .when_some(p.note.clone(), |d, n| d.child(ui::p_muted(n)))
+                            .when_some(self.model.preview_note(p), |d, n| d.child(ui::p_muted(n)))
                             .child(ui::label(&fresh)),
                     ),
                 )
@@ -1249,7 +1254,7 @@ impl Manager {
                         format!("{} (port {})", s.hosts.join(", "), s.port),
                     ))
                     .child(kv("Paired PCs", s.admins.to_string()))
-                    .child(kv("Started", s.started_at.to_string())),
+                    .child(kv("Started", nz_date_time(s.started_at))),
             ),
         );
         out.push(hub.into_any_element());
@@ -1441,7 +1446,7 @@ impl Manager {
             );
         }
         let count = format!("{n} of {HUB_PAGE_LIMIT}");
-        let list_panel = ui::with_ticks(ui::panel(Some(("On the display", &count)), m).child(
+        let list_panel = ui::with_ticks(ui::panel(Some(("All pages", &count)), m).child(
             if list.is_empty() {
                 ui::body(m).child(ui::p_muted("No pages yet. Add your first one from a template."))
             } else {
@@ -1723,42 +1728,30 @@ impl Manager {
 
     /// What to do once by hand after adding: the command, with a Copy button.
     fn setup_panel(&mut self, setup: &model::SetupNote, m: Metrics, cx: &mut Context<Self>) -> Div {
-        let command = setup.command.clone();
-        let copy = self.button(
+        let done = self
+            .button("setup-done", "Done", Kind::Secondary, true, cx, |this, _, _| {
+                this.model.finish_setup()
+            })
+            .into_any_element();
+        let command = self.command_box(
             "setup-copy",
-            if setup.copied { "Copied" } else { "Copy command" },
-            Kind::Primary,
-            true,
+            &setup.command,
+            setup.copied,
+            Some(done),
             cx,
-            move |this, _, cx| {
-                if let Some(text) = this.model.copy_setup() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
+            |this| {
+                this.model.copy_setup();
             },
         );
-        let done = self.button("setup-done", "Done", Kind::Secondary, true, cx, |this, _, _| {
-            this.model.finish_setup()
-        });
         ui::with_ticks(
             ui::panel(Some(("One more step", "")), m).child(
                 ui::body(m)
                     .child(ui::p(setup.help.clone()))
-                    .child(
-                        div()
-                            .id("setup-command")
-                            .role(Role::Group)
-                            .aria_label(SharedString::from(format!("Command to run: {command}")))
-                            .p(px(12.0))
-                            .border_1()
-                            .border_color(c(MUTED))
-                            .bg(c(BLACK))
-                            .child(ui::data(command)),
-                    )
+                    .child(command)
                     .child(ui::p_muted(
                         "Open a terminal on the Pi (for example over SSH), paste the command and press Enter. The \
                          page stays empty until the helper has run.",
-                    ))
-                    .child(div().flex().flex_wrap().gap(px(8.0)).child(copy).child(done)),
+                    )),
             ),
         )
     }
@@ -1823,6 +1816,9 @@ impl Manager {
         }
         if typed_in && can_edit {
             body = body.child(self.content_editor(window, cx));
+            if let Some(err) = self.model.edit.as_ref().and_then(|e| e.content_error.clone()) {
+                body = body.child(form_error(&err));
+            }
         } else {
             let why = match (effective, can_edit) {
                 (Source::Helper, _) => Some("A helper fills this page, so there is nothing to type in here."),
@@ -2055,7 +2051,11 @@ impl Manager {
                     window.focus(&fh, cx);
                 },
             );
-            let ticks = self.tick_panel(&d.id, &d.name, cx);
+            // A hub that doesn't say what a display shows can't have it changed from here: sending
+            // ticks it never reported could untick everything.
+            let ticks = self
+                .tick_panel(&d.id, &d.name, cx)
+                .unwrap_or_else(|| div().child(ui::p_muted("Update the hub to choose pages here.")));
             rows.push(
                 div()
                     .id(ElementId::Name(format!("display-{}", d.id).into()))
@@ -2086,7 +2086,7 @@ impl Manager {
                             )
                             .child(remove),
                     )
-                    .when_some(ticks, |d, t| d.child(t))
+                    .child(ticks)
                     .into_any_element(),
             );
         }
@@ -2128,9 +2128,16 @@ impl Manager {
             } else {
                 r.title.clone()
             };
+            // The kind tells same-named pages apart, but says nothing new when it is the title.
+            let kind = if r.kind.eq_ignore_ascii_case(&r.title) {
+                ""
+            } else {
+                r.kind.as_str()
+            };
             boxes = boxes.child(self.tick_box(
                 format!("tick-{display}-{}", r.id),
                 &label,
+                kind,
                 &format!("{} on {name}", r.title),
                 r.ticked,
                 r.can_change,
@@ -2193,6 +2200,7 @@ impl Manager {
         &mut self,
         id: String,
         text: &str,
+        kind: &str,
         aria: &str,
         on: bool,
         enabled: bool,
@@ -2209,7 +2217,14 @@ impl Manager {
         } else {
             MUTED
         };
-        let edge = if on { BEAK } else { colour };
+        // A box that can't be ticked is dimmed itself, not only its label.
+        let edge = if on {
+            BEAK
+        } else if !enabled {
+            FIELD_NODE
+        } else {
+            colour
+        };
         div()
             .id(ElementId::Name(key.clone()))
             .on_hover(Self::track_hover(key, cx))
@@ -2252,7 +2267,16 @@ impl Manager {
                     .child(
                         div()
                             .text_color(c(colour))
-                            .child(ui::p(text.to_string()).text_color(c(colour))),
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(ui::p(text.to_string()).text_color(c(colour)))
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(c(MUTED))
+                                    .child(kind.to_string()),
+                            ),
                     ),
             )
     }
@@ -2427,7 +2451,7 @@ impl Manager {
             "guide-again",
             "Show the setup guide again",
             Kind::Secondary,
-            self.model.busy.is_none(),
+            true,
             cx,
             |this, _, cx| {
                 let op = this.model.show_guide_again();
@@ -2842,6 +2866,13 @@ fn kv(k: &str, v: String) -> Div {
 
 fn waiting(m: Metrics) -> impl IntoElement {
     ui::with_ticks(ui::panel(None, m).child(ui::body(m).child(ui::p_muted("Checking the hub."))))
+}
+
+/// DD/MM/YYYY and a 24-hour time in the PC's time zone, or UTC when it isn't known.
+fn nz_date_time(t: hub_protocol::Timestamp) -> String {
+    let utc = time::OffsetDateTime::from_unix_timestamp(t.unix()).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let local = crate::LOCAL_OFFSET.get().map_or(utc, |o| utc.to_offset(*o));
+    format!("{} {:02}:{:02}", nz_date(t), local.hour(), local.minute())
 }
 
 /// DD/MM/YYYY in the PC's time zone, or UTC when it isn't known.

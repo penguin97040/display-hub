@@ -570,7 +570,7 @@ async fn admin_status(
     let (pages, displays, admins) = db(&hub, |s| {
         Ok((
             s.page_ids()?.len(),
-            s.devices()?.len(),
+            s.device_count()?,
             s.count_active(Role::Admin)?,
         ))
     })
@@ -1200,6 +1200,7 @@ async fn list_devices(
                     id: r.id,
                     name: r.name,
                     enrolled_at: r.enrolled_at,
+                    pages: Some(r.pages),
                 }
             })
             .collect(),

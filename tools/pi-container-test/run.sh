@@ -86,6 +86,9 @@ check "install.sh starts the service" active
 install_pairing=$(grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' <<<"$out" | head -1 || true)
 check "install.sh prints a pairing string on a first install" test -n "$install_pairing"
 hub=https://127.0.0.1:8443
+# install.sh only waits for systemd to say "active", so wait for the hub to answer (healthy retries for
+# 15 seconds) before pairing with it.
+check "the hub answers on 8443" healthy
 # The manager's side: the string install.sh printed must really work, and at once (it expires).
 pairing=$install_pairing
 secret=$(python3 -c 'import base64, sys
@@ -95,7 +98,6 @@ print(base64.urlsafe_b64encode(b[34:50]).decode().rstrip("="))' "$pairing")
 admin=$(curl -sk --noproxy '*' --max-time 10 -H 'Content-Type: application/json' \
   -d "{\"secret\": \"$secret\", \"label\": \"container test\"}" "$hub/v1/admin/pair" |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["admin_token"])')
-check "the hub answers on 8443" healthy
 check "the unit file verifies" box systemd-analyze verify /etc/systemd/system/display-hub.service
 check "the data folder is private" bash -c "[ \"\$(docker exec $name stat -c '%a %U' /var/lib/display-hub)\" = '700 display-hub' ]"
 check "the key is owner-only" bash -c "[ \"\$(docker exec $name stat -c '%a' /var/lib/display-hub/identity/hub-key.pem)\" = 600 ]"
