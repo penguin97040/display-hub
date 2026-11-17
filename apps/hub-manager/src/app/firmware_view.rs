@@ -87,13 +87,27 @@ impl Manager {
             return vec![head, waiting(m).into_any_element()];
         }
         if self.model.shelf().is_none() {
-            return vec![
-                head,
-                ui::with_ticks(ui::panel(Some(("Firmware", "")), m).child(ui::body(m).child(ui::p_muted(
-                    "This hub doesn't handle firmware yet. Update the hub to the same release as this app.",
-                ))))
-                .into_any_element(),
-            ];
+            // Installing from a file over USB needs nothing new from the hub, so it stays available.
+            let note = ui::with_ticks(ui::panel(Some(("Firmware on the hub", "")), m).child(ui::body(m).child(
+                ui::p_muted(
+                    "This hub doesn't handle firmware updates yet. Update the hub to the same release as this app \
+                     to keep firmware on it and update displays over Wi-Fi. Installing from a file over USB works \
+                     already.",
+                ),
+            )))
+            .into_any_element();
+            let install = self.install_panel(m, window, cx);
+            let row = if m.wide {
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(m.gap))
+                    .child(div().flex_1().min_w_0().child(note))
+                    .child(div().w(px(500.0)).flex_none().child(install))
+            } else {
+                div().flex().flex_col().gap(px(m.gap)).child(install).child(note)
+            };
+            return vec![head, row.into_any_element()];
         }
         let packages = self.packages_panel(m, cx);
         let keys = self.keys_panel(m, window, cx);

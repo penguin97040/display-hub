@@ -126,10 +126,13 @@ impl Board for EspBoard {
             .timeout(Duration::from_secs(3))
             .open_native()
             .map_err(|e| open_error(&self.port, &e))?;
+        // espflash runs its "after" reset at the end of every `write_bin_to_flash`. With a hard reset
+        // there, the board would restart into half-written flash after the first part and stop
+        // answering. So it stays in the loader stub between parts, and `restart` resets it once.
         let connection = Connection::new(
             serial,
             usb_info(&self.port),
-            ResetAfterOperation::HardReset,
+            ResetAfterOperation::NoResetNoStub,
             ResetBeforeOperation::DefaultReset,
             BAUD,
         );
@@ -162,8 +165,9 @@ impl Board for EspBoard {
             .flasher
             .take()
             .ok_or_else(|| BoardError::Other("not connected to the board".into()))?;
-        let chip = flasher.chip();
-        let result = flasher.connection().reset_after(true, chip).map_err(sort);
+        // The connection's "after" setting is to stay in the stub (see `connect`), so this resets
+        // the board directly, the way espflash's own hard reset does (USB-Serial-JTAG aware).
+        let result = flasher.connection().reset().map_err(sort);
         // Dropping the flasher closes the port, so provisioning can open it.
         drop(flasher);
         result
