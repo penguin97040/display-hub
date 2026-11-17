@@ -153,14 +153,14 @@ Set it up as in section 3 (**Add a display**, **Save as a file**), then enrol it
 
 | | Do | Expect |
 |---|---|---|
-| 1 | **Firmware** (Ctrl+4): **Add a firmware file**, choose `v1.1.0.dhfw` | "Added llm-usage-display 1.1.0 to the hub", signed by "Unknown maker" with a fingerprint like `3f9a-01c2-…`. It is listed with its size and "Updates only". |
+| 1 | **Firmware** (Ctrl+4): **Add a firmware file**, choose `v1.1.0.dhfw` | "Added "llm-usage-display" 1.1.0 to the hub", signed by "a maker this app doesn't know" with a fingerprint like `3f9a-01c2-…`. It is listed with its hardware ("For simulated"), its size and "Updates only", and "A test release." under "The maker's note". |
 | 2 | Choose a file that isn't a package (any `.txt`) | "This firmware file failed its checks". Nothing reaches the hub. |
-| 3 | Under **Makers' keys**, **Name it**: type `Test maker`, press Enter | The package and the display now say "Test maker". |
-| 4 | **Displays**: the display's card | Under "Firmware": 1.0.0, "Accepts updates signed by Test maker (…)", and **Update available** with **Update to 1.1.0**. |
-| 5 | **Update to 1.1.0** | A check screen naming 1.1.0, Test maker, its fingerprint and "A test release." Confirm it. The card says "Waiting for the display to check in". |
+| 3 | Under **Makers' keys**, **Name it**: type `Test maker`, press Enter | The key is tagged "The hub's name for it", and the package and the display now say "the key the hub calls "Test maker"". Naming it `Official Display Hub firmware` instead is refused: "That name is kept for official firmware". |
+| 4 | **Displays**: the display's card | Under "Firmware": 1.0.0, "Accepts updates signed by the key the hub calls "Test maker" (…)", and **Update available** with **Update to 1.1.0**. |
+| 5 | **Update to 1.1.0** | A check screen "Update … to 1.1.0?" naming the key the hub calls "Test maker" and its fingerprint, with "A test release." in a separate box under "The maker's note". Confirm it. The card says "Waiting for the display to check in". |
 | 6 | Run the poll command below | Within about 15 seconds the card goes through "Downloading 1.1.0" to "Updated to 1.1.0". |
-| 7 | Sign a `1.2.0-beta.1` the same way and add it, then press **Update to 1.2.0-beta.1** on the card | Two check screens: the second says it's a pre-release and asks "Install it anyway?". **Keep it** on the second leaves everything as it was. |
-| 8 | The card also offers **Install 1.0.0**, if `v1.0.0.dhfw` is added too | Two check screens: the second says 1.0.0 is older and why going back is allowed. |
+| 7 | Sign a `1.2.0-beta.1` the same way and add it, then press **Update to 1.2.0-beta.1** on the card | The button shows the version in its own case (`1.2.0-beta.1`, not `1.2.0-BETA.1`). Two check screens: the second says it's a pre-release and asks "Install it anyway?". **Keep it** on the second leaves everything as it was. If a newer full release (say 1.2.0) is on the hub too, it is the one under **Update available**, and the pre-release is under "Other versions on the hub". |
+| 8 | The card also offers **Install 1.0.0**, if `v1.0.0.dhfw` is added too | Two check screens: the first asks "Go back to 1.0.0 on …?", the second says 1.0.0 is older and why going back is allowed. |
 | 9 | Confirm an update, then **Cancel update** on the card before polling | "The update to … was cancelled". |
 
 ```powershell
@@ -181,12 +181,12 @@ Build the display firmware with ESP-IDF as usual (`idf.py build`). From its `bui
 
 | | Do | Expect |
 |---|---|---|
-| 1 | Plug the board in with a data cable. **Firmware**, **Install firmware**, **Choose a file**, `board.dhfw` | The package, "For an esp32s3 board with at least 16 MB of flash", and an orange box: "Signed by a maker this app doesn't know", the fingerprint, and the instruction to compare it. |
+| 1 | Plug the board in with a data cable. **Firmware**, **Install firmware**, **Choose a file**, `board.dhfw` | The package as `"llm-usage-display" 0.9.0`, "For hardware waveshare-amoled-1.8-v1", "For an esp32s3 board with at least 16 MB of flash", and an orange box: "Signed by a maker this app doesn't know", the fingerprint, and the instruction to compare it. |
 | 2 | Leave the Wi-Fi network empty and choose **Erase and install on COMx** | "Enter the Wi-Fi network's name". Nothing happens to the board. |
-| 3 | Fill in the Wi-Fi details, choose **Erase and install on COMx** | A check screen repeating the fingerprint and that everything is erased. **Keep it** leaves the board alone. |
-| 4 | Confirm with **Erase and install** | "Connecting", "Erasing the whole flash" (up to a couple of minutes for 16 MB), then "Writing" each part with a percentage, then "Restarting". |
+| 3 | Fill in the Wi-Fi details, choose **Erase and install on COMx** | A check screen, "Erase the display on COMx and install this firmware?", repeating the fingerprint, saying everything is erased and listing every key the display will trust afterwards. The package's device type, version and hardware are in a separate box, "What the package says about itself". **Keep it** leaves the board alone. |
+| 4 | Confirm with **Erase and install** | "Connecting", "Erasing the whole flash" (up to a couple of minutes for 16 MB), then "Writing" each part with a percentage that climbs steadily to 100%, then "Restarting". |
 | 5 | Watch the board | It restarts into the firmware you built, as after `idf.py flash`. |
-| 6 | Wait for the app | For now, "The firmware is installed, but the setup details weren't sent", and **Displays** has them ready to send again. Once the firmware speaks the USB exchange, it says "Installed …" instead and the display checks in. |
+| 6 | Wait for the app | For now, "The firmware is installed, but the setup details weren't sent", and **Displays** has them ready to send again, with a box saying the display will trust the keys from the firmware just installed on COMx and a **Leave them out** button. Sending to any other port sends the details without those keys. Once the firmware speaks the USB exchange, it says "Installed …" instead and the display checks in. |
 | 7 | Open a serial monitor on the board's port, then try to install | "COMx is busy", saying to close the other program. Nothing is written. |
 | 8 | If step 4 says "The board didn't start its loader" | Unplug the cable, hold **BOOT** while you plug it back in, let go, and try again. |
 | 9 | Change `--chip` to `esp32` and sign again, then try to install it | "This firmware is for a different chip … the board on COMx is an esp32s3". Nothing is written. |

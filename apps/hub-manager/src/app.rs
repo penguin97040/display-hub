@@ -397,12 +397,12 @@ impl Manager {
             .text_color(c(fg))
             .font_family(FONT_MONO)
             .text_size(px(BUTTON_SIZE))
-            .child(ui::spaced(&text.to_uppercase(), BUTTON_SIZE, BUTTON_TRACKING_EM));
+            .child(ui::spaced(&ui::caps(text), BUTTON_SIZE, BUTTON_TRACKING_EM));
         div()
             .id(ElementId::Name(id.clone()))
             .on_hover(Self::track_hover(id, cx))
             .role(Role::Button)
-            .aria_label(SharedString::from(text.to_string()))
+            .aria_label(SharedString::from(ui::plain(text)))
             .when(!enabled, |d| {
                 d.a11y_synthetic_children(|b| b.parent_node().set_disabled())
             })
@@ -2069,9 +2069,13 @@ impl Manager {
                 .device
                 .as_ref()
                 .map_or("Hasn't reported its software yet".to_string(), |x| {
+                    // The display's own words, in their own case: versions and hardware names are
+                    // case-sensitive.
                     format!(
                         "{} {} · {}",
-                        x.device_type, x.firmware_version, x.hardware_revision
+                        ui::keep_case(&x.device_type),
+                        ui::keep_case(&x.firmware_version),
+                        ui::keep_case(&x.hardware_revision)
                     )
                 });
             let remove = self.button(
@@ -2096,7 +2100,11 @@ impl Manager {
                 div()
                     .id(ElementId::Name(format!("display-{}", d.id).into()))
                     .role(Role::Group)
-                    .aria_label(SharedString::from(format!("{}. {seen}. {what}", d.name)))
+                    .aria_label(SharedString::from(format!(
+                        "{}. {seen}. {}",
+                        d.name,
+                        ui::plain(&what)
+                    )))
                     .flex()
                     .flex_col()
                     .gap(px(14.0))
@@ -2356,7 +2364,13 @@ impl Manager {
                     let op = this.model.create_setup();
                     this.run(op, cx);
                 });
-                ui::body(m).child(name).child(ssid).child(pw).child(div().flex().gap(px(8.0)).child(create).child(cancel))
+                let keys = self.pending_keys_block(cx);
+                ui::body(m)
+                    .child(name)
+                    .child(ssid)
+                    .child(pw)
+                    .children(keys)
+                    .child(div().flex().gap(px(8.0)).child(create).child(cancel))
             }
             EnrolStage::Ready => {
                 let left = self.model.setup_expires_in(Instant::now()).unwrap_or(0);
@@ -2379,11 +2393,13 @@ impl Manager {
                 });
                 let other = self.field(FieldId::OtherPort, "Or type a port", "Such as COM5, or /dev/ttyACM0. Enter sends.", window, cx);
                 let save = self.button("bundle-save", "Save as a file", Kind::Quiet, !busy, cx, |this, _, cx| this.prompt_save(cx));
+                let keys = self.pending_keys_block(cx);
                 ui::body(m)
                     .child(ui::p(format!(
                         "Setup details are ready, valid for about {} more. Choose the display's port.",
                         hub_core::short_duration(left.max(0))
                     )))
+                    .children(keys)
                     .child(list)
                     .child(other)
                     .child(div().flex().flex_wrap().gap(px(8.0)).child(rescan).child(save).child(cancel))
@@ -2747,6 +2763,7 @@ impl Manager {
 
     fn confirm_view(&mut self, c: &Confirm, m: Metrics, cx: &mut Context<Self>) -> impl IntoElement {
         let (q, detail, action) = c.question();
+        let says = c.package_says().map(firmware_view::package_says);
         let yes = self.button(
             "confirm-yes",
             action,
@@ -2785,6 +2802,7 @@ impl Manager {
                             .p(px(m.pad))
                             .child(ui::h2(q))
                             .child(ui::p_muted(detail))
+                            .children(says)
                             .child(div().flex().flex_wrap().gap(px(8.0)).child(no).child(yes)),
                     ),
             ))

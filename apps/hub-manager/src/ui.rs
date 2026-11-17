@@ -64,14 +64,51 @@ pub fn spaced(text: &str, size: f32, em: f32) -> Div {
         }))
 }
 
-/// `.label`: mono, upper case, 0.1em tracking, muted.
+const KEEP_OPEN: char = '\u{E000}';
+const KEEP_CLOSE: char = '\u{E001}';
+
+/// Marks text that the upper-case styles (labels, tags and buttons) must show in its own case, such
+/// as a firmware version: a pre-release tag is case-sensitive, so `1.3.0-beta.1` must not become
+/// `1.3.0-BETA.1`.
+pub fn keep_case(text: &str) -> String {
+    let inner: String = text
+        .chars()
+        .filter(|c| *c != KEEP_OPEN && *c != KEEP_CLOSE)
+        .collect();
+    format!("{KEEP_OPEN}{inner}{KEEP_CLOSE}")
+}
+
+/// Text in upper case for a label or button, except the parts marked with [`keep_case`], without
+/// the marks.
+pub fn caps(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut keep = false;
+    for ch in text.chars() {
+        match ch {
+            KEEP_OPEN => keep = true,
+            KEEP_CLOSE => keep = false,
+            _ if keep => out.push(ch),
+            _ => out.extend(ch.to_uppercase()),
+        }
+    }
+    out
+}
+
+/// Text without the [`keep_case`] marks, as a screen reader should get it.
+pub fn plain(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c != KEEP_OPEN && *c != KEEP_CLOSE)
+        .collect()
+}
+
+/// `.label`: mono, upper case, 0.1em tracking, muted. Parts marked with [`keep_case`] keep theirs.
 pub fn label(text: &str) -> Div {
     div()
         .font_family(FONT_MONO)
         .text_size(px(LABEL_SIZE))
         .line_height(px(LABEL_SIZE * 1.4))
         .text_color(c(MUTED))
-        .child(spaced(&text.to_uppercase(), LABEL_SIZE, LABEL_TRACKING_EM))
+        .child(spaced(&caps(text), LABEL_SIZE, LABEL_TRACKING_EM))
 }
 
 /// A label in another colour, for state words such as STALE.
@@ -390,7 +427,17 @@ pub fn pattern() -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::command_pieces;
+    use super::{caps, command_pieces, keep_case, plain};
+
+    #[test]
+    fn versions_keep_their_case_in_upper_case_styles() {
+        let text = format!("Update to {}", keep_case("1.3.0-beta.1"));
+        assert_eq!(caps(&text), "UPDATE TO 1.3.0-beta.1");
+        assert_eq!(plain(&text), "Update to 1.3.0-beta.1");
+        assert_eq!(caps("Other versions"), "OTHER VERSIONS");
+        // Marks inside the kept text can't end it early.
+        assert_eq!(caps(&keep_case("a\u{E001}b")), "ab");
+    }
 
     #[test]
     fn a_long_path_breaks_after_slashes_and_keeps_every_character() {

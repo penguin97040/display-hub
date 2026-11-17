@@ -56,15 +56,31 @@ impl Signer {
     }
 }
 
-/// The fingerprint of a key id: its first 32 hex digits in groups of four. An id that isn't hex is
-/// shown as it is, cut to that length.
+/// The fingerprint of a key id, as the package library makes it: its first 32 hex digits in groups
+/// of four. An id that isn't 64 hex digits is shown as it is, cut to that length and grouped the same
+/// way.
 pub fn fingerprint(key_id: &str) -> String {
+    if let Some(b) = firmware_package::hex::decode_exact::<32>(key_id) {
+        return firmware_package::KeyId(b).fingerprint();
+    }
     let digits: Vec<char> = key_id.chars().take(32).collect();
     digits
         .chunks(4)
         .map(|g| g.iter().collect::<String>())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Whether the owner may not call a key this: the name the app keeps for keys built into it, or
+/// anything claiming to be official Display Hub firmware. Compared ignoring case, spacing and
+/// punctuation, as the hub compares it (the hub refuses it too).
+pub fn reserved_label(label: &str) -> bool {
+    let plain: String = label
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    plain == "officialdisplayhubfirmware" || (plain.contains("official") && plain.contains("displayhub"))
 }
 
 /// Names a key: official keys first, then the owner's label, then "Unknown maker".
@@ -89,68 +105,7 @@ fn signer_with(key_id: &str, labels: &[SignerView], official: &[&str]) -> Signer
 
 // ----- versions -----
 
-/// A `MAJOR.MINOR.PATCH[-pre]` version, as the manifest rules allow.
-struct Version<'a> {
-    numbers: [u64; 3],
-    pre: Option<&'a str>,
-}
-
-fn parse_version(s: &str) -> Option<Version<'_>> {
-    let (core, pre) = match s.split_once('-') {
-        Some((c, p)) if !p.is_empty() => (c, Some(p)),
-        Some(_) => return None,
-        None => (s, None),
-    };
-    let mut parts = core.split('.');
-    let mut numbers = [0u64; 3];
-    for n in &mut numbers {
-        let p = parts.next()?;
-        if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        *n = p.parse().ok()?;
-    }
-    parts.next().is_none().then_some(Version { numbers, pre })
-}
-
-/// Compares versions as the doc says: three numbers, and with those equal, a version with a
-/// pre-release tag is older than one without. Two tags compare part by part, numbers as numbers.
-/// `None` if either isn't a version. The hub's `compare_versions` does the same (a test keeps them
-/// together).
-pub fn compare_versions(a: &str, b: &str) -> Option<Ordering> {
-    let (a, b) = (parse_version(a)?, parse_version(b)?);
-    Some(a.numbers.cmp(&b.numbers).then_with(|| match (a.pre, b.pre) {
-        (None, None) => Ordering::Equal,
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(x), Some(y)) => {
-            let (mut xs, mut ys) = (x.split('.'), y.split('.'));
-            loop {
-                match (xs.next(), ys.next()) {
-                    (None, None) => break Ordering::Equal,
-                    (None, Some(_)) => break Ordering::Less,
-                    (Some(_), None) => break Ordering::Greater,
-                    (Some(p), Some(q)) => {
-                        let o = match (p.parse::<u64>(), q.parse::<u64>()) {
-                            (Ok(m), Ok(n)) => m.cmp(&n),
-                            (Ok(_), Err(_)) => Ordering::Less,
-                            (Err(_), Ok(_)) => Ordering::Greater,
-                            _ => p.cmp(q),
-                        };
-                        if o != Ordering::Equal {
-                            break o;
-                        }
-                    }
-                }
-            }
-        }
-    }))
-}
-
-/// Whether a version has a pre-release tag (`1.3.0-beta.1`).
-pub fn is_pre_release(v: &str) -> bool {
-    parse_version(v).is_some_and(|v| v.pre.is_some())
-}
+pub use firmware_package::version::{compare as compare_versions, is_pre_release, order as order_versions};
 
 // ----- a display's firmware -----
 
@@ -170,24 +125,33 @@ pub struct Choice {
     pub package_id: String,
     pub version: String,
     pub signer: Signer,
+    /// The maker's own words about the release. Never part of the app's sentences.
     pub summary: Option<String>,
     /// Older than what the display runs, or a pre-release: Update asks twice.
     pub older: bool,
     pub pre_release: bool,
+    /// The display's version can't be compared with this one, so the app can't tell whether it is
+    /// newer or older: Update asks twice for this too.
+    pub unsure: bool,
 }
 
 impl Choice {
     fn of(p: &FirmwarePackageView, running: Option<&str>, labels: &[SignerView]) -> Self {
+        let order = running.map(|r| compare_versions(&p.firmware_version, r));
         Choice {
             package_id: p.package_id.clone(),
             version: p.firmware_version.clone(),
             signer: signer(&p.signer_key_id, labels),
             summary: p.summary.clone(),
-            older: running
-                .and_then(|r| compare_versions(&p.firmware_version, r))
-                .is_some_and(|o| o == Ordering::Less),
+            older: order == Some(Some(Ordering::Less)),
             pre_release: is_pre_release(&p.firmware_version),
+            unsure: matches!(order, Some(None)),
         }
+    }
+
+    /// Whether Update asks a second time before offering it.
+    pub fn asks_twice(&self) -> bool {
+        self.older || self.pre_release || self.unsure
     }
 }
 
@@ -261,7 +225,9 @@ pub struct DisplayFirmware {
     /// Who signed what it runs, when a package on the hub matches its version and a key it trusts.
     pub signed_by: Option<Signer>,
     pub trust: Trust,
-    /// The hub's best update for it, signed by a key it trusts.
+    /// The update to show first: the newest full release newer than what it runs, or a newer
+    /// pre-release when it already runs one or there is no newer full release. Signed by a key it
+    /// trusts.
     pub available: Option<Choice>,
     /// Other packages it would accept, newest first, for going back or trying a pre-release.
     pub others: Vec<Choice>,
@@ -269,11 +235,36 @@ pub struct DisplayFirmware {
     pub offer: Option<(FirmwareOfferView, Phase)>,
     /// The hub doesn't do signed updates (an older hub).
     pub hub_unaware: bool,
+    /// The display has used up its update attempts for now (`attempts_left` is 0). It tries again
+    /// by itself after a few hours switched on. Offers are still allowed; they wait.
+    pub paused: bool,
+}
+
+/// Which button on a display card would try an offer's package again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Retry {
+    /// The "Update to …" button.
+    Update(String),
+    /// One of the "Install …" buttons under the other versions.
+    Install(String),
+}
+
+impl DisplayFirmware {
+    /// The button that offers `package_id` again, if the card shows one.
+    pub fn retry(&self, package_id: &str) -> Option<Retry> {
+        if let Some(a) = self.available.as_ref().filter(|a| a.package_id == package_id) {
+            return Some(Retry::Update(a.version.clone()));
+        }
+        self.others
+            .iter()
+            .find(|o| o.package_id == package_id)
+            .map(|o| Retry::Install(o.version.clone()))
+    }
 }
 
 /// Whether a package passes the checks the app can make for a display, by its last report: the
-/// same device type and hardware revision, a key it trusts, and at or above its floor. The hub and
-/// the display check again.
+/// same device type and hardware revision, a key it trusts, at or above its floor, and small enough
+/// for its spare space. The hub and the display check again.
 pub fn accepts(d: &DisplayView, p: &FirmwarePackageView) -> bool {
     let Some(info) = &d.device else { return false };
     let Some(fw) = &info.firmware else { return false };
@@ -281,6 +272,25 @@ pub fn accepts(d: &DisplayView, p: &FirmwarePackageView) -> bool {
         && p.hardware_revisions.contains(&info.hardware_revision)
         && fw.key_ids.contains(&p.signer_key_id)
         && p.security_counter >= fw.security_floor
+        && p.image_size <= fw.slot_bytes
+}
+
+/// The update a card shows first, from the packages newer than what the display runs: the newest
+/// full release, unless the display already runs a pre-release or there is no newer full release,
+/// when the newest of them all.
+fn headline<'a>(newer: &[&'a FirmwarePackageView], running: &str) -> Option<&'a FirmwarePackageView> {
+    let newest = |stable_only: bool| {
+        newer
+            .iter()
+            .copied()
+            .filter(|p| !stable_only || !is_pre_release(&p.firmware_version))
+            .max_by(|a, b| order_versions(&a.firmware_version, &b.firmware_version))
+    };
+    if is_pre_release(running) {
+        newest(false)
+    } else {
+        newest(true).or_else(|| newest(false))
+    }
 }
 
 /// A display's firmware, from the hub's lists. `packages` is `None` when the hub didn't list them.
@@ -292,53 +302,53 @@ pub fn display_firmware(
 ) -> DisplayFirmware {
     let info = d.device.as_ref();
     let version = info.map(|i| i.firmware_version.clone());
-    let trust = match info.and_then(|i| i.firmware.as_ref()) {
+    let reported = info.and_then(|i| i.firmware.as_ref());
+    let trust = match reported {
         None => Trust::NotReported,
         Some(f) if f.key_ids.is_empty() => Trust::NoKeys,
         Some(f) => Trust::Keys(f.key_ids.iter().map(|k| signer(k, labels)).collect()),
     };
     let packages = packages.unwrap_or_default();
     let running = version.as_deref();
-    let signed_by = info.and_then(|i| {
-        packages
-            .iter()
-            .find(|p| {
-                accepts(d, p)
-                    && compare_versions(&p.firmware_version, &i.firmware_version) == Some(Ordering::Equal)
-            })
-            .map(|p| signer(&p.signer_key_id, labels))
-    });
-    let fw = d.firmware.as_ref();
-    // The hub's choice, shown only when it is signed by a key the display reports trusting.
-    let available = fw
-        .and_then(|f| f.available_package_id.as_deref())
-        .and_then(|id| packages.iter().find(|p| p.package_id == id))
-        .filter(|p| accepts(d, p))
-        .map(|p| Choice::of(p, running, labels));
-    let mut others: Vec<&FirmwarePackageView> = packages
+    let same = |p: &FirmwarePackageView| {
+        running.is_some_and(|r| compare_versions(&p.firmware_version, r) == Some(Ordering::Equal))
+    };
+    let signed_by = packages
         .iter()
-        .filter(|p| accepts(d, p))
-        .filter(|p| Some(&p.package_id) != available.as_ref().map(|a| &a.package_id))
-        .filter(|p| running.is_none_or(|r| compare_versions(&p.firmware_version, r) != Some(Ordering::Equal)))
-        .collect();
-    others.sort_by(|a, b| {
-        compare_versions(&b.firmware_version, &a.firmware_version).unwrap_or(Ordering::Equal)
+        .find(|p| accepts(d, p) && same(p))
+        .map(|p| signer(&p.signer_key_id, labels));
+    let usable: Vec<&FirmwarePackageView> = packages.iter().filter(|p| accepts(d, p) && !same(p)).collect();
+    // Chosen here rather than taken from the hub, so a pre-release isn't put first over a newer
+    // full release.
+    let available = running.and_then(|r| {
+        let newer: Vec<&FirmwarePackageView> = usable
+            .iter()
+            .copied()
+            .filter(|p| compare_versions(&p.firmware_version, r) == Some(Ordering::Greater))
+            .collect();
+        headline(&newer, r)
     });
-    let others = others
+    let mut others: Vec<&FirmwarePackageView> = usable
         .into_iter()
-        .map(|p| Choice::of(p, running, labels))
+        .filter(|p| Some(&p.package_id) != available.map(|a| &a.package_id))
         .collect();
+    others.sort_by(|a, b| order_versions(&b.firmware_version, &a.firmware_version));
+    let fw = d.firmware.as_ref();
     DisplayFirmware {
         version: version.clone(),
         signed_by,
         trust,
-        available,
-        others,
+        available: available.map(|p| Choice::of(p, running, labels)),
+        others: others
+            .into_iter()
+            .map(|p| Choice::of(p, running, labels))
+            .collect(),
         offer: fw.and_then(|f| f.offer.clone()).map(|o| {
             let ph = phase(&o, now);
             (o, ph)
         }),
         hub_unaware: fw.is_none(),
+        paused: reported.is_some_and(|f| f.attempts_left == Some(0)),
     }
 }
 
@@ -384,11 +394,27 @@ impl Loaded {
         signer(&self.checked.signer_key_id().to_hex(), labels)
     }
 
-    /// "llm-usage-display 1.2.0".
+    /// `"llm-usage-display" 1.2.0`: the device type is the maker's text, so it is quoted
+    /// wherever the app's own sentences name it.
     pub fn title(&self) -> String {
         let m = &self.checked.manifest;
-        format!("{} {}", m.device_type, m.firmware_version)
+        package_title(&m.device_type, &m.firmware_version)
     }
+
+    /// The keys a display trusts after a first install from this package: its `key_set` if it has
+    /// one, otherwise the key that signed it.
+    pub fn trusted_keys(&self, labels: &[SignerView]) -> Vec<Signer> {
+        match &self.checked.manifest.key_set {
+            Some(ks) => ks.iter().map(|k| signer(&k.key_id().to_hex(), labels)).collect(),
+            None => vec![self.signer(labels)],
+        }
+    }
+}
+
+/// How the app's sentences name a package: `"llm-usage-display" 1.2.0`. The device type is quoted
+/// because it is the maker's text; the version can only be numbers, letters, `.` and `-`.
+pub fn package_title(device_type: &str, version: &str) -> String {
+    format!("\"{device_type}\" {version}")
 }
 
 /// The bundle's `firmware` section after a first install from this package: its `key_set` if it
@@ -662,35 +688,6 @@ pub(crate) mod tests {
         Timestamp::parse(s).unwrap()
     }
 
-    #[test]
-    fn versions_compare_as_the_hub_compares_them() {
-        use Ordering::*;
-        let cases = [
-            ("1.2.0", "1.10.0", Some(Less)),
-            ("1.2.0", "1.2.0", Some(Equal)),
-            ("2.0.0", "1.99.99", Some(Greater)),
-            ("1.3.0-beta.1", "1.3.0", Some(Less)),
-            ("1.3.0-beta.2", "1.3.0-beta.10", Some(Less)),
-            ("1.3.0-beta", "1.3.0-beta.1", Some(Less)),
-            ("1.3.0-1", "1.3.0-alpha", Some(Less)),
-            ("0.0.0-simulator", "0.0.1", Some(Less)),
-            ("1.2", "1.0.0", None),
-            ("v1.2.3", "1.0.0", None),
-            ("1.2.3-", "1.0.0", None),
-        ];
-        for (a, b, o) in cases {
-            assert_eq!(compare_versions(a, b), o, "{a} {b}");
-            assert_eq!(
-                hubd::firmware::compare_versions(a, b),
-                o,
-                "the hub agrees: {a} {b}"
-            );
-        }
-        assert!(is_pre_release("1.3.0-beta.1"));
-        assert!(!is_pre_release("1.3.0"));
-        assert!(!is_pre_release("nonsense"));
-    }
-
     fn label(key_id: &str, label: &str) -> SignerView {
         SignerView {
             key_id: key_id.into(),
@@ -726,6 +723,7 @@ pub(crate) mod tests {
             signer_label: None,
             size: 1000,
             update_size: 900,
+            image_size: 700,
             usb_install: true,
             uploaded_at: ts("2026-11-17T09:00:00Z"),
             uploaded_by_role: "admin".into(),
@@ -789,16 +787,122 @@ pub(crate) mod tests {
         assert_eq!(others, [("1.1.0", true)]);
 
         // The hub's choice signed by an untrusted key is not shown (the hub would never choose it,
-        // but the app checks).
+        // but the app chooses for itself).
         let d = display(Some(vec!["k"]), "1.2.0", Some("e"));
-        assert!(display_firmware(&d, Some(&packages), &[], None)
-            .available
-            .is_none());
+        let fw = display_firmware(&d, Some(&packages), &[], None);
+        assert_ne!(fw.available.unwrap().package_id, "e".repeat(64));
+        assert!(fw.others.iter().all(|o| o.package_id != "e".repeat(64)));
         // Below the floor isn't offered either.
         let mut low = package("f", "9.0.0", "k");
         low.security_counter = 1;
         let fw = display_firmware(&display(Some(vec!["k"]), "1.2.0", None), Some(&[low]), &[], None);
         assert!(fw.others.is_empty());
+    }
+
+    fn versions(choices: &[Choice]) -> Vec<&str> {
+        choices.iter().map(|c| c.version.as_str()).collect()
+    }
+
+    #[test]
+    fn the_headline_is_the_newest_full_release_unless_the_display_runs_a_pre_release() {
+        let packages = vec![
+            package("a", "1.3.0", "k"),
+            package("b", "1.4.0-beta.1", "k"),
+            package("c", "1.2.5", "k"),
+            package("d", "1.0.0", "k"),
+        ];
+        let fw = |running: &str| {
+            display_firmware(
+                &display(Some(vec!["k"]), running, None),
+                Some(&packages),
+                &[],
+                None,
+            )
+        };
+        // A full release first, the pre-release under the others.
+        let f = fw("1.2.0");
+        assert_eq!(f.available.as_ref().unwrap().version, "1.3.0");
+        assert_eq!(versions(&f.others), ["1.4.0-beta.1", "1.2.5", "1.0.0"]);
+        // Already on a pre-release: the newest of them all.
+        let f = fw("1.3.0-beta.2");
+        assert_eq!(f.available.as_ref().unwrap().version, "1.4.0-beta.1");
+        // No newer full release: the pre-release.
+        let f = fw("1.3.0");
+        assert_eq!(f.available.as_ref().unwrap().version, "1.4.0-beta.1");
+        assert!(f.available.as_ref().unwrap().asks_twice());
+        // Nothing newer at all.
+        let f = fw("2.0.0");
+        assert!(f.available.is_none());
+        assert!(f.others.iter().all(|o| o.older));
+    }
+
+    #[test]
+    fn a_version_that_cant_be_read_makes_every_choice_unsure() {
+        let packages = vec![package("a", "1.3.0", "k")];
+        let f = display_firmware(
+            &display(Some(vec!["k"]), "dev build", None),
+            Some(&packages),
+            &[],
+            None,
+        );
+        assert!(f.available.is_none());
+        let o = &f.others[0];
+        assert!(o.unsure && !o.older && o.asks_twice(), "{o:?}");
+    }
+
+    #[test]
+    fn a_package_too_big_for_the_spare_space_isnt_offered() {
+        // The display has 1 MiB spare, which is what the image alone is compared with.
+        let mut fits = package("a", "1.3.0", "k");
+        fits.image_size = 1 << 20;
+        let mut too_big = package("b", "1.4.0", "k");
+        too_big.image_size = (1 << 20) + 1;
+        let d = display(Some(vec!["k"]), "1.2.0", None);
+        assert!(accepts(&d, &fits));
+        assert!(!accepts(&d, &too_big));
+        let f = display_firmware(&d, Some(&[fits, too_big]), &[], None);
+        assert_eq!(f.available.unwrap().version, "1.3.0");
+        assert!(f.others.is_empty());
+    }
+
+    #[test]
+    fn fingerprints_match_the_package_library_and_official_names_are_reserved() {
+        let key = SigningKey::generate().unwrap().0;
+        let id = key.public_key().key_id();
+        assert_eq!(fingerprint(&id.to_hex()), id.fingerprint());
+        for bad in [
+            "Official Display Hub firmware",
+            "official display-hub firmware",
+            "OFFICIAL  DISPLAY HUB",
+            "Display Hub (official)",
+        ] {
+            assert!(reserved_label(bad), "{bad}");
+        }
+        for ok in ["Kea Displays", "Official Kea firmware", "Display Hub fan club"] {
+            assert!(!reserved_label(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn a_display_out_of_attempts_is_paused() {
+        let mut d = display(Some(vec!["k"]), "1.2.0", None);
+        let f = display_firmware(&d, Some(&[]), &[], None);
+        assert!(!f.paused, "not reported means not paused");
+        d.device
+            .as_mut()
+            .unwrap()
+            .firmware
+            .as_mut()
+            .unwrap()
+            .attempts_left = Some(0);
+        assert!(display_firmware(&d, Some(&[]), &[], None).paused);
+    }
+
+    #[test]
+    fn a_package_names_itself_only_in_quotes() {
+        let (loaded, _) = usb_package("esp32s3", true);
+        assert_eq!(loaded.title(), "\"desk\" 1.0.0");
+        assert_eq!(loaded.trusted_keys(&[]).len(), 2);
     }
 
     #[test]

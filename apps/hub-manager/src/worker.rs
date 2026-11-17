@@ -131,6 +131,10 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
     )
     .map_err(Failure::Client)?;
     let ticks = ticks(&displays);
+    let (firmware, firmware_error) = match shelf(s).await {
+        Ok(f) => (f, None),
+        Err(e) => (None, Some(Arc::new(e))),
+    };
     Ok(Refresh {
         status,
         pages,
@@ -138,24 +142,39 @@ async fn refresh(s: &Session) -> Result<Refresh, Failure> {
         preview,
         helpers,
         ticks,
-        firmware: shelf(s).await,
+        firmware,
+        firmware_error,
     })
 }
 
-/// The firmware lists. A hub without signed updates doesn't have them, which isn't a failure.
-async fn shelf(s: &Session) -> Option<Shelf> {
+/// Whether a failure means the hub has no such route: a hub older than signed updates.
+fn no_such_route(e: &hub_client::ClientError) -> bool {
+    matches!(
+        e,
+        hub_client::ClientError::Status {
+            status: 404 | 405,
+            ..
+        }
+    )
+}
+
+/// The firmware lists. `Ok(None)` from a hub without signed updates, which isn't a failure; any
+/// other failure is one, and the model keeps the lists it had.
+async fn shelf(s: &Session) -> Result<Option<Shelf>, hub_client::ClientError> {
     let t = s.token.as_str();
-    let (packages, signers, publishers) = tokio::try_join!(
+    match tokio::try_join!(
         s.client.firmware_packages(t),
         s.client.firmware_signers(t),
         s.client.publishers(t),
-    )
-    .ok()?;
-    Some(Shelf {
-        packages,
-        signers,
-        publishers,
-    })
+    ) {
+        Ok((packages, signers, publishers)) => Ok(Some(Shelf {
+            packages,
+            signers,
+            publishers,
+        })),
+        Err(e) if no_such_route(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Reads a whole package file, refusing one too large to be a package before reading it.
@@ -468,13 +487,16 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             .await;
             let after = after.map_err(Failure::Install)?;
             // The owner's name for the maker's key, once the display trusts it. A failure here
-            // doesn't undo the install; the name can be set on the Firmware screen.
+            // doesn't undo the install: the model says so, and the name can be set on the Firmware
+            // screen.
+            let mut label_failed = None;
             if let (AfterFlash::Sent(_), Some((key_id, label))) = (&after, &job.label) {
-                let _ = s.client.set_signer_label(&s.token, key_id, label).await;
+                label_failed = s.client.set_signer_label(&s.token, key_id, label).await.err();
             }
             Ok(Outcome::Installed {
                 after,
                 refresh: refresh_after(&s).await,
+                label_failed,
             })
         }
     }
@@ -621,6 +643,17 @@ mod tests {
         }
         let op = model.submit_add();
         run(model, ctx, op).await;
+    }
+
+    #[test]
+    fn only_a_missing_route_means_an_older_hub() {
+        let status = |status| hub_client::ClientError::Status { status, body: None };
+        assert!(no_such_route(&status(404)));
+        assert!(no_such_route(&status(405)));
+        for other in [401, 403, 409, 500, 503] {
+            assert!(!no_such_route(&status(other)), "{other}");
+        }
+        assert!(!no_such_route(&hub_client::ClientError::Timeout));
     }
 
     #[test]
@@ -1056,7 +1089,7 @@ mod install_tests {
                 .as_ref()
                 .unwrap()
                 .title
-                .starts_with("Installed llm-usage-display 2.0.0"),
+                .starts_with("Installed \"llm-usage-display\" 2.0.0"),
             "{:?}",
             m.notice
         );

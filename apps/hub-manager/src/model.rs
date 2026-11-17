@@ -86,6 +86,9 @@ pub struct Refresh {
     pub ticks: HashMap<String, Vec<String>>,
     /// Firmware packages, signer names and publishers. `None` from a hub without signed updates.
     pub firmware: Option<Shelf>,
+    /// Why the firmware lists couldn't be read from a hub that has them. The model then keeps the
+    /// lists it had, rather than taking the hub for one without signed updates.
+    pub firmware_error: Option<std::sync::Arc<ClientError>>,
 }
 
 /// A serial port a display might be on.
@@ -225,6 +228,9 @@ pub enum Outcome {
     Installed {
         after: AfterFlash,
         refresh: Option<Refresh>,
+        /// Why the owner's name for the maker's key wasn't saved on the hub, if it wasn't. The
+        /// install still counts.
+        label_failed: Option<ClientError>,
     },
 }
 
@@ -260,6 +266,14 @@ pub enum Busy {
     Saving {
         done: String,
     },
+    /// Offering an update to a display; `done` is said once it is made.
+    Offering {
+        done: String,
+    },
+    /// Saving a name for a signing key; `done` is said once it is saved.
+    Naming {
+        done: String,
+    },
     /// Adding pages from a template.
     Adding {
         done: String,
@@ -269,6 +283,9 @@ pub enum Busy {
     Ports,
     Sending {
         port: String,
+        /// Whether keys from an install were waiting: sent with these details (`Some(true)`), or
+        /// left out (`Some(false)`).
+        keys: Option<bool>,
     },
     SavingFile,
     SavingGuide,
@@ -286,7 +303,8 @@ impl Busy {
         match self {
             Busy::Pairing => "Pairing",
             Busy::Refreshing => "Checking the hub",
-            Busy::Saving { .. } => "Saving",
+            Busy::Saving { .. } | Busy::Naming { .. } => "Saving",
+            Busy::Offering { .. } => "Offering the update",
             Busy::Adding { .. } => "Adding",
             Busy::Enrolling => "Preparing setup details",
             Busy::Ports => "Looking for USB ports",
@@ -327,6 +345,7 @@ pub enum Confirm {
         package: String,
         title: String,
         detail: String,
+        says: PackageSays,
         second: Option<(String, String)>,
     },
     UpdateAgain {
@@ -344,10 +363,37 @@ pub enum Confirm {
         port: String,
         title: String,
         detail: String,
+        says: PackageSays,
     },
 }
 
+/// What a package says about itself, shown apart from the app's own sentences and marked as the
+/// maker's: a package can't name itself or speak in the app's voice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PackageSays {
+    /// What each value is, and the maker's value: ("Device type", "llm-usage-display").
+    pub facts: Vec<(String, String)>,
+    /// The manifest's `summary`.
+    pub note: Option<String>,
+}
+
+impl PackageSays {
+    pub fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.note.is_none()
+    }
+}
+
 impl Confirm {
+    /// The package's own words, for the questions that show them.
+    pub fn package_says(&self) -> Option<&PackageSays> {
+        match self {
+            Confirm::Update { says, .. } | Confirm::Install { says, .. } => {
+                Some(says).filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    }
+
     pub fn question(&self) -> (String, String, &'static str) {
         match self {
             Confirm::RemovePage { title, .. } => (
@@ -763,8 +809,9 @@ pub struct Model {
     pub install_copied: bool,
     /// The Firmware screen.
     pub fw: FirmwareUi,
-    /// The keys from an install whose setup details weren't made, for the next Add a display.
-    pub pending_firmware: Option<hub_protocol::firmware::BundleFirmware>,
+    /// The keys from an install whose setup details weren't sent, for the next Add a display to
+    /// the same port.
+    pub pending_firmware: Option<PendingKeys>,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -1552,20 +1599,42 @@ impl Model {
     pub fn send_usb(&mut self, port: &str) -> Option<Op> {
         let bundle = self.enrol.bundle.clone()?;
         let port = port.trim().to_string();
-        if port.is_empty() {
+        if port.is_empty() || self.busy.is_some() {
             return None;
         }
+        // Keys from an install go only to the port it was installed through: on any other port
+        // they would make an unrelated display trust that maker.
+        if self.pending_firmware.as_ref().is_some_and(|p| p.port != port) {
+            self.pending_firmware = None;
+            return self.send_usb_without_keys(port, bundle, Some(false));
+        }
+        let keys = self.pending_firmware.as_ref().map(|p| p.include);
+        let bundle = self.bundle_with_pending(bundle);
+        self.send_usb_without_keys(port, bundle, keys)
+    }
+
+    fn send_usb_without_keys(&mut self, port: String, bundle: Bundle, keys: Option<bool>) -> Option<Op> {
         self.notice = None;
-        self.start(Busy::Sending { port: port.clone() }, Op::SendUsb { port, bundle })
+        self.start(
+            Busy::Sending {
+                port: port.clone(),
+                keys,
+            },
+            Op::SendUsb { port, bundle },
+        )
     }
 
     pub fn save_bundle(&mut self, path: PathBuf) -> Option<Op> {
         let bundle = self.enrol.bundle.clone()?;
+        let bundle = self.bundle_with_pending(bundle);
         self.start(Busy::SavingFile, Op::SaveBundle { path, bundle })
     }
 
+    /// Cancels Add a display, or closes it once done. Keys waiting from an install are dropped
+    /// with it, so they can't reach some later, unrelated display.
     pub fn close_enrol(&mut self) {
         self.enrol = Enrol::default();
+        self.pending_firmware = None;
     }
 
     /// The setup details' expiry, by the hub's clock.
@@ -1672,11 +1741,32 @@ impl Model {
         }
     }
 
-    fn take_refresh(&mut self, r: Refresh, now: Instant) {
+    fn take_refresh(&mut self, mut r: Refresh, now: Instant) {
+        if let Some(e) = r.firmware_error.take() {
+            // The hub has firmware lists, but they couldn't be read this time: keep the ones it had
+            // rather than showing it as a hub without signed updates.
+            r.firmware = Some(
+                self.last
+                    .as_ref()
+                    .and_then(|l| l.firmware.clone())
+                    .unwrap_or_default(),
+            );
+            let why = guidance::from_client(&e, Doing::Other, &self.address());
+            self.notice = Some(Guidance {
+                tone: Tone::Problem,
+                title: "Couldn't read the firmware lists".into(),
+                detail: format!(
+                    "{}. {} The Firmware screen shows what the hub held when it last answered.",
+                    why.title, why.detail
+                ),
+                next: Next::None,
+            });
+        }
         if let EnrolStage::Waiting { .. } = self.enrol.stage {
             if let Some(d) = r.displays.iter().find(|d| !self.enrol.known.contains(&d.id)) {
                 self.enrol.stage = EnrolStage::Joined { name: d.name.clone() };
                 self.enrol.bundle = None;
+                self.pending_firmware = None;
             }
         }
         self.last = Some(r);
@@ -1716,9 +1806,13 @@ impl Model {
             }
             Ok(Outcome::Refreshed(r)) => {
                 self.take_refresh_opt(r, now);
-                if let Some(Busy::Saving { done }) =
-                    busy.filter(|b| !matches!(b, Busy::Saving { done } if done.is_empty()))
-                {
+                let done = match busy {
+                    Some(Busy::Saving { done } | Busy::Offering { done } | Busy::Naming { done }) => {
+                        Some(done)
+                    }
+                    _ => None,
+                };
+                if let Some(done) = done.filter(|d| !d.is_empty()) {
                     self.notice = Some(Guidance::done(done, ""));
                 } else if self.notice.as_ref().is_some_and(|n| n.next == Next::Retry) {
                     // The hub is back.
@@ -1775,7 +1869,9 @@ impl Model {
                 let port = self.bundle_port();
                 match hub_client::provisioning::bundle(&grant, self.bundle_hosts(), port, wifi) {
                     Ok(b) => {
-                        self.enrol.bundle = Some(self.bundle_with_pending(b));
+                        // Keys waiting from an install are added when the details are sent, to the
+                        // port it was installed through.
+                        self.enrol.bundle = Some(b);
                         self.enrol.stage = EnrolStage::Ready;
                         self.enrol.known = self.displays().iter().map(|d| d.id.clone()).collect();
                     }
@@ -1813,27 +1909,32 @@ impl Model {
                 self.fw.install.scanned = true;
             }
             Ok(Outcome::Sent(display)) => {
-                // Any keys waiting from an install went with these setup details.
-                if self.enrol.bundle.as_ref().is_some_and(|b| b.firmware.is_some()) {
-                    self.pending_firmware = None;
-                }
-                let port = match busy {
-                    Some(Busy::Sending { port }) => port,
-                    _ => String::new(),
+                // Any keys waiting from an install went with these setup details, or were left out:
+                // either way they are done with.
+                self.pending_firmware = None;
+                let (port, keys) = match busy {
+                    Some(Busy::Sending { port, keys }) => (port, keys),
+                    _ => (String::new(), None),
                 };
                 self.enrol.stage = EnrolStage::Waiting {
                     how: format!("Sent to {port}"),
                 };
+                let keys = match keys {
+                    Some(true) => " It now trusts the keys from the firmware just installed.",
+                    Some(false) => " The keys from the firmware just installed weren't sent with them.",
+                    None => "",
+                };
                 self.notice = Some(Guidance::done(
                     format!("Sent to the display on {port}"),
                     format!(
-                        "{} {} accepted the setup details. It joins Wi-Fi and checks in with the hub; this page \
-                         updates when it does.",
+                        "{} {} accepted the setup details.{keys} It joins Wi-Fi and checks in with the hub; this \
+                         page updates when it does.",
                         display.device.device_type, display.device.firmware_version
                     ),
                 ));
             }
             Ok(Outcome::Saved(path)) => {
+                self.pending_firmware = None;
                 self.enrol.stage = EnrolStage::Waiting {
                     how: format!("Saved to {}", path.display()),
                 };
@@ -1863,16 +1964,22 @@ impl Model {
                 self.take_publisher_invite(invite);
             }
             Ok(Outcome::PackageLoaded(loaded)) => self.take_loaded(*loaded),
-            Ok(Outcome::Installed { after, refresh }) => self.take_installed(after, refresh, now),
+            Ok(Outcome::Installed {
+                after,
+                refresh,
+                label_failed,
+            }) => self.take_installed(after, refresh, label_failed, now),
             Err(f) => self.failed(f, busy, now),
         }
     }
 
     fn failed(&mut self, f: Failure, busy: Option<Busy>, now: Instant) {
-        let doing = if busy == Some(Busy::Pairing) {
-            Doing::Pairing
-        } else {
-            Doing::Other
+        let doing = match busy {
+            Some(Busy::Pairing) => Doing::Pairing,
+            Some(Busy::Uploading) => Doing::Uploading,
+            Some(Busy::Offering { .. }) => Doing::Offering,
+            Some(Busy::Naming { .. }) => Doing::Naming,
+            _ => Doing::Other,
         };
         let g = match &f {
             Failure::Client(e) => {
@@ -1919,7 +2026,10 @@ impl Model {
             self.needs_pairing = true;
         }
         // A reorder shown early is put back by the next refresh.
-        if matches!(busy, Some(Busy::Saving { .. } | Busy::Adding { .. })) {
+        if matches!(
+            busy,
+            Some(Busy::Saving { .. } | Busy::Offering { .. } | Busy::Naming { .. } | Busy::Adding { .. })
+        ) {
             self.refreshed_at = None;
         } else if busy == Some(Busy::Refreshing) {
             // A refresh that failed for any reason waits its turn before the next, never every tick.
@@ -2167,6 +2277,7 @@ mod tests {
             helpers: vec![],
             ticks: Default::default(),
             firmware: None,
+            firmware_error: None,
         }
     }
 
@@ -3526,6 +3637,7 @@ mod helper_string_tests {
             helpers: vec![],
             ticks: Default::default(),
             firmware: None,
+            firmware_error: None,
         };
         m.finish(
             Ok(Outcome::HelperInvite {

@@ -390,6 +390,7 @@ pub fn package_view(
         signer_label: labels.get(&p.signer_key_id).cloned(),
         size: p.size,
         update_size: p.update_size,
+        image_size: p.image_size,
         usb_install: p.usb_install,
         uploaded_at: p.uploaded_at,
         uploaded_by_role: p.uploaded_by_role.as_str().to_string(),

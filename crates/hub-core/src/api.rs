@@ -322,6 +322,8 @@ pub struct FirmwarePackageView {
     /// The whole file, and the part a display receives (without the USB-install parts).
     pub size: u64,
     pub update_size: u64,
+    /// The app image alone: what a display compares with its spare space.
+    pub image_size: u64,
     /// Whether it has what a first install over USB needs.
     pub usb_install: bool,
     pub uploaded_at: Timestamp,

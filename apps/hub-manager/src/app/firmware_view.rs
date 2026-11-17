@@ -9,24 +9,63 @@ use gpui::{div, prelude::*, px, ClipboardItem, Context, Div, ElementId, SharedSt
 
 use super::{nz_date, waiting, FieldId, Kind, Manager};
 use crate::firmware::{Signer, SignerKind, Trust};
-use crate::guidance::{self, Guidance};
-use crate::model::{InstallStage, Model, Op, PackageSource};
+use crate::guidance::{self, size_text, Guidance};
+use crate::model::{InstallStage, Model, Op, PackageSays, PackageSource};
 use crate::theme::*;
-use crate::ui::{self, c, Metrics};
+use crate::ui::{self, c, keep_case, Metrics};
 
-/// "1.4 MB".
-fn size_text(bytes: u64) -> String {
-    let mb = bytes as f64 / (1024.0 * 1024.0);
-    if mb >= 0.1 {
-        format!("{mb:.1} MB")
-    } else {
-        format!("{} KB", bytes.div_ceil(1024))
-    }
+/// "the key the hub calls "Kea Displays" (3f9a-01c2-…)".
+fn signer_text(s: &Signer) -> String {
+    guidance::signer_phrase(s)
 }
 
-/// "Kea Displays (3f9a-01c2-…)".
-fn signer_text(s: &Signer) -> String {
-    format!("{} ({})", s.name(), s.fingerprint)
+/// "rev-a, rev-b", each in its own case in an upper-case label.
+fn hardware_text(revisions: &[String]) -> String {
+    revisions
+        .iter()
+        .map(|r| keep_case(r))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The maker's own words about a release, marked as theirs and kept apart from the app's.
+fn maker_note(note: impl Into<SharedString>) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(ui::label("The maker's note"))
+        .child(ui::p_muted(note))
+}
+
+/// What a package says about itself, in a confirmation: each value as the maker wrote it, then
+/// the maker's note.
+pub(super) fn package_says(says: &PackageSays) -> Div {
+    let mut out = div()
+        .id("package-says")
+        .role(Role::Group)
+        .aria_label("What the package says about itself")
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .p(px(12.0))
+        .border_1()
+        .border_color(c(LINE))
+        .child(ui::label("What the package says about itself"));
+    for (what, value) in &says.facts {
+        out = out.child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(px(8.0))
+                .child(ui::label(what))
+                .child(ui::data(format!("\"{value}\""))),
+        );
+    }
+    if let Some(n) = &says.note {
+        out = out.child(maker_note(n.clone()));
+    }
+    div().child(out)
 }
 
 impl Manager {
@@ -189,6 +228,7 @@ impl Manager {
                 )
             });
             let mut facts = vec![
+                format!("For {}", hardware_text(&p.hardware_revisions)),
                 size_text(p.size),
                 if p.usb_install {
                     "Can do a first install over USB".into()
@@ -221,7 +261,7 @@ impl Manager {
                             .gap(px(4.0))
                             .child(ui::h3(format!("{} {}", p.device_type, p.version)))
                             .child(ui::label(&format!("Signed by {}", signer_text(&p.signer))))
-                            .when_some(p.summary.clone(), |d, s| d.child(ui::p_muted(s)))
+                            .when_some(p.summary.clone(), |d, s| d.child(maker_note(s)))
                             .child(ui::label(&facts.join(" · "))),
                     )
                     .child(div().flex().gap(px(8.0)).children(usb).child(remove)),
@@ -279,6 +319,9 @@ impl Manager {
                         .child(ui::h3(k.signer.name()))
                         .when(k.signer.kind == SignerKind::Official, |d| {
                             d.child(ui::tag("Built into the app", MUTED))
+                        })
+                        .when(matches!(k.signer.kind, SignerKind::Labelled(_)), |d| {
+                            d.child(ui::tag("The hub's name for it", MUTED))
                         }),
                 )
                 .child(ui::data(k.signer.fingerprint.clone()))
@@ -493,7 +536,7 @@ impl Manager {
                             .gap(px(12.0))
                             .child(self.button(
                                 format!("install-hub-{}", p.id),
-                                &format!("Use {} {}", p.device_type, p.version),
+                                &format!("Use {} {}", keep_case(&p.device_type), keep_case(&p.version)),
                                 Kind::Secondary,
                                 !busy,
                                 cx,
@@ -502,7 +545,11 @@ impl Manager {
                                     this.run(op, cx);
                                 },
                             ))
-                            .child(ui::label(&format!("Signed by {}", p.signer.name()))),
+                            .child(ui::label(&format!(
+                                "For {} · Signed by {}",
+                                hardware_text(&p.hardware_revisions),
+                                signer_text(&p.signer)
+                            ))),
                     );
                 }
                 ui::body(m)
@@ -579,10 +626,11 @@ impl Manager {
                 .child(ui::data(signer.fingerprint.clone())),
             kind => {
                 let heading = match kind {
-                    SignerKind::Labelled(l) => format!("Signed by the key you named \"{l}\""),
+                    SignerKind::Labelled(l) => format!("Signed by the key the hub calls \"{l}\""),
                     _ => "Signed by a maker this app doesn't know".into(),
                 };
-                let maker = (*kind == SignerKind::Unknown).then(|| {
+                // An older hub can't keep names for keys.
+                let maker = (*kind == SignerKind::Unknown && self.model.hub_has_firmware()).then(|| {
                     self.field(
                         FieldId::InstallMaker,
                         "Your name for this maker (optional)",
@@ -692,9 +740,11 @@ impl Manager {
             cx,
             |this, _, _| this.model.choose_again(),
         );
+        let hardware = format!("For hardware {}", hardware_text(&man.hardware_revisions));
         ui::body(m)
             .child(ui::h3(loaded.title()))
-            .when_some(man.summary.clone(), |d, s| d.child(ui::p_muted(s)))
+            .when_some(man.summary.clone(), |d, s| d.child(maker_note(s)))
+            .child(ui::label(&hardware))
             .child(ui::label(&needs))
             .child(signer_box)
             .child(name)
@@ -724,6 +774,11 @@ impl Manager {
                 None => v.clone(),
             };
             out = out.child(ui::p(line));
+        }
+        if fw.paused {
+            out = out.child(ui::p_muted(guidance::paused_words(
+                &self.model.display_name(display),
+            )));
         }
         let install_button = |this: &mut Self, cx: &mut Context<Self>| {
             this.button(
@@ -764,8 +819,14 @@ impl Manager {
         }
         let open = fw.offer.as_ref().is_some_and(|(_, p)| p.is_open());
         if let Some((offer, phase)) = &fw.offer {
-            let (title, detail) =
-                guidance::offer_words(phase, offer, fw.version.as_deref(), &self.model.poll_text());
+            let retry = fw.retry(&offer.package_id);
+            let (title, detail) = guidance::offer_words(
+                phase,
+                offer,
+                fw.version.as_deref(),
+                &self.model.poll_text(),
+                retry.as_ref(),
+            );
             let d = display.to_string();
             let cancel = open.then(|| {
                 self.button(
@@ -814,7 +875,7 @@ impl Manager {
                 let (d, p) = (display.to_string(), a.package_id.clone());
                 let update = self.button(
                     format!("update-{display}"),
-                    &format!("Update to {}", a.version),
+                    &format!("Update to {}", keep_case(&a.version)),
                     Kind::Primary,
                     !busy,
                     cx,
@@ -837,12 +898,12 @@ impl Manager {
                                 .gap(px(8.0))
                                 .child(ui::tag("Update available", BEAK))
                                 .child(ui::label(&format!(
-                                    "{} from {}",
-                                    a.version,
+                                    "{}, signed by {}",
+                                    keep_case(&a.version),
                                     signer_text(&a.signer)
                                 ))),
                         )
-                        .when_some(a.summary.clone(), |d, s| d.child(ui::p_muted(s)))
+                        .when_some(a.summary.clone(), |d, s| d.child(maker_note(s)))
                         .child(div().flex().child(update)),
                 );
             }
@@ -852,7 +913,7 @@ impl Manager {
                     let (d, p) = (display.to_string(), o.package_id.clone());
                     row = row.child(self.button(
                         format!("other-{display}-{}", o.package_id),
-                        &format!("Install {}", o.version),
+                        &format!("Install {}", keep_case(&o.version)),
                         Kind::Quiet,
                         !busy,
                         cx,
@@ -867,5 +928,59 @@ impl Manager {
             }
         }
         Some(out)
+    }
+
+    /// In Add a display: the keys waiting from an install, and a way to leave them out.
+    pub(super) fn pending_keys_block(&mut self, cx: &mut Context<Self>) -> Option<Div> {
+        let p = self.model.pending_keys()?.clone();
+        let busy = self.model.busy.is_some();
+        let keys: Vec<String> = p.keys.iter().map(signer_text).collect();
+        let (text, button, include) = if p.include {
+            (
+                format!(
+                    "This display will trust keys from {} from the firmware just installed on {}. They are sent \
+                     only to {}.",
+                    keys.join("; "),
+                    p.port,
+                    p.port
+                ),
+                "Leave them out",
+                false,
+            )
+        } else {
+            (
+                format!(
+                    "The keys from the firmware just installed on {} are left out, so the display keeps whatever \
+                     keys it already has.",
+                    p.port
+                ),
+                "Include them",
+                true,
+            )
+        };
+        let toggle = self.button(
+            "pending-keys",
+            button,
+            Kind::Quiet,
+            !busy,
+            cx,
+            move |this, _, _| this.model.include_pending_keys(include),
+        );
+        Some(
+            div().child(
+                div()
+                    .id("pending-keys-box")
+                    .role(Role::Group)
+                    .aria_label(SharedString::from(text.clone()))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .p(px(12.0))
+                    .border_1()
+                    .border_color(c(BEAK))
+                    .child(ui::p(text))
+                    .child(div().flex().child(toggle)),
+            ),
+        )
     }
 }

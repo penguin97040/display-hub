@@ -7,7 +7,7 @@ use hub_protocol::firmware::ReportReason;
 use hub_protocol::pairing::PairingError;
 use hub_protocol::ErrorCode;
 
-use crate::firmware::{BoardError, InstallError, Phase, Progress, Step};
+use crate::firmware::{BoardError, InstallError, Phase, Progress, Retry, Signer, SignerKind, Step};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
@@ -68,21 +68,75 @@ impl Guidance {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Doing {
     Pairing,
+    /// Adding a firmware file to the hub.
+    Uploading,
+    /// Offering an update to a display (the Update button).
+    Offering,
+    /// Saving a name for a signing key.
+    Naming,
     Other,
 }
 
-/// The hub's own message, kept short and plain for showing.
+/// "1.4 MB", "12 KB": sizes as people read them.
+pub fn size_text(bytes: u64) -> String {
+    let mb = bytes as f64 / (1024.0 * 1024.0);
+    if mb >= 0.1 {
+        format!("{mb:.1} MB")
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
+}
+
+/// A hub message with every "1482752 bytes" in it said as "1.4 MB".
+fn sizes_in_words(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find(" bytes") {
+        let before = &rest[..at];
+        let digits = before.len() - before.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let starts_word = before[..before.len() - digits]
+            .chars()
+            .last()
+            .is_none_or(|c| !c.is_alphanumeric());
+        match before[before.len() - digits..].parse::<u64>() {
+            Ok(n) if digits > 0 && starts_word => {
+                out.push_str(&before[..before.len() - digits]);
+                out.push_str(&size_text(n));
+            }
+            _ => {
+                out.push_str(before);
+                out.push_str(" bytes");
+            }
+        }
+        rest = &rest[at + " bytes".len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The hub's own message, kept short and plain for showing, with sizes in MB or KB.
 fn hub_message(e: &ClientError) -> String {
     match e {
-        ClientError::Status { body: Some(b), .. } => b
-            .error
-            .message
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(200)
-            .collect(),
+        ClientError::Status { body: Some(b), .. } => {
+            let plain: String = b
+                .error
+                .message
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(300)
+                .collect();
+            sizes_in_words(&plain)
+        }
         ClientError::Status { status, body: None } => format!("HTTP {status}"),
         _ => String::new(),
+    }
+}
+
+/// The hub's message, or `fallback` when it gave none.
+fn hub_message_or(e: &ClientError, fallback: &str) -> String {
+    match e {
+        ClientError::Status { body: Some(b), .. } if !b.error.message.trim().is_empty() => hub_message(e),
+        _ => fallback.to_string(),
     }
 }
 
@@ -145,6 +199,11 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
             "The hub and this app may be different versions. Update both to the same release.",
             Next::Retry,
         ),
+        ClientError::Status { status: 408, .. } if doing == Doing::Uploading => Guidance::problem(
+            "The upload stopped part way",
+            hub_message_or(e, "The hub gave up waiting for the file. Try again."),
+            Next::None,
+        ),
         ClientError::Status { .. } => match (e.code(), doing) {
             (Some(EnrolmentExpired), Doing::Pairing) => Guidance::problem(
                 "That pairing string has expired",
@@ -177,7 +236,7 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
             ),
             (Some(Unavailable), _) => Guidance::problem(
                 "The hub is busy",
-                "It couldn't do that just now. Try again in a moment.",
+                hub_message_or(e, "It couldn't do that just now. Try again in a moment."),
                 Next::Retry,
             ),
             (Some(NotFound), _) => Guidance::problem(
@@ -185,7 +244,15 @@ pub fn from_client(e: &ClientError, doing: Doing, address: &str) -> Guidance {
                 "It may have been changed from another PC. The lists have been refreshed.",
                 Next::Retry,
             ),
-            (Some(Conflict), _) => Guidance::problem("That clashes with something on the hub", hub_message(e), Next::None),
+            (Some(Conflict), Doing::Uploading) => {
+                Guidance::problem("The hub has no room for this package", hub_message(e), Next::None)
+            }
+            (Some(Conflict), Doing::Offering) => {
+                Guidance::problem("The display would refuse this update", hub_message(e), Next::None)
+            }
+            (Some(BadRequest), Doing::Naming) => {
+                Guidance::problem("The hub won't use that name", hub_message(e), Next::None)
+            }
             _ => Guidance::problem("The hub refused that", hub_message(e), Next::None),
         },
     }
@@ -328,12 +395,44 @@ pub fn from_install(e: &InstallError, port: &str) -> Guidance {
     }
 }
 
-/// The line on a display card for its open or last update, and a sentence under it.
+/// How the app's sentences name a signing key: by the app's own name for an official key, by the
+/// hub's name for a key the owner named (which is only as trustworthy as the hub), and always with
+/// its fingerprint.
+pub fn signer_phrase(s: &Signer) -> String {
+    match &s.kind {
+        SignerKind::Official => format!("{} ({})", s.name(), s.fingerprint),
+        SignerKind::Labelled(l) => format!("the key the hub calls \"{l}\" ({})", s.fingerprint),
+        SignerKind::Unknown => format!("a maker this app doesn't know ({})", s.fingerprint),
+    }
+}
+
+/// What a display card says when the display has used up its update attempts for now.
+pub fn paused_words(name: &str) -> String {
+    format!(
+        "{name} has tried five updates recently and is pausing to protect its memory. It will try again after \
+         about four hours switched on. To update now, use Install firmware over USB."
+    )
+}
+
+/// How to try an offer's package again, by the button the card shows for it.
+fn try_again(retry: Option<&Retry>) -> String {
+    match retry {
+        Some(Retry::Update(v)) => format!("Press Update to {v} to try again."),
+        Some(Retry::Install(v)) => {
+            format!("To try again, press Install {v}, under Other versions on the hub.")
+        }
+        None => "To try again, add its package to the hub again.".into(),
+    }
+}
+
+/// The line on a display card for its open or last update, and a sentence under it. `retry` is
+/// the card's button for the same package, if it shows one.
 pub fn offer_words(
     phase: &Phase,
     offer: &FirmwareOfferView,
     running: Option<&str>,
     poll: &str,
+    retry: Option<&Retry>,
 ) -> (String, String) {
     let v = &offer.firmware_version;
     let now_runs = running.unwrap_or("the version it had");
@@ -361,7 +460,7 @@ pub fn offer_words(
                 .or(running)
                 .unwrap_or("its previous version");
             (
-                "The update didn't start properly".into(),
+                format!("Went back to {back}"),
                 format!(
                     "The update didn't start properly, so the display went back to {back}. Nothing was lost."
                 ),
@@ -397,18 +496,19 @@ pub fn offer_words(
             )
         }
         Phase::Failed(r) => {
+            let again = try_again(retry);
             let why = match r {
                 ReportReason::Download => {
-                    "The download didn't finish. Check the display's Wi-Fi, then press Update to try again."
+                    format!("The download didn't finish. Check the display's Wi-Fi. {again}")
                 }
                 ReportReason::ImageHash => {
-                    "The firmware arrived damaged, so the display threw it away. Press Update to try again."
+                    format!("The firmware arrived damaged, so the display threw it away. {again}")
                 }
-                ReportReason::Flash => {
-                    "The display couldn't write the firmware to its memory. Press Update to try again; if it keeps \
-                     failing, use Install firmware over USB."
-                }
-                _ => "The display reported a problem this app doesn't know.",
+                ReportReason::Flash => format!(
+                    "The display couldn't write the firmware to its memory. {again} If it keeps failing, use \
+                     Install firmware over USB."
+                ),
+                _ => "The display reported a problem this app doesn't know.".into(),
             };
             (format!("Updating to {v} failed"), format!("{why} {still}"))
         }
@@ -425,9 +525,10 @@ pub fn offer_words(
         ),
         Phase::Expired => (
             format!("The update to {v} expired"),
-            "The display didn't check in within 24 hours, so the update was called off. Press Update to try \
-             again."
-                .into(),
+            format!(
+                "The display didn't check in within 24 hours, so the update was called off. {}",
+                try_again(retry)
+            ),
         ),
         Phase::Unknown(state) => (
             format!("Updating to {v} failed"),
@@ -512,6 +613,48 @@ mod tests {
         assert_eq!(
             (offline.title.as_str(), offline.next),
             ("Can't reach the hub", Next::Retry)
+        );
+    }
+
+    #[test]
+    fn sizes_in_hub_messages_are_said_in_mb_or_kb() {
+        assert_eq!(
+            sizes_in_words("This firmware is 1482752 bytes, too big for 1048576 bytes."),
+            "This firmware is 1.4 MB, too big for 1.0 MB."
+        );
+        assert_eq!(sizes_in_words("2048 bytes"), "2 KB");
+        // Not a number of bytes: left alone.
+        assert_eq!(sizes_in_words("a1 bytes, some bytes"), "a1 bytes, some bytes");
+    }
+
+    #[test]
+    fn a_busy_hub_says_why_when_it_can() {
+        let e = ClientError::Status {
+            status: 503,
+            body: Some(ErrorBody::new(
+                ErrorCode::Unavailable,
+                "This display is already downloading firmware. Try again when that download ends.",
+            )),
+        };
+        let g = from_client(&e, Doing::Other, "x");
+        assert_eq!(g.title, "The hub is busy");
+        assert!(g.detail.contains("already downloading"), "{}", g.detail);
+        let bare = ClientError::Status {
+            status: 503,
+            body: Some(ErrorBody::new(ErrorCode::Unavailable, "")),
+        };
+        assert!(from_client(&bare, Doing::Other, "x")
+            .detail
+            .contains("Try again in a moment"));
+        // A conflict elsewhere is the hub's own reason, under a plain title.
+        let e = ClientError::Status {
+            status: 409,
+            body: Some(ErrorBody::new(ErrorCode::Conflict, "Something specific.")),
+        };
+        let g = from_client(&e, Doing::Other, "x");
+        assert_eq!(
+            (g.title.as_str(), g.detail.as_str()),
+            ("The hub refused that", "Something specific.")
         );
     }
 

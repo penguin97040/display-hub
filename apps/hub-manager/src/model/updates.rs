@@ -14,13 +14,13 @@ use hub_protocol::provisioning::{Bundle, Wifi};
 use hub_protocol::Timestamp;
 use zeroize::Zeroizing;
 
-use super::{minutes, wifi_of, Busy, Confirm, EnrolStage, Model, Op, Refresh};
+use super::{minutes, wifi_of, Busy, Confirm, EnrolStage, Model, Op, PackageSays, Refresh};
 use crate::field::Field;
 use crate::firmware::{
-    self, bundle_firmware, display_firmware, DisplayFirmware, Loaded, Plan, Progress, ProgressCell, Signer,
-    SignerKind,
+    self, bundle_firmware, display_firmware, package_title, DisplayFirmware, Loaded, Plan, Progress,
+    ProgressCell, Signer, SignerKind,
 };
-use crate::guidance::{Guidance, Next, Tone};
+use crate::guidance::{signer_phrase, Guidance, Next, Tone};
 
 /// How often the open app checks the hub while a display has an update on offer.
 pub const FIRMWARE_WATCH_EVERY: std::time::Duration = std::time::Duration::from_secs(15);
@@ -133,6 +133,19 @@ impl Default for InstallFlow {
     }
 }
 
+/// Keys from an install whose setup details weren't sent, waiting for Add a display. They go only
+/// to the port the firmware was installed through, and only while the owner leaves them in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingKeys {
+    pub firmware: BundleFirmware,
+    /// The port the firmware was installed through.
+    pub port: String,
+    /// The keys, as people see them.
+    pub keys: Vec<Signer>,
+    /// The owner hasn't chosen to leave them out.
+    pub include: bool,
+}
+
 /// The owner's name for a key, being edited.
 pub struct LabelEdit {
     pub key_id: String,
@@ -167,6 +180,8 @@ pub struct PackageRow {
     pub id: String,
     pub device_type: String,
     pub version: String,
+    /// The hardware it is built for, as the maker names it.
+    pub hardware_revisions: Vec<String>,
     pub signer: Signer,
     pub summary: Option<String>,
     pub size: u64,
@@ -208,7 +223,8 @@ impl Model {
         firmware::signer(key_id, self.signer_labels())
     }
 
-    fn display_name(&self, id: &str) -> String {
+    /// A display's name on the hub, by id.
+    pub fn display_name(&self, id: &str) -> String {
         self.displays()
             .iter()
             .find(|d| d.id == id)
@@ -223,6 +239,7 @@ impl Model {
                 id: p.package_id.clone(),
                 device_type: p.device_type.clone(),
                 version: p.firmware_version.clone(),
+                hardware_revisions: p.hardware_revisions.clone(),
                 signer: self.signer(&p.signer_key_id),
                 summary: p.summary.clone(),
                 size: p.size,
@@ -233,9 +250,9 @@ impl Model {
             .collect();
         // By device type, newest first.
         rows.sort_by(|a, b| {
-            a.device_type.cmp(&b.device_type).then_with(|| {
-                firmware::compare_versions(&b.version, &a.version).unwrap_or(std::cmp::Ordering::Equal)
-            })
+            a.device_type
+                .cmp(&b.device_type)
+                .then_with(|| firmware::order_versions(&b.version, &a.version))
         });
         rows
     }
@@ -326,7 +343,11 @@ impl Model {
         let Some(p) = self.package_rows().into_iter().find(|p| p.id == id) else {
             return;
         };
-        let mut detail = "It is deleted from the hub. Displays already running it keep it.".to_string();
+        let mut detail = format!(
+            "This is the package for hardware {}. It is deleted from the hub. Displays already running it keep \
+             it.",
+            quoted_list(&p.hardware_revisions)
+        );
         if !p.offered_to.is_empty() {
             detail.push_str(&format!(
                 " It is on offer to {}: that update is cancelled.",
@@ -335,9 +356,14 @@ impl Model {
         }
         self.confirm = Some(Confirm::RemovePackage {
             id: id.to_string(),
-            title: format!("{} {}", p.device_type, p.version),
+            title: package_title(&p.device_type, &p.version),
             detail,
         });
+    }
+
+    /// Whether the hub keeps firmware (packages, key names and publishers). An older hub doesn't.
+    pub fn hub_has_firmware(&self) -> bool {
+        self.shelf().is_some()
     }
 
     // ---- updates ---------------------------------------------------------------------------------
@@ -358,50 +384,70 @@ impl Model {
         };
         let name = self.display_name(display);
         let current = fw.version.clone().unwrap_or_else(|| "its current version".into());
-        let summary = choice
-            .summary
-            .clone()
-            .map(|s| format!(" {s}"))
-            .unwrap_or_default();
+        let when = if fw.paused {
+            format!(
+                "{name} has used up its update attempts for now, so it waits about four hours switched on \
+                 before it installs it."
+            )
+        } else {
+            format!(
+                "{name} installs it at its next check, within about {}.",
+                self.poll_text()
+            )
+        };
         let detail = format!(
-            "Signed by {} ({}).{summary} {name} installs it at its next check, within about {}. If the new \
-             firmware doesn't start properly, it goes back to {current} by itself.",
-            choice.signer.name(),
-            choice.signer.fingerprint,
-            self.poll_text(),
+            "Signed by {}. {when} If the new firmware doesn't start properly, it goes back to {current} by \
+             itself.",
+            signer_phrase(&choice.signer),
         );
-        let second = match (choice.older, choice.pre_release) {
-            (false, false) => None,
-            (older, pre) => {
-                let mut why = Vec::new();
-                if older {
-                    why.push(format!(
-                        "{} is older than {current}, which {name} runs now. Going back is allowed while the older \
-                         release has the same security level, for example to undo an update that went wrong. \
-                         Pages and settings are kept.",
-                        choice.version
-                    ));
-                }
-                if pre {
-                    why.push(format!(
-                        "{} is a pre-release: a test version from its maker, which may not work as well as a full \
-                         release.",
-                        choice.version
-                    ));
-                }
-                let title = match (older, pre) {
-                    (true, true) => format!("{} is an older pre-release", choice.version),
-                    (true, false) => format!("{} is an older version", choice.version),
-                    _ => format!("{} is a pre-release", choice.version),
-                };
-                Some((title, format!("{} Install it anyway?", why.join(" "))))
+        let second = choice.asks_twice().then(|| {
+            let mut why = Vec::new();
+            if choice.unsure {
+                why.push(format!(
+                    "{name} reports its version as \"{current}\", which this app can't compare with {}, so it \
+                     can't tell whether this is newer or older.",
+                    choice.version
+                ));
             }
+            if choice.older {
+                why.push(format!(
+                    "{} is older than {current}, which {name} runs now. Going back is allowed while the older \
+                     release has the same security level, for example to undo an update that went wrong. Pages \
+                     and settings are kept.",
+                    choice.version
+                ));
+            }
+            if choice.pre_release {
+                why.push(format!(
+                    "{} is a pre-release: a test version from its maker, which may not work as well as a full \
+                     release.",
+                    choice.version
+                ));
+            }
+            let title = match (choice.older, choice.pre_release) {
+                (true, true) => format!("{} is an older pre-release", choice.version),
+                (true, false) => format!("{} is an older version", choice.version),
+                (false, true) => format!("{} is a pre-release", choice.version),
+                (false, false) => format!("{} may be older than {current}", choice.version),
+            };
+            (title, format!("{} Install it anyway?", why.join(" ")))
+        });
+        let title = if choice.older {
+            format!("Go back to {} on {name}?", choice.version)
+        } else if choice.unsure {
+            format!("Install {} on {name}?", choice.version)
+        } else {
+            format!("Update {name} to {}?", choice.version)
         };
         self.confirm = Some(Confirm::Update {
             display: display.to_string(),
             package: package.to_string(),
-            title: format!("Update {name} to {}?", choice.version),
+            title,
             detail,
+            says: PackageSays {
+                facts: Vec::new(),
+                note: choice.summary.clone(),
+            },
             second,
         });
     }
@@ -450,7 +496,7 @@ impl Model {
              goes.",
             self.poll_text()
         );
-        self.start(Busy::Saving { done }, Op::OfferFirmware { display, package })
+        self.start(Busy::Offering { done }, Op::OfferFirmware { display, package })
     }
 
     // ---- signer names ------------------------------------------------------------------------------
@@ -479,6 +525,7 @@ impl Model {
             None
         } else {
             match clean_title(&typed) {
+                Some(l) if firmware::reserved_label(&l) => return self.problem(reserved_name()),
                 Some(l) => Some(l),
                 None => {
                     return self.problem(Guidance {
@@ -491,10 +538,16 @@ impl Model {
             }
         };
         let done = match &label {
-            Some(l) => format!("Named the key {} \"{l}\".", firmware::fingerprint(&key_id)),
-            None => format!("Removed the name for the key {}.", firmware::fingerprint(&key_id)),
+            Some(l) => format!(
+                "The hub now calls the key {} \"{l}\".",
+                firmware::fingerprint(&key_id)
+            ),
+            None => format!(
+                "Removed the hub's name for the key {}.",
+                firmware::fingerprint(&key_id)
+            ),
         };
-        let op = self.start(Busy::Saving { done }, Op::SetSignerLabel { key_id, label });
+        let op = self.start(Busy::Naming { done }, Op::SetSignerLabel { key_id, label });
         if op.is_some() {
             self.fw.label_edit = None;
         }
@@ -627,8 +680,8 @@ impl Model {
                 signer.fingerprint
             ),
             SignerKind::Labelled(ref l) => format!(
-                "It is signed by the key you named \"{l}\", fingerprint {}. Names are kept on the hub, so check the \
-                 fingerprint against the one the maker publishes.",
+                "It is signed by the key the hub calls \"{l}\", fingerprint {}. The hub keeps that name, so it is \
+                 only as trustworthy as the hub: check the fingerprint against the one the maker publishes.",
                 signer.fingerprint
             ),
             SignerKind::Unknown => format!(
@@ -638,17 +691,49 @@ impl Model {
                 signer.fingerprint
             ),
         };
+        let keys: Vec<String> = loaded
+            .trusted_keys(self.signer_labels())
+            .iter()
+            .map(|k| {
+                let mut t = signer_phrase(k);
+                if k.key_id == signer.key_id {
+                    t.push_str(", which signed this package");
+                }
+                t
+            })
+            .collect();
+        let trusts = match keys.as_slice() {
+            [one] => format!("Afterwards it accepts updates only if they are signed by {one}."),
+            _ => format!(
+                "Afterwards it accepts updates only if they are signed by one of these {} keys: {}.",
+                keys.len(),
+                keys.join("; ")
+            ),
+        };
+        let mut facts = vec![
+            ("Device type".to_string(), m.device_type.clone()),
+            ("Version".to_string(), m.firmware_version.clone()),
+        ];
+        facts.push((
+            if m.hardware_revisions.len() == 1 {
+                "Hardware".to_string()
+            } else {
+                "Hardware (any of)".to_string()
+            },
+            m.hardware_revisions.join(", "),
+        ));
         self.notice = None;
         self.confirm = Some(Confirm::Install {
             port: port.clone(),
-            title: format!("Erase the display on {port} and install {}?", loaded.title()),
+            title: format!("Erase the display on {port} and install this firmware?"),
             detail: format!(
                 "{who} Everything on the display is erased: its hub details, Wi-Fi settings and trusted keys. \
-                 Afterwards it accepts updates only from this maker's keys. {}",
-                m.summary.clone().unwrap_or_default()
-            )
-            .trim_end()
-            .to_string(),
+                 {trusts}"
+            ),
+            says: PackageSays {
+                facts,
+                note: m.summary.clone(),
+            },
         });
         None
     }
@@ -673,16 +758,26 @@ impl Model {
                 .into(),
             next: Next::None,
         })?;
-        let typed = i.maker.trimmed();
+        // An older hub can't keep names for keys, so the field isn't shown and anything in it is
+        // ignored.
+        let typed = if self.hub_has_firmware() {
+            i.maker.trimmed()
+        } else {
+            ""
+        };
         let maker = if typed.is_empty() {
             None
         } else {
-            Some(clean_title(typed).ok_or_else(|| Guidance {
+            let m = clean_title(typed).ok_or_else(|| Guidance {
                 tone: Tone::Problem,
                 title: "The maker's name is 1 to 48 characters".into(),
                 detail: "Plain text, or leave it empty.".into(),
                 next: Next::None,
-            })?)
+            })?;
+            if firmware::reserved_label(&m) {
+                return Err(reserved_name());
+            }
+            Some(m)
         };
         Ok((name, wifi, maker))
     }
@@ -718,6 +813,8 @@ impl Model {
             Busy::Installing { port: port.clone() },
             Op::Install(Box::new(job)),
         )?;
+        // Keys left from an earlier install are for that display, not this one.
+        self.pending_firmware = None;
         self.fw.install.progress = progress;
         self.fw.install.stage = InstallStage::Running { port };
         self.fw.install.password.clear();
@@ -725,19 +822,27 @@ impl Model {
         Some(op)
     }
 
-    /// After an install: send the setup details, or say what to do next.
-    pub(super) fn take_installed(&mut self, after: AfterFlash, refresh: Option<Refresh>, now: Instant) {
+    /// After an install: send the setup details, or say what to do next. `label_failed` says why
+    /// the owner's name for the maker's key wasn't saved, if it wasn't.
+    pub(super) fn take_installed(
+        &mut self,
+        after: AfterFlash,
+        refresh: Option<Refresh>,
+        label_failed: Option<ClientError>,
+        now: Instant,
+    ) {
         let port = match &self.fw.install.stage {
             InstallStage::Running { port } => port.clone(),
             _ => String::new(),
         };
         let known = std::mem::take(&mut self.fw.install.known);
-        let firmware = self
-            .fw
-            .install
-            .loaded
-            .as_ref()
-            .map(|l| bundle_firmware(&l.checked));
+        let labels = self.signer_labels().to_vec();
+        let pending = self.fw.install.loaded.as_ref().map(|l| PendingKeys {
+            firmware: bundle_firmware(&l.checked),
+            port: port.clone(),
+            keys: l.trusted_keys(&labels),
+            include: true,
+        });
         let title = self
             .fw
             .install
@@ -746,6 +851,7 @@ impl Model {
             .map(Loaded::title)
             .unwrap_or_default();
         let name = clean_title(self.fw.install.name.trimmed()).unwrap_or_default();
+        let maker = clean_title(self.fw.install.maker.trimmed()).unwrap_or_default();
         self.take_refresh_opt(refresh, now);
         // The Displays screen watches for the new display, as after an ordinary setup.
         self.enrol = super::Enrol {
@@ -762,29 +868,43 @@ impl Model {
                     name: name.clone(),
                     port: port.clone(),
                 };
+                let mut detail = format!(
+                    "{} {} on {port} accepted its setup details and its maker's keys, as {name}. It joins Wi-Fi and \
+                     checks in with the hub; the Displays screen updates when it does.",
+                    shown.device.device_type, shown.device.firmware_version
+                );
+                if let Some(e) = label_failed {
+                    let why =
+                        crate::guidance::from_client(&e, crate::guidance::Doing::Naming, &self.address());
+                    detail.push_str(&format!(
+                        " The name \"{maker}\" for the maker's key wasn't saved on the hub ({}: {}). You can name \
+                         the key on the Firmware screen, under Makers' keys.",
+                        why.title.to_lowercase(),
+                        why.detail.trim_end_matches('.')
+                    ));
+                }
                 self.notice = Some(Guidance::done(
                     format!("Installed {title} on the display on {port}"),
-                    format!(
-                        "{} {} on {port} accepted its setup details and its maker's keys, as {name}. It joins \
-                         Wi-Fi and checks in with the hub; the Displays screen updates when it does.",
-                        shown.device.device_type, shown.device.firmware_version
-                    ),
+                    detail,
                 ));
             }
-            AfterFlash::Usb { error, bundle } => {
-                // The firmware is in; only the setup details are missing. They are kept, keys and all,
-                // for Send under Displays.
+            AfterFlash::Usb { error, mut bundle } => {
+                // The firmware is in; only the setup details are missing. They are kept for Send
+                // under Displays, and the keys wait to go with them to this port.
+                bundle.firmware = None;
                 self.enrol.bundle = Some(*bundle);
                 self.enrol.stage = EnrolStage::Ready;
                 self.enrol.ports = Vec::new();
                 self.enrol.scanned = false;
+                self.pending_firmware = pending;
                 self.fw.install = InstallFlow::default();
                 let why = crate::guidance::from_usb(&error);
                 self.notice = Some(Guidance {
                     tone: Tone::Problem,
                     title: "The firmware is installed, but the setup details weren't sent".into(),
                     detail: format!(
-                        "{}: {} Under Displays, Add a display has them ready to send again, with the firmware's keys.",
+                        "{}: {} Under Displays, Add a display has them ready to send again to {port}, with the \
+                         firmware's keys.",
                         why.title, why.detail
                     ),
                     next: Next::None,
@@ -792,8 +912,9 @@ impl Model {
                 self.section = super::Section::Displays;
             }
             AfterFlash::Hub(e) => {
-                // Without setup details, the next Add a display carries the firmware's keys instead.
-                self.pending_firmware = firmware;
+                // Without setup details, the next Add a display to this port carries the firmware's
+                // keys instead.
+                self.pending_firmware = pending;
                 self.enrol.stage = EnrolStage::Form;
                 self.enrol.name.set(&name);
                 self.fw.install = InstallFlow::default();
@@ -802,7 +923,8 @@ impl Model {
                     tone: Tone::Problem,
                     title: "The firmware is installed, but the hub couldn't make setup details".into(),
                     detail: format!(
-                        "{}. {} Set the display up under Displays, Add a display: the app adds the firmware's keys.",
+                        "{}. {} Set the display up under Displays, Add a display, and send the details to {port}: \
+                         the app adds the firmware's keys.",
                         why.title, why.detail
                     ),
                     next: why.next,
@@ -820,34 +942,80 @@ impl Model {
         self.fw.install.known.clear();
     }
 
-    /// The firmware section for the next setup bundle, from an install whose setup didn't happen.
+    /// Setup details with the keys waiting from an install, unless the owner left them out. The
+    /// caller has checked the port.
     pub(super) fn bundle_with_pending(&self, mut b: Bundle) -> Bundle {
         if b.firmware.is_none() {
-            b.firmware = self.pending_firmware.clone();
+            b.firmware = self
+                .pending_firmware
+                .as_ref()
+                .filter(|p| p.include)
+                .map(|p| p.firmware.clone());
         }
         b
     }
 
+    /// Keys waiting from an install, for the Add a display form to show.
+    pub fn pending_keys(&self) -> Option<&PendingKeys> {
+        self.pending_firmware.as_ref()
+    }
+
+    /// Leaves the waiting keys out of the next setup details, or puts them back.
+    pub fn include_pending_keys(&mut self, include: bool) {
+        if let Some(p) = self.pending_firmware.as_mut() {
+            p.include = include;
+        }
+    }
+
     pub(super) fn uploaded(&mut self, p: &FirmwarePackageView, new: bool) {
         let signer = self.signer(&p.signer_key_id);
-        let title = format!("{} {}", p.device_type, p.firmware_version);
+        let title = package_title(&p.device_type, &p.firmware_version);
+        let mut detail = format!(
+            "Signed by {}. {}",
+            signer_phrase(&signer),
+            if p.usb_install {
+                "It can update displays that trust this key, and do a first install over USB."
+            } else {
+                "It can update displays that trust this key."
+            }
+        );
+        if let Some(gone) = &p.evicted {
+            detail.push_str(&format!(
+                " To make room, the hub removed {}.",
+                package_title(&gone.device_type, &gone.firmware_version)
+            ));
+        }
         self.notice = Some(Guidance::done(
             if new {
                 format!("Added {title} to the hub")
             } else {
                 format!("The hub already had {title}")
             },
-            format!(
-                "Signed by {} ({}). {}",
-                signer.name(),
-                signer.fingerprint,
-                if p.usb_install {
-                    "It can update displays that trust this key, and do a first install over USB."
-                } else {
-                    "It can update displays that trust this key."
-                }
-            ),
+            detail,
         ));
+    }
+}
+
+/// "\"rev-a\", \"rev-b\"": the maker's names, quoted.
+fn quoted_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|i| format!("\"{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// A name the app keeps for its own official keys.
+fn reserved_name() -> Guidance {
+    Guidance {
+        tone: Tone::Problem,
+        title: "That name is kept for official firmware".into(),
+        detail: format!(
+            "\"{}\" is what the app calls keys built into it, so a key you name can't use it or anything like \
+             it. Name the key after its maker instead.",
+            firmware::OFFICIAL_NAME
+        ),
+        next: Next::None,
     }
 }
 
@@ -884,6 +1052,7 @@ mod tests {
             signer_label: None,
             size: 1_500_000,
             update_size: 1_400_000,
+            image_size: 1_395_000,
             usb_install: true,
             uploaded_at: ts("2026-11-10T19:00:00Z"),
             uploaded_by_role: "admin".into(),
@@ -971,8 +1140,21 @@ mod tests {
         m.ask_update("d", &up.package_id, now);
         let (title, detail, action) = m.confirm.as_ref().unwrap().question();
         assert_eq!(title, "Update D to 1.3.0-beta.1?");
-        assert!(detail.contains("Signed by Kea Displays (kkkk-"), "{detail}");
-        assert!(detail.contains("Release 1.3.0-beta.1."), "{detail}");
+        assert!(
+            detail.contains("Signed by the key the hub calls \"Kea Displays\" (kkkk-"),
+            "{detail}"
+        );
+        assert!(!detail.contains("Release 1.3.0-beta.1."), "{detail}");
+        assert_eq!(
+            m.confirm
+                .as_ref()
+                .unwrap()
+                .package_says()
+                .unwrap()
+                .note
+                .as_deref(),
+            Some("Release 1.3.0-beta.1.")
+        );
         assert_eq!(action, "Update");
         // First yes: the second question, saying why. Nothing is sent yet.
         assert!(m.confirm_yes().is_none());
@@ -992,6 +1174,7 @@ mod tests {
     fn going_back_to_an_older_version_says_why_and_a_newer_full_release_asks_once() {
         let (mut m, now) = with_firmware();
         m.ask_update("d", &"a".repeat(64), now);
+        assert_eq!(m.confirm.as_ref().unwrap().question().0, "Go back to 1.1.0 on D?");
         assert!(m.confirm_yes().is_none());
         let (title, detail, _) = m.confirm.as_ref().unwrap().question();
         assert_eq!(title, "1.1.0 is an older version");
@@ -1014,7 +1197,7 @@ mod tests {
             .available_package_id = Some("e".repeat(64));
         m.ask_update("d", &"e".repeat(64), now);
         assert!(matches!(m.confirm_yes(), Some(Op::OfferFirmware { .. })));
-        assert!(matches!(m.busy, Some(Busy::Saving { ref done }) if done.contains("Offered 1.4.0 to D")));
+        assert!(matches!(m.busy, Some(Busy::Offering { ref done }) if done.contains("Offered 1.4.0 to D")));
     }
 
     fn offer(state: &str, reason: Option<&str>) -> FirmwareOfferView {
@@ -1055,13 +1238,13 @@ mod tests {
     fn every_offer_phase_has_plain_words() {
         let o = offer("rolled_back", None);
         let (title, detail) =
-            crate::guidance::offer_words(&Phase::RolledBack, &o, Some("1.2.0"), "5 minutes");
-        assert_eq!(title, "The update didn't start properly");
+            crate::guidance::offer_words(&Phase::RolledBack, &o, Some("1.2.0"), "5 minutes", None);
+        assert_eq!(title, "Went back to 1.2.0");
         assert_eq!(
             detail,
             "The update didn't start properly, so the display went back to 1.2.0. Nothing was lost."
         );
-        let words = |p: Phase| crate::guidance::offer_words(&p, &o, Some("1.2.0"), "5 minutes");
+        let words = |p: Phase| crate::guidance::offer_words(&p, &o, Some("1.2.0"), "5 minutes", None);
         assert_eq!(words(Phase::Waiting).0, "Waiting for the display to check in");
         assert!(words(Phase::Waiting).1.contains("within about 5 minutes"));
         assert_eq!(words(Phase::Downloading).0, "Downloading 1.3.0-beta.1");
@@ -1139,9 +1322,253 @@ mod tests {
         m.last.as_mut().unwrap().firmware.as_mut().unwrap().packages[2].offered_to = vec!["d".into()];
         m.ask_remove_package(&"c".repeat(64));
         let (title, detail, _) = m.confirm.as_ref().unwrap().question();
-        assert_eq!(title, "Remove desk 1.3.0-beta.1?");
+        assert_eq!(title, "Remove \"desk\" 1.3.0-beta.1?");
         assert!(detail.contains("on offer to D"), "{detail}");
+        assert!(detail.contains("for hardware \"rev-a\""), "{detail}");
+        assert_eq!(m.package_rows()[0].hardware_revisions, ["rev-a"]);
         assert!(matches!(m.confirm_yes(), Some(Op::RemoveFirmware { .. })));
+    }
+
+    #[test]
+    fn a_name_claiming_to_be_official_is_refused_before_anything_is_sent() {
+        let (mut m, _) = with_firmware();
+        m.begin_label(&"k".repeat(64));
+        for bad in [
+            "Official Display Hub firmware",
+            "official-display hub",
+            "The OFFICIAL Display-Hub build",
+        ] {
+            m.fw.label_edit.as_mut().unwrap().field.set(bad);
+            assert!(m.save_label().is_none(), "{bad}");
+            assert_eq!(
+                m.notice.as_ref().unwrap().title,
+                "That name is kept for official firmware"
+            );
+        }
+        m.fw.label_edit.as_mut().unwrap().field.set("Kea Displays");
+        assert!(matches!(m.save_label(), Some(Op::SetSignerLabel { .. })));
+        assert!(
+            matches!(m.busy, Some(Busy::Naming { ref done }) if done.contains("The hub now calls the key"))
+        );
+        // The hub refuses one too, and its reason is shown.
+        let refused = ClientError::Status {
+            status: 400,
+            body: Some(hub_protocol::ErrorBody::new(
+                hub_protocol::ErrorCode::BadRequest,
+                "That name is kept for firmware whose key is built into the app.",
+            )),
+        };
+        m.finish(Err(Failure::Client(refused)), Instant::now());
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.title, "The hub won't use that name");
+        assert!(n.detail.contains("built into the app"));
+
+        // And as the maker's name typed during Install firmware.
+        let (mut m, _) = with_firmware();
+        ready_to_install(&mut m, false);
+        m.fw.install.ssid.set("Home");
+        m.fw.install.maker.set("Official Display Hub Firmware!");
+        assert!(m.ask_install("COM5").is_none());
+        assert!(m.confirm.is_none());
+        assert_eq!(
+            m.notice.as_ref().unwrap().title,
+            "That name is kept for official firmware"
+        );
+    }
+
+    #[test]
+    fn a_display_pausing_its_updates_says_so_and_the_update_waits() {
+        let (mut m, now) = with_firmware();
+        let d = &mut m.last.as_mut().unwrap().displays[0];
+        d.device
+            .as_mut()
+            .unwrap()
+            .firmware
+            .as_mut()
+            .unwrap()
+            .attempts_left = Some(0);
+        let fw = m.display_firmware("d", now).unwrap();
+        assert!(fw.paused);
+        assert!(fw.available.is_some(), "the offer is never blocked");
+        assert_eq!(
+            crate::guidance::paused_words("D"),
+            "D has tried five updates recently and is pausing to protect its memory. It will try again after \
+             about four hours switched on. To update now, use Install firmware over USB."
+        );
+        m.ask_update("d", &"c".repeat(64), now);
+        let (_, detail, _) = m.confirm.as_ref().unwrap().question();
+        assert!(detail.contains("waits about four hours switched on"), "{detail}");
+
+        let d = &mut m.last.as_mut().unwrap().displays[0];
+        d.device
+            .as_mut()
+            .unwrap()
+            .firmware
+            .as_mut()
+            .unwrap()
+            .attempts_left = Some(3);
+        assert!(!m.display_firmware("d", now).unwrap().paused);
+    }
+
+    #[test]
+    fn a_version_the_app_cant_read_asks_twice() {
+        let (mut m, now) = with_firmware();
+        m.last.as_mut().unwrap().displays[0]
+            .device
+            .as_mut()
+            .unwrap()
+            .firmware_version = "custom build".into();
+        let fw = m.display_firmware("d", now).unwrap();
+        assert!(fw.available.is_none(), "nothing is known to be newer");
+        assert!(fw.others.iter().all(|o| o.unsure && o.asks_twice()));
+        m.ask_update("d", &"b".repeat(64), now);
+        assert_eq!(m.confirm.as_ref().unwrap().question().0, "Install 1.2.0 on D?");
+        assert!(m.confirm_yes().is_none(), "a second question first");
+        let (title, detail, _) = m.confirm.as_ref().unwrap().question();
+        assert_eq!(title, "1.2.0 may be older than custom build");
+        assert!(detail.contains("can't compare"), "{detail}");
+    }
+
+    #[test]
+    fn an_upload_that_made_room_says_which_package_went() {
+        let (mut m, now) = with_firmware();
+        let mut p = package("e", "1.4.0", "k");
+        p.evicted = Some(hub_core::api::EvictedPackage {
+            package_id: "a".repeat(64),
+            device_type: "desk".into(),
+            firmware_version: "1.1.0".into(),
+        });
+        m.finish(
+            Ok(Outcome::Uploaded {
+                package: Box::new(p),
+                new: true,
+                refresh: None,
+            }),
+            now,
+        );
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.title, "Added \"desk\" 1.4.0 to the hub");
+        assert!(
+            n.detail.contains("To make room, the hub removed \"desk\" 1.1.0."),
+            "{}",
+            n.detail
+        );
+        assert!(n.detail.contains("the key the hub calls \"Kea Displays\""));
+    }
+
+    #[test]
+    fn firmware_lists_that_fail_to_load_keep_the_last_ones_and_say_so() {
+        let (mut m, now) = with_firmware();
+        let mut r = m.last.clone().unwrap();
+        r.firmware = None;
+        r.firmware_error = Some(std::sync::Arc::new(ClientError::Status {
+            status: 500,
+            body: None,
+        }));
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
+        assert!(m.hub_has_firmware(), "not taken for an older hub");
+        assert_eq!(m.firmware_packages().len(), 3, "the lists it had");
+        assert_eq!(
+            m.notice.as_ref().unwrap().title,
+            "Couldn't read the firmware lists"
+        );
+        // From a fresh start there is nothing to keep, but it still isn't an older hub.
+        let (mut m, now) = connected(vec![]);
+        let mut r = m.last.clone().unwrap();
+        r.firmware_error = Some(std::sync::Arc::new(ClientError::Timeout));
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
+        assert!(m.hub_has_firmware());
+    }
+
+    #[test]
+    fn a_refused_offer_or_upload_gets_a_title_that_says_what_it_was() {
+        let conflict = |msg: &str| {
+            Failure::Client(ClientError::Status {
+                status: 409,
+                body: Some(hub_protocol::ErrorBody::new(
+                    hub_protocol::ErrorCode::Conflict,
+                    msg,
+                )),
+            })
+        };
+        let (mut m, now) = with_firmware();
+        m.ask_update("d", &"c".repeat(64), now);
+        m.confirm_yes();
+        assert!(matches!(m.confirm_yes(), Some(Op::OfferFirmware { .. })));
+        m.finish(
+            Err(conflict(
+                "This firmware is 3145728 bytes, too big for the display's spare space of 2097152 bytes.",
+            )),
+            now,
+        );
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.title, "The display would refuse this update");
+        assert_eq!(
+            n.detail,
+            "This firmware is 3.0 MB, too big for the display's spare space of 2.0 MB."
+        );
+
+        assert!(m.upload_firmware("x.dhfw".into()).is_some());
+        m.finish(
+            Err(conflict(
+                "The hub keeps at most 64 MiB of firmware from each publisher, and this package would take yours \
+                 past that.",
+            )),
+            now,
+        );
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.title, "The hub has no room for this package");
+        assert!(n.detail.contains("64 MiB"));
+
+        assert!(m.upload_firmware("x.dhfw".into()).is_some());
+        m.finish(
+            Err(Failure::Client(ClientError::Status {
+                status: 408,
+                body: Some(hub_protocol::ErrorBody::new(
+                    hub_protocol::ErrorCode::Unavailable,
+                    "The upload sent nothing for 60 s, so the hub gave up on it. Try again.",
+                )),
+            })),
+            now,
+        );
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.title, "The upload stopped part way");
+        assert!(n.detail.contains("sent nothing for 60 s"));
+    }
+
+    #[test]
+    fn a_failed_write_points_to_the_button_the_card_shows() {
+        let (mut m, now) = with_firmware();
+        let mut o = offer("failed", Some("flash"));
+        // The offer was for 1.1.0, which the card offers under the other versions.
+        o.package_id = "a".repeat(64);
+        o.firmware_version = "1.1.0".into();
+        m.last.as_mut().unwrap().displays[0]
+            .firmware
+            .as_mut()
+            .unwrap()
+            .offer = Some(o.clone());
+        let fw = m.display_firmware("d", now).unwrap();
+        let retry = fw.retry(&o.package_id);
+        assert_eq!(retry, Some(firmware::Retry::Install("1.1.0".into())));
+        let (_, detail) = crate::guidance::offer_words(
+            &fw.offer.as_ref().unwrap().1,
+            &o,
+            Some("1.2.0"),
+            "5 minutes",
+            retry.as_ref(),
+        );
+        assert!(
+            detail.contains("To try again, press Install 1.1.0, under Other versions on the hub."),
+            "{detail}"
+        );
+        assert!(!detail.contains("Press Update"), "{detail}");
+        // The headline's package says Update.
+        assert_eq!(
+            fw.retry(&"c".repeat(64)),
+            Some(firmware::Retry::Update("1.3.0-beta.1".into()))
+        );
+        assert_eq!(fw.retry(&"z".repeat(64)), None);
     }
 
     fn ready_to_install(m: &mut Model, key_set: bool) {
@@ -1177,6 +1604,7 @@ mod tests {
     #[test]
     fn install_shows_the_fingerprint_and_asks_before_anything_is_written() {
         let (mut m, _) = connected(vec![]);
+        m.last.as_mut().unwrap().firmware = Some(Shelf::default());
         ready_to_install(&mut m, true);
         let signer = m.install_signer().unwrap();
         assert_eq!(signer.kind, SignerKind::Unknown);
@@ -1189,11 +1617,26 @@ mod tests {
         m.fw.install.maker.set("Kea Displays");
         assert!(m.ask_install("COM5").is_none(), "only a question so far");
         let (title, detail, action) = m.confirm.as_ref().unwrap().question();
-        assert_eq!(title, "Erase the display on COM5 and install desk 1.0.0?");
+        assert_eq!(title, "Erase the display on COM5 and install this firmware?");
         assert!(detail.contains("a maker this app doesn't know"));
         assert!(detail.contains(&signer.fingerprint));
         assert!(detail.contains("erased"));
         assert_eq!(action, "Erase and install");
+        // Every key the display will trust, and the package's own words kept apart.
+        let keys = m.fw.install.loaded.as_ref().unwrap().trusted_keys(&[]);
+        assert_eq!(keys.len(), 2);
+        for k in &keys {
+            assert!(detail.contains(&k.fingerprint), "{detail}");
+        }
+        assert!(detail.contains("one of these 2 keys"), "{detail}");
+        assert!(
+            !detail.contains("First release."),
+            "the maker's note isn't the app's words"
+        );
+        let says = m.confirm.as_ref().unwrap().package_says().unwrap();
+        assert_eq!(says.note.as_deref(), Some("First release."));
+        assert!(says.facts.contains(&("Device type".into(), "desk".into())));
+        assert!(says.facts.contains(&("Hardware".into(), "simulated".into())));
         let Some(Op::Install(job)) = m.confirm_yes() else {
             panic!("an install")
         };
@@ -1316,6 +1759,7 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Sent(usb_display()),
                 refresh: None,
+                label_failed: None,
             }),
             now,
         );
@@ -1326,7 +1770,54 @@ mod tests {
             .as_ref()
             .unwrap()
             .title
-            .starts_with("Installed desk 1.0.0"));
+            .starts_with("Installed \"desk\" 1.0.0"));
+    }
+
+    #[test]
+    fn a_maker_name_the_hub_didnt_save_is_reported_but_the_install_still_counts() {
+        let (mut m, now) = connected(vec![]);
+        m.last.as_mut().unwrap().firmware = Some(Shelf::default());
+        running(&mut m);
+        m.fw.install.maker.set("Kea Displays");
+        let refused = ClientError::Status {
+            status: 409,
+            body: Some(hub_protocol::ErrorBody::new(
+                hub_protocol::ErrorCode::Conflict,
+                "nope",
+            )),
+        };
+        m.finish(
+            Ok(Outcome::Installed {
+                after: AfterFlash::Sent(usb_display()),
+                refresh: None,
+                label_failed: Some(refused),
+            }),
+            now,
+        );
+        assert!(matches!(m.fw.install.stage, InstallStage::Done { .. }));
+        let n = m.notice.as_ref().unwrap();
+        assert_eq!(n.tone, Tone::Done);
+        assert!(
+            n.detail
+                .contains("The name \"Kea Displays\" for the maker's key wasn't saved on the hub"),
+            "{}",
+            n.detail
+        );
+        assert!(n.detail.contains("nope"), "{}", n.detail);
+    }
+
+    #[test]
+    fn an_older_hub_gets_no_maker_name() {
+        let (mut m, _) = connected(vec![]);
+        assert!(!m.hub_has_firmware());
+        ready_to_install(&mut m, false);
+        m.fw.install.ssid.set("Home");
+        m.fw.install.maker.set("Kea Displays");
+        m.ask_install("COM5");
+        let Some(Op::Install(job)) = m.confirm_yes() else {
+            panic!("an install")
+        };
+        assert_eq!(job.label, None);
     }
 
     #[test]
@@ -1345,6 +1836,7 @@ mod tests {
                     bundle: Box::new(bundle),
                 },
                 refresh: None,
+                label_failed: None,
             }),
             now,
         );
@@ -1361,7 +1853,16 @@ mod tests {
         assert!(n.detail.contains("Only Install firmware"), "{}", n.detail);
         assert_eq!(m.section, Section::Displays);
         assert_eq!(m.enrol.stage, EnrolStage::Ready);
-        assert!(m.enrol.bundle.as_ref().unwrap().firmware.is_some());
+        // The keys wait for the same port, and go with the details sent there.
+        assert!(m.enrol.bundle.as_ref().unwrap().firmware.is_none());
+        assert_eq!(m.pending_keys().unwrap().port, "COM5");
+        match m.send_usb("COM5") {
+            Some(Op::SendUsb { port, bundle }) => {
+                assert_eq!(port, "COM5");
+                assert!(bundle.firmware.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -1373,10 +1874,12 @@ mod tests {
             Ok(Outcome::Installed {
                 after: AfterFlash::Hub(ClientError::Timeout),
                 refresh: None,
+                label_failed: None,
             }),
             now,
         );
-        assert_eq!(m.pending_firmware.as_ref(), Some(&fw));
+        assert_eq!(m.pending_keys().map(|p| &p.firmware), Some(&fw));
+        assert_eq!(m.pending_keys().unwrap().port, "COM5");
         assert!(m
             .notice
             .as_ref()
@@ -1403,12 +1906,84 @@ mod tests {
             },
         };
         m.finish(Ok(Outcome::Enrolment { grant, refresh: None }), now);
-        assert_eq!(
-            m.enrol.bundle.as_ref().map(|b| b.firmware.clone()),
-            Some(Some(fw)),
+        assert_eq!(m.enrol.stage, EnrolStage::Ready, "{:?}", m.notice);
+        match m.send_usb("COM5") {
+            Some(Op::SendUsb { bundle, .. }) => assert_eq!(bundle.firmware, Some(fw)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A model whose install on COM5 worked but whose setup details the hub couldn't make, with the
+    /// setup details then made: the keys are waiting for COM5.
+    fn keys_waiting() -> (Model, Instant) {
+        let (mut m, now) = connected(vec![]);
+        running(&mut m);
+        m.finish(
+            Ok(Outcome::Installed {
+                after: AfterFlash::Hub(ClientError::Timeout),
+                refresh: None,
+                label_failed: None,
+            }),
+            now,
+        );
+        m.enrol.bundle = Some(
+            serde_json::from_str(include_str!(
+                "../../../../protocol/v1/examples/device/provisioning-bundle.json"
+            ))
+            .unwrap(),
+        );
+        m.enrol.bundle.as_mut().unwrap().firmware = None;
+        m.enrol.stage = EnrolStage::Ready;
+        (m, now)
+    }
+
+    #[test]
+    fn waiting_keys_go_only_to_the_port_just_flashed_and_can_be_left_out() {
+        // Another port: sent without the keys, which are dropped.
+        let (mut m, _) = keys_waiting();
+        let p = m.pending_keys().unwrap();
+        assert!(p.include);
+        assert_eq!(p.keys.len(), 1, "the signer, as the package has no key set");
+        match m.send_usb("COM9") {
+            Some(Op::SendUsb { bundle, .. }) => assert!(bundle.firmware.is_none()),
+            other => panic!("{other:?}"),
+        }
+        assert!(m.pending_keys().is_none());
+        m.finish(Ok(Outcome::Sent(usb_display())), Instant::now());
+        assert!(
+            m.notice
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("weren't sent with them"),
             "{:?}",
             m.notice
         );
+
+        // Left out by the owner: the same port gets the details without them.
+        let (mut m, _) = keys_waiting();
+        m.include_pending_keys(false);
+        match m.send_usb("COM5") {
+            Some(Op::SendUsb { bundle, .. }) => assert!(bundle.firmware.is_none()),
+            other => panic!("{other:?}"),
+        }
+        m.finish(Ok(Outcome::Sent(usb_display())), Instant::now());
+        assert!(m.pending_keys().is_none(), "done with once sent");
+
+        // Cancelling Add a display drops them; so does starting another install.
+        let (mut m, _) = keys_waiting();
+        m.close_enrol();
+        assert!(m.pending_keys().is_none());
+        let (mut m, _) = keys_waiting();
+        running(&mut m);
+        assert!(m.pending_keys().is_none());
+
+        // Sent with them: the notice says so.
+        let (mut m, _) = keys_waiting();
+        assert!(matches!(m.send_usb("COM5"), Some(Op::SendUsb { bundle, .. }) if bundle.firmware.is_some()));
+        m.finish(Ok(Outcome::Sent(usb_display())), Instant::now());
+        assert!(m.notice.as_ref().unwrap().detail.contains("now trusts the keys"));
+        assert!(m.pending_keys().is_none());
     }
 
     #[test]

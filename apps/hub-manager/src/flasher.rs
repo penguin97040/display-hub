@@ -105,18 +105,49 @@ fn sort(e: espflash::Error) -> BoardError {
     }
 }
 
-/// Hands espflash's progress to the board's caller.
+/// Hands espflash's progress to the board's caller, in bytes of the part being written. espflash
+/// 4.7 counts in blocks, not bytes: `init` gives the number of blocks and `update` the blocks sent
+/// so far, so the count is scaled to the part's length.
 struct Report<'a> {
     progress: &'a mut dyn FnMut(u64),
+    /// The part's length in bytes.
+    part_len: u64,
+    /// The blocks espflash will send, once `init` has said.
+    blocks: u64,
+}
+
+impl<'a> Report<'a> {
+    fn new(part_len: usize, progress: &'a mut dyn FnMut(u64)) -> Self {
+        Report {
+            progress,
+            part_len: part_len as u64,
+            blocks: 0,
+        }
+    }
+
+    /// The bytes written after `current` blocks, never more than the part.
+    fn bytes(&self, current: usize) -> u64 {
+        if self.blocks == 0 {
+            return 0;
+        }
+        let done = (current as u128).min(self.blocks as u128);
+        (done * self.part_len as u128 / self.blocks as u128) as u64
+    }
 }
 
 impl ProgressCallbacks for Report<'_> {
-    fn init(&mut self, _addr: u32, _total: usize) {}
+    fn init(&mut self, _addr: u32, total: usize) {
+        self.blocks = total as u64;
+        (self.progress)(0)
+    }
     fn update(&mut self, current: usize) {
-        (self.progress)(current as u64)
+        let n = self.bytes(current);
+        (self.progress)(n)
     }
     fn verifying(&mut self) {}
-    fn finish(&mut self, _skipped: bool) {}
+    fn finish(&mut self, _skipped: bool) {
+        (self.progress)(self.part_len)
+    }
 }
 
 impl Board for EspBoard {
@@ -154,7 +185,7 @@ impl Board for EspBoard {
     }
 
     fn write(&mut self, offset: u32, bytes: &[u8], progress: &mut dyn FnMut(u64)) -> Result<(), BoardError> {
-        let mut report = Report { progress };
+        let mut report = Report::new(bytes.len(), progress);
         self.flasher()?
             .write_bin_to_flash(offset, bytes, &mut report)
             .map_err(sort)
@@ -214,6 +245,32 @@ mod tests {
             BoardError::NoBoard(_)
         ));
         assert!(matches!(sort(espflash::Error::VerifyFailed), BoardError::Lost(_)));
+    }
+
+    #[test]
+    fn espflash_block_counts_become_bytes_of_the_part() {
+        let mut seen = Vec::new();
+        let mut record = |n: u64| seen.push(n);
+        {
+            // A 10,000-byte part sent in 4 blocks, as espflash reports it.
+            let mut r = Report::new(10_000, &mut record);
+            r.update(1); // before init: nothing known yet
+            r.init(0x10000, 4);
+            for i in 1..=4 {
+                r.update(i);
+            }
+            r.update(9); // more blocks than it said: clamped to the part
+            r.finish(false);
+        }
+        assert_eq!(seen, [0, 0, 2_500, 5_000, 7_500, 10_000, 10_000, 10_000]);
+
+        // A part larger than a u64 product of blocks and bytes would overflow in a naive sum.
+        let mut last = 0;
+        let mut keep = |n: u64| last = n;
+        let mut r = Report::new(8 << 20, &mut keep);
+        r.init(0, usize::MAX);
+        r.update(usize::MAX / 2);
+        assert!(last > 0 && last < 8 << 20, "{last}");
     }
 
     #[test]
