@@ -460,7 +460,7 @@ The bundle gains one optional member:
 | Route | Who | Does |
 |---|---|---|
 | `POST /v1/admin/firmware` | Admin | Uploads a package: the raw file as the body, with a `Content-Length` of at most 16 MiB. `201` with the package's description, and `evicted` naming any package removed to make room; `200` if the hub already had it, or the same release signed again. An upload that sends nothing for 60 seconds is dropped. |
-| `GET /v1/admin/firmware` | Admin | Every package: id, device type, hardware revisions, version, security counter, summary, signer key id and label, size, whether it can be used for a USB install, the key ids of its `key_set` (`key_set`, `null` without one), `damaged: true` if the hub can't read what it holds about it (it is never offered then; remove it and add it again), when and by whom it was uploaded, and which displays it is on offer to. |
+| `GET /v1/admin/firmware` | Admin | Every package: id, device type, hardware revisions, version, security counter, summary, signer key id and label, size, whether it can be used for a USB install, the key ids of its `key_set` (`key_set`, `null` without one), `damaged: true` if the hub can't read what it holds about it (it is never offered then; uploading the same file again repairs it, keeping its offers), when and by whom it was uploaded, and which displays it is on offer to. |
 | `GET /v1/admin/firmware/{package_id}/file` | Admin | The whole package, so the app can do a USB install from a package the hub holds. |
 | `DELETE /v1/admin/firmware/{package_id}` | Admin | Removes a package and cancels its open offers. |
 | `PUT /v1/admin/devices/{id}/firmware-update` | Admin | `{"package_id": …}`: makes the offer (the **Update** button). `DELETE` cancels it. |

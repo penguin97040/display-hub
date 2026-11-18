@@ -1742,6 +1742,7 @@ impl Model {
 
     /// Takes a refresh that may be missing. If it is, one is due at once. True if it couldn't read
     /// the firmware lists, as for `take_refresh`.
+    #[must_use = "whether the firmware lists were unreadable, for tell_unreadable_lists"]
     fn take_refresh_opt(&mut self, r: Option<Refresh>, now: Instant) -> bool {
         match r {
             Some(r) => self.take_refresh(r, now),
@@ -1753,6 +1754,7 @@ impl Model {
     }
 
     /// Takes a refresh. True if it couldn't read the firmware lists, for `tell_unreadable_lists`.
+    #[must_use = "whether the firmware lists were unreadable, for tell_unreadable_lists"]
     fn take_refresh(&mut self, mut r: Refresh, now: Instant) -> bool {
         let unreadable = r.firmware_error.is_some();
         if unreadable {
@@ -1829,6 +1831,7 @@ impl Model {
     }
 
     /// Takes an answer. True if it brought a refresh that couldn't read the firmware lists.
+    #[must_use = "whether the firmware lists were unreadable, for tell_unreadable_lists"]
     fn take_outcome(&mut self, result: Result<Outcome, Failure>, now: Instant) -> bool {
         let busy = self.busy.take();
         let mut unreadable = false;

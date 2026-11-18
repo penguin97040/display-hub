@@ -187,7 +187,7 @@ impl Store {
         if !ids.is_empty() {
             tracing::error!(
                 packages = %ids.join(", "),
-                "a stored package's key_set can't be read, so it won't be offered; remove the package and add it again"
+                "a stored package's key_set can't be read, so it won't be offered; add the same file again to repair it"
             );
         }
     }
@@ -380,6 +380,11 @@ impl Store {
         cancel_where(&tx, "package_id = ?3", id, reason, now)?;
         let n = tx.execute("DELETE FROM firmware_packages WHERE id = ?1", params![id])?;
         tx.commit()?;
+        // Logged again if the same package comes back and is ever damaged again.
+        self.damaged_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
         Ok(n > 0)
     }
 

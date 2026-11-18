@@ -230,7 +230,7 @@ impl Manager {
             let mut facts = vec![
                 format!("For {}", hardware_text(&p.hardware_revisions)),
                 size_text(p.size),
-                if p.usb_install {
+                if p.for_usb_install() {
                     "Can do a first install over USB".into()
                 } else {
                     "Updates only".into()
@@ -265,7 +265,7 @@ impl Manager {
                             .child(ui::label(&facts.join(" · ")))
                             .when(p.damaged, |d| {
                                 d.child(ui::p(
-                                    "The hub couldn't read this package's details. Remove it and add it again.",
+                                    "The hub couldn't read this package's details. Add the same file again to repair it.",
                                 ))
                             }),
                     )

@@ -426,7 +426,9 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String>
         KeySet::Absent => None,
         KeySet::Keys(ks) => Some(ks.as_slice()),
         KeySet::Unreadable => {
-            return Err("The hub couldn't read this package's details. Remove it and add it again.".into())
+            return Err(
+                "The hub couldn't read this package's details. Add the same file again to repair it.".into(),
+            )
         }
     };
     let Some(info) = info else {

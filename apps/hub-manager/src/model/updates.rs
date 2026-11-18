@@ -856,6 +856,7 @@ impl Model {
     /// After an install: send the setup details, or say what to do next. `label` says what became
     /// of the owner's name for the maker's key; whichever way the install ended, the notice says if
     /// it wasn't saved. True if the refresh it brought couldn't read the firmware lists.
+    #[must_use = "whether the firmware lists were unreadable, for tell_unreadable_lists"]
     pub(super) fn take_installed(
         &mut self,
         after: AfterFlash,
