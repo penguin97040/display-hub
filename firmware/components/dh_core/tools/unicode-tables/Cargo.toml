@@ -1,0 +1,14 @@
+# Writes ../../src/dh_unicode_tables.c from the same unicode-normalization release that
+# crates/hub-protocol uses, so the firmware's NFC check matches the hub's exactly.
+# Run from this folder: cargo run --release > ../../src/dh_unicode_tables.c
+[package]
+name = "dh-unicode-tables"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+unicode-normalization = "=0.1.26"
+
+# Not part of the main workspace.
+[workspace]

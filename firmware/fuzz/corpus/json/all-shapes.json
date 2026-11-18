@@ -1,0 +1,97 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "claude-max",
+      "title": "Claude Max",
+      "kind": "meter",
+      "data_quality": "provider_reported",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "items": [
+          {
+            "id": "five-hour",
+            "label": "Five-hour allowance used",
+            "percent": 42.0,
+            "resets_at": "2026-11-10T22:00:00Z"
+          },
+          {
+            "id": "weekly",
+            "label": "Weekly allowance used",
+            "percent": null
+          }
+        ]
+      }
+    },
+    {
+      "id": "tokens-today",
+      "title": "Tokens today",
+      "kind": "big_number",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "value": 1234.5,
+        "decimals": 1,
+        "unit": "k",
+        "caption": "Since midnight"
+      }
+    },
+    {
+      "id": "cost-today",
+      "title": "Cost today",
+      "kind": "big_number",
+      "data_quality": "estimated",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "value": null,
+        "unit": "NZ$",
+        "caption": "Not reported yet"
+      }
+    },
+    {
+      "id": "reminder",
+      "title": "Reminder",
+      "kind": "text",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "text": "The monthly allowance resets on the first. Plan big jobs for after that."
+      }
+    },
+    {
+      "id": "queue",
+      "title": "Build queue",
+      "kind": "list",
+      "data_quality": "manual",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "items": [
+          {
+            "text": "display-hub",
+            "detail": "passed"
+          },
+          {
+            "text": "firmware"
+          },
+          {
+            "text": "docs",
+            "detail": "running"
+          }
+        ]
+      }
+    }
+  ]
+}

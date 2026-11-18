@@ -1,0 +1,12 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [],
+  "firmware_update": {
+    "offer_id": "5d41402abc4b2a76b9719d911017c592",
+    "package_id": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+    "size": 1484937
+  }
+}

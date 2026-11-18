@@ -1,0 +1,1 @@
+{"type":"hello","device_type":"llm-usage-display","firmware_version":"1.1.0","hardware_revision":"waveshare-amoled-1.8-v2","protocol_version":1,"provisioned":false,"firmware":{"key_ids":["6959c1061917338cd274c1e6d78b01cbca0ac8ef03326646dae1b0ac0a7de336","65ea7f4b63fea26954712bf24a4722036822edb24317607d323ee92716a0cd8c"],"security_floor":3,"slot_bytes":3145728,"attempts_left":5}}

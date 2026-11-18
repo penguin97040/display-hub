@@ -1,0 +1,6 @@
+{
+  "error": {
+    "code": "token_revoked",
+    "message": "This display's access was revoked. Set it up again from the desktop manager."
+  }
+}

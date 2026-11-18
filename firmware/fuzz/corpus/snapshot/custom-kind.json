@@ -1,0 +1,56 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "nearby-flights",
+      "title": "Nearby flights",
+      "kind": "nearby-flights/1",
+      "data_quality": "provider_reported",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 300,
+      "note": null,
+      "data": {
+        "flights": [
+          {
+            "callsign": "NZ123",
+            "altitude_m": 3200,
+            "heading": 270
+          },
+          {
+            "callsign": "QF45",
+            "altitude_m": 9800,
+            "heading": 90
+          }
+        ],
+        "radius_km": 25
+      }
+    },
+    {
+      "id": "claude-max",
+      "title": "Claude Max",
+      "kind": "meter",
+      "data_quality": "provider_reported",
+      "updated_at": "2026-11-10T20:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "items": [
+          {
+            "id": "five-hour",
+            "label": "Five-hour allowance used",
+            "percent": 42.0,
+            "resets_at": "2026-11-10T22:00:00Z"
+          },
+          {
+            "id": "weekly",
+            "label": "Weekly allowance used",
+            "percent": null
+          }
+        ]
+      }
+    }
+  ]
+}

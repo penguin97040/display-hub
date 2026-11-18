@@ -1,0 +1,31 @@
+{
+  "protocol_version": 1,
+  "message_type": "dashboard.snapshot",
+  "generated_at": "2026-11-10T20:00:00Z",
+  "refresh_after_seconds": 300,
+  "pages": [
+    {
+      "id": "claude-max",
+      "title": "Claude Max",
+      "kind": "meter",
+      "data_quality": "provider_reported",
+      "updated_at": "2026-11-10T14:00:00Z",
+      "stale_after_seconds": 1800,
+      "note": null,
+      "data": {
+        "items": [
+          {
+            "id": "five-hour",
+            "label": "Five-hour allowance used",
+            "percent": 70.0
+          },
+          {
+            "id": "weekly",
+            "label": "Weekly allowance used",
+            "percent": null
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,67 @@
+# Host tests for dh_core. CI runs:
+#   cmake -S firmware/host-tests -B <dir> -DMBEDTLS_DIR=<prefix>
+#   cmake --build <dir>
+#   ctest --test-dir <dir> --output-on-failure
+#
+# -DDH_SANITIZE=ON builds everything with AddressSanitizer and UndefinedBehaviorSanitizer, and
+# -DCMAKE_C_COMPILER picks gcc or clang. The vector and example tests need Python 3 (standard
+# library only).
+cmake_minimum_required(VERSION 3.16)
+project(dh_host_tests C)
+
+# Where Mbed TLS is installed. The signed-update tests will need it; nothing here does yet.
+set(MBEDTLS_DIR "" CACHE PATH "Install prefix of Mbed TLS 3.6")
+
+option(DH_WERROR "Treat compiler warnings as errors" ON)
+option(DH_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS OFF)
+
+set(DH_WARNINGS -Wall -Wextra -Wpedantic -Wconversion -Wshadow -Wstrict-prototypes)
+if(DH_WERROR)
+    list(APPEND DH_WARNINGS -Werror)
+endif()
+if(DH_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+get_filename_component(DH_FIRMWARE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
+get_filename_component(DH_PROTOCOL_DIR "${DH_FIRMWARE_DIR}/../protocol/v1" ABSOLUTE)
+
+add_subdirectory("${DH_FIRMWARE_DIR}/components/dh_core" dh_core)
+target_compile_options(dh_core PRIVATE ${DH_WARNINGS})
+
+add_executable(dh_unit_tests unit_tests.c)
+target_link_libraries(dh_unit_tests PRIVATE dh_core)
+target_compile_options(dh_unit_tests PRIVATE ${DH_WARNINGS})
+
+add_executable(dh_conform conform_cli.c)
+target_link_libraries(dh_conform PRIVATE dh_core)
+target_compile_options(dh_conform PRIVATE ${DH_WARNINGS})
+
+# The fuzz targets, built with a small main that replays a folder of inputs.
+foreach(target json snapshot)
+    add_executable(dh_fuzz_${target}_replay
+        "${DH_FIRMWARE_DIR}/fuzz/fuzz_${target}.c"
+        "${DH_FIRMWARE_DIR}/fuzz/replay_main.c")
+    target_link_libraries(dh_fuzz_${target}_replay PRIVATE dh_core)
+    target_compile_options(dh_fuzz_${target}_replay PRIVATE ${DH_WARNINGS})
+endforeach()
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+enable_testing()
+add_test(NAME unit COMMAND dh_unit_tests)
+add_test(NAME vectors
+    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
+            vectors $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/vectors")
+add_test(NAME examples
+    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
+            examples $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/examples")
+foreach(target json snapshot)
+    add_test(NAME fuzz_${target}_corpus
+        COMMAND dh_fuzz_${target}_replay "${DH_FIRMWARE_DIR}/fuzz/corpus/${target}")
+endforeach()
