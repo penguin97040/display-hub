@@ -2,7 +2,7 @@
 
 The official firmware for a Display Hub display, written in C with ESP-IDF. It is also the starter project for anyone making firmware for their own display.
 
-**Status: early.** It starts up, prints its version and which app slot it is running from, and does nothing else yet. The screen, setup over USB, Wi-Fi, the hub protocol and signed updates follow. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
+**Status: early.** For now it is a board test: it starts the screen, touch and power reading and shows what it finds (see [Board test](#board-test)). Setup over USB, Wi-Fi, the hub protocol and signed updates follow. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
 
 ## The board
 
@@ -13,6 +13,18 @@ Waveshare **ESP32-S3-Touch-AMOLED-1.8**, **V2 only** (CO5300 screen, CST820 touc
 | `device_type` | `display-hub-waveshare-amoled-1.8` |
 | `hardware_revision` | `waveshare-amoled-1.8-v2` |
 | Version | 0.1.0, set by `PROJECT_VER` in [CMakeLists.txt](CMakeLists.txt) |
+
+## Board test
+
+Install it with the desktop app's **Install firmware**. It has three screens; swipe left or right to move between them (the dots at the bottom show which one you're on):
+
+1. **About the board:** the firmware version, the app slot it is running from and its address (`ota_0` at `0x20000` after a first install), what the boot record says (`blank` after a first install), the board revision (V2 if the CST820 touch chip answers; a V1 board shows "not supported yet"), whether USB power is good, and free PSRAM and heap.
+2. **Touch test:** a dot follows your finger, and the last swipe is shown in words.
+3. **eFuse keys:** for each key block KEY0 to KEY5, its purpose, whether it is read-protected or write-protected, and whether it is empty; then whether download mode, secure download mode and USB-Serial-JTAG are turned off by eFuse, and whether Secure Boot and flash encryption are on. **It only reads**: nothing in this firmware writes an eFuse.
+
+The same facts are printed to the console (USB-Serial-JTAG) every 10 seconds, and each swipe as it happens.
+
+The board code is in [main/board/](main/board/). It uses the board package's screen, touch and brightness functions, but not its `bsp_display_start()`, which hands this QSPI screen to LVGL as if it were an RGB panel. It pulses the I/O expander's screen power and resets as Waveshare's examples do, and only reads the AXP2101 power chip.
 
 ## Building
 

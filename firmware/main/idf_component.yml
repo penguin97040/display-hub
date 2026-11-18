@@ -1,7 +1,7 @@
 # Components from the ESP Component Registry (components.espressif.com), each pinned to one exact
 # version. The board package's own dependencies are pinned here too, so nothing moves unless this
 # file does. THIRD_PARTY.md lists each one's licence and source, and what was checked.
-# main doesn't call any of them yet: the board work (milestone D1) will.
+# main/board/ uses them; THIRD_PARTY.md says how the board package is used and what is avoided.
 dependencies:
   idf: "==5.5.6"
 

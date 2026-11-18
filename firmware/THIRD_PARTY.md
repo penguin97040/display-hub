@@ -38,6 +38,15 @@ The board package needs `esp_lcd_panel_io_additions`, `esp_codec_dev` (the board
   - `esp_codec_dev` contains a prebuilt library for a ZL38063 voice chip, linked only when `CONFIG_CODEC_ZL38063_SUPPORT` is on. It is off by default and turned off explicitly in `sdkconfig.defaults`. (That library's folder carries an MIT licence from Microsemi.)
 - **The downloads match.** The components the build downloaded were compared file by file with the archives that were read, and their hashes in `dependencies.lock` match the registry's.
 
+## How the board package is used
+
+The board code ([main/board/board.c](main/board/board.c)) calls the board package's `bsp_i2c_init`, `bsp_display_new`, `bsp_touch_new` and `bsp_display_brightness_set`, and the TCA9554 and LVGL port drivers directly. It does **not** call `bsp_display_start()`: in version 2.0.3 that registers the QSPI screen with `lvgl_port_add_disp_rgb()`, which makes `esp_lvgl_port` write RGB-panel callbacks into memory past the end of the CO5300 driver's data and finish each frame before the screen has received it. The screen is added with `lvgl_port_add_disp()` instead. Check this again when updating either component.
+
+## Read for reference, not copied
+
+- Waveshare's examples for this board, https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8 (Apache-2.0), commit `01fd3200370a4417b257e8a4c185a04ef931342a`: the I/O expander's pins and start-up pulse, the V2 screen's 16-pixel column offset, and that their AXP2101 example changes no power output.
+- XPowersLib's AXP2101 register list (MIT), as bundled in those examples: the addresses of the chip ID, status and output on/off registers, which the board test only reads. No XPowersLib code is used.
+
 ## Libraries bundled inside LVGL
 
 LVGL's `COPYRIGHTS.md` lists the libraries it carries. Only those turned on in the settings are built. All are permissive: BSD-2-Clause (barcode, LZ4), BSD-3-Clause (TLSF), MIT (QR code, ThorVG, RapidJSON with a BSD-3-Clause part, printf, FT800 driver), Zlib (LodePNG), MIT or Unlicense (TinyTTF), Apache-2.0 (AnimatedGIF), and TJpgDec's own permissive licence. FreeType support needs the separate FreeType component, which isn't used, and the demo font beside it is OFL-1.1.

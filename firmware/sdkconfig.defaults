@@ -60,3 +60,16 @@ CONFIG_MBEDTLS_GCM_C=y
 # esp_codec_dev (pulled in by the board package) can link a prebuilt library for a ZL38063 voice
 # chip. This board has no such chip, so keep it out.
 # CONFIG_CODEC_ZL38063_SUPPORT is not set
+
+# --- Screen (LVGL 9) ---
+# The sizes of Montserrat the screens use. Others are left out to save flash.
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20=y
+# CONFIG_LV_FONT_MONTSERRAT_14 is not set
+# Dark is the starting point for anything not styled by hand: black pixels are off on an AMOLED.
+CONFIG_LV_THEME_DEFAULT_DARK=y
+# LVGL's own examples aren't used, so don't compile them.
+# CONFIG_LV_BUILD_EXAMPLES is not set
