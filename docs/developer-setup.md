@@ -43,7 +43,7 @@ Install Rust with `rustup` and the Visual Studio Build Tools (the "Desktop devel
 Install Rust with `rustup` and the Xcode command line tools (`xcode-select --install`). The full Xcode app isn't needed: the manager builds GPUI with `runtime_shaders`, so its Metal shaders are compiled when it starts, not at build time. The build and test commands below are the same as on Linux. CI runs them on a `macos-15` (arm64) runner.
 
 - **Keychain.** Tokens go in the login keychain (through `apple-native-keyring-store`, never a file). The first time the manager, `hub-send` or `usage-helper` saves a token, macOS asks for the login password or to allow access. Choose Always Allow so it doesn't ask again. Rebuilding changes the program, so it may ask again.
-- **USB ports.** A display shows up as `/dev/cu.usbmodemNNNN` (or `/dev/cu.usbserial-NNNN` on boards with a serial chip). The manager lists only the `cu` name and hides its `/dev/tty.` twin. Type the `cu` name in "Or type a port" if it isn't listed.
+- **USB ports.** A display shows up as `/dev/cu.usbmodemNNNN` (or `/dev/cu.usbserial-NNNN` on boards with a serial chip). The manager lists only the `cu` name and hides its `/dev/tty.` twin. Type the `cu` name in "Or type a port" if it isn't listed. The simulator's `usb` command doesn't work with the app on a Mac: `serialport` can't open a pseudo-terminal there, so those tests run on Linux only.
 - **Not signed.** The app isn't code-signed or notarised yet, so macOS warns the first time it opens a downloaded copy. Built on your own Mac, it just runs.
 
 ## Build and test

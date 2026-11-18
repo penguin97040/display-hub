@@ -1097,7 +1097,9 @@ mod own_helper_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+// Not on macOS, where a pseudo-terminal can't stand in for a USB port (see
+// tools/display-simulator/tests/usb.rs).
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod install_tests {
     //! Install firmware through the model and the worker, against a real hub over pinned HTTPS and
     //! the simulated display on a pseudo-terminal: the flash goes through a fake board (the

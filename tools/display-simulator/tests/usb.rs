@@ -1,6 +1,9 @@
 //! USB provisioning over a real pseudo-terminal: the manager's sender (`hub_client::usb`) against the
 //! simulator's display end, then enrolment with the bundle it received.
-#![cfg(unix)]
+//!
+//! Not on macOS: there, `serialport` sets the speed with an ioctl that a pseudo-terminal refuses
+//! ("Not a typewriter"), so a pty can't stand in for a USB port. Real USB serial ports are fine.
+#![cfg(all(unix, not(target_os = "macos")))]
 
 use std::sync::Arc;
 use std::time::Duration;

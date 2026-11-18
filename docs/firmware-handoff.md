@@ -411,7 +411,7 @@ From a checkout of this repository, with Rust installed (see `docs/developer-set
    - The board and the PC must share a network: the hub accepts only local addresses.
    - Make a setup file with `cargo run -p hubd -- display-bundle --data-dir dev-data/hub --name Desk --host <the PC's address> --out bundle.json`, or use the desktop app's **Displays**, **Add a display**, which sends the bundle over USB.
    - `hubd dev` (plain HTTP, sample figures, no authentication) is for the simulator only. Firmware never talks to it.
-4. **USB setup:** the desktop app sends the bundle to the board's port. To watch the app's side first, `display-simulator usb --state <folder>` answers the same exchange on a pseudo-terminal (Unix only).
+4. **USB setup:** the desktop app sends the bundle to the board's port. To watch the app's side first, `display-simulator usb --state <folder>` answers the same exchange on a pseudo-terminal (Linux only: on macOS the app can't open a pseudo-terminal as a serial port).
 5. **Side by side:** `display-simulator enrol --bundle bundle.json --state <folder>`, then `display-simulator poll --state <folder>`, with a second bundle, shows what the board should show.
 6. **Updates:** sign two versions with `hub-firmware`, upload them in the app, and press **Update**. `display-simulator firmware show --state <folder>` prints the simulator's keys, floor, slots and update record, and `display-simulator firmware set` sets test switches (a trial boot that never reaches the hub, a power cut part-way through) to try the failures by hand.
 
