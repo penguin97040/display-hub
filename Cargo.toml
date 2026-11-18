@@ -63,6 +63,10 @@ ring = "=0.17.14"
 rcgen = { version = "=0.14.10", default-features = false, features = ["crypto", "ring", "pem"] }
 hyper = { version = "=1.12.0", features = ["server", "http1"] }
 hyper-util = { version = "=0.1.21", features = ["server", "server-graceful", "http1", "tokio", "service"] }
+# The same versions hyper, axum and tower use (already in the lock): a download buffer that hands its
+# frames over uncopied, and reading into its spare room without zero-filling it first.
+bytes = "=1.12.1"
+tokio-util = { version = "=0.7.20", default-features = false, features = ["io"] }
 rusqlite = { version = "=0.41.1", features = ["bundled", "backup"] }
 base64 = "=0.23.1"
 crc32fast = "=1.5.5"

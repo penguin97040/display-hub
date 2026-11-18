@@ -331,6 +331,10 @@ pub struct FirmwarePackageView {
     /// the keys it has), or from a hub that doesn't say.
     #[serde(default)]
     pub key_set: Option<Vec<String>>,
+    /// The hub couldn't read what it holds about this package (its `key_set`), so it never offers
+    /// it, and a manager treats it as fit for no display. Left out when false, as from an older hub.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub damaged: bool,
     pub uploaded_at: Timestamp,
     /// `admin` or `publisher`, with that credential's id and label.
     pub uploaded_by_role: String,

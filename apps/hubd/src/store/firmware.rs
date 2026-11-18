@@ -174,18 +174,34 @@ fn package_row(r: &Row<'_>) -> rusqlite::Result<PackageRow> {
     })
 }
 
-/// Says once in the log, for a query's rows, which packages' `key_set` can't be read.
-fn log_unreadable<'a>(rows: impl IntoIterator<Item = &'a PackageRow>) {
-    let ids: Vec<&str> = rows
-        .into_iter()
-        .filter(|p| p.key_set == KeySet::Unreadable)
-        .map(|p| p.id.as_str())
-        .collect();
-    if !ids.is_empty() {
-        tracing::error!(
-            packages = %ids.join(", "),
-            "a stored package's key_set can't be read, so it won't be offered; remove the package and add it again"
-        );
+impl Store {
+    /// Logs the packages among `rows` whose `key_set` can't be read: each one once while the hub
+    /// runs, not at every read, since a display's poll can read one again and again.
+    fn log_unreadable<'a>(&self, rows: impl IntoIterator<Item = &'a PackageRow>) {
+        let mut logged = self.damaged_logged.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<&str> = rows
+            .into_iter()
+            .filter(|p| p.key_set == KeySet::Unreadable && logged.insert(p.id.clone()))
+            .map(|p| p.id.as_str())
+            .collect();
+        if !ids.is_empty() {
+            tracing::error!(
+                packages = %ids.join(", "),
+                "a stored package's key_set can't be read, so it won't be offered; remove the package and add it again"
+            );
+        }
+    }
+}
+
+/// A `key_set` as its column holds it: JSON, or null for none. One that can't be read is never
+/// written.
+fn key_set_column(key_set: &KeySet) -> Result<Option<String>, StoreError> {
+    match key_set {
+        KeySet::Absent => Ok(None),
+        KeySet::Keys(ks) => Ok(Some(serde_json::to_string(ks).expect("serialises"))),
+        KeySet::Unreadable => Err(StoreError::Invalid(
+            "A package's key_set must be known to store it.".into(),
+        )),
     }
 }
 
@@ -253,7 +269,7 @@ impl Store {
             "SELECT {PACKAGE_COLUMNS} FROM firmware_packages p ORDER BY p.device_type, p.uploaded_at DESC, p.id"
         ))?;
         let rows = st.query_map([], package_row)?.collect::<Result<Vec<_>, _>>()?;
-        log_unreadable(&rows);
+        self.log_unreadable(&rows);
         Ok(rows)
     }
 
@@ -266,7 +282,7 @@ impl Store {
                 package_row,
             )
             .optional()?;
-        log_unreadable(&row);
+        self.log_unreadable(&row);
         Ok(row)
     }
 
@@ -306,15 +322,7 @@ impl Store {
         evict: &[String],
         now: Timestamp,
     ) -> Result<(), StoreError> {
-        let key_set = match &row.key_set {
-            KeySet::Absent => None,
-            KeySet::Keys(ks) => Some(serde_json::to_string(ks).expect("serialises")),
-            KeySet::Unreadable => {
-                return Err(StoreError::Invalid(
-                    "A package's key_set must be known to store it.".into(),
-                ))
-            }
-        };
+        let key_set = key_set_column(&row.key_set)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire(&tx, now)?;
@@ -372,6 +380,22 @@ impl Store {
         cancel_where(&tx, "package_id = ?3", id, reason, now)?;
         let n = tx.execute("DELETE FROM firmware_packages WHERE id = ?1", params![id])?;
         tx.commit()?;
+        Ok(n > 0)
+    }
+
+    /// Puts back a package's `key_set`, as its checked manifest has it, in a row whose own can't be
+    /// read. Touches nothing else, offers included. False if there was no such package.
+    pub fn repair_key_set(&self, id: &str, key_set: &KeySet) -> Result<bool, StoreError> {
+        let key_set = key_set_column(key_set)?;
+        let n = self.conn().execute(
+            "UPDATE firmware_packages SET key_set = ?2 WHERE id = ?1",
+            params![id, key_set],
+        )?;
+        // Logged again if it is ever damaged again.
+        self.damaged_logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
         Ok(n > 0)
     }
 

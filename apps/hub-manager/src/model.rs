@@ -814,8 +814,6 @@ pub struct Model {
     /// The owner has been shown that the hub's firmware lists couldn't be read, since they were
     /// last readable.
     lists_told: bool,
-    /// The answer being taken brought a refresh that couldn't read the firmware lists.
-    lists_unreadable_now: bool,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -870,7 +868,6 @@ impl Model {
             fw: FirmwareUi::default(),
             pending_firmware: None,
             lists_told: false,
-            lists_unreadable_now: false,
         }
     }
 
@@ -1743,17 +1740,22 @@ impl Model {
 
     // ---- answers ------------------------------------------------------------------------------------
 
-    /// Takes a refresh that may be missing. If it is, one is due at once.
-    fn take_refresh_opt(&mut self, r: Option<Refresh>, now: Instant) {
+    /// Takes a refresh that may be missing. If it is, one is due at once. True if it couldn't read
+    /// the firmware lists, as for `take_refresh`.
+    fn take_refresh_opt(&mut self, r: Option<Refresh>, now: Instant) -> bool {
         match r {
             Some(r) => self.take_refresh(r, now),
-            None => self.refreshed_at = None,
+            None => {
+                self.refreshed_at = None;
+                false
+            }
         }
     }
 
-    fn take_refresh(&mut self, mut r: Refresh, now: Instant) {
-        self.lists_unreadable_now = r.firmware_error.is_some();
-        if r.firmware_error.is_some() {
+    /// Takes a refresh. True if it couldn't read the firmware lists, for `tell_unreadable_lists`.
+    fn take_refresh(&mut self, mut r: Refresh, now: Instant) -> bool {
+        let unreadable = r.firmware_error.is_some();
+        if unreadable {
             // The hub has firmware lists, but they couldn't be read this time: keep the ones it had
             // rather than showing it as a hub without signed updates. The error stays, for
             // `tell_unreadable_lists`.
@@ -1777,6 +1779,7 @@ impl Model {
         self.refreshed_at = Some(now);
         self.online = Some(true);
         self.prune_tick_changes();
+        unreadable
     }
 
     /// Forgets unsaved tick changes that no longer mean anything: the display or page has gone, or
@@ -1795,9 +1798,7 @@ impl Model {
     }
 
     pub fn finish(&mut self, result: Result<Outcome, Failure>, now: Instant) {
-        self.lists_unreadable_now = false;
-        self.take_outcome(result, now);
-        if std::mem::take(&mut self.lists_unreadable_now) {
+        if self.take_outcome(result, now) {
             self.tell_unreadable_lists();
         }
     }
@@ -1827,8 +1828,10 @@ impl Model {
         self.lists_told = true;
     }
 
-    fn take_outcome(&mut self, result: Result<Outcome, Failure>, now: Instant) {
+    /// Takes an answer. True if it brought a refresh that couldn't read the firmware lists.
+    fn take_outcome(&mut self, result: Result<Outcome, Failure>, now: Instant) -> bool {
         let busy = self.busy.take();
+        let mut unreadable = false;
         match result {
             Ok(Outcome::Paired { hub, refresh }) => {
                 self.pairing.clear();
@@ -1837,14 +1840,14 @@ impl Model {
                 self.hub = Some(hub);
                 self.needs_pairing = false;
                 self.section = Section::Overview;
-                self.take_refresh_opt(refresh, now);
+                unreadable = self.take_refresh_opt(refresh, now);
                 self.notice = Some(Guidance::done(
                     "Paired",
                     "This PC can now manage your hub. The checklist on the Overview shows what's left to do.",
                 ));
             }
             Ok(Outcome::Refreshed(r)) => {
-                self.take_refresh_opt(r, now);
+                unreadable = self.take_refresh_opt(r, now);
                 let done = match busy {
                     Some(Busy::Saving { done } | Busy::Offering { done } | Busy::Naming { done }) => {
                         Some(done)
@@ -1863,7 +1866,7 @@ impl Model {
                 let held = match refresh {
                     Some(r) => {
                         let held = self.held_back(&old, &r);
-                        self.take_refresh(r, now);
+                        unreadable = self.take_refresh(r, now);
                         held
                     }
                     None => {
@@ -1902,7 +1905,7 @@ impl Model {
                 }
             }
             Ok(Outcome::Enrolment { grant, refresh }) => {
-                self.take_refresh_opt(refresh, now);
+                unreadable = self.take_refresh_opt(refresh, now);
                 let wifi = wifi_of(&self.enrol.ssid, &self.enrol.password).ok().flatten();
                 self.enrol.password.clear();
                 let port = self.bundle_port();
@@ -1925,7 +1928,7 @@ impl Model {
                 }
             }
             Ok(Outcome::HelperInvite { invite, refresh }) => {
-                self.take_refresh_opt(refresh, now);
+                unreadable = self.take_refresh_opt(refresh, now);
                 match self.invite_string(&invite.secret) {
                     Some(s) => {
                         self.helper.string = Some(Zeroizing::new(s));
@@ -2007,11 +2010,11 @@ impl Model {
                 new,
                 refresh,
             }) => {
-                self.take_refresh_opt(refresh, now);
+                unreadable = self.take_refresh_opt(refresh, now);
                 self.uploaded(&package, new);
             }
             Ok(Outcome::PublisherInvite { invite, refresh }) => {
-                self.take_refresh_opt(refresh, now);
+                unreadable = self.take_refresh_opt(refresh, now);
                 self.take_publisher_invite(invite);
             }
             Ok(Outcome::PackageLoaded(loaded)) => self.take_loaded(*loaded),
@@ -2019,9 +2022,10 @@ impl Model {
                 after,
                 refresh,
                 label,
-            }) => self.take_installed(after, refresh, label, now),
+            }) => unreadable = self.take_installed(after, refresh, label, now),
             Err(f) => self.failed(f, busy, now),
         }
+        unreadable
     }
 
     fn failed(&mut self, f: Failure, busy: Option<Busy>, now: Instant) {

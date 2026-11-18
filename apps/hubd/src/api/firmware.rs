@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::body::{Body, Bytes, HttpBody};
-use bytes::BytesMut;
+use bytes::{BufMut, BytesMut};
 use hub_core::api::{
     DisplayFirmware, EvictedPackage, FirmwareOfferRequest, FirmwareOfferView, FirmwarePackageView,
     NewPublisher, PublisherInvite, PublisherPairRequest, PublisherPairResponse, PublisherView, SignerLabel,
@@ -22,8 +22,9 @@ use hub_core::api::{
 };
 use hub_protocol::firmware::{is_lower_hex, FirmwareReport, KEY_ID_HEX_LEN, PACKAGE_ID_HEX_LEN};
 use hub_protocol::limits::{FIRMWARE_OFFER_LIFETIME_SECONDS, MAX_FIRMWARE_DOWNLOADS_PER_WINDOW};
-use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio_util::io::poll_read_buf;
 
 use super::*;
 use crate::firmware::{self as shelf, MAX_UPLOAD_BYTES, MIN_FREE_DISK_BYTES};
@@ -286,16 +287,26 @@ async fn upload(
     let publisher = (role == Role::Publisher).then(|| who.clone());
     let (status, view) = db_api(&hub, move |s| {
         let dest = shelf::package_path(&dir, &row.id);
-        if let Some(existing) = s.firmware_package(&row.id)? {
-            if dest.is_file() && existing.key_set != KeySet::Unreadable {
-                // Uploading the same file twice is harmless.
+        if let Some(mut existing) = s.firmware_package(&row.id)? {
+            if dest.is_file() {
+                // Uploading the same file twice is harmless. A row whose key_set can't be read is
+                // put right from the file's own manifest, just checked, and its offers are left be.
+                if existing.key_set == KeySet::Unreadable {
+                    s.repair_key_set(&existing.id, &row.key_set)?;
+                    s.audit(
+                        now,
+                        "firmware_repaired",
+                        &format!("{} key_set by {who}", existing.id),
+                    )?;
+                    existing.key_set = row.key_set.clone();
+                }
                 let offered = s.offered_to(now)?.remove(&existing.id).unwrap_or_default();
                 return Ok((
                     StatusCode::OK,
                     shelf::package_view(&existing, &labels(s)?, offered),
                 ));
             }
-            // A row whose file went missing, or whose key_set can't be read: start again.
+            // A row whose file went missing: start again.
             s.remove_firmware_package(&row.id, crate::store::firmware::CANCELLED_PACKAGE_MISSING, now)?;
         }
         let stored = s.firmware_packages()?;
@@ -778,37 +789,37 @@ pub(super) async fn device_download(
         ));
     }
     hub.download_starts.hit(device.clone(), t);
-    // One download at a time for each display, and a few across the hub. A newer request from a
-    // display always wins: the display only asks again once it has given up on its last download,
-    // so one still held is on a connection that died without saying so. The older download it
-    // overtakes is closed, or answered `unavailable` if it hadn't started sending yet. But a request
-    // that can't be served, because the file can't be read or the hub has no slot for it, never
-    // ends a running download: everything that could stop it is checked before it takes over.
-    let (slot, file) = match hub.download_slots.clone().try_acquire_owned() {
-        // A free slot: only the file is left to check. If it fails, the slot is let go unused.
-        Ok(slot) => (slot, open_package(&hub, &pkg, pkg.update_size).await?),
-        // None free: check the file first, then take the slot this display's last download holds.
+    // One download at a time for each display, and a few across the hub. When requests from one
+    // display overlap, a later one takes over from an earlier one: the display only asks again once
+    // it has given up on its last download, so one still held is on a connection that died without
+    // saying so. The earlier download is closed, or answered `unavailable` if it hadn't started
+    // sending yet. But a request that can't be served never ends a running download: the file is
+    // opened and checked first, before the request takes a slot or the display's turn, and with no
+    // slot free and no earlier download of this display's to take one from, it is answered
+    // `unavailable`. Nothing is awaited from here on, so a slot is never held while waiting.
+    let file = open_package(&hub, &pkg, pkg.update_size).await?;
+    let slot = match hub.download_slots.clone().try_acquire_owned() {
+        Ok(slot) => slot,
+        // None free: take the slot this display's earlier download holds.
         Err(_) => {
-            let file = open_package(&hub, &pkg, pkg.update_size).await?;
             let before = hub
                 .downloading
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(&device)
                 .and_then(std::sync::Weak::upgrade);
-            let slot = match before.as_ref().and_then(|b| take_over_slot(b)) {
+            match before.as_ref().and_then(|b| take_over_slot(b)) {
                 Some(slot) => {
                     tracing::info!(%device, "a new firmware download takes over this display's last one");
                     slot
                 }
-                // The last download ended meanwhile, freeing its slot, or there was none to take.
+                // The earlier download ended meanwhile, freeing its slot, or there was none to take.
                 None => hub.download_slots.clone().try_acquire_owned().map_err(|_| {
                     ApiError::unavailable(
                         "The hub is already sending firmware to other displays. Try again later.",
                     )
                 })?,
-            };
-            (slot, file)
+            }
         }
     };
     let held = Arc::new(Mutex::new(Held {
@@ -823,9 +834,8 @@ pub(super) async fn device_download(
     {
         let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
         if h.superseded {
-            // A newer download from this display began in the moment since, and wins. Returning
-            // lets go of the slot this one holds, whether free or taken over, and of its turn.
-            drop(h);
+            // A later request from this display took over in the moment since. Returning lets go
+            // of the slot this one holds, whether free or taken over, and of its turn.
             return Err(ApiError::unavailable(
                 "This display started another firmware download, which replaces this one.",
             ));
@@ -1064,19 +1074,16 @@ impl HttpBody for FileBody {
             return Poll::Ready(Some(Err(std::io::ErrorKind::TimedOut.into())));
         }
         let want = this.remaining.min(shelf::STREAM_CHUNK_BYTES as u64) as usize;
-        // Takes back the memory of the last frame if it has been sent, or else finds more.
-        // Zero-filled rather than read into uninitialised memory, so no `unsafe` is needed.
-        this.buf.resize(want, 0);
-        let mut read = ReadBuf::new(&mut this.buf[..want]);
-        match Pin::new(&mut this.file).poll_read(cx, &mut read) {
+        // Takes back the memory of the last frame if it has been sent, or else finds more, and
+        // reads into it as it is, with no zero-filling first.
+        this.buf.reserve(want);
+        match poll_read_buf(Pin::new(&mut this.file), cx, &mut (&mut this.buf).limit(want)) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
-            Poll::Ready(Ok(())) => {
-                let n = read.filled().len();
+            Poll::Ready(Ok(n)) => {
                 if n == 0 {
                     return Poll::Ready(Some(Err(std::io::ErrorKind::UnexpectedEof.into())));
                 }
-                this.buf.truncate(n);
                 let chunk = this.buf.split().freeze();
                 this.remaining -= n as u64;
                 if this.remaining == 0 {

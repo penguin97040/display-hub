@@ -568,6 +568,8 @@ pub struct DeviceRow {
 pub struct Store {
     conn: Arc<Mutex<Connection>>,
     pub path: PathBuf,
+    /// The packages whose damaged rows have been logged, so each is logged once while the hub runs.
+    damaged_logged: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 fn ts(t: i64) -> Timestamp {
@@ -646,6 +648,7 @@ impl Store {
         let store = Self {
             conn: Arc::new(Mutex::new(conn)),
             path: path.into(),
+            damaged_logged: Arc::default(),
         };
         store.migrate()?;
         Ok(store)
@@ -2597,6 +2600,21 @@ mod tests {
         let key_sets: Vec<_> = all.iter().map(|p| (p.id.as_str(), &p.key_set)).collect();
         assert!(key_sets.contains(&("p1", &KeySet::Unreadable)));
         assert!(key_sets.contains(&("p2", &KeySet::Absent)));
+        // Logged once while the hub runs, however often it is read: only p1 is in the log's list.
+        assert_eq!(
+            *store.damaged_logged.lock().unwrap(),
+            std::collections::HashSet::from(["p1".to_string()])
+        );
+        // Put back from the package's own manifest, it reads again, and is logged again if it is
+        // ever damaged again.
+        assert!(store.repair_key_set("p1", &with.key_set).unwrap());
+        assert_eq!(
+            store.firmware_package("p1").unwrap().unwrap().key_set,
+            with.key_set
+        );
+        assert!(store.damaged_logged.lock().unwrap().is_empty());
+        assert!(store.repair_key_set("p1", &KeySet::Unreadable).is_err());
+        assert!(!store.repair_key_set("p9", &KeySet::Absent).unwrap());
         // Nor is such a row ever written.
         let mut bad = package("p3", "test-display", "1.2.0");
         bad.key_set = KeySet::Unreadable;

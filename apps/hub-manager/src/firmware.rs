@@ -255,12 +255,14 @@ impl DisplayFirmware {
 
 /// Whether a package passes the checks the app can make for a display, by its last report: the
 /// same device type and hardware revision, a key it trusts, at or above its floor, not dropping a
-/// key it trusts without a higher counter, and small enough for its spare space. The hub and the
-/// display check again.
+/// key it trusts without a higher counter, and small enough for its spare space. Never a package
+/// the hub calls damaged, since what the app knows of it can't be relied on and the hub won't offer
+/// it. The hub and the display check again.
 pub fn accepts(d: &DisplayView, p: &FirmwarePackageView) -> bool {
     let Some(info) = &d.device else { return false };
     let Some(fw) = &info.firmware else { return false };
-    p.device_type == info.device_type
+    !p.damaged
+        && p.device_type == info.device_type
         && p.hardware_revisions.contains(&info.hardware_revision)
         && fw.key_ids.contains(&p.signer_key_id)
         && p.security_counter >= fw.security_floor
@@ -724,6 +726,7 @@ pub(crate) mod tests {
             image_size: 700,
             usb_install: true,
             key_set: None,
+            damaged: false,
             uploaded_at: ts("2026-11-17T09:00:00Z"),
             uploaded_by_role: "admin".into(),
             uploaded_by: "a".into(),
@@ -862,6 +865,23 @@ pub(crate) mod tests {
         let f = display_firmware(&d, Some(&[fits, too_big]), &[], None);
         assert_eq!(f.available.unwrap().version, "1.3.0");
         assert!(f.others.is_empty());
+    }
+
+    #[test]
+    fn a_damaged_package_is_never_an_update_or_a_choice() {
+        // The newest package is damaged on the hub: it shows no key_set, so it would otherwise pass.
+        let d = display(Some(vec!["k"]), "1.2.0", None);
+        let fine = package("a", "1.3.0", "k");
+        let mut damaged = package("b", "1.4.0", "k");
+        damaged.damaged = true;
+        assert!(accepts(&d, &fine));
+        assert!(!accepts(&d, &damaged));
+        let f = display_firmware(&d, Some(&[fine, damaged.clone()]), &[], None);
+        assert_eq!(f.available.unwrap().version, "1.3.0");
+        assert!(f.others.is_empty());
+        // Nor the only choice.
+        let f = display_firmware(&d, Some(&[damaged]), &[], None);
+        assert!(f.available.is_none() && f.others.is_empty());
     }
 
     #[test]

@@ -45,7 +45,6 @@ impl Target {
         }
     }
 
-    /// Sends a heartbeat when paired with a state folder.
     /// Sends a heartbeat if paired with a state folder. False only if one was sent and failed.
     async fn heartbeat(&self, dir: Option<&std::path::Path>) -> bool {
         if let (Target::Paired(s), Some(dir)) = (self, dir) {
@@ -422,28 +421,31 @@ const TRIAL_POLL_SECONDS: u64 = 15;
 
 /// When `run` sends a heartbeat: once an hour, and once as soon as the attempts left change, so the
 /// app doesn't show a pause late or keep showing it after the display has recovered. If the hub
-/// doesn't take the change, it is tried again every five minutes until it does, never at every
-/// poll, which keeps it to a handful an hour however long the hub is away.
+/// doesn't take the change, the same value is tried again every five minutes until it does, never
+/// at every poll, which keeps it to a handful an hour however long the hub is away. A newer change
+/// still goes at the next poll.
 #[derive(Default)]
 struct Heartbeats {
     /// When the last heartbeat was sent, taken or not.
     last: Option<std::time::Instant>,
     /// The attempts left that the hub last took.
     sent_attempts: Option<u32>,
-    /// When the last heartbeat failed, if the hub hasn't taken one since.
-    failed: Option<std::time::Instant>,
+    /// When the last heartbeat failed, and the attempts left it carried, if the hub hasn't taken
+    /// one since.
+    failed: Option<(std::time::Instant, Option<u32>)>,
 }
 
 impl Heartbeats {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
-    /// How soon a change the hub didn't take is tried again.
+    /// How soon a change the hub didn't take is tried again with the same value.
     const RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
     fn due(&self, now: std::time::Instant, attempts: Option<u32>) -> bool {
+        let held_back = self
+            .failed
+            .is_some_and(|(t, tried)| tried == attempts && now.duration_since(t) < Self::RETRY);
         self.last.is_none_or(|t| now.duration_since(t) >= Self::EVERY)
-            || (attempts.is_some()
-                && attempts != self.sent_attempts
-                && self.failed.is_none_or(|t| now.duration_since(t) >= Self::RETRY))
+            || (attempts.is_some() && attempts != self.sent_attempts && !held_back)
     }
 
     /// Records a heartbeat carrying `attempts`, and whether the hub took it.
@@ -453,7 +455,7 @@ impl Heartbeats {
             self.sent_attempts = attempts;
             self.failed = None;
         } else {
-            self.failed = Some(now);
+            self.failed = Some((now, attempts));
         }
     }
 }
@@ -829,5 +831,26 @@ mod tests {
             assert!(!h.due(at(s), Some(4)), "{s} s");
         }
         assert!(h.due(at(660 + 3600), Some(4)));
+    }
+
+    #[test]
+    fn a_new_change_isnt_held_back_by_an_earlier_one_the_hub_didnt_take() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut h = Heartbeats::default();
+        h.sent(start, Some(5), true);
+        h.sent(at(60), Some(4), false);
+        assert!(!h.due(at(120), Some(4)), "the same value waits");
+        // A newer change goes at the next poll, and if that fails, it is the one that waits.
+        assert!(h.due(at(120), Some(3)));
+        h.sent(at(120), Some(3), false);
+        assert!(!h.due(at(180), Some(3)));
+        assert!(
+            h.due(at(180), Some(4)),
+            "differs from both the taken and the failed value"
+        );
+        // Back to what the hub last took: nothing to send.
+        assert!(!h.due(at(180), Some(5)));
+        assert!(h.due(at(420), Some(3)));
     }
 }

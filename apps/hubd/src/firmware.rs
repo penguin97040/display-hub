@@ -386,11 +386,12 @@ pub fn package_view(
         update_size: p.update_size,
         image_size: p.image_size,
         usb_install: p.usb_install,
-        // One that can't be read is shown as none; such a package is never offered.
+        // One that can't be read is shown as none, and the package as damaged: it is never offered.
         key_set: match &p.key_set {
             KeySet::Keys(ks) => Some(ks.clone()),
             KeySet::Absent | KeySet::Unreadable => None,
         },
+        damaged: p.key_set == KeySet::Unreadable,
         uploaded_at: p.uploaded_at,
         uploaded_by_role: p.uploaded_by_role.as_str().to_string(),
         uploaded_by: p.uploaded_by.clone(),
@@ -644,6 +645,21 @@ mod tests {
         assert!(!is_upload("hub.db"));
         let p = upload_path(Path::new("x"));
         assert!(is_upload(p.file_name().unwrap().to_str().unwrap()));
+    }
+
+    #[test]
+    fn a_package_whose_key_set_cant_be_read_is_shown_as_damaged() {
+        let labels = std::collections::HashMap::new();
+        let mut p = row("a", "t", "1.0.0", MIB, None);
+        let ok = package_view(&p, &labels, Vec::new());
+        assert!(!ok.damaged);
+        // Left out when false, so an older manager reads the same view as before.
+        assert!(serde_json::to_value(&ok).unwrap().get("damaged").is_none());
+        p.key_set = KeySet::Unreadable;
+        let bad = package_view(&p, &labels, Vec::new());
+        assert!(bad.damaged);
+        assert_eq!(bad.key_set, None);
+        assert_eq!(serde_json::to_value(&bad).unwrap()["damaged"], true);
     }
 
     #[test]

@@ -583,11 +583,19 @@ async fn a_package_whose_key_set_cant_be_read_is_listed_but_never_offered() {
         )
         .unwrap();
 
-    // The shelf still lists both, the damaged one with no key_set shown.
+    // The shelf still lists both, the damaged one marked so, with no key_set shown.
     let shelf = c.firmware_packages(&admin).await.unwrap();
     assert_eq!(shelf.len(), 2);
     let listed = shelf.iter().find(|p| p.package_id == newer.package_id).unwrap();
     assert_eq!(listed.key_set, None);
+    assert!(listed.damaged);
+    assert!(
+        !shelf
+            .iter()
+            .find(|p| p.package_id == older.package_id)
+            .unwrap()
+            .damaged
+    );
     // It is never picked as available, and never offered again.
     let views = c.displays(&admin).await.unwrap();
     let available = |id: &str| {
@@ -615,13 +623,23 @@ async fn a_package_whose_key_set_cant_be_read_is_listed_but_never_offered() {
         .firmware_update
         .unwrap();
     assert_eq!(shown.offer_id, offer.offer_id);
-    // Another package still uploads, and the same file again puts the damaged row right.
+    // Another package still uploads, and the same file again puts the damaged row right in place:
+    // the hub already had it, and the offer made before goes on, not cancelled.
     c.upload_firmware(&admin, package(&k, "1.3.0", 1).bytes)
         .await
         .unwrap();
     let (again, created) = c.upload_firmware(&admin, built.bytes).await.unwrap();
-    assert!(created);
+    assert!(!created);
+    assert!(!again.damaged);
     assert_eq!(again.key_set, Some(vec![k.public_key().key_id().to_hex()]));
+    assert_eq!(again.offered_to, vec![desk.clone()]);
+    let still = c
+        .device_snapshot(Some(&token))
+        .await
+        .unwrap()
+        .firmware_update
+        .unwrap();
+    assert_eq!(still.offer_id, offer.offer_id);
     c.offer_firmware(&admin, &hall, &newer.package_id).await.unwrap();
     r.stop().await;
 }

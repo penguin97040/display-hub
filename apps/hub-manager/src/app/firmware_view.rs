@@ -10,7 +10,7 @@ use gpui::{div, prelude::*, px, ClipboardItem, Context, Div, ElementId, SharedSt
 use super::{nz_date, waiting, FieldId, Kind, Manager};
 use crate::firmware::{Signer, SignerKind, Trust};
 use crate::guidance::{self, size_text, Guidance};
-use crate::model::{InstallStage, Model, Op, PackageSays, PackageSource};
+use crate::model::{InstallStage, Model, Op, PackageRow, PackageSays, PackageSource};
 use crate::theme::*;
 use crate::ui::{self, c, keep_case, Metrics};
 
@@ -214,7 +214,7 @@ impl Manager {
                     window.focus(&fh, cx);
                 },
             );
-            let usb = p.usb_install.then(|| {
+            let usb = p.for_usb_install().then(|| {
                 self.button(
                     format!("fw-usb-{}", p.id),
                     "Install over USB",
@@ -262,7 +262,12 @@ impl Manager {
                             .child(ui::h3(format!("{} {}", p.device_type, p.version)))
                             .child(ui::label(&format!("Signed by {}", signer_text(&p.signer))))
                             .when_some(p.summary.clone(), |d, s| d.child(maker_note(s)))
-                            .child(ui::label(&facts.join(" · "))),
+                            .child(ui::label(&facts.join(" · ")))
+                            .when(p.damaged, |d| {
+                                d.child(ui::p(
+                                    "The hub couldn't read this package's details. Remove it and add it again.",
+                                ))
+                            }),
                     )
                     .child(div().flex().gap(px(8.0)).children(usb).child(remove)),
             );
@@ -521,7 +526,7 @@ impl Manager {
                     .model
                     .package_rows()
                     .into_iter()
-                    .filter(|p| p.usb_install)
+                    .filter(PackageRow::for_usb_install)
                     .collect();
                 if !usable.is_empty() {
                     from_hub = from_hub.child(ui::label("Or one on the hub"));

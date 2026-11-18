@@ -206,9 +206,19 @@ pub struct PackageRow {
     pub summary: Option<String>,
     pub size: u64,
     pub usb_install: bool,
+    /// The hub couldn't read what it holds about it: it is offered to no display and not used for
+    /// an install over USB, until it is removed and added again.
+    pub damaged: bool,
     /// The names of the displays it is on offer to.
     pub offered_to: Vec<String>,
     pub uploaded_at: Timestamp,
+}
+
+impl PackageRow {
+    /// Whether the Firmware screen offers it for an install over USB.
+    pub fn for_usb_install(&self) -> bool {
+        self.usb_install && !self.damaged
+    }
 }
 
 /// One signing key the app knows of, for naming.
@@ -264,6 +274,7 @@ impl Model {
                 summary: p.summary.clone(),
                 size: p.size,
                 usb_install: p.usb_install,
+                damaged: p.damaged,
                 offered_to: p.offered_to.iter().map(|d| self.display_name(d)).collect(),
                 uploaded_at: p.uploaded_at,
             })
@@ -844,14 +855,14 @@ impl Model {
 
     /// After an install: send the setup details, or say what to do next. `label` says what became
     /// of the owner's name for the maker's key; whichever way the install ended, the notice says if
-    /// it wasn't saved.
+    /// it wasn't saved. True if the refresh it brought couldn't read the firmware lists.
     pub(super) fn take_installed(
         &mut self,
         after: AfterFlash,
         refresh: Option<Refresh>,
         label: MakerName,
         now: Instant,
-    ) {
+    ) -> bool {
         let port = match &self.fw.install.stage {
             InstallStage::Running { port } => port.clone(),
             _ => String::new(),
@@ -874,7 +885,7 @@ impl Model {
         let name = clean_title(self.fw.install.name.trimmed()).unwrap_or_default();
         let maker = clean_title(self.fw.install.maker.trimmed()).unwrap_or_default();
         let unsaved = self.maker_not_saved(&maker, label);
-        self.take_refresh_opt(refresh, now);
+        let unreadable = self.take_refresh_opt(refresh, now);
         // The Displays screen watches for the new display, as after an ordinary setup.
         self.enrol = super::Enrol {
             open: true,
@@ -945,6 +956,7 @@ impl Model {
                 self.section = super::Section::Displays;
             }
         }
+        unreadable
     }
 
     /// The sentence for a notice when the owner's name for the maker's key wasn't saved, with a
@@ -1089,6 +1101,7 @@ mod tests {
             image_size: 1_395_000,
             usb_install: true,
             key_set: None,
+            damaged: false,
             uploaded_at: ts("2026-11-10T19:00:00Z"),
             uploaded_by_role: "admin".into(),
             uploaded_by: "a".into(),
@@ -1164,6 +1177,25 @@ mod tests {
             (keys[0].packages, keys[0].trusted_by.as_slice()),
             (3, ["D".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn a_damaged_package_is_listed_but_never_the_update_or_an_install_over_usb() {
+        let (mut m, _) = with_firmware();
+        // The hub couldn't read 1.3.0-beta.1, the update the display would otherwise be shown.
+        m.last.as_mut().unwrap().firmware.as_mut().unwrap().packages[2].damaged = true;
+        let rows = m.package_rows();
+        assert_eq!(rows.len(), 3);
+        let damaged = rows.iter().find(|r| r.version == "1.3.0-beta.1").unwrap();
+        assert!(damaged.damaged && damaged.usb_install && !damaged.for_usb_install());
+        assert!(rows
+            .iter()
+            .filter(|r| !r.damaged)
+            .all(PackageRow::for_usb_install));
+        let f = firmware::display_firmware(&m.displays()[0], Some(m.firmware_packages()), &[], None);
+        assert!(f.available.is_none());
+        let others: Vec<&str> = f.others.iter().map(|o| o.version.as_str()).collect();
+        assert_eq!(others, ["1.1.0"]);
     }
 
     #[test]
