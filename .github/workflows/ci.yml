@@ -227,3 +227,81 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Test everything except the desktop manager
         run: cargo test --workspace --exclude hub-manager --locked --no-fail-fast
+
+  firmware:
+    # The official firmware (firmware/), built in Espressif's own ESP-IDF v5.5.6 image, pinned by
+    # digest so a re-pushed tag can't change what builds it. The image is root-owned and its
+    # entrypoint isn't run for steps, so each step sources export.sh itself.
+    runs-on: ubuntu-24.04
+    container:
+      image: espressif/idf:v5.5.6@sha256:bf72fe7a15c22849a9a94147301165a545fb8905d97c176cf748e3e4614cac84
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The lock file must already say exactly what the build downloads.
+      - name: Build
+        run: |
+          set -o pipefail
+          . "$IDF_PATH/export.sh"
+          cp firmware/dependencies.lock "$RUNNER_TEMP/dependencies.lock"
+          idf.py -C firmware -B "$RUNNER_TEMP/fw-build" build
+          cmp firmware/dependencies.lock "$RUNNER_TEMP/dependencies.lock"
+          mkdir -p fw-out/bootloader fw-out/partition_table
+          cd "$RUNNER_TEMP/fw-build"
+          cp flasher_args.json display-hub.bin display-hub.elf ota_data_initial.bin "$GITHUB_WORKSPACE/fw-out/"
+          cp bootloader/bootloader.bin "$GITHUB_WORKSPACE/fw-out/bootloader/"
+          cp partition_table/partition-table.bin "$GITHUB_WORKSPACE/fw-out/partition_table/"
+          sha256sum display-hub.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin
+      # Unsigned, laid out as a build folder, so firmware/tools/package-dev.sh can sign it as it is.
+      # The ELF is there to decode a crash's backtrace.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: display-hub-firmware-unsigned
+          path: fw-out
+          if-no-files-found: error
+          retention-days: 14
+
+  firmware-host:
+    # The firmware's protocol and update cores, built for this computer and tested with every
+    # vector, against mbedTLS 3.6 (the line ESP-IDF 5.5 ships), built as in the linux job. Skipped
+    # until firmware/host-tests/ exists.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check the packing script
+        run: shellcheck firmware/tools/package-dev.sh
+      - name: Look for the host tests
+        id: present
+        run: |
+          if [ -f firmware/host-tests/CMakeLists.txt ]; then
+            echo "tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::firmware/host-tests/CMakeLists.txt isn't there yet, so the host tests are skipped."
+            echo "tests=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build mbedTLS
+        if: steps.present.outputs.tests == 'true'
+        env:
+          MBEDTLS_VERSION: 3.6.6
+          MBEDTLS_SHA256: 8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a
+        run: |
+          tarball="mbedtls-${MBEDTLS_VERSION}.tar.bz2"
+          curl -sSfL -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/$tarball"
+          echo "${MBEDTLS_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/mbedtls"
+          tar xjf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/mbedtls" --strip-components=1
+          make -C "$RUNNER_TEMP/mbedtls" -j4 lib > /dev/null
+      # MBEDTLS_DIR is the built source tree: headers in include/, libraries in library/.
+      - name: Build and run the host tests
+        if: steps.present.outputs.tests == 'true'
+        run: |
+          cmake -S firmware/host-tests -B "$RUNNER_TEMP/host-tests" -DMBEDTLS_DIR="$RUNNER_TEMP/mbedtls" \
+            && cmake --build "$RUNNER_TEMP/host-tests" \
+            && ctest --test-dir "$RUNNER_TEMP/host-tests" --output-on-failure

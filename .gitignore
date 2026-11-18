@@ -81,6 +81,12 @@ desktop.ini
 *.db-shm
 *.dhbundle.json
 /display-hub-starter/
+# The official firmware: build output, components the build downloads, and generated settings
+# (sdkconfig.defaults is the record; dependencies.lock is kept)
+/firmware/build/
+/firmware/managed_components/
+/firmware/sdkconfig
+/firmware/sdkconfig.old
 
 # agent-rules: rules v2
 # More local agent files, tool folders and settings (never publish)

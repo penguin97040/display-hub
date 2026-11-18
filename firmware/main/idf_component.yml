@@ -1,0 +1,29 @@
+# Components from the ESP Component Registry (components.espressif.com), each pinned to one exact
+# version. The board package's own dependencies are pinned here too, so nothing moves unless this
+# file does. THIRD_PARTY.md lists each one's licence and source, and what was checked.
+# main doesn't call any of them yet: the board work (milestone D1) will.
+dependencies:
+  idf: "==5.5.6"
+
+  # The board: screen, touch, I/O expander and power wiring.
+  waveshare/esp32_s3_touch_amoled_1_8: "==2.0.3"
+
+  # Screen and touch controllers. V2 boards have a CO5300 screen and a CST820 touch chip (driven by
+  # the CST816S driver). The FT5x06 driver is for V1's FT3168; the board package needs it.
+  espressif/esp_lcd_co5300: "==2.2.0"
+  espressif/esp_lcd_touch: "==1.2.1"
+  espressif/esp_lcd_touch_cst816s: "==1.1.2"
+  espressif/esp_lcd_touch_ft5x06: "==1.1.1"
+
+  # Graphics.
+  lvgl/lvgl: "==9.6.0~1"
+  espressif/esp_lvgl_port: "==2.9.0"
+
+  # The TCA9554 I/O expander, which powers and resets the screen and touch.
+  espressif/esp_io_expander: "==1.2.1"
+  espressif/esp_io_expander_tca9554: "==2.0.3"
+
+  # Further dependencies of the board package and the drivers.
+  espressif/esp_lcd_panel_io_additions: "==1.0.1~1"
+  espressif/esp_codec_dev: "==1.5.11"
+  espressif/cmake_utilities: "==0.5.3"
