@@ -2021,6 +2021,16 @@ impl Model {
         )
     }
 
+    /// The feeds the last helper string covers, other than the usage ones.
+    pub fn invited_own_feeds(&self) -> Vec<&str> {
+        self.helper
+            .invited
+            .iter()
+            .filter(|f| !USAGE_FEEDS.iter().any(|s| s.slug() == f.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+
     pub fn ask_revoke_helper(&mut self, id: &str) {
         if let Some(h) = self.helpers().iter().find(|h| h.id == id) {
             self.confirm = Some(Confirm::RevokeHelper {
@@ -2274,6 +2284,10 @@ impl Model {
                     Some(s) => {
                         self.helper.string = Some(Zeroizing::new(s));
                         self.helper.expires_at = Some(invite.expires_at);
+                        // A problem from an earlier try, such as a bad feed name, no longer applies.
+                        if self.notice.as_ref().is_some_and(|n| n.tone == Tone::Problem) {
+                            self.notice = None;
+                        }
                     }
                     None => {
                         self.notice = Some(Guidance {
@@ -4037,6 +4051,13 @@ mod helper_string_tests {
             firmware: None,
             firmware_error: None,
         };
+        // A problem left from an earlier try, such as a bad feed name, goes once a string is made.
+        m.notice = Some(Guidance {
+            tone: Tone::Problem,
+            title: "Bad_Name can't be a feed's name".into(),
+            detail: String::new(),
+            next: Next::None,
+        });
         m.finish(
             Ok(Outcome::HelperInvite {
                 invite,

@@ -1790,15 +1790,14 @@ impl Manager {
             Some(e) => format!("Data for a {kind} page looks like this: {e}"),
             None => "The data is in the shape your kind needs, which your display's firmware draws.".into(),
         };
-        let mut pi_help = format!(
-            "Copy your helper program to the Pi, named {}. Then, in the folder that holds it, run:",
-            steps.pi_name
-        );
+        let mut pi_help = format!("Copy your helper program to the Pi, named {}.", steps.pi_name);
         if steps.pi_name != steps.feed {
             pi_help.push_str(
-                " (A helper's name on the Pi is 20 characters at most, so it sends to the feed by --feed.)",
+                " A helper's name on the Pi is 20 characters at most, so this one has a shorter name and the \
+                 command names its feed with --feed.",
             );
         }
+        pi_help.push_str(" Then, in the folder that holds it, run:");
         ui::with_ticks(
             ui::panel(Some(("Feed this page", "")), m).child(
                 ui::body(m)
@@ -2923,7 +2922,14 @@ impl Manager {
                 },
             );
             let (usage, own) = self.model.invite_programs();
-            let mut how = Vec::new();
+            let own_line = own.then(|| {
+                format!(
+                    "For your own helper (feeds: {}), run hub-send login on that computer and paste it. Your \
+                     helper then sends with hub-send page: docs/helpers.md has the steps.",
+                    self.model.invited_own_feeds().join(", ")
+                )
+            });
+            let mut how: Vec<&str> = Vec::new();
             if usage {
                 how.push(
                     "For the usage limits, run usage-helper login on that computer and paste it. Then add usage-helper \
@@ -2931,11 +2937,8 @@ impl Manager {
                      docs/providers.md has the steps.",
                 );
             }
-            if own {
-                how.push(
-                    "For your own helper, run hub-send login on that computer and paste it. Your helper then sends \
-                     with hub-send page: docs/helpers.md has the steps.",
-                );
+            if let Some(line) = &own_line {
+                how.push(line);
             }
             if usage && own {
                 how.push("A string works once, for one program: to set up both, make a string for each.");
