@@ -205,7 +205,9 @@ pub fn send_after_install(
     std::thread::sleep(Duration::from_millis(1500));
     loop {
         match send_usb(port, bundle) {
-            Err(UsbError::Port(_) | UsbError::NoAnswer) if std::time::Instant::now() < deadline => {
+            Err(UsbError::Port(_) | UsbError::NoAnswer | UsbError::Stopped)
+                if std::time::Instant::now() < deadline =>
+            {
                 std::thread::sleep(Duration::from_secs(1))
             }
             r => return r,

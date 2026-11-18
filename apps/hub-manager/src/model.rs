@@ -497,7 +497,7 @@ fn pi_helper_name(feed: &str) -> String {
     if feed.len() <= PI_HELPER_NAME_LEN {
         return feed.to_string();
     }
-    // FNV-1a, 32 bits, written as six base-36 digits at most.
+    // FNV-1a, 32 bits, written as seven base-36 digits at most.
     let mut hash: u32 = 0x811c_9dc5;
     for b in feed.bytes() {
         hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
@@ -871,6 +871,9 @@ pub struct HelperForm {
     pub expires_at: Option<Timestamp>,
     /// The feeds the last string asked for, to say which program takes it.
     pub invited: Vec<String>,
+    /// The title of the problem this form last showed, so a string made later clears that one
+    /// notice and no other.
+    pub problem: Option<String>,
 }
 
 /// A feed that a helper page on the hub takes, to tick when inviting a helper.
@@ -888,6 +891,11 @@ const HELPER_OTHER_MAX: usize = 4096;
 
 /// The usage feeds, which have boxes of their own.
 const USAGE_FEEDS: [Service; 2] = [Service::ClaudeMax, Service::ChatgptPlus];
+
+/// Whether a feed is one of the usage helper's, which have their own boxes.
+fn is_usage_feed(feed: &str) -> bool {
+    USAGE_FEEDS.iter().any(|s| s.slug() == feed)
+}
 
 pub struct Model {
     pub hub: Option<SavedHub>,
@@ -1303,7 +1311,7 @@ impl Model {
         self.helper.claude = feed == Service::ClaudeMax.slug();
         self.helper.chatgpt = feed == Service::ChatgptPlus.slug();
         // A usage feed has its own box, ticked above.
-        self.helper.feeds = if USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+        self.helper.feeds = if is_usage_feed(feed) {
             Vec::new()
         } else {
             vec![feed.to_string()]
@@ -1898,7 +1906,7 @@ impl Model {
         let mut out: Vec<FeedChoice> = Vec::new();
         for p in self.pages().iter().filter(|p| p.source == Source::Helper) {
             let Some(feed) = p.feed.as_deref() else { continue };
-            if USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+            if is_usage_feed(feed) {
                 continue;
             }
             match out.iter_mut().find(|c| c.feed == feed) {
@@ -1911,7 +1919,7 @@ impl Model {
             }
         }
         for feed in &self.helper.feeds {
-            if !out.iter().any(|c| &c.feed == feed) && !USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+            if !out.iter().any(|c| &c.feed == feed) && !is_usage_feed(feed) {
                 out.push(FeedChoice {
                     feed: feed.clone(),
                     pages: Vec::new(),
@@ -1946,7 +1954,9 @@ impl Model {
         for c in self.helper_feed_choices().into_iter().filter(|c| c.ticked) {
             feeds.push(c.feed);
         }
-        if self.helper.other.text.len() >= self.helper.other.max_len {
+        // A paste is cut to fit, back to a character boundary, so treat a box within one character
+        // (at most 4 bytes) of full as cut.
+        if self.helper.other.text.len() + 4 > self.helper.other.max_len {
             return Err(Guidance {
                 tone: Tone::Problem,
                 title: "That list of feeds is too long".into(),
@@ -1997,7 +2007,10 @@ impl Model {
     pub fn create_helper(&mut self) -> Option<Op> {
         let feeds = match self.helper_feeds() {
             Ok(f) => f,
-            Err(g) => return self.problem(g),
+            Err(g) => {
+                self.helper.problem = Some(g.title.clone());
+                return self.problem(g);
+            }
         };
         let label = clean_title(self.pc_name.trimmed()).unwrap_or_else(|| "Helper".into());
         if self.busy.is_some() {
@@ -2014,7 +2027,7 @@ impl Model {
     /// Whether the last helper string is for `usage-helper`, for `hub-send`, or for both: the usage
     /// feeds are usage-helper's, any other feed hub-send's.
     pub fn invite_programs(&self) -> (bool, bool) {
-        let usage = |f: &String| USAGE_FEEDS.iter().any(|s| s.slug() == f);
+        let usage = |f: &String| is_usage_feed(f);
         (
             self.helper.invited.iter().any(usage),
             self.helper.invited.iter().any(|f| !usage(f)),
@@ -2026,7 +2039,7 @@ impl Model {
         self.helper
             .invited
             .iter()
-            .filter(|f| !USAGE_FEEDS.iter().any(|s| s.slug() == f.as_str()))
+            .filter(|f| !is_usage_feed(f))
             .map(String::as_str)
             .collect()
     }
@@ -2127,7 +2140,32 @@ impl Model {
         self.refreshed_at = Some(now);
         self.online = Some(true);
         self.prune_tick_changes();
+        self.prune_helper_feeds();
         unreadable
+    }
+
+    /// Once a helper string is made, the form's own problem from an earlier try, such as a bad feed
+    /// name, no longer applies. Any other notice stays.
+    fn clear_helper_problem(&mut self) {
+        let Some(title) = self.helper.problem.take() else {
+            return;
+        };
+        if self.notice.as_ref().is_some_and(|n| n.title == title) {
+            self.notice = None;
+        }
+    }
+
+    /// Drops ticked helper feeds that no page on the hub takes any more, so a page removed since
+    /// isn't still granted to the next helper.
+    fn prune_helper_feeds(&mut self) {
+        let Some(last) = &self.last else { return };
+        let taken: HashSet<&str> = last
+            .pages
+            .iter()
+            .filter(|p| p.source == Source::Helper)
+            .filter_map(|p| p.feed.as_deref())
+            .collect();
+        self.helper.feeds.retain(|f| taken.contains(f.as_str()));
     }
 
     /// Forgets unsaved tick changes that no longer mean anything: the display or page has gone, or
@@ -2284,10 +2322,7 @@ impl Model {
                     Some(s) => {
                         self.helper.string = Some(Zeroizing::new(s));
                         self.helper.expires_at = Some(invite.expires_at);
-                        // A problem from an earlier try, such as a bad feed name, no longer applies.
-                        if self.notice.as_ref().is_some_and(|n| n.tone == Tone::Problem) {
-                            self.notice = None;
-                        }
+                        self.clear_helper_problem();
                     }
                     None => {
                         self.notice = Some(Guidance {
@@ -4052,6 +4087,7 @@ mod helper_string_tests {
             firmware_error: None,
         };
         // A problem left from an earlier try, such as a bad feed name, goes once a string is made.
+        m.helper.problem = Some("Bad_Name can't be a feed's name".into());
         m.notice = Some(Guidance {
             tone: Tone::Problem,
             title: "Bad_Name can't be a feed's name".into(),
@@ -4320,6 +4356,43 @@ mod own_helper_tests {
     }
 
     #[test]
+    fn a_tick_for_a_page_that_has_gone_is_dropped_at_the_next_refresh() {
+        let (mut m, _) = connected(vec![helper_page("garden", "garden-weather", "Garden")]);
+        m.toggle_helper_feed("garden-weather");
+        m.helper.feeds.push("gone".into());
+        let r = m.last.clone().expect("a refresh");
+        assert!(!m.take_refresh(r, Instant::now()), "the lists were readable");
+        assert_eq!(m.helper.feeds, ["garden-weather"]);
+    }
+
+    #[test]
+    fn a_new_string_clears_only_the_forms_own_problem() {
+        let (mut m, _) = connected(vec![]);
+        m.helper.claude = false;
+        m.helper.chatgpt = false;
+        m.helper.other.set("Bad_Name");
+        assert!(m.create_helper().is_none());
+        assert_eq!(
+            m.helper.problem.as_deref(),
+            Some("Bad_Name can't be a feed's name")
+        );
+        // Something else is showing by the time the string arrives: it stays.
+        m.notice = Some(Guidance {
+            tone: Tone::Problem,
+            title: "Couldn't read the firmware lists".into(),
+            detail: String::new(),
+            next: Next::None,
+        });
+        m.clear_helper_problem();
+        assert!(m.notice.is_some(), "another notice stays");
+        assert!(m.helper.problem.is_none());
+
+        assert!(m.create_helper().is_none());
+        m.clear_helper_problem();
+        assert!(m.notice.is_none(), "the form's own problem goes");
+    }
+
+    #[test]
     fn an_over_long_paste_in_other_feeds_is_refused_not_cut() {
         let (mut m, _) = connected(vec![]);
         m.helper.claude = false;
@@ -4456,15 +4529,19 @@ mod own_helper_tests {
         assert!(m.create_helper().is_none());
         assert!(m.notice.as_ref().unwrap().title.contains("at most 50 feeds"));
 
-        // A tick stays, and is sent, even when no listed page takes the feed any more.
+        // A tick for a page that has since gone is dropped at the next refresh, not sent.
         m.helper.other.clear();
         m.toggle_helper_feed("garden-weather");
         let now = Instant::now();
         m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now);
-        let Some(Op::NewHelper(n)) = m.create_helper() else {
-            panic!("helper")
-        };
-        assert_eq!(n.feeds, ["garden-weather"]);
+        assert!(m.helper.feeds.is_empty());
+        assert!(m.create_helper().is_none());
+        assert!(m
+            .notice
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("Choose what the helper sends to"));
     }
 
     #[test]

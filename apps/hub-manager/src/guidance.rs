@@ -286,12 +286,13 @@ pub fn from_store(detail: &str) -> Guidance {
 
 pub fn from_usb(e: &UsbError) -> Guidance {
     let next = match e {
-        UsbError::Port(_) | UsbError::NoAnswer => Next::Retry,
+        UsbError::Port(_) | UsbError::NoAnswer | UsbError::Stopped => Next::Retry,
         _ => Next::None,
     };
     let title = match e {
         UsbError::Port(_) => "The USB port didn't work",
         UsbError::NoAnswer => "No display answered on that port",
+        UsbError::Stopped => "The display stopped answering",
         UsbError::AlreadyProvisioned => "That display is already set up",
         UsbError::Incompatible(_) => "That display's software doesn't match",
         UsbError::Unexpected => "The display's answer wasn't understood",

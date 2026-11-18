@@ -2890,7 +2890,7 @@ impl Manager {
             ))
             .child(div().flex().flex_wrap().gap(px(8.0)).child(claude).child(chatgpt))
             .child(ui::label("Your own helper, sending with hub-send"))
-            .when(choices.is_empty(), |d| {
+            .when(choices.iter().all(|c| c.pages.is_empty()), |d| {
                 d.child(ui::p_muted(
                     "No page takes a feed of your own yet. Make one in Pages, with A page for your own helper, or type \
                      its feed below.",

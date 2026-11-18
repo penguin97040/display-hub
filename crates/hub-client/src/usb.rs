@@ -49,6 +49,11 @@ pub enum UsbError {
     FirmwareKeysLocked,
     #[error("the display refused the setup details ({0})")]
     Refused(String),
+    #[error(
+        "the display answered, then stopped reading the port partway through. Unplug it, plug it back in \
+         and try again."
+    )]
+    Stopped,
 }
 
 /// How often `hello` is repeated while nothing answers. A board that resets when the port opens
@@ -85,7 +90,9 @@ impl<P: Read + Write> Conn<'_, P> {
             if let Some(line) = self.pending.pop_front() {
                 match line {
                     Line::Json(s) => {
-                        return Ok(Some(serde_json::from_str(&s).map_err(|_| UsbError::Unexpected)?))
+                        // Any message, even a late one from an earlier session, shows the port is read.
+                        self.answered = true;
+                        return Ok(Some(serde_json::from_str(&s).map_err(|_| UsbError::Unexpected)?));
                     }
                     Line::Overlong => return Err(UsbError::Unexpected),
                 }
@@ -122,10 +129,16 @@ fn port_error(e: std::io::Error) -> UsbError {
 
 /// Before anything has answered, a write that times out (Windows says "os error 121") or writes
 /// nothing (`WriteZero`) means nothing on the other end is reading the port: a board whose firmware
-/// doesn't speak this exchange, not a port in use. Once the display has answered, it is a port error.
+/// doesn't speak this exchange, not a port in use. Once the display has sent anything, it stopped partway.
 fn write_error(e: std::io::Error, answered: bool) -> UsbError {
     match e.kind() {
-        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::WriteZero if !answered => UsbError::NoAnswer,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::WriteZero => {
+            if answered {
+                UsbError::Stopped
+            } else {
+                UsbError::NoAnswer
+            }
+        }
         _ => port_error(e),
     }
 }
@@ -158,7 +171,6 @@ fn hello_on<P: Read + Write>(conn: &mut Conn<'_, P>) -> Result<UsbDisplay, UsbEr
                 if device.protocol_version != PROTOCOL_VERSION {
                     return Err(UsbError::Incompatible(device.protocol_version));
                 }
-                conn.answered = true;
                 return Ok(UsbDisplay { device, provisioned });
             }
             // A late answer to an earlier session. Keep waiting for the hello.
@@ -293,7 +305,7 @@ mod tests {
     }
 
     #[test]
-    fn a_write_that_stalls_after_the_display_answered_is_a_port_error() {
+    fn a_write_that_stalls_after_the_display_answered_is_stopped() {
         let bundle: Bundle = serde_json::from_str(include_str!(
             "../../../protocol/v1/examples/device/provisioning-bundle.json"
         ))
@@ -309,7 +321,7 @@ mod tests {
                 kind,
             };
             let err = provision(&mut port, &bundle).unwrap_err();
-            assert!(matches!(err, UsbError::Port(_)), "{kind:?}: {err:?}");
+            assert_eq!(err, UsbError::Stopped, "{kind:?}");
         }
     }
 
