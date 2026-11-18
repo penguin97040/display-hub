@@ -4,7 +4,8 @@
 //! with any `Read + Write`: a real serial port, or a pseudo-terminal in tests. It blocks, so run it on
 //! a blocking thread.
 //!
-//! Experimental until the `llm-usage-display` firmware implements the same framing.
+//! The framing is in `docs/protocol-v1.md`, "Over USB"; `display-simulator usb` is the reference
+//! display for it. Real firmware speaking it hasn't been tried yet.
 
 use std::io::{ErrorKind, Read, Write};
 use std::time::{Duration, Instant};
@@ -63,8 +64,8 @@ struct Conn<'a, P: Read + Write> {
 
 impl<P: Read + Write> Conn<'_, P> {
     fn send(&mut self, msg: &ToDisplay) -> Result<(), UsbError> {
-        self.port.write_all(&encode(msg)).map_err(port_error)?;
-        self.port.flush().map_err(port_error)
+        self.port.write_all(&encode(msg)).map_err(write_error)?;
+        self.port.flush().map_err(write_error)
     }
 
     /// The next JSON message, or `None` at the deadline. `repeat` is resent every [`HELLO_REPEAT`].
@@ -112,6 +113,15 @@ impl<P: Read + Write> Conn<'_, P> {
 
 fn port_error(e: std::io::Error) -> UsbError {
     UsbError::Port(e.to_string())
+}
+
+/// A write that times out means nothing on the other end is reading the port (Windows says
+/// "os error 121"): a board whose firmware doesn't speak this exchange, not a port in use.
+fn write_error(e: std::io::Error) -> UsbError {
+    match e.kind() {
+        ErrorKind::TimedOut | ErrorKind::WouldBlock => UsbError::NoAnswer,
+        _ => port_error(e),
+    }
 }
 
 fn answer_deadline() -> Instant {
@@ -215,6 +225,33 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A port nothing reads: every write times out, as Windows does when the board ignores it.
+    struct Unread;
+
+    impl Read for Unread {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    impl Write for Unread {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_board_that_never_reads_is_no_answer_not_a_busy_port() {
+        let bundle: Bundle = serde_json::from_str(include_str!(
+            "../../../protocol/v1/examples/device/provisioning-bundle.json"
+        ))
+        .unwrap();
+        assert_eq!(provision(&mut Unread, &bundle).unwrap_err(), UsbError::NoAnswer);
     }
 
     #[test]
