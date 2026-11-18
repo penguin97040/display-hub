@@ -1,4 +1,5 @@
-**Display Hub {{VERSION}}**, a preview. It works, but it's young: expect rough edges. The installer backs your hub up before an upgrade. The official firmware for the displays isn't in these downloads yet.
+{{PREVIEW}}**Display Hub {{VERSION}}**, a preview. It works, but it's young: expect rough edges. The installer backs your hub up before an upgrade. The official firmware for the displays isn't in these downloads yet.
+{{STABLE}}**Display Hub {{VERSION}}**. The installer backs your hub up before an upgrade. The official firmware for the displays isn't in these downloads yet.
 
 <!-- Write what's new in this release here, then publish. -->
 

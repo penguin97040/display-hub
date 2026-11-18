@@ -4,7 +4,9 @@
 
 The tag is v<version>, optionally with -rc.N or -test.N after it, and <version> must be the version
 of every program the release ships (each crate's Cargo.toml; the workspace has no version of its
-own). Prints version=, prerelease= and name= lines for $GITHUB_OUTPUT, or fails saying why.
+own). Prints version=, prerelease=, preview= and name= lines for $GITHUB_OUTPUT, or fails saying
+why. A preview is a 0.x version or a tagged suffix: its title says so, and so do its notes
+(tools/release/release-notes.sh).
 """
 
 import pathlib
@@ -45,10 +47,11 @@ def main() -> int:
               + ". Change the versions in Cargo.toml, or tag again.", file=sys.stderr)
         return 1
     version = core + suffix
-    preview = " (preview)" if core.startswith("0.") else ""
+    preview = core.startswith("0.") or bool(suffix)
     print(f"version={version}")
     print(f"prerelease={'true' if suffix else 'false'}")
-    print(f"name=Display Hub {version}{preview}")
+    print(f"preview={'true' if preview else 'false'}")
+    print(f"name=Display Hub {version}{' (preview)' if preview else ''}")
     return 0
 
 

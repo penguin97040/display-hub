@@ -5,8 +5,8 @@
 #
 #   bash tools/release/pi-tarball.sh <folder with hubd and hub-send> <version> <output folder>
 #
-# Programs and scripts are 0755, everything else 0644, owned by root, with every time set to the
-# last commit's, so the same build gives the same file.
+# Programs and scripts are 0755, everything else 0644, owned by root, with every time set to
+# $SOURCE_DATE_EPOCH, or else the last commit's, so the same build gives the same file.
 set -euo pipefail
 
 [ $# -eq 3 ] || { echo "usage: $0 <bin-dir> <version> <out-dir>" >&2; exit 2; }
@@ -29,7 +29,8 @@ find "$dir" -type d -exec chmod 0755 {} +
 find "$dir" -type f -exec chmod 0644 {} +
 chmod 0755 "$dir/hubd" "$dir/hub-send" "$dir/install.sh" "$dir/display-hub-helper" "$dir/helpers/pi-status"
 
-stamp=$(git -C "$root" log -1 --format=%ct 2>/dev/null || date +%s)
+stamp=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || date +%s)}
+[[ $stamp =~ ^[0-9]+$ ]] || { echo "not a time in seconds: $stamp" >&2; exit 2; }
 mkdir -p "$out"
 file=$(cd "$out" && pwd)/display-hub-pi-arm64-$version.tar.gz
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$stamp" --format=gnu \

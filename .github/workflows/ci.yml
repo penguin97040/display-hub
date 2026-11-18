@@ -38,6 +38,42 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      # The release's packing and its check on every push, so a release tag finds them working.
+      # Debug builds: it's the layout that's checked here, not the programs.
+      - name: Pack as a release would
+        run: |
+          cargo build --locked -p hub-manager -p hub-send -p hub-firmware -p display-simulator -p usage-helper
+          bash tools/release/package-app.sh linux 0.0.0-ci target/debug ci-out
+          python3 -I tools/release/check-package.py linux 0.0.0-ci ci-out
+      # The release workflow's first and last steps, on stand-in tags: what it reads from a tag, and
+      # the notes it writes (a preview's say so, a stable release's don't).
+      - name: Check a stand-in tag and the release notes
+        run: |
+          v=$(python3 -I -c 'import tomllib; print(tomllib.load(open("apps/hubd/Cargo.toml", "rb"))["package"]["version"])')
+          python3 -I tools/release/check-version.py "v$v-test.1" | tee "$RUNNER_TEMP/tag"
+          grep -qx "version=$v-test.1" "$RUNNER_TEMP/tag"
+          grep -qx prerelease=true "$RUNNER_TEMP/tag"
+          grep -qx preview=true "$RUNNER_TEMP/tag"
+          for bad in "v$v-beta.1" "v$v.0" "$v" "v9999.0.0"; do
+            if python3 -I tools/release/check-version.py "$bad" 2>/dev/null; then
+              echo "check-version.py took $bad"
+              exit 1
+            fi
+          done
+          sha=$(printf '%064d' 0)
+          notes() {
+            bash tools/release/release-notes.sh "v$v" "$v" "$1" "https://github.com/$GITHUB_REPOSITORY" \
+              "display-hub-pi-arm64-$v.tar.gz" \
+              "https://github.com/$GITHUB_REPOSITORY/releases/download/v$v/display-hub-pi-arm64-$v.tar.gz" "$sha"
+          }
+          notes true > "$RUNNER_TEMP/preview.md"
+          notes false > "$RUNNER_TEMP/stable.md"
+          grep -q "expect rough edges" "$RUNNER_TEMP/preview.md"
+          if grep -q "preview\|rough edges" "$RUNNER_TEMP/stable.md"; then
+            echo "a stable release's notes call it a preview"
+            exit 1
+          fi
+          grep -qF "$sha  display-hub-pi-arm64-$v.tar.gz" "$RUNNER_TEMP/stable.md"
       # An mbedTLS client set up like ESP-IDF's, against the real hub over TLS 1.2 and 1.3. Ubuntu
       # 24.04 packages mbedTLS 2.28, so 3.6 (the line ESP-IDF 5.x uses) is built from its release.
       - name: mbedTLS interop
@@ -82,8 +118,10 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
-      - name: Build the desktop manager
-        run: cargo build --release --locked -p hub-manager
+      - name: Build the desktop manager and the tools
+        run: |
+          cargo build --release --locked -p hub-manager -p hub-send -p hub-firmware \
+            -p display-simulator -p usage-helper
       # A hosted runner has no GPU, so this relies on Windows' software renderer (WARP). It proves the
       # window opens and the first frame renders; it does not show what a person sees.
       - name: Smoke test the desktop manager
@@ -92,6 +130,11 @@ jobs:
           timeout 180 target/release/hub-manager.exe --smoke-test | tee smoke.log
           grep -qx launched smoke.log
           grep -qx rendered smoke.log
+      # As the release packs it. Relative paths: Python here is a Windows program.
+      - name: Pack as a release would
+        run: |
+          bash tools/release/package-app.sh windows 0.0.0-ci target/release ci-out
+          python -I tools/release/check-package.py windows 0.0.0-ci ci-out
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hub-manager-windows-x64
@@ -104,7 +147,8 @@ jobs:
     # except what only makes sense there: the mbedTLS interop, the Pi build and its containers, and
     # the audit and licence checks. No test needs the keychain, which has no one to answer its prompt
     # on a runner: they use in-memory token stores. The manager isn't run, so the window isn't
-    # smoke tested here as it is on Windows.
+    # smoke tested here as it is on Windows. The release's packing is, with debug builds: the app
+    # bundle, its ad hoc signature and the zip's layout.
     runs-on: macos-15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -116,6 +160,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --no-fail-fast
+      - name: Pack as a release would
+        run: |
+          cargo build --locked -p hub-manager -p hub-send -p hub-firmware -p display-simulator -p usage-helper
+          bash tools/release/package-app.sh macos 0.0.0-ci target/debug ci-out
+          python3 -I tools/release/check-package.py macos 0.0.0-ci ci-out
 
   pi:
     # The Raspberry Pi release build (aarch64 against glibc 2.36, so it runs on Raspberry Pi OS
@@ -126,53 +175,38 @@ jobs:
       fail-fast: false
       matrix:
         suite: [bookworm, trixie]
-    env:
-      ZIG_VERSION: 0.15.2
-      ZIG_SHA256: 02aa270f183da276e5b5920b1dac44a63f1a49e55050ebde3aecc9eb82f93239
-      CARGO_ZIGBUILD_VERSION: 0.24.0
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
-      - name: Install zig and cargo-zigbuild
-        run: |
-          curl -sSfL -o "$RUNNER_TEMP/zig.tar.xz" \
-            "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-linux-${ZIG_VERSION}.tar.xz"
-          echo "${ZIG_SHA256}  $RUNNER_TEMP/zig.tar.xz" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/zig"
-          tar xJf "$RUNNER_TEMP/zig.tar.xz" -C "$RUNNER_TEMP/zig" --strip-components=1
-          echo "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
-          cargo install --locked --version "$CARGO_ZIGBUILD_VERSION" cargo-zigbuild
+      - uses: ./.github/actions/zigbuild
       - name: Check the scripts
         if: matrix.suite == 'bookworm'
         run: |
           shellcheck deploy/raspberry-pi/install.sh deploy/raspberry-pi/display-hub-helper \
             deploy/raspberry-pi/helpers/pi-status tools/pi-container-test/run.sh \
             tools/pi-container-test/probe-helper tools/release/pi-tarball.sh \
-            tools/release/package-app.sh starters/helper/my-helper
-      - name: Build hubd and hub-send for the Pi
+            tools/release/package-app.sh tools/release/build-pi.sh tools/release/release-notes.sh \
+            starters/helper/my-helper
+      # Built and packed by the release's own scripts, then unpacked: the folder below is the one a
+      # release's download unpacks to.
+      - name: Build and pack hubd and hub-send for the Pi
         if: matrix.suite == 'bookworm'
         run: |
-          cargo zigbuild --release --locked -p hubd -p hub-send --target aarch64-unknown-linux-gnu.2.36
-          for b in hubd hub-send; do
-            bin=target/aarch64-unknown-linux-gnu/release/$b
-            readelf -h "$bin" | grep -q AArch64
-            newest=$(readelf -V "$bin" | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1)
-            echo "$b needs at most $newest"
-            [ "$(printf '%s\nGLIBC_2.36\n' "$newest" | sort -V | tail -1)" = GLIBC_2.36 ]
-          done
-          mkdir -p display-hub-pi
-          cp -r deploy/raspberry-pi/. display-hub-pi/
-          cp target/aarch64-unknown-linux-gnu/release/hubd target/aarch64-unknown-linux-gnu/release/hub-send display-hub-pi/
+          bins=$(bash tools/release/build-pi.sh)
+          bash tools/release/pi-tarball.sh "$bins" 0.0.0-ci pi-out
+          python3 -I tools/release/check-package.py pi 0.0.0-ci pi-out
+          tar -xzf pi-out/display-hub-pi-arm64-0.0.0-ci.tar.gz
       - name: Install and run the service and helpers in a systemd container (${{ matrix.suite }})
         env:
           SUITE: ${{ matrix.suite }}
         run: |
           cargo zigbuild --release --locked -p hubd -p hub-send -p display-simulator --target x86_64-unknown-linux-gnu.2.36
           bash tools/pi-container-test/run.sh "$SUITE"
-      # The folder to copy to the Pi: both binaries and everything from deploy/raspberry-pi/.
+      # The folder to copy to the Pi: both binaries and everything from deploy/raspberry-pi/. The
+      # container test above packs its own, around x86-64 builds, with the same script.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: matrix.suite == 'bookworm'
         with:

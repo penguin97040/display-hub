@@ -38,16 +38,18 @@ const BUILT_IN: Option<(&str, &str, &str)> = match (
     ),
 };
 
-/// This build's line, or `None` for a developer build.
+/// This build's line, or `None` for a developer build. [`BUILT_IN`] has already checked each part
+/// when this was compiled.
 pub fn built_in() -> Option<&'static str> {
     static LINE: LazyLock<Option<String>> =
-        LazyLock::new(|| BUILT_IN.and_then(|(name, url, sha256)| one_liner(name, url, sha256)));
+        LazyLock::new(|| BUILT_IN.map(|(name, url, sha256)| line(name, url, sha256)));
     LINE.as_deref()
 }
 
-/// The line for a download, or `None` if any part of it isn't what a release makes: so nothing
-/// odd ever reaches a terminal.
-pub fn one_liner(name: &str, url: &str, sha256: &str) -> Option<String> {
+/// The line for a download, or `None` if any part of it isn't what a release makes: the same
+/// checks [`BUILT_IN`] makes when compiling, so the tests can try them on any value.
+#[cfg(test)]
+fn one_liner(name: &str, url: &str, sha256: &str) -> Option<String> {
     (valid_name(name) && valid_url(url, name) && valid_sha256(sha256)).then(|| line(name, url, sha256))
 }
 

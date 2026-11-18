@@ -2,7 +2,9 @@
 # Installs Display Hub in a Debian container running systemd (Bookworm or Trixie, the releases
 # Raspberry Pi OS is built on), then checks the service as a Pi would use it: install, health, a
 # display enrolling and polling, restarts, a crash, a network cut, a reboot, a bad configuration,
-# backup and restore, helpers in their sandboxes, an upgrade and an uninstall.
+# backup and restore, helpers in their sandboxes, an upgrade from the release download (made by
+# tools/release/pi-tarball.sh, unpacked in a throwaway folder as the one-line install does) and an
+# uninstall.
 #
 # A CONTAINER, NOT A PI: x86-64, Docker's network, no SD card or power cuts. It tests the installer,
 # the units and the recovery steps; docs/deploy-raspberry-pi.md has what to check on the Pi itself.
@@ -63,6 +65,14 @@ booted() {
 display_online() { sim once --state "$work/display" >/dev/null 2>&1; }
 display_offline_with_data() { local s=0; sim once --state "$work/display" >/dev/null 2>&1 || s=$?; [ "$s" = 3 ]; }
 fingerprint() { as_hub hubd fingerprint 2>/dev/null; }
+# What install.sh keeps after the folder it ran from has gone.
+share=/usr/local/share/display-hub
+# "<mode> <owner>:<group>" of a file in the container.
+mode_owner() { box stat -c '%a %U:%G' "$1"; }
+is_mode() { [ "$(mode_owner "$2")" = "$1" ]; }
+# The firewall settings, with the line docs/deploy-raspberry-pi.md says to add, load cleanly
+# (checked only, not applied, so Docker's own network is left alone).
+firewall_loads() { box nft -c -f /etc/nftables.conf; }
 
 for f in hubd hub-send display-simulator; do
   [ -x "$rel/$f" ] || { echo "no $rel/$f; build it first (see the top of this script)" >&2; exit 2; }
@@ -85,6 +95,12 @@ out=$(box bash /root/display-hub/install.sh 2>&1) || { echo "$out"; bad "install
 check "install.sh starts the service" active
 install_pairing=$(grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' <<<"$out" | head -1 || true)
 check "install.sh prints a pairing string on a first install" test -n "$install_pairing"
+check "install.sh keeps its folder in $share" is_mode "755 root:root" "$share"
+check "install.sh keeps a copy of itself (0755, root's)" is_mode "755 root:root" "$share/install.sh"
+check "install.sh keeps the firewall rule (0644, root's)" is_mode "644 root:root" "$share/nftables-display-hub.conf"
+check "the kept copies match the folder's" box sh -c "cmp -s /root/display-hub/install.sh $share/install.sh && cmp -s /root/display-hub/nftables-display-hub.conf $share/nftables-display-hub.conf"
+box sh -c "echo 'include \"$share/nftables-display-hub.conf\"' >> /etc/nftables.conf"
+check "the firewall includes the kept rule, as the guide says" firewall_loads
 hub=https://127.0.0.1:8443
 # install.sh only waits for systemd to say "active", so wait for the hub to answer (healthy retries for
 # 15 seconds) before pairing with it.
@@ -239,7 +255,19 @@ echo "     systemd-analyze security (helper): $score"
 exposure=$(grep -oE '[0-9]+\.[0-9]+' <<<"$score" | head -1)
 check "helper: the exposure score is low (under $helper_max)" awk "BEGIN { exit !(${exposure:-9} < $helper_max) }"
 
-out=$(box bash /root/display-hub/install.sh 2>&1) || bad "install.sh again"
+# The upgrade, as the one-line install runs it: the release download, unpacked into a folder from
+# mktemp -d and installed from there, then the folder deleted. Packed by the release's own script,
+# here around the x86-64 programs.
+tarball=$(bash "$root/tools/release/pi-tarball.sh" "$rel" 0.0.0-test "$work/pi")
+docker cp "$tarball" "$name:/root/display-hub-pi.tar.gz"
+# shellcheck disable=SC2016  # $d is expanded by the inner bash, on purpose
+out=$(box bash -c 'd=$(mktemp -d) && echo "folder $d" && cd "$d" && tar -xzf /root/display-hub-pi.tar.gz && bash display-hub-pi/install.sh; s=$?; cd / && rm -rf "$d"; exit $s' 2>&1) || { echo "$out"; bad "install.sh again, from the download"; }
+download_dir=$(sed -n 's/^folder //p' <<<"$out" | head -1)
+check "upgrade: ran from a folder under /tmp" test "${download_dir#/tmp/}" != "$download_dir"
+check "upgrade: and that folder is gone" gone "$download_dir"
+check "upgrade: the kept copy of install.sh is still there (0755, root's)" is_mode "755 root:root" "$share/install.sh"
+check "upgrade: the kept firewall rule is still there (0644, root's)" is_mode "644 root:root" "$share/nftables-display-hub.conf"
+check "upgrade: the firewall still loads" firewall_loads
 check "upgrade: backed up first" grep -q "Backed up the current hub" <<<"$out"
 check "upgrade: settings kept" grep -q "Kept your" <<<"$out"
 # shellcheck disable=SC2016  # $0 is expanded by the inner bash, on purpose
@@ -269,7 +297,7 @@ check "remove: its folder and token are gone" gone "$pistate"
 check "remove: its settings are gone" gone /etc/systemd/system/display-hub-helper@pi-status.timer.d
 check "remove: list leaves it out" refused sh -c 'display-hub-helper list | grep "^pi-status "'
 check "remove: the other helper is untouched" listed '^probe +1min'
-check "uninstall: refused while a helper is set up" refused bash /root/display-hub/install.sh --uninstall
+check "uninstall: refused while a helper is set up" refused bash "$share/install.sh" --uninstall
 box display-hub-helper remove probe >/dev/null
 
 # Remove on a helper the hub has already cut off is still a success, with no warning.
@@ -308,11 +336,20 @@ check "orphan: the look-alike helper is still active" lookalike_active
 as_hub hubd helper revoke "$lookalike_id" >/dev/null
 box rm -rf /root/lookalike
 
-box bash /root/display-hub/install.sh --uninstall >/dev/null
+# From the kept copy, as docs/deploy-raspberry-pi.md says: it removes itself as it finishes.
+out=$(box bash "$share/install.sh" --uninstall 2>&1) || { echo "$out"; bad "uninstall"; }
+check "uninstall: says it finished" grep -q "Removed the service" <<<"$out"
 check "uninstall: the service is gone" bash -c "! docker exec $name systemctl cat display-hub >/dev/null 2>&1"
 check "uninstall: the data is kept" box test -f /var/lib/display-hub/identity/hub-key.pem
 check "uninstall: the helper tools are gone" gone /usr/local/sbin/display-hub-helper
 check "uninstall: hub-send is gone" gone /usr/local/bin/hub-send
+check "uninstall: its kept copy is gone" gone "$share/install.sh"
+check "uninstall: the firewall rule is kept while it is included" box test -f "$share/nftables-display-hub.conf"
+check "uninstall: and says so" grep -q "because your firewall settings include it" <<<"$out"
+check "uninstall: the firewall still loads" firewall_loads
+box sed -i "\|$share/nftables-display-hub.conf|d" /etc/nftables.conf
+box bash /root/display-hub/install.sh --uninstall >/dev/null
+check "uninstall: once not included, the firewall rule and its folder go too" gone "$share"
 
 if [ "$failures" = 0 ]; then
   echo "Pi install test (container, not a Pi): all passed"

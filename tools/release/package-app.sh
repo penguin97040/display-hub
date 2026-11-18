@@ -9,7 +9,12 @@
 #
 # Each holds one folder of the same name with the programs and LICENSE. On macOS the app is
 # "Display Hub.app", signed ad hoc (no paid certificate, but Apple silicon runs nothing unsigned).
-# Windows needs Python for the zip; macOS uses ditto and codesign, which come with it.
+# The zips need Python 3 (on the Windows and macOS runners); macOS also uses codesign and plutil,
+# which come with it.
+#
+# The same programs give the same file: entries in name order, programs 0755 and everything else
+# 0644, owned by root in the tarball, and every time set to $SOURCE_DATE_EPOCH, or else the last
+# commit's.
 set -euo pipefail
 
 [ $# -eq 4 ] || { echo "usage: $0 <windows|macos|linux> <version> <bin-dir> <out-dir>" >&2; exit 2; }
@@ -31,10 +36,56 @@ for b in hub-manager "${tools[@]}"; do
   [ -f "$bins/$b$exe" ] || { echo "no $bins/$b$exe" >&2; exit 2; }
 done
 
+stamp=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || date +%s)}
+[[ $stamp =~ ^[0-9]+$ ]] || { echo "not a time in seconds: $stamp" >&2; exit 2; }
+# The first that really runs Python 3: on Windows, "python3" may be only a pointer to the Store.
+py=
+for c in python3 python; do
+  if "$c" -c 'import sys; sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then py=$c; break; fi
+done
+
+# Zips the folder $name in $stage into $1, with these paths in it (relative to $stage) as programs.
+# Python here may be a Windows program, which doesn't read Git Bash's /d/... paths: hence relative
+# paths, run from $stage.
+pack_zip() {
+  local dest=$1
+  shift
+  [ -n "$py" ] || { echo "packing a zip needs Python 3" >&2; exit 2; }
+  (cd "$stage" && STAMP=$stamp "$py" -I - "$name" "$name.zip" "$@" <<'PY'
+import os, sys, time, zipfile
+top, dest, programs = sys.argv[1], sys.argv[2], set(sys.argv[3:])
+# A zip keeps local time without a zone, from 1980 on: the stamp is written as UTC.
+when = time.gmtime(max(int(os.environ["STAMP"]), 315532800))[:6]
+entries = []
+for folder, dirs, files in os.walk(top):
+    rel = folder.replace(os.sep, "/")
+    entries.append(rel + "/")
+    entries.extend(rel + "/" + f for f in files)
+missing = programs - set(entries)
+if missing:
+    sys.exit(f"not in the folder: {sorted(missing)}")
+with zipfile.ZipFile(dest, "w") as z:
+    for path in sorted(entries):
+        info = zipfile.ZipInfo(path, when)
+        info.create_system = 3  # Unix, so the modes below are used, whichever system packs it
+        if path.endswith("/"):
+            info.external_attr = (0o040755 << 16) | 0x10
+            z.writestr(info, b"")
+            continue
+        mode = 0o755 if path in programs else 0o644
+        info.external_attr = (0o100000 | mode) << 16
+        info.compress_type = zipfile.ZIP_DEFLATED
+        with open(path, "rb") as f:
+            z.writestr(info, f.read(), compresslevel=9)
+PY
+  )
+  mv "$stage/$name.zip" "$dest"
+}
+
 stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 dir=$stage/$name
-mkdir "$dir"
+mkdir -m 0755 "$dir"
 cp "$root/LICENSE" "$dir/LICENSE"
 for b in "${tools[@]}"; do
   cp "$bins/$b$exe" "$dir/$b$exe"
@@ -46,19 +97,9 @@ out=$(cd "$out" && pwd)
 case $platform in
   windows)
     cp "$bins/hub-manager.exe" "$dir/hub-manager.exe"
-    # Relative paths: Python here is a Windows program, which doesn't read Git Bash's /d/... paths.
-    (cd "$stage" && python - "$name" "$name.zip" <<'PY'
-import os, sys, zipfile
-top, dest = sys.argv[1], sys.argv[2]
-with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-    for folder, dirs, files in os.walk(top):
-        dirs.sort()
-        for f in sorted(files):
-            path = os.path.join(folder, f)
-            z.write(path, path.replace(os.sep, "/"))
-PY
-    )
-    mv "$stage/$name.zip" "$out/$name.zip"
+    programs=("$name/hub-manager.exe")
+    for b in "${tools[@]}"; do programs+=("$name/$b.exe"); done
+    pack_zip "$out/$name.zip" "${programs[@]}"
     echo "$out/$name.zip"
     ;;
   macos)
@@ -80,7 +121,7 @@ PY
   <key>CFBundleExecutable</key>
   <string>hub-manager</string>
   <key>CFBundleIdentifier</key>
-  <string>org.displayhub.manager</string>
+  <string>io.github.penguin97040.display-hub</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
@@ -106,14 +147,22 @@ PLIST
     done
     codesign --force --deep -s - "$app"
     codesign --verify --deep --strict "$app"
-    ditto -c -k --keepParent "$dir" "$out/$name.zip"
+    # Python rather than ditto, which keeps each file's own time, owner and extended attributes in
+    # the zip, in the order the disk lists them. A signature covers the files' contents, not their
+    # times or modes, so it survives this; the check below is on the unpacked zip.
+    programs=("$name/Display Hub.app/Contents/MacOS/hub-manager")
+    for b in "${tools[@]}"; do programs+=("$name/$b"); done
+    pack_zip "$out/$name.zip" "${programs[@]}"
+    mkdir "$stage/check"
+    ditto -x -k "$out/$name.zip" "$stage/check"
+    codesign --verify --deep --strict "$stage/check/$name/Display Hub.app"
+    for b in "${tools[@]}"; do codesign --verify --strict "$stage/check/$name/$b"; done
     echo "$out/$name.zip"
     ;;
   linux)
     cp "$bins/hub-manager" "$dir/hub-manager"
     chmod 0755 "$dir/hub-manager"
     chmod 0644 "$dir/LICENSE"
-    stamp=$(git -C "$root" log -1 --format=%ct 2>/dev/null || date +%s)
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$stamp" --format=gnu \
       -C "$stage" -cf - "$name" | gzip -9 -n > "$out/$name.tar.gz"
     echo "$out/$name.tar.gz"

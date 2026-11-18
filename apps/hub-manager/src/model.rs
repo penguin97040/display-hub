@@ -4022,9 +4022,20 @@ mod tests {
         assert!(docs.contains(INSTALL_COMMAND) && docs.contains(NEW_PAIRING_COMMAND));
         let mut m = Model::new(None, "PC");
         assert!(!m.install_copied);
-        let expected = pi_install::built_in().unwrap_or(INSTALL_COMMAND);
-        assert_eq!(m.install_downloads(), pi_install::built_in().is_some());
-        assert_eq!(m.copy_install(), expected);
+        match option_env!("DISPLAY_HUB_PI_SHA256") {
+            // A developer build, as every CI test run is: copy the folder over, then this command.
+            None => {
+                assert!(!m.install_downloads());
+                assert_eq!(m.copy_install(), INSTALL_COMMAND);
+            }
+            // Built with the release's variables: the line that fetches and checks the files.
+            Some(sha256) => {
+                assert!(m.install_downloads());
+                let line = m.copy_install();
+                assert!(line.starts_with("d=$(mktemp -d) && ") && line.contains(sha256));
+                assert!(line.ends_with(INSTALL_COMMAND));
+            }
+        }
         assert!(m.install_copied);
     }
 }

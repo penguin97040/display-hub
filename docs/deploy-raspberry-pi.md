@@ -36,9 +36,10 @@ It downloads that release's `display-hub-pi` folder into a new, private folder u
 2. Installs `/usr/local/bin/hubd`, plus `/etc/display-hub/hubd.toml` if you don't have one.
 3. Installs the hardened `display-hub.service` (systemd rates its exposure 1.0, "OK"), then enables and starts it.
 4. Installs what helpers need: `hub-send`, the `display-hub-helper` command and the example helper. It turns no helper on (see [Helpers on the Pi](#helpers-on-the-pi)).
-5. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
-6. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
-7. On a first install only, ends by printing a pairing string (the `dh1.…` line), ready for step 4. It is shown on the terminal only: the installer doesn't save it or send it to the log. An upgrade doesn't print one.
+5. Keeps a copy of itself and of the optional firewall rule in `/usr/local/share/display-hub/`, so the folder it ran from can be deleted (see [Removing](#removing) and [the firewall](#5-optional-settings-and-firewall)).
+6. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
+7. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
+8. On a first install only, ends by printing a pairing string (the `dh1.…` line), ready for step 4. It is shown on the terminal only: the installer doesn't save it or send it to the log. An upgrade doesn't print one.
 
 ## 3. Or copy the files over yourself
 
@@ -92,10 +93,14 @@ Some PCs can't look up `.local` names, especially Windows with a VPN connected, 
 
   ```sh
   sudo apt install nftables
-  sudo nft -f nftables-display-hub.conf
+  sudo nft -f /usr/local/share/display-hub/nftables-display-hub.conf
   ```
 
-  This rule is lost on reboot unless you include it from `/etc/nftables.conf` and run `sudo systemctl enable nftables`.
+  The installer keeps that file there, and an upgrade updates it. The rule is lost on reboot unless you add this line to the end of `/etc/nftables.conf`, then run `sudo systemctl enable nftables`:
+
+  ```text
+  include "/usr/local/share/display-hub/nftables-display-hub.conf"
+  ```
 - **No port forwarding.** The hub is for your local network only. Never forward 8443 on your router.
 
 ## Helpers on the Pi
@@ -241,7 +246,13 @@ To go back to the old version after an upgrade, reinstall the old release, then 
 
 ## Removing
 
-`sudo bash install.sh --uninstall` stops and removes the service, the programs and the helper tools. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.
+```sh
+sudo bash /usr/local/share/display-hub/install.sh --uninstall
+```
+
+This stops and removes the service, the programs, the helper tools and the installer's own copy. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.
+
+If `/etc/nftables.conf` includes the firewall rule, it keeps that file too, because the firewall would otherwise fail to load at the next boot. Take the `include` line out, then delete it with `sudo rm -r /usr/local/share/display-hub`.
 
 It refuses while helpers are set up: remove each one first with `sudo display-hub-helper remove <name>`, which also cuts it off at the hub.
 

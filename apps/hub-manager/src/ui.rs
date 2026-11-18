@@ -205,12 +205,26 @@ pub fn command(text: &str) -> Div {
     row
 }
 
-/// `word` split after each "/" when it is long enough to need it, keeping every character.
+/// The most characters a piece of a command shows without a place to break.
+const PIECE_MAX: usize = 24;
+
+/// `word` split after each "/" when it is long enough to need it, then any piece still longer than
+/// [`PIECE_MAX`] (a checksum, say) cut every [`PIECE_MAX`] characters, so a narrow window can
+/// always wrap it. Every character is kept, in order; only how it is shown changes, never what is
+/// copied.
 fn command_pieces(word: &str) -> Vec<String> {
-    if word.chars().count() <= 24 {
+    if word.chars().count() <= PIECE_MAX {
         return vec![word.to_string()];
     }
-    word.split_inclusive('/').map(str::to_string).collect()
+    word.split_inclusive('/')
+        .flat_map(|part| {
+            let chars: Vec<char> = part.chars().collect();
+            chars
+                .chunks(PIECE_MAX)
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// `.stat-big` with its label underneath.
@@ -427,7 +441,7 @@ pub fn pattern() -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{caps, command_pieces, keep_case, plain};
+    use super::{caps, command_pieces, keep_case, plain, PIECE_MAX};
 
     #[test]
     fn versions_keep_their_case_in_upper_case_styles() {
@@ -447,5 +461,36 @@ mod tests {
         assert!(pieces.len() > 1 && pieces[..pieces.len() - 1].iter().all(|p| p.ends_with('/')));
         assert_eq!(command_pieces("--run"), ["--run"]);
         assert_eq!(command_pieces("display-hub-helper"), ["display-hub-helper"]);
+    }
+
+    #[test]
+    fn a_long_unbroken_piece_is_cut_so_it_can_wrap() {
+        // A checksum as the install line quotes it: 65 characters, no space or slash.
+        let sha = format!("'{}", "0123456789abcdef".repeat(4));
+        let pieces = command_pieces(&sha);
+        assert_eq!(pieces.concat(), sha);
+        assert_eq!(
+            pieces.iter().map(|p| p.chars().count()).collect::<Vec<_>>(),
+            [24, 24, 17]
+        );
+        // Exactly the limit stays whole; one more is cut.
+        let at = "a".repeat(PIECE_MAX);
+        assert_eq!(command_pieces(&at), [at.as_str()]);
+        assert_eq!(command_pieces(&format!("{at}b")), [at, "b".to_string()]);
+        // Cut by characters, never inside one.
+        let wide = "é".repeat(30);
+        let pieces = command_pieces(&wide);
+        assert_eq!(pieces.concat(), wide);
+        assert!(pieces.iter().all(|p| p.chars().count() <= PIECE_MAX));
+    }
+
+    #[test]
+    fn a_long_address_breaks_at_slashes_and_inside_long_parts() {
+        let url = "'https://github.com/penguin97040/display-hub/releases/download/v0.1.0/\
+                   display-hub-pi-arm64-0.1.0.tar.gz'";
+        let pieces = command_pieces(url);
+        assert_eq!(pieces.concat(), url);
+        assert!(pieces.iter().all(|p| p.chars().count() <= PIECE_MAX));
+        assert!(pieces.contains(&"penguin97040/".to_string()));
     }
 }

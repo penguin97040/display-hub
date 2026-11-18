@@ -2,13 +2,16 @@
 # Installs or upgrades Display Hub on a Raspberry Pi (Raspberry Pi OS Bookworm or Trixie, 64-bit).
 #
 #   sudo bash install.sh              install, or upgrade in place
-#   sudo bash install.sh --uninstall  stop and remove the service, binaries and helper tools; keep
+#   sudo bash /usr/local/share/display-hub/install.sh --uninstall
+#                                     stop and remove the service, binaries and helper tools; keep
 #                                     data and settings
 #
 # Run it from a folder holding `hubd` and `hub-send` (the aarch64 builds) and the files next to this
 # script. Safe to run again: it never overwrites /etc/display-hub/hubd.toml, never deletes data, and
 # backs the hub up before replacing a running version. It installs what helpers need, but turns no
-# helper on: that's `sudo display-hub-helper add`. See docs/deploy-raspberry-pi.md.
+# helper on: that's `sudo display-hub-helper add`. That folder may be thrown away afterwards (the
+# one-line install unpacks it under /tmp): this script and the firewall rule are kept in
+# /usr/local/share/display-hub/, for removing it and for the firewall. See docs/deploy-raspberry-pi.md.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -22,7 +25,12 @@ send_bin=/usr/local/bin/hub-send
 helper_cmd=/usr/local/sbin/display-hub-helper
 helper_units=(/etc/systemd/system/display-hub-helper@.service /etc/systemd/system/display-hub-helper@.timer)
 helper_programs=/usr/local/lib/display-hub/helpers
-examples=/usr/local/share/display-hub/helpers
+share=/usr/local/share/display-hub
+examples=$share/helpers
+# Kept after the folder this ran from has gone: the uninstaller, and the firewall rule, which
+# /etc/nftables.conf may include, so it must stay put.
+kept_script=$share/install.sh
+firewall=$share/nftables-display-hub.conf
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'install.sh: %s\n' "$*" >&2; exit 1; }
@@ -45,17 +53,33 @@ Remove each one first (it also cuts it off at the hub): sudo display-hub-helper 
   systemctl disable --now display-hub 2>/dev/null || true
   rm -f "$unit" "$bin" "$send_bin" "$helper_cmd" "${helper_units[@]}"
   rm -rf "$examples"
-  rmdir "$helper_programs" /usr/local/lib/display-hub /usr/local/share/display-hub 2>/dev/null || true
+  # A firewall that includes the rule would fail to load at the next boot without it, so it stays
+  # until that line is gone.
+  kept_firewall=0
+  if grep -qsF "$firewall" /etc/nftables.conf || grep -rqsF "$firewall" /etc/nftables.d; then
+    kept_firewall=1
+  else
+    rm -f "$firewall"
+  fi
+  # Bash has read this whole if-block already, so this copy of the script can go even while it is
+  # the one running.
+  rm -f "$kept_script"
+  rmdir "$helper_programs" /usr/local/lib/display-hub "$share" 2>/dev/null || true
   systemctl daemon-reload
   say "Removed the service, $bin, hub-send and the helper tools."
   say "Kept $data_dir (the hub's identity and data), $conf_dir and $backups."
   say "Delete them yourself only if you'll never use this hub again: every display and PC trusts its key."
+  if [ "$kept_firewall" = 1 ]; then
+    say ""
+    say "Kept $firewall, because your firewall settings include it. To remove it, take the"
+    say "line that names it out of /etc/nftables.conf, then: sudo rm -r $share"
+  fi
   exit 0
 fi
 [ $# -eq 0 ] || fail "unknown argument: $1"
 
-for f in hubd hub-send display-hub.service hubd.toml display-hub-helper@.service \
-  display-hub-helper@.timer display-hub-helper helpers/pi-status; do
+for f in hubd hub-send install.sh nftables-display-hub.conf display-hub.service hubd.toml \
+  display-hub-helper@.service display-hub-helper@.timer display-hub-helper helpers/pi-status; do
   [ -f "$here/$f" ] || fail "$f is missing from $here"
 done
 # The binaries are staged beside where they go and tried there first, so a copy that lost its
@@ -104,8 +128,12 @@ mv -f "$send_bin.new" "$send_bin"
 put 0755 "$here/display-hub-helper" "$helper_cmd"
 put 0644 "$here/display-hub-helper@.service" "${helper_units[0]}"
 put 0644 "$here/display-hub-helper@.timer" "${helper_units[1]}"
-install -d -m 0755 -o root -g root "$helper_programs" "$examples"
+install -d -m 0755 -o root -g root "$helper_programs" "$share" "$examples"
 put 0755 "$here/helpers/pi-status" "$examples/pi-status"
+# The uninstaller and the firewall rule, kept where they last. Put atomically: replacing this
+# script in place could change what a running copy of it reads next.
+put 0755 "$here/install.sh" "$kept_script"
+put 0644 "$here/nftables-display-hub.conf" "$firewall"
 
 systemctl daemon-reload
 systemctl enable display-hub >/dev/null 2>&1

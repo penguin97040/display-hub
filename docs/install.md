@@ -112,7 +112,7 @@ What each part does:
 
 The `&&` between the parts means "only if that worked". If the download fails or the checksum doesn't match, nothing is unpacked or installed.
 
-It takes about a minute, and ends by printing a pairing string. Raspberry Pi OS clears old files from `/tmp` by itself; to remove the download now, in the same terminal: `cd && rm -rf "$d"`. If the Pi says `curl: command not found`, run `sudo apt install curl` first.
+It takes about a minute, and ends by printing a pairing string. The installer keeps what it needs later (a copy of itself, for removing the hub, and the optional firewall rule) in `/usr/local/share/display-hub/`, so the download isn't needed afterwards. Raspberry Pi OS clears old files from `/tmp` by itself; to remove the download now, in the same terminal: `cd && rm -rf "$d"`. If the Pi says `curl: command not found`, run `sudo apt install curl` first.
 
 ## 5. Pair the app with the hub
 
