@@ -1,0 +1,15 @@
+{
+  "id": "my-helper/1",
+  "name": "My helper",
+  "description": "A short line of text, sent every few minutes by the my-helper starter helper.",
+  "setup": {
+    "help": "Run this once on the hub's Raspberry Pi, in the folder that holds my-helper, to start the helper that fills this page.",
+    "command": "sudo display-hub-helper add my-helper --run \"$PWD/my-helper\""
+  },
+  "settings": [
+    { "key": "title", "label": "Title", "type": "text", "max_length": 48, "default": "My helper" }
+  ],
+  "pages": [
+    { "title": "{title}", "kind": "text", "source": "helper", "feed": "my-helper" }
+  ]
+}

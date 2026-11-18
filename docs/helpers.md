@@ -6,11 +6,11 @@ A helper is invited to one or more **feeds**. A feed is just a name, such as `ga
 
 ### Pages for a helper
 
-The manager makes helper pages from **templates** ([templates.md](templates.md)), such as usage limits and `pi-status/1`: in the manager, open **Pages**, then **Add from template**. Any other page can be made with the hub's admin API: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example.
+The manager makes helper pages from **templates** ([templates.md](templates.md)), such as usage limits and `pi-status/1`: in the manager, open **Pages**, then **Add from template**. The manager makes a page for a feed of your own too: open **Pages**, then **A page for your own helper**, and give it a title, a kind (one of the four shapes, or a custom kind such as `nearby-flights/1`) and the feed. It then shows how to feed it, on the hub's Pi or on another computer, with the commands to copy. The hub's admin API can make any page as well: `POST /v1/admin/pages` with, for example, `{"title": "Pi status", "kind": "big_number", "source": "helper", "feed": "pi-status"}`. `tools/pi-container-test/run.sh` shows a complete example. [`starters/helper/`](../starters/helper/) is a helper to copy, and [BUILDING-A-DISPLAY.md](../BUILDING-A-DISPLAY.md) is the place to start.
 
 ## Pairing
 
-1. Make a helper string: on the hub, run `hubd pair-helper --feed garden-weather` (repeat `--feed` for more feeds). For the usage helper on a PC, the manager's Settings makes one too.
+1. Make a helper string: on the hub, run `hubd pair-helper --feed garden-weather` (repeat `--feed` for more feeds). The manager's Settings makes one too, for the usage feeds or any other: tick the feeds (or type them), then **Create helper string**.
 2. On the helper's computer, run `hub-send login` and paste the string when asked. It is read from standard input, never from the command line, and works once, within 10 minutes.
 
 `hub-send status` shows the hub, the feeds this helper may send to and recent activity. `hub-send logout` forgets the hub. Remove the helper in the manager's Settings to cut it off at the hub, or on the hub run `hubd helper list`, then `hubd helper revoke <id>`.

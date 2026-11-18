@@ -1,0 +1,23 @@
+#!/bin/sh
+# Display Hub starter helper: sends one short line of text to the hub through hub-send.
+#
+# Copy this folder, give the program a name of your own, and change the part marked "What to show".
+#
+#   On a computer that has run `hub-send login`:   ./my-helper
+#   On the hub's own Raspberry Pi:                  sudo display-hub-helper add my-helper --run "$PWD/my-helper"
+#
+# The hub shows what it sends on text pages whose content comes from a helper and whose feed is
+# my-helper. README.md says how to make that page.
+set -eu
+
+# The feed to send to: the first one display-hub-helper set up on the Pi, or my-helper elsewhere.
+feed=${DISPLAY_HUB_FEEDS:-${DISPLAY_HUB_HELPER:-my-helper}}
+feed=${feed%% *}
+
+# What to show. A text page holds 1 to 280 characters of plain text, on one line. Keep double
+# quotes (") and backslashes (\) out of it, or build the JSON with a tool that escapes them.
+now=$(date +%H:%M)
+text="Hello from my helper. It last ran at $now."
+
+printf '{"text": "%s"}\n' "$text" |
+  hub-send page "$feed" --kind text --data -
