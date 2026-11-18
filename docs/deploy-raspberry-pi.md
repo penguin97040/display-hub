@@ -10,11 +10,43 @@
 - The Pi and your PC on the same network.
 - **Recommended:** a fixed address for the Pi. In your router's settings, reserve its current address for it (often called a "DHCP reservation" or "static lease").
 
-## 1. Get the files
+## 1. Connect over SSH, and check the Pi's key
+
+From PowerShell on Windows (OpenSSH is built in), or a terminal elsewhere:
+
+```powershell
+ssh <user>@raspberrypi.local
+```
+
+The first time, SSH shows the Pi's key fingerprint and asks whether to trust it. **This check matters:** the pairing string you'll copy over this connection carries the hub's key, so the pairing is only as trustworthy as this SSH connection. If you can, compare it with the fingerprint shown on the Pi's own screen and keyboard: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.
+
+## 2. Install with one line
+
+The desktop app from a [release](https://github.com/penguin97040/display-hub/releases) shows one line in its first-run guide, with a **Copy** button. The notes on the release page show the same line. Paste it into the Pi's terminal, over the SSH connection from step 1. For version 0.1.0 it looks like this, with the real checksum where `<checksum>` is:
+
+```sh
+d=$(mktemp -d) && cd "$d" && curl -fsSL -o 'display-hub-pi-arm64-0.1.0.tar.gz' 'https://github.com/penguin97040/display-hub/releases/download/v0.1.0/display-hub-pi-arm64-0.1.0.tar.gz' && echo '<checksum>  display-hub-pi-arm64-0.1.0.tar.gz' | sha256sum -c - && tar -xzf 'display-hub-pi-arm64-0.1.0.tar.gz' && sudo bash display-hub-pi/install.sh
+```
+
+It downloads that release's `display-hub-pi` folder into a new, private folder under `/tmp`, checks it against the checksum built into the app, and only if it matches, unpacks it and runs the installer. [Installing Display Hub](install.md#4-set-up-the-hub-on-the-pi) explains each part. A developer build of the app, made from this repository, has no download to point at, so it shows only the last part: then copy the files over yourself (step 3).
+
+### What the installer does
+
+1. Creates a `display-hub` system user with no login.
+2. Installs `/usr/local/bin/hubd`, plus `/etc/display-hub/hubd.toml` if you don't have one.
+3. Installs the hardened `display-hub.service` (systemd rates its exposure 1.0, "OK"), then enables and starts it.
+4. Installs what helpers need: `hub-send`, the `display-hub-helper` command and the example helper. It turns no helper on (see [Helpers on the Pi](#helpers-on-the-pi)).
+5. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
+6. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
+7. On a first install only, ends by printing a pairing string (the `dh1.…` line), ready for step 4. It is shown on the terminal only: the installer doesn't save it or send it to the log. An upgrade doesn't print one.
+
+## 3. Or copy the files over yourself
+
+Use this instead of step 2 to install your own build, a CI build, or a Pi that can't reach GitHub.
 
 You need a folder holding the two ARM64 programs, `hubd` (the hub) and `hub-send` (for helpers), and everything in `deploy/raspberry-pi/`: `install.sh`, `display-hub.service`, `hubd.toml`, `nftables-display-hub.conf`, the helper tools `display-hub-helper`, `display-hub-helper@.service` and `display-hub-helper@.timer`, and the `helpers` folder.
 
-- **Ready-made:** if `dist\display-hub-pi\` exists in your checkout, that's the folder. Alternatively, CI makes the whole folder for every push: the `display-hub-raspberry-pi-arm64` artefact on the run's page on GitHub. Unzip it; it doesn't matter that the download loses the programs' "executable" marks, because the installer sets them.
+- **Ready-made:** a release's `display-hub-pi-arm64-<version>.tar.gz` unpacks to that folder (check it against the release's `SHA256SUMS`). If `dist\display-hub-pi\` exists in your checkout, that's the folder too. CI also makes it for every push: the `display-hub-raspberry-pi-arm64` artefact on the run's page on GitHub. Unzip it; it doesn't matter that the download loses the programs' "executable" marks, because the installer sets them.
 - **Or build it** on Linux, with [zig](https://ziglang.org) and `cargo install cargo-zigbuild`:
 
   ```sh
@@ -26,40 +58,20 @@ You need a folder holding the two ARM64 programs, `hubd` (the hub) and `hub-send
 
   The `.2.36` suffix builds against the C library of Raspberry Pi OS Bookworm, so one build runs on Bookworm and Trixie. A program built on the Pi itself, or by a newer distribution, may not run on Bookworm.
 
-## 2. Connect over SSH, and check the Pi's key
-
-From PowerShell on Windows (OpenSSH is built in), or a terminal elsewhere:
-
-```powershell
-ssh <user>@raspberrypi.local
-```
-
-The first time, SSH shows the Pi's key fingerprint and asks whether to trust it. **This check matters:** the pairing string you'll copy over this connection carries the hub's key, so the pairing is only as trustworthy as this SSH connection. If you can, compare it with the fingerprint shown on the Pi's own screen and keyboard: `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`. Type `exit` to leave.
-
-## 3. Copy and install
-
-From your PC:
+Copy it over from a terminal on your PC (not the one connected to the Pi), then connect again:
 
 ```powershell
 scp -r dist\display-hub-pi <user>@raspberrypi.local:
 ssh <user>@raspberrypi.local
 ```
 
-Then on the Pi, from the folder you land in (your home folder), run the one command the manager's first-run guide shows with a **Copy** button:
+Then on the Pi, from the folder you land in (your home folder), run:
 
 ```sh
 sudo bash display-hub-pi/install.sh
 ```
 
-The installer does the following:
-
-1. Creates a `display-hub` system user with no login.
-2. Installs `/usr/local/bin/hubd`, plus `/etc/display-hub/hubd.toml` if you don't have one.
-3. Installs the hardened `display-hub.service` (systemd rates its exposure 1.0, "OK"), then enables and starts it.
-4. Installs what helpers need: `hub-send`, the `display-hub-helper` command and the example helper. It turns no helper on (see [Helpers on the Pi](#helpers-on-the-pi)).
-5. On first start, the hub makes its identity: an ECDSA key and certificate in `/var/lib/display-hub/identity/`, readable only by the service.
-6. Prints `hubd check`. An unsynchronised clock is normal for a minute after boot.
-7. On a first install only, ends by printing a pairing string (the `dh1.…` line), ready for step 4. It is shown on the terminal only: the installer doesn't save it or send it to the log. An upgrade doesn't print one.
+It does what step 2's installer does ([above](#what-the-installer-does)).
 
 ## 4. Pair the desktop manager
 
@@ -195,7 +207,7 @@ The installer also backs up automatically before every upgrade, into `/var/backu
 
 ### Restoring, for example onto a new SD card or a new Pi
 
-1. Install as above (steps 1 to 3). This makes a new, empty hub.
+1. Install as above (step 2, or step 3). This makes a new, empty hub.
 2. Copy the backup over and unpack it: `tar -xzf display-hub-backup.tgz`.
 3. Restore it:
 
@@ -216,7 +228,7 @@ Helpers on the Pi aren't in the backup. On a new SD card or Pi, set them up agai
 
 ## Upgrading
 
-Copy the new folder over, then run `sudo bash install.sh` in it again. It does the following:
+Run the new release's one line on the Pi, as in step 2 (the release notes show it). Or copy the new folder over, then run `sudo bash install.sh` in it again. Either way, the installer does the following:
 
 1. Backs up the hub.
 2. Replaces the programs and the units. Helpers you've set up keep running, and use the new versions from their next run.

@@ -150,7 +150,8 @@ jobs:
         run: |
           shellcheck deploy/raspberry-pi/install.sh deploy/raspberry-pi/display-hub-helper \
             deploy/raspberry-pi/helpers/pi-status tools/pi-container-test/run.sh \
-            tools/pi-container-test/probe-helper
+            tools/pi-container-test/probe-helper tools/release/pi-tarball.sh \
+            tools/release/package-app.sh starters/helper/my-helper
       - name: Build hubd and hub-send for the Pi
         if: matrix.suite == 'bookworm'
         run: |

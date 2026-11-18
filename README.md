@@ -29,8 +29,8 @@ The app doesn't need to stay open. When your computer is off, the displays keep 
 
 ## Getting going
 
-<!-- RELEASE DOWNLOADS: a later release step replaces this block with the download links. -->
-> **Downloads are coming with the first release.** Until then, build Display Hub from this repository as below.
+<!-- RELEASE DOWNLOADS: where the ready-made downloads are. -->
+> **Ready-made downloads** for Windows, Apple silicon Macs, Linux and the Raspberry Pi hub are coming as previews on the [releases page](https://github.com/penguin97040/display-hub/releases). [Installing Display Hub](docs/install.md) says how to check them, open them and set up the hub with one line. If no release is listed yet, or you'd rather, build Display Hub from this repository as below.
 <!-- END RELEASE DOWNLOADS -->
 
 You need [Rust](https://rustup.rs). `rust-toolchain.toml` pins the version, and `cargo` installs it the first time.

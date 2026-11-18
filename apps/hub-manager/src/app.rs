@@ -1070,24 +1070,37 @@ impl Manager {
             ),
         );
         let copied = self.model.install_copied;
-        let command = self.command_box("install-copy", model::INSTALL_COMMAND, copied, None, cx, |this| {
+        let downloads = self.model.install_downloads();
+        let line = self.model.install_command();
+        let command = self.command_box("install-copy", line, copied, None, cx, |this| {
             this.model.copy_install();
         });
+        let (before, after, more) = if downloads {
+            (
+                "The hub keeps your pages and sends them to your displays. Open a terminal on the Pi (connecting \
+                 over SSH from this PC is easiest, so you can paste) and run this one line:",
+                "It downloads the hub's files for this version of the app, checks them against the checksum built \
+                 into this app, and installs them only if they match. It takes about a minute, and ends by printing \
+                 a pairing string for the next step.",
+                "Every step in detail, and how to copy the files over yourself instead: docs/install.md and \
+                 docs/deploy-raspberry-pi.md on the project's GitHub page.",
+            )
+        } else {
+            (
+                "The hub keeps your pages and sends them to your displays. First copy the display-hub-pi \
+                 folder onto the Pi (the full guide says how). Then open a terminal on the Pi and run this \
+                 one command:",
+                "It takes about a minute, and ends by printing a pairing string for the next step.",
+                "Every step in detail, including getting the files: docs/deploy-raspberry-pi.md.",
+            )
+        };
         let install = ui::with_ticks(
             ui::panel(Some(("2. Set up the hub on the Pi", "")), m).child(
                 ui::body(m)
-                    .child(ui::p(
-                        "The hub keeps your pages and sends them to your displays. First copy the display-hub-pi \
-                         folder onto the Pi (the full guide says how). Then open a terminal on the Pi and run this \
-                         one command:",
-                    ))
+                    .child(ui::p(before))
                     .child(command)
-                    .child(ui::p(
-                        "It takes about a minute, and ends by printing a pairing string for the next step.",
-                    ))
-                    .child(ui::p_muted(
-                        "Every step in detail, including getting the files: docs/deploy-raspberry-pi.md.",
-                    )),
+                    .child(ui::p(after))
+                    .child(ui::p_muted(more)),
             ),
         );
         vec![

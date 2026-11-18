@@ -32,6 +32,7 @@ use crate::guidance::{self, Doing, Guidance, Next, Tone};
 use crate::settings::SavedHub;
 use crate::shown::{kind_label, origin_text, Shown};
 
+pub mod pi_install;
 mod updates;
 pub use updates::*;
 
@@ -935,7 +936,8 @@ pub struct Model {
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
-/// `docs/deploy-raspberry-pi.md` shows the same line (a test keeps them together).
+/// `docs/deploy-raspberry-pi.md` shows the same line (a test keeps them together). A release build
+/// shows [`pi_install::built_in`] instead, which fetches the files too.
 pub const INSTALL_COMMAND: &str = "sudo bash display-hub-pi/install.sh";
 /// For a pairing string that has expired or was lost.
 pub const NEW_PAIRING_COMMAND: &str = "sudo -u display-hub hubd pair-admin";
@@ -1005,10 +1007,21 @@ impl Model {
         self.hub.is_none()
     }
 
+    /// The install step's command: the one line that downloads, checks and installs, in a release
+    /// build; in a developer build, the command to run once the folder is on the Pi.
+    pub fn install_command(&self) -> &'static str {
+        pi_install::built_in().unwrap_or(INSTALL_COMMAND)
+    }
+
+    /// Whether the install step's command downloads the files itself (a release build).
+    pub fn install_downloads(&self) -> bool {
+        pi_install::built_in().is_some()
+    }
+
     /// The text to put on the clipboard for the install step, and a note that it was copied.
     pub fn copy_install(&mut self) -> &'static str {
         self.install_copied = true;
-        INSTALL_COMMAND
+        self.install_command()
     }
 
     /// The steps left after pairing, ticked from what the hub has. `None` when it shouldn't show:
@@ -4009,7 +4022,9 @@ mod tests {
         assert!(docs.contains(INSTALL_COMMAND) && docs.contains(NEW_PAIRING_COMMAND));
         let mut m = Model::new(None, "PC");
         assert!(!m.install_copied);
-        assert_eq!(m.copy_install(), INSTALL_COMMAND);
+        let expected = pi_install::built_in().unwrap_or(INSTALL_COMMAND);
+        assert_eq!(m.install_downloads(), pi_install::built_in().is_some());
+        assert_eq!(m.copy_install(), expected);
         assert!(m.install_copied);
     }
 }
