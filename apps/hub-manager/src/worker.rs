@@ -949,6 +949,152 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod own_helper_tests {
+    //! A maker's own helper, end to end: the page made in the manager, a helper invited for its feed
+    //! in the manager, then a page sent with hub-send's library, as `hub-send page` sends it.
+
+    use std::time::Instant;
+
+    use hub_core::api::FeedContent;
+    use hub_core::FakeClock;
+    use hub_protocol::pairing::PairingString;
+    use os_secrets::{MemoryStore, TokenStore};
+
+    use super::*;
+    use crate::model::Model;
+    use crate::shown::Shown;
+
+    async fn run(model: &mut Model, ctx: &Arc<Ctx>, op: Option<Op>) {
+        let op = op.expect("an operation");
+        let result = execute(ctx.clone(), op).await;
+        model.finish(result, Instant::now());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_page_for_your_own_helper_fills_from_hub_send() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = FakeClock::parse("2026-11-10T20:00:00Z");
+        let hub = hubd::open_hub(
+            hubd::config::Config {
+                data_dir: dir.path().join("hub"),
+                ..Default::default()
+            },
+            Arc::new(clock.clone()),
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(hubd::serve_https(hub.clone(), listener, async {
+            let _ = rx.await;
+        }));
+        let pairing = PairingString {
+            host: "127.0.0.1".into(),
+            port,
+            spki_sha256: hub.identity.spki_sha256,
+            secret: hub.new_admin_pairing("test").unwrap(),
+        };
+        let ctx = Ctx::new(Arc::new(MemoryStore::default()), dir.path().join("pc"));
+        let mut m = Model::new(None, "Desk PC");
+        m.pairing.set(&pairing.encode());
+        let op = m.submit_pairing();
+        run(&mut m, &ctx, op).await;
+        assert!(m.connected(), "{:?}", m.notice);
+
+        // The page, made in the manager: a list, and one of a kind of the maker's own.
+        for (title, shape, kind, feed) in [
+            ("Bus times", Some("list"), "list", "bus-times"),
+            ("Flights", None, "nearby-flights/1", "nearby-flights"),
+        ] {
+            m.open_helper_page();
+            let f = m.add.helper_page.as_mut().unwrap();
+            f.title.set(title);
+            f.choose_kind(shape);
+            f.custom_kind.set(kind);
+            f.feed.set(feed);
+            let op = m.submit_helper_page();
+            run(&mut m, &ctx, op).await;
+            assert_eq!(
+                m.add.feed.as_ref().map(|s| s.feed.as_str()),
+                Some(feed),
+                "{:?}",
+                m.notice
+            );
+            m.finish_setup();
+        }
+        let rows = m.page_rows(Instant::now());
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].origin, "Filled by a helper (feed bus-times)");
+        assert_eq!(rows[0].freshness, "Waiting for the helper's first update");
+        assert_eq!(rows[1].kind, "Custom: nearby-flights/1");
+
+        // A helper invited for both feeds, from the manager's Settings.
+        m.invite_for_feed("bus-times");
+        m.helper.other.set("nearby-flights");
+        let op = m.create_helper();
+        run(&mut m, &ctx, op).await;
+        let string = m.helper.string.clone().expect("a helper string");
+        assert_eq!(m.invite_programs(), (false, true));
+
+        // The helper's computer: hub-send login, then hub-send page.
+        let profile = hub_send::Profile::new(
+            "hub-send",
+            dir.path().join("helper"),
+            Box::new(MemoryStore::default()) as Box<dyn TokenStore>,
+        );
+        let cfg = profile.login(&string, clock.now()).await.unwrap();
+        assert_eq!(cfg.feeds, ["bus-times", "nearby-flights"]);
+        let helper = profile.open().unwrap();
+        let example = crate::model::example_data("list").unwrap();
+        let sent = helper
+            .send_page(
+                "bus-times",
+                &FeedContent {
+                    kind: "list".into(),
+                    data: serde_json::from_str(example).unwrap(),
+                    collected_at: None,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.updated, ["bus-times"]);
+        let flights = serde_json::json!({"planes": [{"callsign": "NZ123"}]});
+        let sent = helper
+            .send_page(
+                "nearby-flights",
+                &FeedContent {
+                    kind: "nearby-flights/1".into(),
+                    data: flights.clone(),
+                    collected_at: None,
+                    note: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent.updated, ["nearby-flights"]);
+
+        // The manager sees what arrived, and the helper with its feeds.
+        let op = m.refresh();
+        run(&mut m, &ctx, op).await;
+        assert_eq!(m.helpers()[0].feeds, ["bus-times", "nearby-flights"]);
+        let rows = m.page_rows(Instant::now());
+        assert_eq!(rows[0].quality, "REPORTED");
+        let Shown::List(items) = &rows[0].shown else {
+            panic!("{:?}", rows[0].shown)
+        };
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(rows[1].quality, "REPORTED");
+        assert_eq!(
+            m.pages()[1].content.as_ref().and_then(|c| c.data.clone()),
+            Some(flights)
+        );
+        let _ = tx.send(());
+        server.await.unwrap().unwrap();
+    }
+}
+
 #[cfg(all(test, unix))]
 mod install_tests {
     //! Install firmware through the model and the worker, against a real hub over pinned HTTPS and

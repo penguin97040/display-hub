@@ -35,5 +35,6 @@ gpui-pre-windows.workspace = true
 
 [dev-dependencies]
 hubd = { path = "../hubd" }
+hub-send = { path = "../hub-send" }
 display-simulator = { path = "../../tools/display-simulator" }
 tempfile.workspace = true

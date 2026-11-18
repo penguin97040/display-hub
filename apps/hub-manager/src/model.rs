@@ -15,7 +15,7 @@ use hub_core::api::{
     PageContentInput, PageView,
 };
 use hub_core::freshness::{short_duration, Freshness};
-use hub_core::model::clean_title;
+use hub_core::model::{clean_title, valid_feed};
 use hub_core::Source;
 use hub_protocol::limits::{MAX_PAGES, MAX_TITLE_LEN};
 use hub_protocol::pairing::PairingString;
@@ -27,7 +27,7 @@ use hub_templates::Template;
 use usage::{clean_percent, Service};
 
 use crate::field::Field;
-use crate::forms::{ContentEdit, TemplateForm};
+use crate::forms::{feed_rule, ContentEdit, HelperPageForm, TemplateForm};
 use crate::guidance::{self, Doing, Guidance, Next, Tone};
 use crate::settings::SavedHub;
 use crate::shown::{kind_label, origin_text, Shown};
@@ -273,10 +273,11 @@ pub enum Busy {
     Naming {
         done: String,
     },
-    /// Adding pages from a template.
+    /// Adding pages from a template, or a page for the maker's own helper.
     Adding {
         done: String,
         setup: Option<SetupNote>,
+        feed: Option<FeedSteps>,
     },
     Enrolling,
     Ports,
@@ -410,7 +411,7 @@ impl Confirm {
             Confirm::RevokeHelper { label, .. } => (
                 format!("Remove the helper on {label}?"),
                 "Its credential stops working straight away. Pages it fed keep their last figures, and go stale. On \
-                 that computer, usage-helper logout tidies up."
+                 that computer, usage-helper logout or hub-send logout tidies up."
                     .into(),
                 "Remove helper",
             ),
@@ -468,14 +469,78 @@ pub struct SetupNote {
     pub copied: bool,
 }
 
-/// Adding pages from a template: pick one, fill in its form, then perhaps a setup step.
+/// The longest name `display-hub-helper` takes for a helper on the Pi (it becomes part of a user
+/// name). A longer feed is given to it with `--feed`, under a shorter name.
+pub const PI_HELPER_NAME_LEN: usize = 20;
+
+/// How to feed a page made for the maker's own helper, shown once it is added.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedSteps {
+    pub feed: String,
+    pub kind: String,
+    /// The helper's name on the Pi, which is also the program's file name in `pi_command`.
+    pub pi_name: String,
+    /// Sets the helper up on the hub's Pi, run in the folder that holds its program.
+    pub pi_command: String,
+    /// Sends one page from another computer once `hub-send login` has paired it, with the page's
+    /// data as JSON on standard input.
+    pub send_command: String,
+    /// Data of the page's kind to try `send_command` with. `None` for a kind of the maker's own.
+    pub example: Option<&'static str>,
+    pub pi_copied: bool,
+    pub send_copied: bool,
+}
+
+impl FeedSteps {
+    pub fn new(feed: &str, kind: &str) -> Self {
+        let pi_name = if feed.len() <= PI_HELPER_NAME_LEN {
+            feed.to_string()
+        } else {
+            // A feed is a slug, so its start is a usable name once a cut-off hyphen is dropped.
+            feed[..PI_HELPER_NAME_LEN].trim_end_matches('-').to_string()
+        };
+        let mut pi_command = format!("sudo display-hub-helper add {pi_name} --run \"$PWD/{pi_name}\"");
+        if pi_name != feed {
+            pi_command.push_str(&format!(" --feed {feed}"));
+        }
+        Self {
+            feed: feed.to_string(),
+            kind: kind.to_string(),
+            send_command: format!("hub-send page {feed} --kind {kind} --data -"),
+            example: example_data(kind),
+            pi_name,
+            pi_command,
+            pi_copied: false,
+            send_copied: false,
+        }
+    }
+}
+
+/// Small, valid data for each of the four shapes, for a first try of a helper.
+pub fn example_data(kind: &str) -> Option<&'static str> {
+    use hub_protocol::shapes::{KIND_BIG_NUMBER, KIND_LIST, KIND_METER, KIND_TEXT};
+    Some(match kind {
+        KIND_METER => r#"{"items": [{"id": "tank", "label": "Tank", "percent": 80}]}"#,
+        KIND_BIG_NUMBER => r#"{"value": 21.5, "decimals": 1, "unit": "°C"}"#,
+        KIND_TEXT => r#"{"text": "Hello from my helper."}"#,
+        KIND_LIST => r#"{"items": [{"text": "Bins", "detail": "Tuesday"}]}"#,
+        _ => return None,
+    })
+}
+
+/// Adding pages from a template, or a page for the maker's own helper: pick one, fill in its form,
+/// then perhaps a setup step.
 pub struct AddFlow {
     /// The templates that come with the app.
     pub templates: Vec<Template>,
-    /// The chosen template's form. Without one, the picker shows.
+    /// The chosen template's form. Without one (or `helper_page`), the picker shows.
     pub form: Option<TemplateForm>,
+    /// The form for a page the maker's own helper fills.
+    pub helper_page: Option<HelperPageForm>,
     /// What to do next, after pages were added.
     pub setup: Option<SetupNote>,
+    /// How to feed the page just made for the maker's own helper.
+    pub feed: Option<FeedSteps>,
 }
 
 /// A page being edited.
@@ -769,15 +834,35 @@ impl TickView {
     }
 }
 
-/// Setting up a helper on this computer (`usage-helper`).
+/// Inviting a helper on another computer: `usage-helper` for the usage feeds, or `hub-send` for
+/// any feed.
 #[derive(Default)]
 pub struct HelperForm {
     pub claude: bool,
     pub chatgpt: bool,
-    /// The `dh1.` string for `usage-helper login`, once made. A secret until used or expired.
+    /// Other feeds ticked, from the hub's helper pages.
+    pub feeds: Vec<String>,
+    /// More feed names typed in, separated by spaces or commas, for feeds no page has yet.
+    pub other: Field,
+    /// The `dh1.` string for `usage-helper login` or `hub-send login`, once made. A secret until
+    /// used or expired.
     pub string: Option<Zeroizing<String>>,
     pub expires_at: Option<Timestamp>,
+    /// The feeds the last string asked for, to say which program takes it.
+    pub invited: Vec<String>,
 }
+
+/// A feed that a helper page on the hub takes, to tick when inviting a helper.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FeedChoice {
+    pub feed: String,
+    /// The titles of the pages it fills, to say what it is.
+    pub pages: Vec<String>,
+    pub ticked: bool,
+}
+
+/// The usage feeds, which have boxes of their own.
+const USAGE_FEEDS: [Service; 2] = [Service::ClaudeMax, Service::ChatgptPlus];
 
 pub struct Model {
     pub hub: Option<SavedHub>,
@@ -852,7 +937,9 @@ impl Model {
             add: AddFlow {
                 templates: hub_templates::built_in(),
                 form: None,
+                helper_page: None,
                 setup: None,
+                feed: None,
             },
             edit: None,
             tick_changes: HashMap::new(),
@@ -860,6 +947,7 @@ impl Model {
             helper: HelperForm {
                 claude: true,
                 chatgpt: true,
+                other: Field::new(256),
                 ..HelperForm::default()
             },
             guide_dismissed: false,
@@ -1085,13 +1173,82 @@ impl Model {
         if let Some(t) = self.add.templates.get(i) {
             self.add.form = Some(TemplateForm::new(t.clone(), None));
             self.add.setup = None;
+            self.add.feed = None;
             self.notice = None;
         }
+    }
+
+    /// Chooses "A page for your own helper" from the picker, and shows its form.
+    pub fn open_helper_page(&mut self) {
+        if let Some(g) = self.page_limit_problem(1) {
+            self.notice = Some(g);
+            return;
+        }
+        self.add.helper_page = Some(HelperPageForm::default());
+        self.add.setup = None;
+        self.add.feed = None;
+        self.notice = None;
     }
 
     /// Back to the list of templates.
     pub fn leave_form(&mut self) {
         self.add.form = None;
+        self.add.helper_page = None;
+    }
+
+    /// Checks the form for a page the maker's own helper fills, and adds it.
+    pub fn submit_helper_page(&mut self) -> Option<Op> {
+        let form = self.add.helper_page.as_mut()?;
+        let mut page = match form.check() {
+            Ok(p) => p,
+            Err(e) => {
+                form.error = Some(e);
+                return None;
+            }
+        };
+        form.error = None;
+        let taken: Vec<String> = self.pages().iter().map(|p| p.title.clone()).collect();
+        page.title = unique_title(&page.title, &taken);
+        if let Some(g) = self.page_limit_problem(1) {
+            self.notice = Some(g);
+            return None;
+        }
+        let feed = page.feed.clone().unwrap_or_default();
+        let done = format!(
+            "Added {}. It stays empty until a helper sends to the feed {feed}.",
+            page.title
+        );
+        let steps = FeedSteps::new(&feed, &page.kind);
+        self.start(
+            Busy::Adding {
+                done,
+                setup: None,
+                feed: Some(steps),
+            },
+            Op::AddPages { pages: vec![page] },
+        )
+    }
+
+    /// Notes that one of the commands for feeding the new page was copied.
+    pub fn copy_feed_command(&mut self, pi: bool) {
+        if let Some(f) = self.add.feed.as_mut() {
+            if pi {
+                f.pi_copied = true;
+            } else {
+                f.send_copied = true;
+            }
+        }
+    }
+
+    /// Goes to Settings with the helper form ready to invite a helper for just this feed.
+    pub fn invite_for_feed(&mut self, feed: &str) {
+        self.helper.claude = false;
+        self.helper.chatgpt = false;
+        self.helper.feeds = vec![feed.to_string()];
+        self.helper.other.clear();
+        self.helper.string = None;
+        self.section = Section::Settings;
+        self.confirm = None;
     }
 
     /// Checks the form and adds the pages it makes.
@@ -1126,7 +1283,14 @@ impl Model {
             command: s.command,
             copied: false,
         });
-        self.start(Busy::Adding { done, setup }, Op::AddPages { pages })
+        self.start(
+            Busy::Adding {
+                done,
+                setup,
+                feed: None,
+            },
+            Op::AddPages { pages },
+        )
     }
 
     /// Notes that the setup command was copied (the button puts it on the clipboard).
@@ -1139,12 +1303,17 @@ impl Model {
     /// Done with the setup step: back to the list of templates.
     pub fn finish_setup(&mut self) {
         self.add.setup = None;
+        self.add.feed = None;
         self.add.form = None;
+        self.add.helper_page = None;
     }
 
     /// Clears messages about what was typed once someone types again.
     pub fn typing(&mut self) {
         if let Some(f) = self.add.form.as_mut() {
+            f.error = None;
+        }
+        if let Some(f) = self.add.helper_page.as_mut() {
             f.error = None;
         }
         if let Some(f) = self.edit.as_mut().and_then(|e| e.form.as_mut()) {
@@ -1659,9 +1828,41 @@ impl Model {
             .unwrap_or_default()
     }
 
-    pub fn create_helper(&mut self) -> Option<Op> {
-        // Each service the helper reports is the feed of the same name.
-        let feeds: Vec<String> = [
+    /// The feeds of the hub's helper pages, other than the usage feeds, to tick when inviting a
+    /// helper. In page order, each once.
+    pub fn helper_feed_choices(&self) -> Vec<FeedChoice> {
+        let mut out: Vec<FeedChoice> = Vec::new();
+        for p in self.pages().iter().filter(|p| p.source == Source::Helper) {
+            let Some(feed) = p.feed.as_deref() else { continue };
+            if USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+                continue;
+            }
+            match out.iter_mut().find(|c| c.feed == feed) {
+                Some(c) => c.pages.push(p.title.clone()),
+                None => out.push(FeedChoice {
+                    feed: feed.to_string(),
+                    pages: vec![p.title.clone()],
+                    ticked: self.helper.feeds.iter().any(|f| f == feed),
+                }),
+            }
+        }
+        out
+    }
+
+    /// Ticks or unticks one of the hub's helper-page feeds for the next invite.
+    pub fn toggle_helper_feed(&mut self, feed: &str) {
+        match self.helper.feeds.iter().position(|f| f == feed) {
+            Some(at) => {
+                self.helper.feeds.remove(at);
+            }
+            None => self.helper.feeds.push(feed.to_string()),
+        }
+    }
+
+    /// The feeds the helper form asks for, checked by the hub's rules, or what is wrong.
+    fn helper_feeds(&self) -> Result<Vec<String>, Guidance> {
+        // Each service the usage helper reports is the feed of the same name.
+        let mut feeds: Vec<String> = [
             (self.helper.claude, Service::ClaudeMax),
             (self.helper.chatgpt, Service::ChatgptPlus),
         ]
@@ -1669,19 +1870,74 @@ impl Model {
         .filter(|&(on, _)| on)
         .map(|(_, s)| s.slug().to_string())
         .collect();
+        // Only the ticks still offered: a feed whose pages have gone since isn't sent.
+        for c in self.helper_feed_choices().into_iter().filter(|c| c.ticked) {
+            feeds.push(c.feed);
+        }
+        for typed in self
+            .helper
+            .other
+            .text
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+        {
+            if !valid_feed(typed) {
+                return Err(Guidance {
+                    tone: Tone::Problem,
+                    title: format!("{typed} can't be a feed's name"),
+                    detail: feed_rule(),
+                    next: Next::None,
+                });
+            }
+            feeds.push(typed.to_string());
+        }
+        let mut seen = HashSet::new();
+        feeds.retain(|f| seen.insert(f.clone()));
         if feeds.is_empty() {
-            return self.problem(Guidance {
+            return Err(Guidance {
                 tone: Tone::Problem,
-                title: "Choose what the helper reports".into(),
-                detail: "Claude Max (from Claude Code), ChatGPT Plus (from Codex), or both.".into(),
+                title: "Choose what the helper sends to".into(),
+                detail: "Claude Max (from Claude Code), ChatGPT Plus (from Codex), or a feed of your own: tick one \
+                         of your helper pages' feeds, or type its name."
+                    .into(),
                 next: Next::None,
             });
         }
+        if feeds.len() > HUB_PAGE_LIMIT {
+            return Err(Guidance {
+                tone: Tone::Problem,
+                title: format!("A helper can send to at most {HUB_PAGE_LIMIT} feeds"),
+                detail: "Choose fewer.".into(),
+                next: Next::None,
+            });
+        }
+        Ok(feeds)
+    }
+
+    pub fn create_helper(&mut self) -> Option<Op> {
+        let feeds = match self.helper_feeds() {
+            Ok(f) => f,
+            Err(g) => return self.problem(g),
+        };
         let label = clean_title(self.pc_name.trimmed()).unwrap_or_else(|| "Helper".into());
+        if self.busy.is_some() {
+            return None;
+        }
         self.helper.string = None;
+        self.helper.invited = feeds.clone();
         self.start(
             Busy::Saving { done: String::new() },
             Op::NewHelper(NewHelper { label, feeds }),
+        )
+    }
+
+    /// Whether the last helper string is for `usage-helper`, for `hub-send`, or for both: the usage
+    /// feeds are usage-helper's, any other feed hub-send's.
+    pub fn invite_programs(&self) -> (bool, bool) {
+        let usage = |f: &String| USAGE_FEEDS.iter().any(|s| s.slug() == f);
+        (
+            self.helper.invited.iter().any(usage),
+            self.helper.invited.iter().any(|f| !usage(f)),
         )
     }
 
@@ -1880,9 +2136,11 @@ impl Model {
                     }
                 };
                 self.add.form = None;
+                self.add.helper_page = None;
                 match (failed, busy) {
-                    (None, Some(Busy::Adding { done, setup })) => {
+                    (None, Some(Busy::Adding { done, setup, feed })) => {
                         self.add.setup = setup;
+                        self.add.feed = feed;
                         self.notice = Some(Guidance::done(done, held));
                     }
                     (None, _) => {}
@@ -3461,6 +3719,7 @@ mod tests {
         m.busy = Some(Busy::Adding {
             done: "Added Page. Displays show it soon.".into(),
             setup: None,
+            feed: None,
         });
         m.finish(
             Ok(Outcome::Added {
@@ -3482,6 +3741,7 @@ mod tests {
         m.busy = Some(Busy::Adding {
             done: "Added Page.".into(),
             setup: None,
+            feed: None,
         });
         m.finish(
             Ok(Outcome::Added {
@@ -3721,5 +3981,324 @@ mod helper_string_tests {
             m.notice.is_none(),
             "no message for a new string; the panel shows it"
         );
+    }
+}
+
+#[cfg(test)]
+mod own_helper_tests {
+    //! Pages for a maker's own helper, and helper invites for any feed.
+
+    use super::tests::{connected, refresh};
+    use super::*;
+
+    fn helper_page(id: &str, feed: &str, title: &str) -> PageView {
+        PageView {
+            id: id.into(),
+            title: title.into(),
+            kind: "text".into(),
+            source: Source::Helper,
+            feed: Some(feed.into()),
+            stale_after_seconds: Source::Helper.stale_after_seconds(),
+            content: None,
+            template: None,
+            settings: None,
+        }
+    }
+
+    /// Opens the form and fills it in: a shape's kind, or a kind of the maker's own.
+    fn fill(m: &mut Model, title: &str, kind: Result<&'static str, &str>, feed: &str) {
+        m.open_helper_page();
+        let f = m.add.helper_page.as_mut().expect("the form");
+        f.title.set(title);
+        match kind {
+            Ok(shape) => f.choose_kind(Some(shape)),
+            Err(custom) => {
+                f.choose_kind(None);
+                f.custom_kind.set(custom);
+            }
+        }
+        f.feed.set(feed);
+    }
+
+    fn error_after_submit(m: &mut Model) -> String {
+        assert!(m.submit_helper_page().is_none(), "nothing is sent");
+        assert!(m.busy.is_none());
+        assert!(m.notice.is_none(), "it belongs to the form");
+        m.add
+            .helper_page
+            .as_ref()
+            .unwrap()
+            .error
+            .clone()
+            .expect("a message")
+    }
+
+    #[test]
+    fn a_page_for_your_own_helper_is_added_with_its_feed_and_then_says_how_to_feed_it() {
+        let (mut m, now) = connected(vec![]);
+        fill(&mut m, "  Bus times ", Ok("list"), " bus-times ");
+        let Some(Op::AddPages { pages }) = m.submit_helper_page() else {
+            panic!("add")
+        };
+        let p = &pages[0];
+        assert_eq!(
+            (p.title.as_str(), p.kind.as_str(), p.source, p.feed.as_deref()),
+            ("Bus times", "list", Source::Helper, Some("bus-times"))
+        );
+        assert!(p.template.is_none() && p.settings.is_none() && p.id.is_none());
+        assert!(m.submit_helper_page().is_none(), "one operation at a time");
+        m.finish(
+            Ok(Outcome::Added {
+                refresh: Some(refresh(vec![helper_page("bus-times", "bus-times", "Bus times")])),
+                failed: None,
+            }),
+            now,
+        );
+        assert!(m.add.helper_page.is_none(), "the form closes");
+        let n = m.notice.clone().unwrap();
+        assert_eq!(n.tone, Tone::Done);
+        assert!(
+            n.title.contains("Added Bus times") && n.title.contains("bus-times"),
+            "{}",
+            n.title
+        );
+        let steps = m.add.feed.clone().expect("how to feed it");
+        assert_eq!(
+            steps.pi_command,
+            r#"sudo display-hub-helper add bus-times --run "$PWD/bus-times""#
+        );
+        assert_eq!(steps.send_command, "hub-send page bus-times --kind list --data -");
+        assert!(steps.example.is_some());
+        m.copy_feed_command(true);
+        assert!(m.add.feed.as_ref().is_some_and(|f| f.pi_copied && !f.send_copied));
+        m.copy_feed_command(false);
+        assert!(m.add.feed.as_ref().unwrap().send_copied);
+        m.finish_setup();
+        assert!(m.add.feed.is_none(), "back to the list");
+    }
+
+    #[test]
+    fn each_field_is_checked_by_the_hubs_rules_before_anything_is_sent() {
+        let (mut m, _) = connected(vec![]);
+        fill(&mut m, "", Ok("text"), "bus-times");
+        assert!(error_after_submit(&mut m).contains("title"));
+        fill(&mut m, &"w".repeat(MAX_TITLE_LEN + 1), Ok("text"), "bus-times");
+        assert!(error_after_submit(&mut m).contains("at most 48 characters"));
+        fill(&mut m, "\u{200b}", Ok("text"), "bus-times");
+        assert!(error_after_submit(&mut m).contains("printable"));
+        for bad in ["Bus-Times", "bus_times", "bus--times", "-bus", &"a".repeat(49)] {
+            fill(&mut m, "Bus times", Ok("text"), bad);
+            assert!(
+                error_after_submit(&mut m).contains("lower-case letters and digits"),
+                "{bad}"
+            );
+        }
+        fill(&mut m, "Bus times", Ok("text"), "");
+        assert!(error_after_submit(&mut m).contains("Name the feed"));
+        // The message clears once someone types again.
+        m.typing();
+        assert!(m.add.helper_page.as_ref().unwrap().error.is_none());
+        m.leave_form();
+        assert!(m.add.helper_page.is_none());
+    }
+
+    #[test]
+    fn a_kind_of_your_own_is_typed_in_and_checked() {
+        let (mut m, _) = connected(vec![]);
+        fill(&mut m, "Flights", Err(""), "nearby-flights");
+        assert!(error_after_submit(&mut m).contains("Type the kind"));
+        for bad in [
+            "Flights",
+            "nearby-flights",
+            "nearby-flights/0",
+            "nearby flights/1",
+            "a/12345",
+        ] {
+            fill(&mut m, "Flights", Err(bad), "nearby-flights");
+            assert!(error_after_submit(&mut m).contains("name, a slash"), "{bad}");
+        }
+        fill(&mut m, "Flights", Err(" nearby-flights/1 "), "nearby-flights");
+        let Some(Op::AddPages { pages }) = m.submit_helper_page() else {
+            panic!("add")
+        };
+        assert_eq!(pages[0].kind, "nearby-flights/1");
+        // Choosing a shape again uses it, whatever is still in the box.
+        let mut f = HelperPageForm::default();
+        f.choose_kind(None);
+        f.custom_kind.set("nearby-flights/1");
+        f.choose_kind(Some("meter"));
+        assert_eq!(f.kind(), "meter");
+        let steps = FeedSteps::new("nearby-flights", "nearby-flights/1");
+        assert_eq!(steps.example, None, "only the four shapes have an example");
+        assert_eq!(
+            steps.send_command,
+            "hub-send page nearby-flights --kind nearby-flights/1 --data -"
+        );
+    }
+
+    #[test]
+    fn a_full_hub_refuses_a_page_for_your_own_helper() {
+        let (mut full, _) = connected(
+            (0..HUB_PAGE_LIMIT)
+                .map(|i| helper_page(&format!("p{i}"), "x", &format!("P{i}")))
+                .collect(),
+        );
+        full.open_helper_page();
+        assert!(full.add.helper_page.is_none());
+        assert!(full.notice.as_ref().unwrap().title.contains("at most 50"));
+
+        // Filled while the hub had room, then the hub filled up from another PC.
+        let (mut m, now) = connected(vec![]);
+        fill(&mut m, "Bus times", Ok("text"), "bus-times");
+        let pages = (0..HUB_PAGE_LIMIT)
+            .map(|i| helper_page(&format!("p{i}"), "x", &format!("P{i}")))
+            .collect();
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(pages)))), now);
+        assert!(m.submit_helper_page().is_none());
+        assert!(m.notice.as_ref().unwrap().title.contains("at most 50"));
+    }
+
+    #[test]
+    fn a_taken_title_gets_a_number_and_a_long_feed_gets_a_shorter_name_on_the_pi() {
+        let (mut m, _) = connected(vec![helper_page("bus", "bus", "Bus times")]);
+        fill(&mut m, "Bus times", Ok("text"), "the-number-eleven-bus-to-town");
+        let Some(Op::AddPages { pages }) = m.submit_helper_page() else {
+            panic!("add")
+        };
+        assert_eq!(pages[0].title, "Bus times 2");
+        let steps = FeedSteps::new("the-number-eleven-bus-to-town", "text");
+        assert_eq!(steps.pi_name, "the-number-eleven-bu");
+        assert_eq!(
+            steps.pi_command,
+            r#"sudo display-hub-helper add the-number-eleven-bu --run "$PWD/the-number-eleven-bu" --feed the-number-eleven-bus-to-town"#
+        );
+        // Cut just after a hyphen, the name drops it.
+        assert_eq!(
+            FeedSteps::new("abcdefghijklmnopqrs-tuv", "text").pi_name,
+            "abcdefghijklmnopqrs"
+        );
+        assert_eq!(
+            FeedSteps::new("abcdefghijklmnopqrst-u", "text").pi_name,
+            "abcdefghijklmnopqrst"
+        );
+    }
+
+    #[test]
+    fn the_examples_pass_the_hubs_own_checks() {
+        use hub_protocol::shapes::SHAPES;
+        for kind in SHAPES {
+            let data: serde_json::Value = serde_json::from_str(example_data(kind).unwrap()).unwrap();
+            let page = hub_protocol::Page {
+                id: "p".into(),
+                title: "P".into(),
+                kind: kind.into(),
+                data_quality: DataQuality::ProviderReported,
+                updated_at: Some(tests::ts("2026-11-10T20:00:00Z")),
+                stale_after_seconds: 3600,
+                note: None,
+                data: Some(data),
+            };
+            assert!(page.check().is_ok(), "{kind}: {:?}", page.check());
+        }
+    }
+
+    #[test]
+    fn an_invite_can_name_the_hubs_helper_feeds_and_typed_ones() {
+        let mut usage = helper_page("claude-max", "claude-max", "Claude Max");
+        usage.kind = "meter".into();
+        let mut typed_in = helper_page("note", "notes", "Note");
+        typed_in.source = Source::Manual;
+        let (mut m, _) = connected(vec![
+            usage,
+            helper_page("bus-times", "bus-times", "Bus times"),
+            typed_in,
+            helper_page("bus-times-2", "bus-times", "Bus times later"),
+            helper_page("garden", "garden-weather", "Garden"),
+        ]);
+        let choices = m.helper_feed_choices();
+        assert_eq!(
+            choices.iter().map(|c| c.feed.as_str()).collect::<Vec<_>>(),
+            ["bus-times", "garden-weather"],
+            "helper pages' feeds, once each, without the usage feeds or a typed-in page's"
+        );
+        assert_eq!(choices[0].pages, ["Bus times", "Bus times later"]);
+        assert!(choices.iter().all(|c| !c.ticked));
+
+        // The usage boxes still work as before.
+        m.helper.claude = false;
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["chatgpt-plus"]);
+        assert_eq!(m.invite_programs(), (true, false));
+        m.busy = None;
+
+        m.helper.chatgpt = false;
+        m.toggle_helper_feed("garden-weather");
+        m.toggle_helper_feed("bus-times");
+        m.toggle_helper_feed("bus-times");
+        assert!(m.helper_feed_choices()[1].ticked);
+        m.helper.other.set(" sauna-temp, garden-weather  bins ");
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["garden-weather", "sauna-temp", "bins"], "each once");
+        assert_eq!(m.invite_programs(), (false, true));
+        m.busy = None;
+
+        m.helper.claude = true;
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds[0], "claude-max");
+        assert_eq!(m.invite_programs(), (true, true));
+        m.busy = None;
+    }
+
+    #[test]
+    fn a_bad_or_missing_feed_is_refused_before_anything_is_sent() {
+        let (mut m, _) = connected(vec![helper_page("garden", "garden-weather", "Garden")]);
+        m.helper.claude = false;
+        m.helper.chatgpt = false;
+        assert!(m.create_helper().is_none());
+        assert!(m
+            .notice
+            .as_ref()
+            .unwrap()
+            .title
+            .contains("Choose what the helper sends to"));
+        m.helper.other.set("Sauna_Temp");
+        assert!(m.create_helper().is_none());
+        let n = m.notice.clone().unwrap();
+        assert!(
+            n.title.contains("Sauna_Temp") && n.detail.contains("lower-case"),
+            "{n:?}"
+        );
+        assert!(m.busy.is_none());
+        let many: Vec<String> = (0..=HUB_PAGE_LIMIT).map(|i| format!("f{i}")).collect();
+        m.helper.other.set(&many.join(" "));
+        assert!(m.create_helper().is_none());
+        assert!(m.notice.as_ref().unwrap().title.contains("at most 50 feeds"));
+
+        // A tick for a feed whose pages have since gone isn't sent.
+        m.helper.other.clear();
+        m.toggle_helper_feed("garden-weather");
+        let now = Instant::now();
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now);
+        assert!(m.create_helper().is_none(), "nothing left to send to");
+    }
+
+    #[test]
+    fn inviting_from_the_new_page_readies_the_form_for_just_its_feed() {
+        let (mut m, _) = connected(vec![helper_page("bus-times", "bus-times", "Bus times")]);
+        m.helper.other.set("old");
+        m.invite_for_feed("bus-times");
+        assert_eq!(m.section, Section::Settings);
+        assert!(!m.helper.claude && !m.helper.chatgpt && m.helper.other.text.is_empty());
+        assert!(m.helper_feed_choices()[0].ticked);
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["bus-times"]);
     }
 }

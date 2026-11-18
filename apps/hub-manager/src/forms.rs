@@ -1,11 +1,13 @@
-//! The forms on the Pages screen, without any GPUI: a template's settings form, and the editors for
-//! content someone types in. Each checks what was entered and says what is wrong in plain words.
+//! The forms on the Pages screen, without any GPUI: a template's settings form, the form for a page
+//! a maker's own helper fills, and the editors for content someone types in. Each checks what was
+//! entered and says what is wrong in plain words.
 
 use hub_core::api::{NewPage, PageContentInput, PageView};
-use hub_core::model::clean_note;
+use hub_core::model::{clean_note, clean_title, valid_feed, MAX_FEED_LEN};
+use hub_core::Source;
 use hub_protocol::limits::{
-    MAX_BIG_NUMBER_ABS, MAX_CAPTION_LEN, MAX_LABEL_LEN, MAX_LIST_ITEMS, MAX_LIST_TEXT_LEN, MAX_METER_ITEMS,
-    MAX_NOTE_LEN, MAX_TEXT_LEN, MAX_UNIT_LEN,
+    MAX_BIG_NUMBER_ABS, MAX_CAPTION_LEN, MAX_KIND_LEN, MAX_LABEL_LEN, MAX_LIST_ITEMS, MAX_LIST_TEXT_LEN,
+    MAX_METER_ITEMS, MAX_NOTE_LEN, MAX_TEXT_LEN, MAX_TITLE_LEN, MAX_UNIT_LEN,
 };
 use hub_protocol::shapes::{classify_kind, KindClass, KIND_BIG_NUMBER, KIND_LIST, KIND_METER, KIND_TEXT};
 use hub_protocol::text::sanitise_text;
@@ -270,6 +272,108 @@ impl Input {
             FieldKind::YesNo => Input::YesNo(value.and_then(Value::as_bool).unwrap_or(false)),
         }
     }
+}
+
+// ---- a page for the maker's own helper -------------------------------------------------------------
+
+/// The kinds the form offers: the four ready-made shapes, then `None` for a kind of the maker's own.
+pub const HELPER_PAGE_KINDS: [Option<&str>; 5] = [
+    Some(KIND_METER),
+    Some(KIND_BIG_NUMBER),
+    Some(KIND_TEXT),
+    Some(KIND_LIST),
+    None,
+];
+
+/// A page filled by a helper the maker wrote: its title, its kind and the feed it takes.
+#[derive(Clone, Debug)]
+pub struct HelperPageForm {
+    pub title: Field,
+    /// One of the four shapes, or `None` for a kind of the maker's own, typed into `custom_kind`.
+    pub shape: Option<&'static str>,
+    pub custom_kind: Field,
+    pub feed: Field,
+    /// What the last check found wrong, in words for the owner.
+    pub error: Option<String>,
+}
+
+impl Default for HelperPageForm {
+    fn default() -> Self {
+        // Room for any characters, so a too-long answer is refused with a message instead of the
+        // box silently stopping.
+        Self {
+            title: Field::new(MAX_TITLE_LEN * 4 + 16),
+            shape: Some(KIND_TEXT),
+            custom_kind: Field::new(MAX_KIND_LEN + 16),
+            feed: Field::new(MAX_FEED_LEN + 16),
+            error: None,
+        }
+    }
+}
+
+impl HelperPageForm {
+    /// The kind chosen, or typed in for a kind of the maker's own.
+    pub fn kind(&self) -> String {
+        match self.shape {
+            Some(k) => k.to_string(),
+            None => self.custom_kind.trimmed().to_string(),
+        }
+    }
+
+    pub fn choose_kind(&mut self, shape: Option<&'static str>) {
+        self.shape = shape;
+        self.error = None;
+    }
+
+    /// The page to add, checked by the hub's own rules, or what is wrong with it.
+    pub fn check(&self) -> Result<NewPage, String> {
+        let typed = self.title.trimmed();
+        if typed.is_empty() {
+            return Err("Give the page a title, such as Bus times.".into());
+        }
+        if typed.chars().count() > MAX_TITLE_LEN {
+            return Err(format!("The title can be at most {MAX_TITLE_LEN} characters."));
+        }
+        let title = clean_title(typed).ok_or("The title needs some printable text.")?;
+        let kind = self.kind();
+        if self.shape.is_none() {
+            if kind.is_empty() {
+                return Err("Type the kind of page your helper sends, such as nearby-flights/1.".into());
+            }
+            if classify_kind(&kind) == KindClass::Invalid {
+                return Err(format!(
+                    "A kind of your own is a name, a slash and a version number, such as nearby-flights/1. The \
+                     name is lower-case letters, digits and hyphens (with dots between parts if you like), and \
+                     the whole kind is at most {MAX_KIND_LEN} characters."
+                ));
+            }
+        }
+        let feed = self.feed.trimmed();
+        if feed.is_empty() {
+            return Err("Name the feed your helper sends to, such as bus-times.".into());
+        }
+        if !valid_feed(feed) {
+            return Err(feed_rule());
+        }
+        Ok(NewPage {
+            title,
+            kind,
+            source: Source::Helper,
+            feed: Some(feed.to_string()),
+            id: None,
+            stale_after_seconds: None,
+            template: None,
+            settings: None,
+        })
+    }
+}
+
+/// What a feed name may be, as the hub says it.
+pub fn feed_rule() -> String {
+    format!(
+        "A feed name is lower-case letters and digits, in words joined by single hyphens, such as \
+         garden-weather, up to {MAX_FEED_LEN} characters."
+    )
 }
 
 // ---- editing typed-in content ---------------------------------------------------------------------------

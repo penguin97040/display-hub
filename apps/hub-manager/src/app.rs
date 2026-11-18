@@ -16,7 +16,7 @@ use gpui::{
 use hub_core::Source;
 
 use crate::field::Field;
-use crate::forms::{Input, Shape};
+use crate::forms::{Input, Shape, HELPER_PAGE_KINDS};
 use crate::guidance::{Guidance, Next, Tone};
 use crate::model::{self, Confirm, EnrolStage, Failure, Model, Op, Section, HUB_PAGE_LIMIT};
 use crate::shown::{self, Shown};
@@ -46,6 +46,9 @@ pub enum FieldId {
     /// A text or number setting of a template's form.
     Form(FormSlot, usize),
     EditTitle,
+    HelperPageTitle,
+    HelperPageKind,
+    HelperPageFeed,
     MeterLabel(usize),
     MeterPercent(usize),
     MeterResets(usize),
@@ -67,6 +70,8 @@ pub enum FieldId {
     InstallMaker,
     SignerLabel,
     PublisherLabel,
+    /// Feed names typed in for a helper invite.
+    HelperOther,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -202,6 +207,10 @@ impl Manager {
             FieldId::Form(FormSlot::Add, i) => m.add.form.as_mut()?.text_mut(i)?,
             FieldId::Form(FormSlot::Edit, i) => m.edit.as_mut()?.form.as_mut()?.text_mut(i)?,
             FieldId::EditTitle => &mut m.edit.as_mut()?.title,
+            FieldId::HelperPageTitle => &mut m.add.helper_page.as_mut()?.title,
+            FieldId::HelperPageKind => &mut m.add.helper_page.as_mut()?.custom_kind,
+            FieldId::HelperPageFeed => &mut m.add.helper_page.as_mut()?.feed,
+            FieldId::HelperOther => &mut m.helper.other,
             FieldId::MeterLabel(i) => {
                 &mut m
                     .edit
@@ -277,6 +286,10 @@ impl Manager {
         let op = match id {
             FieldId::Pairing | FieldId::PcName => self.model.submit_pairing(),
             FieldId::Form(FormSlot::Add, _) => self.model.submit_add(),
+            FieldId::HelperPageTitle | FieldId::HelperPageKind | FieldId::HelperPageFeed => {
+                self.model.submit_helper_page()
+            }
+            FieldId::HelperOther => self.model.create_helper(),
             FieldId::Form(FormSlot::Edit, _)
             | FieldId::EditTitle
             | FieldId::MeterLabel(_)
@@ -346,9 +359,9 @@ impl Manager {
                     self.model.cancel_label();
                 } else if self.model.fw.install.open && self.model.busy.is_none() {
                     self.model.close_install();
-                } else if self.model.add.setup.is_some() {
+                } else if self.model.add.setup.is_some() || self.model.add.feed.is_some() {
                     self.model.finish_setup();
-                } else if self.model.add.form.is_some() {
+                } else if self.model.add.form.is_some() || self.model.add.helper_page.is_some() {
                     self.model.leave_form();
                 } else if self.model.enrol.open && self.model.busy.is_none() {
                     self.model.close_enrol();
@@ -1586,8 +1599,14 @@ impl Manager {
         if let Some(setup) = self.model.add.setup.clone() {
             return self.setup_panel(&setup, m, cx);
         }
+        if let Some(steps) = self.model.add.feed.clone() {
+            return self.feed_panel(&steps, m, cx);
+        }
         if self.model.add.form.is_some() {
             return self.add_form_panel(m, window, cx);
+        }
+        if self.model.add.helper_page.is_some() {
+            return self.helper_page_panel(m, window, cx);
         }
         self.template_picker(m, cx)
     }
@@ -1627,12 +1646,207 @@ impl Manager {
                     .child(ui::p_muted(description).text_size(px(14.0))),
             );
         }
+        let own = self.button(
+            "helper-page",
+            "A page for your own helper",
+            Kind::Secondary,
+            enabled,
+            cx,
+            |this, _, _| this.model.open_helper_page(),
+        );
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(px(6.0))
+                .pt(px(10.0))
+                .border_t_1()
+                .border_color(c(LINE))
+                .child(own)
+                .child(
+                    ui::p_muted(
+                        "A page filled by a helper you wrote: a small program of yours that sends it with hub-send. \
+                         You choose its kind and the feed it takes.",
+                    )
+                    .text_size(px(14.0)),
+                ),
+        );
         if !self.model.can_add_page() {
             body = body.child(ui::p_muted(format!(
                 "The hub holds at most {HUB_PAGE_LIMIT} pages. Remove one to add another."
             )));
         }
         ui::with_ticks(ui::panel(Some(("Add from template", "")), m).child(body))
+    }
+
+    /// The form for a page the maker's own helper fills.
+    fn helper_page_panel(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let Some(form) = self.model.add.helper_page.clone() else {
+            return div();
+        };
+        let busy = self.model.busy.is_some();
+        let title = self.field(
+            FieldId::HelperPageTitle,
+            "Title",
+            &format!("Up to {} characters.", hub_protocol::limits::MAX_TITLE_LEN),
+            window,
+            cx,
+        );
+        let names: Vec<(Option<&'static str>, String)> = HELPER_PAGE_KINDS
+            .iter()
+            .map(|k| {
+                (
+                    *k,
+                    k.map_or_else(|| "Your own kind".to_string(), shown::kind_label),
+                )
+            })
+            .collect();
+        let options: Vec<(Option<&'static str>, &str)> =
+            names.iter().map(|(k, t)| (*k, t.as_str())).collect();
+        let kind = self.choice("helper-page-kind", "Kind", &options, form.shape, cx, |this, k| {
+            if let Some(f) = this.model.add.helper_page.as_mut() {
+                f.choose_kind(k);
+            }
+        });
+        let custom = form.shape.is_none().then(|| {
+            self.field(
+                FieldId::HelperPageKind,
+                "Your kind",
+                "A name, a slash and a version, such as nearby-flights/1. Only a display whose firmware knows \
+                 this kind can draw it.",
+                window,
+                cx,
+            )
+        });
+        let feed = self.field(
+            FieldId::HelperPageFeed,
+            "Feed",
+            "The name your helper sends to, such as bus-times: lower-case letters, digits and single hyphens.",
+            window,
+            cx,
+        );
+        let add = self.button(
+            "helper-page-add",
+            "Add page",
+            Kind::Primary,
+            !busy,
+            cx,
+            |this, _, cx| {
+                let op = this.model.submit_helper_page();
+                this.run(op, cx);
+            },
+        );
+        let back = self.button(
+            "helper-page-back",
+            "Back",
+            Kind::Quiet,
+            !busy,
+            cx,
+            |this, _, _| this.model.leave_form(),
+        );
+        let mut body = ui::body(m)
+            .child(ui::p_muted(
+                "A page your own helper fills. Choose the kind of page it sends, and the feed it sends to. Meter, \
+                 big number, short text and list are the shapes every display draws.",
+            ))
+            .child(title)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(kind)
+                    .children(custom),
+            )
+            .child(feed);
+        if let Some(e) = form.error.clone() {
+            body = body.child(form_error(&e));
+        }
+        ui::with_ticks(
+            ui::panel(Some(("A page for your own helper", "Esc to go back")), m)
+                .child(body.child(div().flex().gap(px(8.0)).child(add).child(back))),
+        )
+    }
+
+    /// How to feed a page just made for the maker's own helper: on the Pi, or on another computer.
+    fn feed_panel(&mut self, steps: &model::FeedSteps, m: Metrics, cx: &mut Context<Self>) -> Div {
+        let done = self
+            .button("feed-done", "Done", Kind::Secondary, true, cx, |this, _, _| {
+                this.model.finish_setup()
+            })
+            .into_any_element();
+        let pi = self.command_box(
+            "feed-pi-copy",
+            &steps.pi_command,
+            steps.pi_copied,
+            None,
+            cx,
+            |this| this.model.copy_feed_command(true),
+        );
+        let feed = steps.feed.clone();
+        let invite = self.button(
+            "feed-invite",
+            "Invite a helper",
+            Kind::Secondary,
+            true,
+            cx,
+            move |this, _, _| this.model.invite_for_feed(&feed),
+        );
+        let send = self.command_box(
+            "feed-send-copy",
+            &steps.send_command,
+            steps.send_copied,
+            None,
+            cx,
+            |this| this.model.copy_feed_command(false),
+        );
+        let kind = shown::kind_label(&steps.kind).to_lowercase();
+        let example = match steps.example {
+            Some(e) => format!("Data for a {kind} page looks like this: {e}"),
+            None => "The data is in the shape your kind needs, which your display's firmware draws.".into(),
+        };
+        let mut pi_help = format!(
+            "Copy your helper program to the Pi, named {}. Then, in the folder that holds it, run:",
+            steps.pi_name
+        );
+        if steps.pi_name != steps.feed {
+            pi_help.push_str(
+                " (A helper's name on the Pi is 20 characters at most, so it sends to the feed by --feed.)",
+            );
+        }
+        ui::with_ticks(
+            ui::panel(Some(("Feed this page", "")), m).child(
+                ui::body(m)
+                    .child(ui::p(format!(
+                        "The page shows what a helper sends to the feed {}, as {} pages. Set the helper up in one \
+                         of these two places.",
+                        steps.feed,
+                        if steps.example.is_some() { kind.clone() } else { steps.kind.clone() }
+                    )))
+                    .child(ui::h3("On the hub's Raspberry Pi"))
+                    .child(ui::p_muted(pi_help))
+                    .child(pi)
+                    .child(ui::p_muted(
+                        "That pairs the helper, runs it once and then every 5 minutes, in a sandbox of its own. It \
+                         needs no invite.",
+                    ))
+                    .child(ui::h3("On another computer"))
+                    .child(ui::p_muted(format!(
+                        "1. Invite a helper for {} in Settings. On that computer, run hub-send login and paste the \
+                         helper string.",
+                        steps.feed
+                    )))
+                    .child(div().flex().child(invite))
+                    .child(ui::p_muted(
+                        "2. Your helper sends each page with this command, giving the page's data as JSON on \
+                         standard input:",
+                    ))
+                    .child(send)
+                    .child(ui::p_muted(example).text_size(px(14.0)))
+                    .child(div().flex().pt(px(8.0)).child(done)),
+            ),
+        )
     }
 
     /// The chosen template's form, and the buttons to add the pages or go back.
@@ -2435,7 +2649,7 @@ impl Manager {
         .detach();
     }
 
-    fn settings(&mut self, m: Metrics, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+    fn settings(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let head = self
             .head("Settings", "This PC's connection to the hub.", m, cx)
             .into_any_element();
@@ -2521,7 +2735,7 @@ impl Manager {
                     .child(div().flex().child(again)),
             ),
         );
-        let helper_panel = self.helper_panel(m, cx);
+        let helper_panel = self.helper_panel(m, window, cx);
         let about = ui::with_ticks(
             ui::panel(Some(("About", "")), m).child(
                 ui::body(m)
@@ -2628,7 +2842,7 @@ impl Manager {
             )
     }
 
-    fn helper_panel(&mut self, m: Metrics, cx: &mut Context<Self>) -> Div {
+    fn helper_panel(&mut self, m: Metrics, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let busy = self.model.busy.is_some();
         let claude = self.toggle(
             "helper-claude",
@@ -2655,14 +2869,46 @@ impl Manager {
                 this.run(op, cx);
             },
         );
+        let mut own = div().flex().flex_wrap().gap(px(8.0));
+        for choice in self.model.helper_feed_choices() {
+            let feed = choice.feed.clone();
+            own = own.child(self.toggle(
+                &format!("helper-feed-{}", choice.feed),
+                &choice.feed,
+                choice.ticked,
+                cx,
+                move |this| this.model.toggle_helper_feed(&feed),
+            ));
+        }
+        let other = self.field(
+            FieldId::HelperOther,
+            "Other feeds (optional)",
+            "Feeds no page has yet, separated by spaces, such as garden-weather.",
+            window,
+            cx,
+        );
         let mut body = ui::body(m)
             .child(ui::p_muted(
-                "A helper is a small program that sends figures to your pages, and you can do without it. This one, usage-helper, runs on a computer \
-                 where Claude Code or Codex is signed in, and passes on the plan limits they report there. Pages whose \
-                 figures are set to Helper show them, marked REPORTED. It reads nothing else: no browser data, \
-                 passwords or other apps' tokens. (Helpers on the Pi are set up there, with the Pi status template.)",
+                "A helper is a small program that sends figures to your pages, and you can do without it. Pages whose \
+                 figures are set to Helper show what it sends, marked REPORTED. Choose the feeds it may send to, then \
+                 make a helper string for it here. (Helpers on the hub's Pi are set up there, with \
+                 display-hub-helper, and need no string.)",
+            ))
+            .child(ui::label("Usage limits, sent by usage-helper"))
+            .child(ui::p_muted(
+                "usage-helper runs on a computer where Claude Code or Codex is signed in, and passes on the plan limits \
+                 they report there. It reads nothing else: no browser data, passwords or other apps' tokens.",
             ))
             .child(div().flex().flex_wrap().gap(px(8.0)).child(claude).child(chatgpt))
+            .child(ui::label("Your own helper, sending with hub-send"))
+            .when(self.model.helper_feed_choices().is_empty(), |d| {
+                d.child(ui::p_muted(
+                    "No page takes a feed of your own yet. Make one in Pages, with A page for your own helper, or type \
+                     its feed below.",
+                ))
+            })
+            .child(own)
+            .child(other)
             .child(div().flex().child(create));
         if let Some(s) = self.model.helper.string.clone() {
             let shown: String = s
@@ -2682,10 +2928,28 @@ impl Manager {
                     cx.write_to_clipboard(ClipboardItem::new_string(full.clone()));
                     this.model.notice = Some(Guidance::done(
                         "Copied the helper string",
-                        "Paste it where usage-helper login asks. It works once, within 10 minutes.",
+                        "Paste it where usage-helper login or hub-send login asks. It works once, within 10 minutes.",
                     ));
                 },
             );
+            let (usage, own) = self.model.invite_programs();
+            let mut how = Vec::new();
+            if usage {
+                how.push(
+                    "For the usage limits, run usage-helper login on that computer and paste it. Then add usage-helper \
+                     claude-statusline as Claude Code's status line, or schedule usage-helper-sync for Codex: \
+                     docs/providers.md has the steps.",
+                );
+            }
+            if own {
+                how.push(
+                    "For your own helper, run hub-send login on that computer and paste it. Your helper then sends \
+                     with hub-send page: docs/helpers.md has the steps.",
+                );
+            }
+            if usage && own {
+                how.push("A string works once, for one program: to set up both, make a string for each.");
+            }
             body = body.child(
                 div()
                     .id("helper-string")
@@ -2700,10 +2964,7 @@ impl Manager {
                     .child(ui::label("Helper string: works once, within 10 minutes"))
                     .child(ui::data(shown))
                     .child(div().flex().child(copy))
-                    .child(ui::p_muted(
-                        "On that computer, run usage-helper login and paste it. Then add usage-helper claude-statusline as Claude \
-                         Code's status line, or schedule usage-helper-sync for Codex: docs/providers.md has the steps.",
-                    )),
+                    .child(ui::p_muted(how.join(" "))),
             );
         }
         let helpers = self.model.helpers().to_vec();
@@ -2837,7 +3098,7 @@ impl Render for Manager {
                 Section::Pages => self.pages(m, window, cx),
                 Section::Displays => self.displays(m, window, cx),
                 Section::Firmware => self.firmware(m, window, cx),
-                Section::Settings => self.settings(m, cx),
+                Section::Settings => self.settings(m, window, cx),
             };
             content.extend(screen);
         }

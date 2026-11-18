@@ -3050,6 +3050,7 @@ dependencies = [
  "hub-client",
  "hub-core",
  "hub-protocol",
+ "hub-send",
  "hub-templates",
  "hubd",
  "os-secrets",
