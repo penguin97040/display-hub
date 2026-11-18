@@ -13,6 +13,11 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 
+# --- Tasks ---
+# app_main draws the first screen itself (lv_refr_now), and LVGL's software drawing needs far more
+# than the default 3.5 KB of stack: the first board test overflowed it. 8 KB, as the LVGL task has.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
 # --- Partitions and updates ---
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

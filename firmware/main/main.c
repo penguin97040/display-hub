@@ -45,6 +45,9 @@ void app_main(void)
 
     while (true) {
         report_log(&s_board, &s_system, &s_efuse, ui_board_test_last_swipe());
+        // How close app_main has come to the end of its stack, so the headroom is seen, not guessed.
+        ESP_LOGI(TAG, "main task stack never used: %u bytes",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL));
         vTaskDelay(pdMS_TO_TICKS(LOG_EVERY_MS));
     }
 }
