@@ -1,6 +1,6 @@
 # Templates: ready-made pages with a short form
 
-A **template** describes a kind of page someone might want, such as "usage limits" or "Pi status", as a small JSON file. It has a short **settings form** (the questions to ask, such as "Which service?") and a list of the **pages** the answers make. The desktop manager will show the form, check the answers and add the pages. That part of the manager comes later; for now the format, the built-in templates and the hub's side are in place.
+A **template** describes a kind of page someone might want, such as "usage limits" or "Pi status", as a small JSON file. It has a short **settings form** (the questions to ask, such as "Which service?") and a list of the **pages** the answers make. The desktop manager shows the form, checks the answers and adds the pages: in **Pages**, choose **Add from template**. For now the manager offers only its built-in templates; loading one from a file comes later. [`starters/helper/template.json`](../starters/helper/template.json) is a small example.
 
 A template holds no code. It is only fields, options, simple conditions and `{key}` placeholders, so a template from anywhere can't run anything on your computer or the hub.
 

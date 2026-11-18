@@ -73,7 +73,7 @@ fn usage_limits_makes_what_the_manager_makes_today() {
 }
 
 #[test]
-fn usage_limits_offers_the_pc_helper_only_where_something_reports() {
+fn usage_limits_offers_the_helper_only_where_something_reports() {
     let t = built_in_template("usage-limits/1").unwrap();
     let source = t.field("source").unwrap();
     for service in Service::ALL {

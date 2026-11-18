@@ -5,10 +5,10 @@
 | Part | Runs on | Job |
 |---|---|---|
 | `hubd` | Raspberry Pi 5, always on | Keeps the pages, what each shows, which pages each display shows, and the displays. Builds each display's snapshot. Serves the device and admin APIs over HTTPS on the local network. |
-| ESP32 displays (`llm-usage-display` repo) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
-| `hub-manager` | Windows PC (macOS and Linux later) | Pairs with the hub. Adds, removes and reorders pages. Enters manual figures. Adds and revokes displays. Shows diagnostics. Doesn't need to stay open. |
+| ESP32 displays (official firmware in `firmware/`, being built; or a maker's own) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
+| `hub-manager` | A PC: Windows and Linux, macOS being added | Pairs with the hub. Adds, removes and reorders pages. Enters manual figures. Adds and revokes displays. Shows diagnostics. Doesn't need to stay open. |
 | `hub-send` | Any computer | The general "send data" tool and library: pairs a helper with the hub, keeps its token, and sends a page body to a feed ([helpers.md](helpers.md)). |
-| `hub-templates` | Inside the manager (later) | Reads, checks and fills in page templates: a settings form and the pages it makes, as declarative JSON ([templates.md](templates.md)). The hub doesn't use it. |
+| `hub-templates` | Inside the manager | Reads, checks and fills in page templates: a settings form and the pages it makes, as declarative JSON ([templates.md](templates.md)). The hub doesn't use it. |
 | `usage-helper` | The PC | Optional helper that forwards usage figures your own tools already report (Claude Code, Codex) to the hub ([providers.md](providers.md)). It builds usage meter pages with the `usage` crate and sends them through `hub-send`'s library. |
 | `display-simulator` | Any computer | Behaves like a display, for testing without hardware. |
 
@@ -73,7 +73,7 @@ The manager still works in usage subscriptions. `hub-client` maps them onto mete
 
 ## Helper API
 
-Makers writing their own helper: see [helpers.md](helpers.md).
+Makers writing their own helper: start with [BUILDING-A-DISPLAY.md](../BUILDING-A-DISPLAY.md) and [helpers.md](helpers.md).
 
 A firmware maker's `hub-firmware` tool pairs as a **publisher** with `POST /v1/publisher/pair` (`{"secret": ...}` from a publisher string made by the app or `hubd pair-publisher`), and gets `{"publisher_id", "publisher_token"}`. The token (`dhp_…`) works only on `POST` and `GET /v1/publisher/firmware`, which upload and list packages as the admin routes do (the list without the displays a package is offered to). Everything else answers `403`.
 
@@ -120,8 +120,11 @@ A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper st
 |---|---|---|
 | M0 | Plan, toolchain, GPUI start-up check on Linux and a cross-built Windows executable | Done; the owner ran it on Windows (11/11/2026) |
 | M1 | Protocol v1, demo hub on loopback, display simulator, offline tests | Done |
-| M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Done (Linux and mbedTLS; not yet on a Pi) |
-| M3 | Desktop manager on GPUI, USB provisioning | Done on Linux and built for Windows; the Windows desktop run is the owner's to try |
-| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Done in a systemd container and under emulation; the real Pi is the owner's to try |
+| M2 | SQLite, HTTPS with pinned identity, admin pairing, display enrolment, revocation | Done, and running on a real Pi |
+| M3 | Desktop manager on GPUI, USB provisioning | Done, and used on Windows with a real Pi |
+| M4 | Raspberry Pi install: systemd, backups, ARM64 builds | Done, tested in Bookworm and Trixie containers and on a real Pi 5 |
 | M5 | Helpers: helper on the PC for Claude Code and Codex, manual entry for OpenCode Go | Done and tested against stand-ins; not yet against a live Claude Code or Codex |
-| M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | Done: [firmware-handoff.md](firmware-handoff.md). The firmware itself is built in `llm-usage-display`. |
+| M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | Done, and rewritten for the general backbone: [firmware-handoff.md](firmware-handoff.md) |
+| Backbone 1–4 | Custom pages and ready-made shapes, generic hub storage with per-display ticks, one door for helpers (also on the Pi), templates and the first-run guide | Done |
+| Backbone 5 | Install firmware over USB from the app, signed updates through the hub, rollback, the simulator as the reference display | Done; the flasher and the update path tried on real hardware with a test image |
+| Backbone 6 | Release: macOS, downloads, guides for makers, the official firmware | In progress |

@@ -1,6 +1,6 @@
 # Trying the desktop manager on Windows
 
-The manager is built and tested on Linux, cross-built for Windows, and smoke-tested on a Windows runner in CI (the window opens and draws one frame with Windows' software renderer). Nobody has yet used it on a real Windows desktop. This page is the checklist for doing that.
+The manager is built and tested on Linux, cross-built for Windows, and smoke-tested on a Windows runner in CI (the window opens and draws one frame with Windows' software renderer). It has also been used on a real Windows desktop, with a real Pi and an ESP32-S3 board. This page is the checklist for trying it yourself.
 
 You don't need the Raspberry Pi for this. `hubd` also runs on Windows, on your own PC, and the display simulator stands in for a display.
 

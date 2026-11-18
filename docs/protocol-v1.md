@@ -1,6 +1,6 @@
 # Display protocol, version 1
 
-**Status: reshaped on 16/11/2026 for general pages, and not yet frozen again.** Until it is, v1 may still change in ways that aren't just additions. Once it is frozen, it changes only by adding things (see Compatibility). Everything here is implemented in `hubd` and tested, including against mbedTLS 3.6, the line ESP-IDF 5.x uses.
+**Status: frozen on 18/11/2026.** v1 was reshaped for general pages on 16/11/2026, extended with signed firmware updates in November 2026, and frozen again on 18/11/2026. From now on it changes only by optional additions (see [Compatibility](#compatibility)). Everything here is implemented in `hubd` and tested, including against mbedTLS 3.6, the line ESP-IDF 5.x uses.
 
 This document is for anyone writing display firmware. The machine-readable parts are in `protocol/v1/`: JSON Schemas for every message and examples for each. The Rust reference implementation is `crates/hub-protocol`, and `tools/display-simulator` is the reference display.
 
@@ -312,7 +312,7 @@ Rules:
 
 - Each answer must arrive within 10 seconds.
 - The manager repeats `hello` every 2 seconds until it gets an answer, in case the board restarted when the port opened. Answer every `hello`.
-- The manager opens the port with DTR set and RTS clear, which doesn't reset an ESP32 through its USB serial bridge.
+- The manager opens the port with DTR set and RTS clear. Through a USB serial bridge chip, that doesn't reset an ESP32. On a chip's own USB-Serial-JTAG it may: on an ESP32-S3 board, opening the port with DTR set restarted the chip, and console output flowed only while DTR was set. That restart is why `hello` is repeated.
 - A display that is already provisioned answers `already_provisioned`, and keeps its settings, until the owner factory-resets it on the device itself. Someone who plugs a cable in can't silently point it at another hub.
 - A factory reset erases the Wi-Fi settings, trust anchors and token. It keeps the firmware keys and security floor.
 - `firmware_keys_locked` means the display already trusts a different set of firmware keys, and only **Install firmware** (a USB install that erases it) can change them. An older manager shows it as an unrecognised error, with the message.

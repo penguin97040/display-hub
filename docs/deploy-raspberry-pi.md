@@ -2,7 +2,7 @@
 
 `hubd` runs on a Raspberry Pi 5 (a Pi 4 works too) as a systemd service, around the clock. Displays and the desktop manager reach it over HTTPS on port 8443 on your local network.
 
-**What has been tested:** the installer, the service, restarts, a crash, a network cut, a reboot, a bad setting, backup and restore, helpers in their sandboxes, an upgrade and an uninstall. They ran in Debian Bookworm and Trixie containers with systemd (`tools/pi-container-test/run.sh`, also in CI). The ARM64 binaries were also run under emulation against Bookworm's and Trixie's own C libraries. **Nobody has run it on a real Pi yet.** The steps below are written for that, and the last section lists what to watch for.
+**What has been tested:** the installer, the service, restarts, a crash, a network cut, a reboot, a bad setting, backup and restore, helpers in their sandboxes, an upgrade and an uninstall. They ran in Debian Bookworm and Trixie containers with systemd (`tools/pi-container-test/run.sh`, also in CI). The ARM64 binaries were also run under emulation against Bookworm's and Trixie's own C libraries. It has also been installed and upgraded several times on a real Raspberry Pi 5 running Trixie. The last section lists what to watch for.
 
 ## What you need
 
@@ -110,7 +110,7 @@ The hub shows what a helper sends on pages of the same kind whose content comes 
 
 ### Your own helper
 
-A helper can be any program that runs on its own, without anyone typing at it: a shell script or a Python script, for instance. It sends a page with `hub-send`, for example:
+A helper can be any program that runs on its own, without anyone typing at it: a shell script or a Python script, for instance. [`starters/helper/`](../starters/helper/) is one to copy. It sends a page with `hub-send`, for example:
 
 ```sh
 echo '{"value": 21.5, "unit": "°C"}' | hub-send page garden-weather --kind big_number --data -
