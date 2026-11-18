@@ -1541,9 +1541,33 @@ mod tests {
         assert_eq!(title(&m), None);
         // Readable again, then failing again: told again.
         m.finish(Ok(Outcome::Refreshed(Some(readable))), now);
-        assert_eq!(m.firmware_lists, super::super::ListsState::Readable);
+        assert!(!m.lists_told);
         m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
         assert_eq!(title(&m), Some(lists));
+    }
+
+    #[test]
+    fn the_firmware_lists_notice_waits_for_a_notice_the_same_answer_brings() {
+        let failing = |m: &Model| {
+            let mut r = m.last.clone().unwrap();
+            r.firmware = None;
+            r.firmware_error = Some(std::sync::Arc::new(ClientError::Timeout));
+            r
+        };
+        let title = |m: &Model| m.notice.as_ref().map(|n| n.title.clone());
+        let (mut m, now) = with_firmware();
+        // A save whose refresh finds the lists unreadable: the save's own notice is what shows.
+        m.busy = Some(Busy::Saving {
+            done: "Removed Weather.".into(),
+        });
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m).as_deref(), Some("Removed Weather."));
+        assert!(!m.lists_told, "not counted as told");
+        // Once that has been dismissed, the next refresh says it.
+        m.notice = None;
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m).as_deref(), Some("Couldn't read the firmware lists"));
+        assert!(m.lists_told);
     }
 
     #[test]
@@ -2102,13 +2126,34 @@ mod tests {
         assert!(m.send_usb("COM9").is_none());
         assert_eq!(m.pending_keys().unwrap().port, "COM5");
 
-        // Saved to a file: never with the keys, which keep waiting for COM5.
+        // Saved to a file: never with the keys. They wait while it is saved, in case that fails, and
+        // once it is saved they are dropped, as nothing more can be sent from here: the notice says
+        // so.
         let (mut m, _) = keys_waiting();
         match m.save_bundle(PathBuf::from("setup.json")) {
             Some(Op::SaveBundle { bundle, .. }) => assert!(bundle.firmware.is_none()),
             other => panic!("{other:?}"),
         }
         assert!(m.pending_keys().unwrap().include);
+        m.finish(Err(Failure::File("The disk is full.".into())), Instant::now());
+        assert_eq!(m.pending_keys().unwrap().port, "COM5", "kept after a failed save");
+        assert!(m.save_bundle(PathBuf::from("setup.json")).is_some());
+        m.finish(Ok(Outcome::Saved(PathBuf::from("setup.json"))), Instant::now());
+        assert!(m.pending_keys().is_none());
+        assert!(matches!(m.enrol.stage, EnrolStage::Waiting { .. }));
+        let n = m.notice.as_ref().unwrap();
+        assert!(
+            n.detail.contains("just installed on COM5 aren't in it"),
+            "{}",
+            n.detail
+        );
+        // Left out by the owner beforehand: nothing to say.
+        let (mut m, _) = keys_waiting();
+        m.include_pending_keys(false);
+        m.save_bundle(PathBuf::from("setup.json"));
+        m.finish(Ok(Outcome::Saved(PathBuf::from("setup.json"))), Instant::now());
+        assert!(m.pending_keys().is_none());
+        assert!(!m.notice.as_ref().unwrap().detail.contains("keys"));
 
         // Cancelling Add a display drops them; so does starting another install.
         let (mut m, _) = keys_waiting();

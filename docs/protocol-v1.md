@@ -340,7 +340,7 @@ The full design, with the package format, what a display must check and the thre
 
 - `not_found` (404): this display has no open offer for that package;
 - `rate_limited` (429): this display has started 6 downloads in the last hour;
-- `unavailable` (503): this display is already downloading, or the hub is already sending 2 downloads.
+- `unavailable` (503): the hub is already sending 2 downloads to other displays, or can't read the package. A new download from a display that is already downloading isn't refused: it takes over from the last one, whose connection the hub closes.
 
 The request has its own 15-minute time limit, in place of the usual 10 seconds. A display gives up on a download that sends nothing for 30 seconds or takes more than 15 minutes, by its monotonic timer.
 

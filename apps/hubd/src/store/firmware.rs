@@ -52,6 +52,8 @@ pub struct PackageRow {
     /// What a display receives: header, manifest and image.
     pub update_size: u64,
     pub usb_install: bool,
+    /// The key ids (64 hex digits each) of the manifest's `key_set`, if it has one.
+    pub key_set: Option<Vec<String>>,
     pub uploaded_at: Timestamp,
     pub uploaded_by_role: Role,
     pub uploaded_by: String,
@@ -119,7 +121,7 @@ pub struct NewOffer<'a> {
 
 const PACKAGE_COLUMNS: &str = "p.id, p.device_type, p.hardware_revisions, p.firmware_version, \
      p.security_counter, p.summary, p.signer_key_id, p.signer_public_key, p.image_size, p.size, \
-     p.update_size, p.usb_install, p.uploaded_at, p.uploaded_by_role, p.uploaded_by, \
+     p.update_size, p.usb_install, p.uploaded_at, p.uploaded_by_role, p.uploaded_by, p.key_set, \
      (SELECT c.label FROM credentials c WHERE c.subject = p.uploaded_by AND c.role = p.uploaded_by_role \
       ORDER BY c.created_at DESC LIMIT 1)";
 
@@ -145,7 +147,16 @@ fn package_row(r: &Row<'_>) -> rusqlite::Result<PackageRow> {
         uploaded_at: ts(r.get(12)?),
         uploaded_by_role: Role::parse(&role).unwrap_or(Role::Admin),
         uploaded_by: r.get(14)?,
-        uploaded_by_label: r.get(15)?,
+        // Never read as "no key_set": that would let the courtesy check pass a package that drops
+        // a key.
+        key_set: r
+            .get::<_, Option<String>>(15)?
+            .map(|ks| serde_json::from_str(&ks))
+            .transpose()
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(e))
+            })?,
+        uploaded_by_label: r.get(16)?,
     })
 }
 
@@ -282,8 +293,8 @@ impl Store {
         tx.execute(
             "INSERT INTO firmware_packages (id, device_type, hardware_revisions, firmware_version, \
              security_counter, summary, signer_key_id, signer_public_key, image_size, size, update_size, \
-             usb_install, uploaded_at, uploaded_by_role, uploaded_by) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+             usb_install, uploaded_at, uploaded_by_role, uploaded_by, key_set) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 row.id,
                 row.device_type,
@@ -300,6 +311,9 @@ impl Store {
                 row.uploaded_at.unix(),
                 row.uploaded_by_role.as_str(),
                 row.uploaded_by,
+                row.key_set
+                    .as_ref()
+                    .map(|ks| serde_json::to_string(ks).expect("serialises")),
             ],
         )?;
         tx.commit()?;

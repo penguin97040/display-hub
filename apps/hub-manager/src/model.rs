@@ -811,20 +811,9 @@ pub struct Model {
     /// The keys from an install whose setup details weren't sent, for the next Add a display to
     /// the same port.
     pub pending_firmware: Option<PendingKeys>,
-    /// Whether the hub's firmware lists could be read at the last refresh.
-    firmware_lists: ListsState,
-}
-
-/// Whether the hub's firmware lists could be read, and if not, whether the owner has been told.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ListsState {
-    #[default]
-    Readable,
-    /// They couldn't be read at the last refresh, and the notice hasn't been shown yet: another
-    /// notice was showing.
-    Failing,
-    /// They couldn't be read, and the notice was shown once.
-    Told,
+    /// The owner has been shown that the hub's firmware lists couldn't be read, since they were
+    /// last readable.
+    lists_told: bool,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -878,7 +867,7 @@ impl Model {
             install_copied: false,
             fw: FirmwareUi::default(),
             pending_firmware: None,
-            firmware_lists: ListsState::Readable,
+            lists_told: false,
         }
     }
 
@@ -1642,7 +1631,7 @@ impl Model {
 
     /// Saves the setup details to a file. Keys waiting from an install never go in it: they go
     /// only over USB, to the port the firmware was installed through, and a file could reach any
-    /// display.
+    /// display. Once it is saved they are dropped, as the details can't then be sent from here.
     pub fn save_bundle(&mut self, path: PathBuf) -> Option<Op> {
         let bundle = self.enrol.bundle.clone()?;
         self.start(Busy::SavingFile, Op::SaveBundle { path, bundle })
@@ -1760,35 +1749,18 @@ impl Model {
     }
 
     fn take_refresh(&mut self, mut r: Refresh, now: Instant) {
-        if let Some(e) = r.firmware_error.take() {
+        if r.firmware_error.is_some() {
             // The hub has firmware lists, but they couldn't be read this time: keep the ones it had
-            // rather than showing it as a hub without signed updates.
+            // rather than showing it as a hub without signed updates. The error stays, for
+            // `tell_unreadable_lists`.
             r.firmware = Some(
                 self.last
                     .as_ref()
                     .and_then(|l| l.firmware.clone())
                     .unwrap_or_default(),
             );
-            // Said once each time the lists stop being readable, not at every refresh while they
-            // stay so, and never over a notice the owner hasn't dismissed.
-            if self.firmware_lists != ListsState::Told {
-                self.firmware_lists = ListsState::Failing;
-                if self.notice.is_none() {
-                    let why = guidance::from_client(&e, Doing::Other, &self.address());
-                    self.notice = Some(Guidance {
-                        tone: Tone::Problem,
-                        title: "Couldn't read the firmware lists".into(),
-                        detail: format!(
-                            "{}. {} The Firmware screen shows what the hub held when it last answered.",
-                            why.title, why.detail
-                        ),
-                        next: Next::None,
-                    });
-                    self.firmware_lists = ListsState::Told;
-                }
-            }
         } else {
-            self.firmware_lists = ListsState::Readable;
+            self.lists_told = false;
         }
         if let EnrolStage::Waiting { .. } = self.enrol.stage {
             if let Some(d) = r.displays.iter().find(|d| !self.enrol.known.contains(&d.id)) {
@@ -1819,6 +1791,35 @@ impl Model {
     }
 
     pub fn finish(&mut self, result: Result<Outcome, Failure>, now: Instant) {
+        self.take_outcome(result, now);
+        self.tell_unreadable_lists();
+    }
+
+    /// Says the firmware lists couldn't be read at the last refresh: once each time they stop being
+    /// readable, not at every refresh while they stay so, and never over another notice, including
+    /// one the outcome just set. If one is showing, it is said at a later answer, once that notice
+    /// has been dismissed.
+    fn tell_unreadable_lists(&mut self) {
+        if self.lists_told || self.notice.is_some() {
+            return;
+        }
+        let Some(e) = self.last.as_ref().and_then(|r| r.firmware_error.clone()) else {
+            return;
+        };
+        let why = guidance::from_client(&e, Doing::Other, &self.address());
+        self.notice = Some(Guidance {
+            tone: Tone::Problem,
+            title: "Couldn't read the firmware lists".into(),
+            detail: format!(
+                "{}. {} The Firmware screen shows what the hub held when it last answered.",
+                why.title, why.detail
+            ),
+            next: Next::None,
+        });
+        self.lists_told = true;
+    }
+
+    fn take_outcome(&mut self, result: Result<Outcome, Failure>, now: Instant) {
         let busy = self.busy.take();
         match result {
             Ok(Outcome::Paired { hub, refresh }) => {
@@ -1962,13 +1963,25 @@ impl Model {
                 ));
             }
             Ok(Outcome::Saved(path)) => {
-                self.pending_firmware = None;
+                // Keys waiting from an install were left out of the file, and nothing more can be
+                // sent from here once it is saved: they are done with.
+                let keys = match self.pending_firmware.take() {
+                    Some(p) if p.include => format!(
+                        " The keys from the firmware just installed on {} aren't in it, so the display keeps the keys \
+                         it already trusts, if any. With none, it accepts no updates until it gets keys over USB.",
+                        p.port
+                    ),
+                    _ => String::new(),
+                };
                 self.enrol.stage = EnrolStage::Waiting {
                     how: format!("Saved to {}", path.display()),
                 };
                 self.notice = Some(Guidance::done(
                     "Setup file saved",
-                    "It holds a one-time secret and any Wi-Fi password. Delete it once the display has checked in.",
+                    format!(
+                        "It holds a one-time secret and any Wi-Fi password. Delete it once the display has \
+                         checked in.{keys}"
+                    ),
                 ));
             }
             Ok(Outcome::Forgotten) => {

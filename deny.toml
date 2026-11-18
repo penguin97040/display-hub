@@ -18,6 +18,7 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant, Linux only, as zbus_names." },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, Linux only, as zbus_names." },
     { id = "RUSTSEC-2024-0436", reason = "paste, from GPUI image dependencies: a compile-time macro, no code in the executable." },
+    { id = "RUSTSEC-2026-0543", reason = "chrono, from gpui-pre and its scheduler: date and time handling inside GPUI. No direct use, and no parsing of untrusted dates." },
 ]
 
 [licenses]

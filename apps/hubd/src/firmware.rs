@@ -331,27 +331,6 @@ pub fn same_release<'a>(
         })
 }
 
-/// The key ids of each stored package's `key_set`, by package id, for the packages that have one.
-pub type KeySets = std::collections::HashMap<String, Vec<String>>;
-
-/// The key ids of a stored package's `key_set`, read from the manifest in its file, which passed
-/// every check when it was uploaded. `None` if it has no `key_set`, or if the file can't be read
-/// (then it can't be sent either, and tidying drops its row).
-pub fn key_set(dir: &Path, package_id: &str) -> Option<Vec<String>> {
-    let (_, manifest) = signed_part(&package_path(dir, package_id))?;
-    let m = firmware_package::Manifest::parse(&manifest).ok()?;
-    m.key_set
-        .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect())
-}
-
-/// [`key_set`] for each of `packages`.
-pub fn key_sets(dir: &Path, packages: &[PackageRow]) -> KeySets {
-    packages
-        .iter()
-        .filter_map(|p| key_set(dir, &p.id).map(|ks| (p.id.clone(), ks)))
-        .collect()
-}
-
 /// A row for a package that passed `firmware_package::check`.
 pub fn row_from(checked: &CheckedPackage, role: Role, by: &str, now: Timestamp) -> PackageRow {
     let m = &checked.manifest;
@@ -368,6 +347,10 @@ pub fn row_from(checked: &CheckedPackage, role: Role, by: &str, now: Timestamp) 
         size: checked.len,
         update_size: checked.update_form_len(),
         usb_install: m.usb_install.is_some(),
+        key_set: m
+            .key_set
+            .as_ref()
+            .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect()),
         uploaded_at: now,
         uploaded_by_role: role,
         uploaded_by: by.to_string(),
@@ -387,7 +370,6 @@ pub fn package_view(
     p: &PackageRow,
     labels: &std::collections::HashMap<String, String>,
     offered_to: Vec<String>,
-    key_set: Option<Vec<String>>,
 ) -> FirmwarePackageView {
     FirmwarePackageView {
         package_id: p.id.clone(),
@@ -403,7 +385,7 @@ pub fn package_view(
         update_size: p.update_size,
         image_size: p.image_size,
         usb_install: p.usb_install,
-        key_set,
+        key_set: p.key_set.clone(),
         uploaded_at: p.uploaded_at,
         uploaded_by_role: p.uploaded_by_role.as_str().to_string(),
         uploaded_by: p.uploaded_by.clone(),
@@ -433,8 +415,7 @@ pub fn offer_view(o: &OfferRow, now: Timestamp) -> FirmwareOfferView {
 /// The courtesy checks before an offer: by the display's own last report, would it refuse this
 /// package? A plain sentence if so. The display repeats every check; these only save a pointless
 /// download and say why.
-/// `key_set` is the package's, from [`key_set`].
-pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow, key_set: Option<&[String]>) -> Result<(), String> {
+pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String> {
     let Some(info) = info else {
         return Err(
             "This display hasn't reported itself to the hub yet. Wait for it to check in, then try again."
@@ -479,7 +460,12 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow, key_set: Option<&[Str
             fw.security_floor, p.security_counter
         ));
     }
-    if firmware_package::drops_key_unraised(key_set, &fw.key_ids, p.security_counter, fw.security_floor) {
+    if firmware_package::drops_key_unraised(
+        p.key_set.as_deref(),
+        &fw.key_ids,
+        p.security_counter,
+        fw.security_floor,
+    ) {
         return Err(format!(
             "This package would stop the display trusting one of its firmware keys without a higher \
              security counter (this package's counter is {}, and the display's floor is {}), so it would \
@@ -497,15 +483,11 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow, key_set: Option<&[Str
 }
 
 /// The newest package that passes the courtesy checks for a display and is newer than what it runs.
-pub fn best_package<'a>(
-    info: Option<&DeviceInfo>,
-    packages: &'a [PackageRow],
-    key_sets: &KeySets,
-) -> Option<&'a PackageRow> {
+pub fn best_package<'a>(info: Option<&DeviceInfo>, packages: &'a [PackageRow]) -> Option<&'a PackageRow> {
     let current = info.map(|i| i.firmware_version.as_str());
     packages
         .iter()
-        .filter(|p| courtesy(info, p, key_sets.get(&p.id).map(Vec::as_slice)).is_ok())
+        .filter(|p| courtesy(info, p).is_ok())
         .filter(
             |p| match current.and_then(|c| compare_versions(&p.firmware_version, c)) {
                 Some(o) => o == Ordering::Greater,
@@ -534,6 +516,7 @@ mod tests {
             size,
             update_size: size,
             usb_install: false,
+            key_set: None,
             uploaded_at: Timestamp::from_unix(1_800_000_000).unwrap(),
             uploaded_by_role: if by.is_some() {
                 Role::Publisher

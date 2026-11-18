@@ -939,7 +939,8 @@ impl Manager {
             (
                 format!(
                     "This display will trust keys from {} from the firmware just installed on {}. They are sent \
-                     only to {} over USB, never in a saved file: Save as a file leaves them out.",
+                     only to {} over USB, never in a saved file: set up from a saved file, the display keeps the \
+                     keys it already trusts, if any. With none, it accepts no updates until it gets keys over USB.",
                     keys.join("; "),
                     p.port,
                     p.port
@@ -950,8 +951,8 @@ impl Manager {
         } else {
             (
                 format!(
-                    "The keys from the firmware just installed on {} are left out, so the display keeps whatever \
-                     keys it already has.",
+                    "The keys from the firmware just installed on {} are left out, so the display keeps the keys \
+                     it already trusts, if any. With none, it accepts no updates until it gets keys over USB.",
                     p.port
                 ),
                 "Include them",

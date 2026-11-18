@@ -520,6 +520,31 @@ async fn a_package_that_drops_a_trusted_key_is_only_offered_with_a_higher_counte
     assert_eq!(available(&at_floor), None);
     assert_eq!(available(&below), Some(pkg.package_id.clone()));
     c.offer_firmware(&admin, &below, &pkg.package_id).await.unwrap();
+
+    // The key_set is kept with the package's row: a file that can't be read meanwhile doesn't make
+    // the package look like one without a key_set.
+    std::fs::write(
+        dir.path()
+            .join("firmware")
+            .join(format!("{}.dhfw", pkg.package_id)),
+        b"damaged",
+    )
+    .unwrap();
+    let e = c
+        .offer_firmware(&admin, &at_floor, &pkg.package_id)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("stop the display trusting"), "{e}");
+    let views = c.displays(&admin).await.unwrap();
+    assert!(views
+        .iter()
+        .find(|d| d.id == at_floor)
+        .and_then(|d| d.firmware.as_ref())
+        .is_some_and(|f| f.available_package_id.is_none()));
+    assert_eq!(
+        c.firmware_packages(&admin).await.unwrap()[0].key_set,
+        Some(vec![maker_id.clone()])
+    );
     r.stop().await;
 }
 
@@ -1487,6 +1512,73 @@ async fn a_new_download_from_a_display_takes_over_from_its_last() {
         r.hub.download_slots.available_permits(),
         hub_protocol::limits::MAX_CONCURRENT_FIRMWARE_DOWNLOADS
     );
+    r.stop().await;
+}
+
+/// Moving an open file aside, which this test needs, works only on Unix.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_download_that_cant_be_served_leaves_the_displays_last_one_running() {
+    use tokio::io::AsyncReadExt;
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let k = key();
+    let big = largest(&k, "2.0.0");
+    let form = big.checked.update_form_len();
+    let expected = big.bytes[..form as usize].to_vec();
+    let pkg = c.upload_firmware(&admin, big.bytes).await.unwrap().0;
+    let (desk, token) = r
+        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 16 << 20)))
+        .await;
+    c.offer_firmware(&admin, &desk, &pkg.package_id).await.unwrap();
+    let file = dir
+        .path()
+        .join("firmware")
+        .join(format!("{}.dhfw", pkg.package_id));
+    let aside = dir.path().join("aside.dhfw");
+
+    let mut first = stalled_download(&r, &token, &pkg.package_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(r.hub.is_downloading(&desk));
+    // The file can't be opened for a new download (the running one has it open already): the new
+    // one is refused, and the running one is left alone, slot and all.
+    std::fs::rename(&file, &aside).unwrap();
+    let e = c.firmware_download(&token, &pkg.package_id).await.unwrap_err();
+    assert_eq!((status(&e), code(&e)), (503, Some(ErrorCode::Unavailable)));
+    assert!(r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 1);
+    std::fs::rename(&aside, &file).unwrap();
+    // It goes on to the end.
+    let mut rest = vec![0u8; form as usize];
+    tokio::time::timeout(std::time::Duration::from_secs(60), first.read_exact(&mut rest))
+        .await
+        .expect("the first download stopped")
+        .unwrap();
+    assert!(rest == expected, "the first download's bytes changed");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 2);
+
+    // With every slot taken, one by another display, a new download from this display takes over
+    // its last one's slot rather than being refused.
+    let mut second = stalled_download(&r, &token, &pkg.package_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let elsewhere = r.hub.download_slots.clone().try_acquire_owned().unwrap();
+    let got = c.firmware_download(&token, &pkg.package_id).await.unwrap();
+    assert_eq!(got.bytes.len() as u64, form);
+    let cut = read_to_end(&mut second)
+        .await
+        .expect("the stalled connection was left open");
+    assert!(
+        cut < form,
+        "{cut} of {form} bytes: the stalled download wasn't cut off"
+    );
+    assert!(!r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 1);
+    drop(elsewhere);
     r.stop().await;
 }
 

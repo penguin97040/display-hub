@@ -45,15 +45,13 @@ impl Target {
         }
     }
 
-    /// Sends a heartbeat when paired with a state folder. True if the hub took it.
-    async fn heartbeat(&self, dir: Option<&std::path::Path>) -> bool {
+    /// Sends a heartbeat when paired with a state folder.
+    async fn heartbeat(&self, dir: Option<&std::path::Path>) {
         if let (Target::Paired(s), Some(dir)) = (self, dir) {
-            match paired::heartbeat(s, &paired::device_info(dir)).await {
-                Ok(_) => return true,
-                Err(e) => eprintln!("display-simulator: heartbeat not sent: {e}"),
+            if let Err(e) = paired::heartbeat(s, &paired::device_info(dir)).await {
+                eprintln!("display-simulator: heartbeat not sent: {e}");
             }
         }
-        false
     }
 }
 
@@ -343,10 +341,7 @@ async fn main() -> ExitCode {
                 _ => None,
             };
             let mut polls = 0;
-            let mut last_heartbeat: Option<std::time::Instant> = None;
-            // The attempts left as the hub last heard them: a change is reported straight away, so
-            // the app doesn't show a pause late or keep showing it after the display has recovered.
-            let mut reported_attempts: Option<u32> = None;
+            let mut heartbeats = Heartbeats::default();
             loop {
                 let result = hub.poll().await;
                 let offer = result.as_ref().ok().and_then(|s| s.firmware_update.clone());
@@ -367,15 +362,13 @@ async fn main() -> ExitCode {
                     .as_deref()
                     .and_then(|d| display_simulator::firmware::store::record(d).ok())
                     .map(|r| r.budget().attempts_left);
+                let now = std::time::Instant::now();
                 if matches!(device.link, Link::Online { .. })
                     && !updates.as_ref().is_some_and(Firmware::in_trial)
-                    && (last_heartbeat.is_none_or(|t| t.elapsed().as_secs() >= 3600)
-                        || (attempts.is_some() && attempts != reported_attempts))
+                    && heartbeats.due(now, attempts)
                 {
-                    if hub.heartbeat(conn.state.as_deref()).await {
-                        reported_attempts = attempts;
-                    }
-                    last_heartbeat = Some(std::time::Instant::now());
+                    hub.heartbeat(conn.state.as_deref()).await;
+                    heartbeats.sent(now, attempts);
                 }
                 if let Some(max) = max_wait {
                     wait = wait.min(std::time::Duration::from_secs(max));
@@ -423,6 +416,31 @@ async fn main() -> ExitCode {
 
 /// How often new firmware on trial polls, so it reaches the hub well within its five minutes.
 const TRIAL_POLL_SECONDS: u64 = 15;
+
+/// When `run` sends a heartbeat: once an hour, and once as soon as the attempts left change, so the
+/// app doesn't show a pause late or keep showing it after the display has recovered. A heartbeat
+/// that fails isn't tried again at the next poll: the hourly one carries the number, which keeps it
+/// to a handful a day however long the hub is away.
+#[derive(Default)]
+struct Heartbeats {
+    last: Option<std::time::Instant>,
+    /// The attempts left that the last heartbeat carried, whether or not the hub took it.
+    sent_attempts: Option<u32>,
+}
+
+impl Heartbeats {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    fn due(&self, now: std::time::Instant, attempts: Option<u32>) -> bool {
+        self.last.is_none_or(|t| now.duration_since(t) >= Self::EVERY)
+            || (attempts.is_some() && attempts != self.sent_attempts)
+    }
+
+    fn sent(&mut self, now: std::time::Instant, attempts: Option<u32>) {
+        self.last = Some(now);
+        self.sent_attempts = attempts;
+    }
+}
 
 fn started_text(s: &Started) -> String {
     match s {
@@ -742,4 +760,35 @@ async fn usb(state: &std::path::Path, once: bool) -> ExitCode {
 async fn usb(_state: &std::path::Path, _once: bool) -> ExitCode {
     eprintln!("display-simulator: `usb` needs a pseudo-terminal, which only Linux and macOS have");
     ExitCode::from(2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Heartbeats;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_change_in_attempts_is_sent_once_and_then_hourly() {
+        let start = Instant::now();
+        let mut h = Heartbeats::default();
+        assert!(h.due(start, Some(5)), "the first poll");
+        h.sent(start, Some(5));
+        assert!(!h.due(start + Duration::from_secs(300), Some(5)));
+        // A change goes at once. Whether or not the hub took it, the next polls don't repeat it.
+        assert!(h.due(start + Duration::from_secs(300), Some(4)));
+        h.sent(start + Duration::from_secs(300), Some(4));
+        for poll in 2..12 {
+            assert!(
+                !h.due(start + Duration::from_secs(300 * poll), Some(4)),
+                "poll {poll}"
+            );
+        }
+        // The hourly one carries it again.
+        assert!(h.due(start + Duration::from_secs(300 + 3600), Some(4)));
+        // A display without a budget to report is heard from hourly.
+        let mut h = Heartbeats::default();
+        h.sent(start, None);
+        assert!(!h.due(start + Duration::from_secs(600), None));
+        assert!(h.due(start + Duration::from_secs(3600), None));
+    }
 }

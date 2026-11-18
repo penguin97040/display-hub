@@ -1323,11 +1323,8 @@ async fn list_devices(
 ) -> Result<Json<Vec<DisplayView>>, ApiError> {
     authenticate(&hub, &headers, peer.ip(), Role::Admin).await?;
     let now = hub.clock.now();
-    let dir = hub.firmware_dir();
-    let (rows, packages, key_sets, offers) = db(&hub, move |s| {
-        let packages = s.firmware_packages()?;
-        let key_sets = crate::firmware::key_sets(&dir, &packages);
-        Ok((s.devices()?, packages, key_sets, s.latest_offers(now)?))
+    let (rows, packages, offers) = db(&hub, move |s| {
+        Ok((s.devices()?, s.firmware_packages()?, s.latest_offers(now)?))
     })
     .await?;
     let seen = hub.seen();
@@ -1344,7 +1341,7 @@ async fn list_devices(
         .iter()
         .map(|(r, _, info)| (r.id.clone(), info.clone(), r.auto_update))
         .collect();
-    let mut fw = firmware::display_firmware(&infos, &packages, &key_sets, &offers, now);
+    let mut fw = firmware::display_firmware(&infos, &packages, &offers, now);
     Ok(Json(
         rows.into_iter()
             .map(|(r, live_at, info)| DisplayView {

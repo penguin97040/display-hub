@@ -34,7 +34,7 @@ The hub keeps everything in one SQLite database, `hub.db` in its data folder (`/
 | `display_pages` | Which pages each display shows: one row per display and ticked page. |
 | `devices`, `credentials`, `one_time_codes` | Displays, the hashes of every token, and pairing and enrolment codes. |
 | `helper_feeds` | The feeds each helper may send to. |
-| `firmware_packages` | Each firmware package the hub holds: its id (the SHA-256 of the file), what its manifest says (device type, hardware revisions, version, security counter, summary), the signer's key, its sizes, whether it can be used for a USB install, and who uploaded it and when. The file itself is `firmware/<package id>.dhfw` in the data folder, owner-only. |
+| `firmware_packages` | Each firmware package the hub holds: its id (the SHA-256 of the file), what its manifest says (device type, hardware revisions, version, security counter, summary, and the key ids of its `key_set` as JSON text, if it has one), the signer's key, its sizes, whether it can be used for a USB install, and who uploaded it and when. The file itself is `firmware/<package id>.dhfw` in the data folder, owner-only. |
 | `firmware_signers` | The owner's labels for signing keys, by key id. |
 | `firmware_offers` | Each offer of a package to a display, what the display reported about it, and when it ended. At most one is open per display (a partial unique index), and the 10 most recent ended ones are kept. |
 | `audit_log` | Security-relevant events, kept for 90 days. |

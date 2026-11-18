@@ -165,7 +165,8 @@ const MIGRATIONS: &[&str] = &[
     "#,
     // 6: signed firmware updates (`docs/firmware-updates.md`). Packages the hub holds (each file is
     // `firmware/<id>.dhfw` in the data folder), the owner's labels for signing keys, and offers, with
-    // at most one open offer per display. Each display gains `auto_update`, always off for now.
+    // at most one open offer per display. A package's `key_set` is a JSON array of the key ids its
+    // manifest names, or null without one. Each display gains `auto_update`, always off for now.
     // Publishers, a new role with their own pairing codes, need the two CHECK constraints widened,
     // so those tables are copied as in version 4.
     r#"
@@ -182,6 +183,7 @@ const MIGRATIONS: &[&str] = &[
         size INTEGER NOT NULL,
         update_size INTEGER NOT NULL,
         usb_install INTEGER NOT NULL,
+        key_set TEXT,
         uploaded_at INTEGER NOT NULL,
         uploaded_by_role TEXT NOT NULL CHECK (uploaded_by_role IN ('admin', 'publisher')),
         uploaded_by TEXT NOT NULL
@@ -2539,6 +2541,7 @@ mod tests {
             size: 300,
             update_size: 280,
             usb_install: false,
+            key_set: None,
             uploaded_at: ts(NOW),
             uploaded_by_role: Role::Admin,
             uploaded_by: "a-1".into(),
@@ -2556,6 +2559,32 @@ mod tests {
             now: ts(now),
             expires_at: ts(now + hub_protocol::limits::FIRMWARE_OFFER_LIFETIME_SECONDS),
         }
+    }
+
+    #[test]
+    fn a_packages_key_set_is_kept_in_its_row() {
+        let store = Store::in_memory().unwrap();
+        let mut with = package("p1", "test-display", "1.0.0");
+        with.key_set = Some(vec!["a".repeat(64), "b".repeat(64)]);
+        store.add_firmware_package(&with, &[], ts(NOW)).unwrap();
+        store
+            .add_firmware_package(&package("p2", "test-display", "1.1.0"), &[], ts(NOW))
+            .unwrap();
+        assert_eq!(
+            store.firmware_package("p1").unwrap().unwrap().key_set,
+            with.key_set
+        );
+        assert_eq!(store.firmware_package("p2").unwrap().unwrap().key_set, None);
+        // A key_set that can't be read is an error, never "no key_set".
+        store
+            .conn()
+            .execute(
+                "UPDATE firmware_packages SET key_set = 'not json' WHERE id = 'p1'",
+                [],
+            )
+            .unwrap();
+        assert!(store.firmware_package("p1").is_err());
+        assert!(store.firmware_packages().is_err());
     }
 
     #[test]
