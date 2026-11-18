@@ -55,10 +55,10 @@ Remove each one first (it also cuts it off at the hub): sudo display-hub-helper 
   rm -rf "$examples"
   # A firewall that includes the rule would fail to load at the next boot without it, so it stays
   # until that line is gone.
-  kept_firewall=0
-  if grep -qsF "$firewall" /etc/nftables.conf || grep -rqsF "$firewall" /etc/nftables.d; then
-    kept_firewall=1
-  else
+  # Only a real include line counts: not a comment, and not the path mentioned in some other way.
+  kept_in=$(grep -rlsE "^[[:space:]]*include[[:space:]]+\"?$firewall\"?[[:space:]]*;?[[:space:]]*$" \
+    /etc/nftables.conf /etc/nftables.d 2>/dev/null | tr '\n' ' ' || true)
+  if [ -z "$kept_in" ]; then
     rm -f "$firewall"
   fi
   # Bash has read this whole if-block already, so this copy of the script can go even while it is
@@ -69,10 +69,11 @@ Remove each one first (it also cuts it off at the hub): sudo display-hub-helper 
   say "Removed the service, $bin, hub-send and the helper tools."
   say "Kept $data_dir (the hub's identity and data), $conf_dir and $backups."
   say "Delete them yourself only if you'll never use this hub again: every display and PC trusts its key."
-  if [ "$kept_firewall" = 1 ]; then
+  if [ -n "$kept_in" ]; then
     say ""
     say "Kept $firewall, because your firewall settings include it. To remove it, take the"
-    say "line that names it out of /etc/nftables.conf, then: sudo rm -r $share"
+    say "line that names it out of: ${kept_in% }"
+    say "Then: sudo rm -r $share"
   fi
   exit 0
 fi

@@ -16,9 +16,10 @@ case $preview in
   false) keep=STABLE drop=PREVIEW ;;
   *) echo "preview must be true or false, not $preview" >&2; exit 2 ;;
 esac
-# Every value is one the workflow made; none may hold the "|" that sed splits on, or a new line.
+# Every value is one the workflow made; none may hold the "|" that sed splits on, the "&" or "\" it reads
+# specially, or a new line.
 for v in "$tag" "$version" "$repo" "$tarball" "$url" "$sha"; do
-  case $v in *'|'* | *$'\n'* | '') echo "not a value for the notes: $v" >&2; exit 2 ;; esac
+  case $v in *'|'* | *'&'* | *\\* | *$'\n'* | '') echo "not a value for the notes: $v" >&2; exit 2 ;; esac
 done
 
 notes=$(sed -e "/^{{$drop}}/d" -e "s/^{{$keep}}//" \

@@ -486,11 +486,11 @@ mod tests {
 
     #[test]
     fn a_long_address_breaks_at_slashes_and_inside_long_parts() {
-        let url = "'https://github.com/penguin97040/display-hub/releases/download/v0.1.0/\
+        let url = "'https://github.com/owner/repo/releases/download/v0.1.0/\
                    display-hub-pi-arm64-0.1.0.tar.gz'";
         let pieces = command_pieces(url);
         assert_eq!(pieces.concat(), url);
         assert!(pieces.iter().all(|p| p.chars().count() <= PIECE_MAX));
-        assert!(pieces.contains(&"penguin97040/".to_string()));
+        assert!(pieces.contains(&"owner/".to_string()));
     }
 }

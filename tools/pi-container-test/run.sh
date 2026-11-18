@@ -25,7 +25,7 @@ case $suite in
   *) echo "usage: $0 [bookworm|trixie]" >&2; exit 2 ;;
 esac
 root=$(cd "$(dirname "$0")/../.." && pwd)
-rel=${CARGO_TARGET_DIR:-$root/target}/x86_64-unknown-linux-gnu/release
+rel=$(realpath -m "${CARGO_TARGET_DIR:-$root/target}")/x86_64-unknown-linux-gnu/release
 name=display-hub-pi-test-$suite
 # The highest exposure systemd-analyze may give a helper's unit. Lower than this needs cutting
 # helpers off the internet, which is their job.
@@ -347,9 +347,17 @@ check "uninstall: its kept copy is gone" gone "$share/install.sh"
 check "uninstall: the firewall rule is kept while it is included" box test -f "$share/nftables-display-hub.conf"
 check "uninstall: and says so" grep -q "because your firewall settings include it" <<<"$out"
 check "uninstall: the firewall still loads" firewall_loads
+# An include in a file under /etc/nftables.d/ counts too, and the message names that file.
 box sed -i "\|$share/nftables-display-hub.conf|d" /etc/nftables.conf
+box sh -c "mkdir -p /etc/nftables.d && echo 'include \"$share/nftables-display-hub.conf\"' > /etc/nftables.d/hub.conf"
+out=$(box bash /root/display-hub/install.sh --uninstall 2>&1) || { echo "$out"; bad "uninstall with an include in nftables.d"; }
+check "uninstall: an include under nftables.d keeps the rule" box test -f "$share/nftables-display-hub.conf"
+check "uninstall: and names that file, not nftables.conf" grep -q "/etc/nftables.d/hub.conf" <<<"$out"
+box rm -f /etc/nftables.d/hub.conf
+# A commented-out include is not an include.
+box sh -c "echo '# include \"$share/nftables-display-hub.conf\"' >> /etc/nftables.conf"
 box bash /root/display-hub/install.sh --uninstall >/dev/null
-check "uninstall: once not included, the firewall rule and its folder go too" gone "$share"
+check "uninstall: once not included (a comment doesn't count), the firewall rule and its folder go too" gone "$share"
 
 if [ "$failures" = 0 ]; then
   echo "Pi install test (container, not a Pi): all passed"

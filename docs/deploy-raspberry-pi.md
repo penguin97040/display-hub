@@ -96,7 +96,7 @@ Some PCs can't look up `.local` names, especially Windows with a VPN connected, 
   sudo nft -f /usr/local/share/display-hub/nftables-display-hub.conf
   ```
 
-  The installer keeps that file there, and an upgrade updates it. The rule is lost on reboot unless you add this line to the end of `/etc/nftables.conf`, then run `sudo systemctl enable nftables`:
+  The installer keeps that file there, and an upgrade replaces it with the new one. An upgrade does not reload the rule: a changed rule takes effect only after a reboot or after you load it again. If you loaded it by hand as above, run `sudo nft -f /usr/local/share/display-hub/nftables-display-hub.conf`. If you added the `include` line below, run `sudo nft -f /etc/nftables.conf`. The rule is lost on reboot unless you add this line to the end of `/etc/nftables.conf`, then run `sudo systemctl enable nftables`:
 
   ```text
   include "/usr/local/share/display-hub/nftables-display-hub.conf"
@@ -249,6 +249,8 @@ To go back to the old version after an upgrade, reinstall the old release, then 
 ```sh
 sudo bash /usr/local/share/display-hub/install.sh --uninstall
 ```
+
+If that file is missing (installs from before the installer kept a copy), download the same release's tarball, or use the folder you installed from, unpack it and run `sudo bash display-hub-pi/install.sh --uninstall` from there.
 
 This stops and removes the service, the programs, the helper tools and the installer's own copy. It keeps `/var/lib/display-hub` (the identity and data), `/etc/display-hub` and the backups. Delete those yourself only if you'll never use this hub again.
 

@@ -11,10 +11,12 @@ set -euo pipefail
 
 [ $# -eq 0 ] || { echo "usage: $0" >&2; exit 2; }
 root=$(cd "$(dirname "$0")/../.." && pwd)
+# Made absolute first: after the cd below, a relative path would mean something else to the caller.
+target_dir=$(realpath -m "${CARGO_TARGET_DIR:-$root/target}")
 cd "$root"
 target=aarch64-unknown-linux-gnu
 cargo zigbuild --release --locked -p hubd -p hub-send --target "$target.2.36" >&2
-bins=${CARGO_TARGET_DIR:-$root/target}/$target/release
+bins=$target_dir/$target/release
 for b in hubd hub-send; do
   bin=$bins/$b
   # Captured first: with pipefail, grep -q stopping early could fail the pipe.
