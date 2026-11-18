@@ -126,6 +126,14 @@ pub fn valid_feed(name: &str) -> bool {
         })
 }
 
+/// What a feed name may be, as a sentence, for a refusal.
+pub fn feed_rule() -> String {
+    format!(
+        "A feed name is lower-case letters and digits, in words joined by single hyphens, such as \
+         garden-weather, up to {MAX_FEED_LEN} characters."
+    )
+}
+
 /// A template id is written like a custom kind, `name/version`, such as `usage-limits/1`.
 pub fn valid_template_id(id: &str) -> bool {
     hub_protocol::shapes::custom_kind_ok(id)

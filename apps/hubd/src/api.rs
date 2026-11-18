@@ -21,7 +21,7 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use hub_core::api::*;
 use hub_core::model::{
-    clean_note, clean_title, settings_problem, valid_feed, valid_page_id, valid_template_id, MAX_FEED_LEN,
+    clean_note, clean_title, feed_rule, settings_problem, valid_feed, valid_page_id, valid_template_id,
 };
 use hub_core::{build_snapshot, Clock, Settings, Source, StoredContent, StoredPage};
 use hub_protocol::device::{DeviceInfo, EnrolRequest, EnrolResponse, Heartbeat};
@@ -778,10 +778,7 @@ fn helper_refused() -> ApiError {
 }
 
 fn bad_feed() -> ApiError {
-    ApiError::bad_request(format!(
-        "A feed name is lower-case letters and digits, in words joined by single hyphens, such as \
-         garden-weather, up to {MAX_FEED_LEN} characters."
-    ))
+    ApiError::bad_request(feed_rule())
 }
 
 /// Checks a helper invite's feeds: at least one, each a valid name.

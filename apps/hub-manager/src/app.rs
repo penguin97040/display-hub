@@ -351,23 +351,7 @@ impl Manager {
                 self.run(op, cx);
             }
             "escape" => {
-                if self.model.confirm.is_some() {
-                    self.model.confirm_no();
-                } else if self.model.edit.is_some() {
-                    self.model.edit = None;
-                } else if self.model.fw.label_edit.is_some() {
-                    self.model.cancel_label();
-                } else if self.model.fw.install.open && self.model.busy.is_none() {
-                    self.model.close_install();
-                } else if self.model.add.setup.is_some() || self.model.add.feed.is_some() {
-                    self.model.finish_setup();
-                } else if self.model.add.form.is_some() || self.model.add.helper_page.is_some() {
-                    self.model.leave_form();
-                } else if self.model.enrol.open && self.model.busy.is_none() {
-                    self.model.close_enrol();
-                } else {
-                    self.model.notice = None;
-                }
+                self.model.escape();
                 cx.notify();
             }
             _ => {}
@@ -2870,11 +2854,17 @@ impl Manager {
             },
         );
         let mut own = div().flex().flex_wrap().gap(px(8.0));
-        for choice in self.model.helper_feed_choices() {
+        let choices = self.model.helper_feed_choices();
+        for choice in &choices {
             let feed = choice.feed.clone();
+            let label = if choice.pages.is_empty() {
+                choice.feed.clone()
+            } else {
+                format!("{} (fills: {})", choice.feed, choice.pages.join(", "))
+            };
             own = own.child(self.toggle(
                 &format!("helper-feed-{}", choice.feed),
-                &choice.feed,
+                &label,
                 choice.ticked,
                 cx,
                 move |this| this.model.toggle_helper_feed(&feed),
@@ -2901,7 +2891,7 @@ impl Manager {
             ))
             .child(div().flex().flex_wrap().gap(px(8.0)).child(claude).child(chatgpt))
             .child(ui::label("Your own helper, sending with hub-send"))
-            .when(self.model.helper_feed_choices().is_empty(), |d| {
+            .when(choices.is_empty(), |d| {
                 d.child(ui::p_muted(
                     "No page takes a feed of your own yet. Make one in Pages, with A page for your own helper, or type \
                      its feed below.",

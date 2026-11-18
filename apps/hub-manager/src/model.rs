@@ -15,7 +15,7 @@ use hub_core::api::{
     PageContentInput, PageView,
 };
 use hub_core::freshness::{short_duration, Freshness};
-use hub_core::model::{clean_title, valid_feed};
+use hub_core::model::{clean_title, feed_rule, valid_feed};
 use hub_core::Source;
 use hub_protocol::limits::{MAX_PAGES, MAX_TITLE_LEN};
 use hub_protocol::pairing::PairingString;
@@ -27,7 +27,7 @@ use hub_templates::Template;
 use usage::{clean_percent, Service};
 
 use crate::field::Field;
-use crate::forms::{feed_rule, ContentEdit, HelperPageForm, TemplateForm};
+use crate::forms::{ContentEdit, HelperPageForm, TemplateForm};
 use crate::guidance::{self, Doing, Guidance, Next, Tone};
 use crate::settings::SavedHub;
 use crate::shown::{kind_label, origin_text, Shown};
@@ -491,14 +491,35 @@ pub struct FeedSteps {
     pub send_copied: bool,
 }
 
+/// The Pi helper's name for a feed: the feed itself when it fits, else its start and a short hash of
+/// the whole feed, so long feeds sharing a start get different names, the same each time.
+fn pi_helper_name(feed: &str) -> String {
+    if feed.len() <= PI_HELPER_NAME_LEN {
+        return feed.to_string();
+    }
+    // FNV-1a, 32 bits, written as six base-36 digits at most.
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in feed.bytes() {
+        hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    let mut tail = String::new();
+    let mut rest = hash;
+    while rest > 0 {
+        tail.insert(0, char::from_digit(rest % 36, 36).unwrap_or('0'));
+        rest /= 36;
+    }
+    if tail.is_empty() {
+        tail.push('0');
+    }
+    // A feed is a slug, so its start is usable once a cut-off hyphen is dropped.
+    let room = PI_HELPER_NAME_LEN - tail.len() - 1;
+    let start = feed[..room].trim_end_matches('-');
+    format!("{start}-{tail}")
+}
+
 impl FeedSteps {
     pub fn new(feed: &str, kind: &str) -> Self {
-        let pi_name = if feed.len() <= PI_HELPER_NAME_LEN {
-            feed.to_string()
-        } else {
-            // A feed is a slug, so its start is a usable name once a cut-off hyphen is dropped.
-            feed[..PI_HELPER_NAME_LEN].trim_end_matches('-').to_string()
-        };
+        let pi_name = pi_helper_name(feed);
         let mut pi_command = format!("sudo display-hub-helper add {pi_name} --run \"$PWD/{pi_name}\"");
         if pi_name != feed {
             pi_command.push_str(&format!(" --feed {feed}"));
@@ -861,6 +882,10 @@ pub struct FeedChoice {
     pub ticked: bool,
 }
 
+/// Room for the "other feeds" field: the longest legal list (every page's feed, one space between)
+/// with plenty to spare, so a legal list is never cut. Text that fills it is refused, not cut.
+const HELPER_OTHER_MAX: usize = 4096;
+
 /// The usage feeds, which have boxes of their own.
 const USAGE_FEEDS: [Service; 2] = [Service::ClaudeMax, Service::ChatgptPlus];
 
@@ -947,7 +972,7 @@ impl Model {
             helper: HelperForm {
                 claude: true,
                 chatgpt: true,
-                other: Field::new(256),
+                other: Field::new(HELPER_OTHER_MAX),
                 ..HelperForm::default()
             },
             guide_dismissed: false,
@@ -1240,11 +1265,49 @@ impl Model {
         }
     }
 
+    /// What Escape closes: the innermost thing shown on the current section, else the notice.
+    pub fn escape(&mut self) {
+        let idle = self.busy.is_none();
+        if self.confirm.is_some() {
+            self.confirm_no();
+            return;
+        }
+        match self.section {
+            Section::Pages => {
+                if self.edit.is_some() {
+                    self.edit = None;
+                } else if self.add.setup.is_some() || self.add.feed.is_some() {
+                    self.finish_setup();
+                } else if self.add.form.is_some() || self.add.helper_page.is_some() {
+                    self.leave_form();
+                } else {
+                    self.notice = None;
+                }
+            }
+            Section::Displays if self.enrol.open && idle => self.close_enrol(),
+            Section::Firmware => {
+                if self.fw.label_edit.is_some() {
+                    self.cancel_label();
+                } else if self.fw.install.open && idle {
+                    self.close_install();
+                } else {
+                    self.notice = None;
+                }
+            }
+            _ => self.notice = None,
+        }
+    }
+
     /// Goes to Settings with the helper form ready to invite a helper for just this feed.
     pub fn invite_for_feed(&mut self, feed: &str) {
-        self.helper.claude = false;
-        self.helper.chatgpt = false;
-        self.helper.feeds = vec![feed.to_string()];
+        self.helper.claude = feed == Service::ClaudeMax.slug();
+        self.helper.chatgpt = feed == Service::ChatgptPlus.slug();
+        // A usage feed has its own box, ticked above.
+        self.helper.feeds = if USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+            Vec::new()
+        } else {
+            vec![feed.to_string()]
+        };
         self.helper.other.clear();
         self.helper.string = None;
         self.section = Section::Settings;
@@ -1829,7 +1892,8 @@ impl Model {
     }
 
     /// The feeds of the hub's helper pages, other than the usage feeds, to tick when inviting a
-    /// helper. In page order, each once.
+    /// helper. In page order, each once. A feed that is ticked stays offered (last) even when no
+    /// listed page takes it, so it can still be sent or unticked.
     pub fn helper_feed_choices(&self) -> Vec<FeedChoice> {
         let mut out: Vec<FeedChoice> = Vec::new();
         for p in self.pages().iter().filter(|p| p.source == Source::Helper) {
@@ -1844,6 +1908,15 @@ impl Model {
                     pages: vec![p.title.clone()],
                     ticked: self.helper.feeds.iter().any(|f| f == feed),
                 }),
+            }
+        }
+        for feed in &self.helper.feeds {
+            if !out.iter().any(|c| &c.feed == feed) && !USAGE_FEEDS.iter().any(|s| s.slug() == feed) {
+                out.push(FeedChoice {
+                    feed: feed.clone(),
+                    pages: Vec::new(),
+                    ticked: true,
+                });
             }
         }
         out
@@ -1870,9 +1943,16 @@ impl Model {
         .filter(|&(on, _)| on)
         .map(|(_, s)| s.slug().to_string())
         .collect();
-        // Only the ticks still offered: a feed whose pages have gone since isn't sent.
         for c in self.helper_feed_choices().into_iter().filter(|c| c.ticked) {
             feeds.push(c.feed);
+        }
+        if self.helper.other.text.len() >= self.helper.other.max_len {
+            return Err(Guidance {
+                tone: Tone::Problem,
+                title: "That list of feeds is too long".into(),
+                detail: "Type fewer feeds, or tick the ones your pages already have.".into(),
+                next: Next::None,
+            });
         }
         for typed in self
             .helper
@@ -4167,20 +4247,95 @@ mod own_helper_tests {
         };
         assert_eq!(pages[0].title, "Bus times 2");
         let steps = FeedSteps::new("the-number-eleven-bus-to-town", "text");
-        assert_eq!(steps.pi_name, "the-number-eleven-bu");
+        assert!(steps.pi_name.starts_with("the-number-") && steps.pi_name.len() <= PI_HELPER_NAME_LEN);
+        assert!(steps.pi_command.contains(" --feed the-number-eleven-bus-to-town"));
+        assert_eq!(FeedSteps::new("short-feed", "text").pi_name, "short-feed");
+    }
+
+    #[test]
+    fn long_feeds_sharing_a_start_get_different_valid_pi_names() {
+        let a = FeedSteps::new("garden-weather-station-north", "text").pi_name;
+        let b = FeedSteps::new("garden-weather-station-south", "text").pi_name;
+        assert_ne!(a, b);
         assert_eq!(
-            steps.pi_command,
-            r#"sudo display-hub-helper add the-number-eleven-bu --run "$PWD/the-number-eleven-bu" --feed the-number-eleven-bus-to-town"#
+            a,
+            FeedSteps::new("garden-weather-station-north", "text").pi_name,
+            "stable"
         );
-        // Cut just after a hyphen, the name drops it.
+        for name in [
+            a,
+            b,
+            FeedSteps::new("abcdefghijklmnopqrs-tuv-wxyz", "text").pi_name,
+        ] {
+            assert!(name.len() <= PI_HELPER_NAME_LEN, "{name}");
+            assert!(valid_feed(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_usage_feed_invite_sets_its_box_and_an_unlisted_tick_is_kept() {
+        let (mut m, _) = connected(vec![helper_page("garden", "garden-weather", "Garden")]);
+        m.invite_for_feed("claude-max");
+        assert!(m.helper.claude && !m.helper.chatgpt && m.helper.feeds.is_empty());
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["claude-max"]);
+        m.busy = None;
+
+        // The page isn't listed yet (the refresh failed), but its feed is still sent and shown.
+        m.invite_for_feed("new-feed");
+        let choices = m.helper_feed_choices();
+        assert!(choices
+            .iter()
+            .any(|c| c.feed == "new-feed" && c.ticked && c.pages.is_empty()));
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["new-feed"]);
+        m.busy = None;
+        m.toggle_helper_feed("new-feed");
+        assert!(m.helper_feed_choices().iter().all(|c| c.feed != "new-feed"));
+    }
+
+    #[test]
+    fn an_over_long_paste_in_other_feeds_is_refused_not_cut() {
+        let (mut m, _) = connected(vec![]);
+        m.helper.claude = false;
+        m.helper.chatgpt = false;
+        let legal: Vec<String> = (0..HUB_PAGE_LIMIT)
+            .map(|i| format!("{:0>48}", format!("f{i}")))
+            .collect();
+        m.helper.other.insert(&legal.join(" "));
         assert_eq!(
-            FeedSteps::new("abcdefghijklmnopqrs-tuv", "text").pi_name,
-            "abcdefghijklmnopqrs"
+            m.helper.other.text,
+            legal.join(" "),
+            "the largest legal list fits whole"
         );
-        assert_eq!(
-            FeedSteps::new("abcdefghijklmnopqrst-u", "text").pi_name,
-            "abcdefghijklmnopqrst"
+        m.helper.other.set("");
+        m.helper.other.insert(&"a".repeat(HELPER_OTHER_MAX + 50));
+        assert!(m.create_helper().is_none());
+        assert!(m.notice.as_ref().unwrap().title.contains("too long"));
+    }
+
+    #[test]
+    fn escape_acts_only_on_what_the_section_shows() {
+        let (mut m, _) = connected(vec![helper_page("bus", "bus", "Bus times")]);
+        m.add.feed = Some(FeedSteps::new("bus", "text"));
+        m.invite_for_feed("bus");
+        m.notice = Some(Guidance::done("Hi", "there"));
+        m.escape();
+        assert!(
+            m.notice.is_none() && m.add.feed.is_some(),
+            "notice goes; the add flow stays"
         );
+        m.section = Section::Pages;
+        m.escape();
+        assert!(m.add.feed.is_none(), "on Pages it closes the add flow");
+        m.section = Section::Displays;
+        m.enrol.open = true;
+        m.escape();
+        assert!(!m.enrol.open);
     }
 
     #[test]
@@ -4280,12 +4435,15 @@ mod own_helper_tests {
         assert!(m.create_helper().is_none());
         assert!(m.notice.as_ref().unwrap().title.contains("at most 50 feeds"));
 
-        // A tick for a feed whose pages have since gone isn't sent.
+        // A tick stays, and is sent, even when no listed page takes the feed any more.
         m.helper.other.clear();
         m.toggle_helper_feed("garden-weather");
         let now = Instant::now();
         m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now);
-        assert!(m.create_helper().is_none(), "nothing left to send to");
+        let Some(Op::NewHelper(n)) = m.create_helper() else {
+            panic!("helper")
+        };
+        assert_eq!(n.feeds, ["garden-weather"]);
     }
 
     #[test]

@@ -60,12 +60,17 @@ struct Conn<'a, P: Read + Write> {
     lines: LineReader,
     /// Lines read but not yet handled: one read can bring several.
     pending: std::collections::VecDeque<Line>,
+    /// Whether the display has answered `hello`: after that, a write that stalls is a port problem.
+    answered: bool,
 }
 
 impl<P: Read + Write> Conn<'_, P> {
     fn send(&mut self, msg: &ToDisplay) -> Result<(), UsbError> {
-        self.port.write_all(&encode(msg)).map_err(write_error)?;
-        self.port.flush().map_err(write_error)
+        let answered = self.answered;
+        self.port
+            .write_all(&encode(msg))
+            .map_err(|e| write_error(e, answered))?;
+        self.port.flush().map_err(|e| write_error(e, answered))
     }
 
     /// The next JSON message, or `None` at the deadline. `repeat` is resent every [`HELLO_REPEAT`].
@@ -115,11 +120,12 @@ fn port_error(e: std::io::Error) -> UsbError {
     UsbError::Port(e.to_string())
 }
 
-/// A write that times out means nothing on the other end is reading the port (Windows says
-/// "os error 121"): a board whose firmware doesn't speak this exchange, not a port in use.
-fn write_error(e: std::io::Error) -> UsbError {
+/// Before anything has answered, a write that times out (Windows says "os error 121") or writes
+/// nothing (`WriteZero`) means nothing on the other end is reading the port: a board whose firmware
+/// doesn't speak this exchange, not a port in use. Once the display has answered, it is a port error.
+fn write_error(e: std::io::Error, answered: bool) -> UsbError {
     match e.kind() {
-        ErrorKind::TimedOut | ErrorKind::WouldBlock => UsbError::NoAnswer,
+        ErrorKind::TimedOut | ErrorKind::WouldBlock | ErrorKind::WriteZero if !answered => UsbError::NoAnswer,
         _ => port_error(e),
     }
 }
@@ -134,6 +140,7 @@ pub fn hello<P: Read + Write>(port: &mut P) -> Result<UsbDisplay, UsbError> {
         port,
         lines: LineReader::default(),
         pending: Default::default(),
+        answered: false,
     };
     hello_on(&mut conn)
 }
@@ -151,6 +158,7 @@ fn hello_on<P: Read + Write>(conn: &mut Conn<'_, P>) -> Result<UsbDisplay, UsbEr
                 if device.protocol_version != PROTOCOL_VERSION {
                     return Err(UsbError::Incompatible(device.protocol_version));
                 }
+                conn.answered = true;
                 return Ok(UsbDisplay { device, provisioned });
             }
             // A late answer to an earlier session. Keep waiting for the hello.
@@ -165,6 +173,7 @@ pub fn provision<P: Read + Write>(port: &mut P, bundle: &Bundle) -> Result<UsbDi
         port,
         lines: LineReader::default(),
         pending: Default::default(),
+        answered: false,
     };
     let display = hello_on(&mut conn)?;
     if display.provisioned {
@@ -252,6 +261,64 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(provision(&mut Unread, &bundle).unwrap_err(), UsbError::NoAnswer);
+    }
+
+    /// Answers `hello`, then stalls (or writes nothing) on the next write.
+    struct StallsAfterHello {
+        inner: Scripted,
+        hello_done: bool,
+        kind: std::io::ErrorKind,
+    }
+
+    impl Read for StallsAfterHello {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for StallsAfterHello {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if !self.hello_done {
+                self.hello_done = true;
+                return self.inner.write(b);
+            }
+            match self.kind {
+                std::io::ErrorKind::WriteZero => Ok(0),
+                k => Err(k.into()),
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_write_that_stalls_after_the_display_answered_is_a_port_error() {
+        let bundle: Bundle = serde_json::from_str(include_str!(
+            "../../../protocol/v1/examples/device/provisioning-bundle.json"
+        ))
+        .unwrap();
+        for kind in [std::io::ErrorKind::TimedOut, std::io::ErrorKind::WriteZero] {
+            let hello = "{\"type\":\"hello\",\"device_type\":\"d\",\"firmware_version\":\"1\",\"hardware_revision\":\"r\",\"protocol_version\":1,\"provisioned\":false}\n";
+            let mut port = StallsAfterHello {
+                inner: Scripted {
+                    reads: VecDeque::from([hello.as_bytes().to_vec()]),
+                    written: Vec::new(),
+                },
+                hello_done: false,
+                kind,
+            };
+            let err = provision(&mut port, &bundle).unwrap_err();
+            assert!(matches!(err, UsbError::Port(_)), "{kind:?}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_of_nothing_before_any_answer_is_no_answer() {
+        assert_eq!(
+            write_error(std::io::ErrorKind::WriteZero.into(), false),
+            UsbError::NoAnswer
+        );
     }
 
     #[test]

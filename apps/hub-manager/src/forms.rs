@@ -3,7 +3,7 @@
 //! entered and says what is wrong in plain words.
 
 use hub_core::api::{NewPage, PageContentInput, PageView};
-use hub_core::model::{clean_note, clean_title, valid_feed, MAX_FEED_LEN};
+use hub_core::model::{clean_note, clean_title, feed_rule, valid_feed, MAX_FEED_LEN};
 use hub_core::Source;
 use hub_protocol::limits::{
     MAX_BIG_NUMBER_ABS, MAX_CAPTION_LEN, MAX_KIND_LEN, MAX_LABEL_LEN, MAX_LIST_ITEMS, MAX_LIST_TEXT_LEN,
@@ -366,14 +366,6 @@ impl HelperPageForm {
             settings: None,
         })
     }
-}
-
-/// What a feed name may be, as the hub says it.
-pub fn feed_rule() -> String {
-    format!(
-        "A feed name is lower-case letters and digits, in words joined by single hyphens, such as \
-         garden-weather, up to {MAX_FEED_LEN} characters."
-    )
 }
 
 // ---- editing typed-in content ---------------------------------------------------------------------------
