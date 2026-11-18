@@ -52,13 +52,32 @@ pub struct PackageRow {
     /// What a display receives: header, manifest and image.
     pub update_size: u64,
     pub usb_install: bool,
-    /// The key ids (64 hex digits each) of the manifest's `key_set`, if it has one.
-    pub key_set: Option<Vec<String>>,
+    /// The manifest's `key_set`, as the row holds it.
+    pub key_set: KeySet,
     pub uploaded_at: Timestamp,
     pub uploaded_by_role: Role,
     pub uploaded_by: String,
     /// The uploader's label, from its credential.
     pub uploaded_by_label: Option<String>,
+}
+
+/// A package's `key_set`: the keys a display trusts once it has installed the package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KeySet {
+    /// The manifest has none: a display keeps the keys it trusts.
+    Absent,
+    /// The key ids, 64 hex digits each.
+    Keys(Vec<String>),
+    /// The row's value can't be read. Never taken as `Absent`, which would let the courtesy check
+    /// pass a package that drops a key: such a package is listed but never offered.
+    Unreadable,
+}
+
+impl KeySet {
+    /// The manifest's key ids, if it has a `key_set`.
+    pub fn from_keys(keys: Option<Vec<String>>) -> Self {
+        keys.map_or(Self::Absent, Self::Keys)
+    }
 }
 
 /// One offer.
@@ -147,17 +166,27 @@ fn package_row(r: &Row<'_>) -> rusqlite::Result<PackageRow> {
         uploaded_at: ts(r.get(12)?),
         uploaded_by_role: Role::parse(&role).unwrap_or(Role::Admin),
         uploaded_by: r.get(14)?,
-        // Never read as "no key_set": that would let the courtesy check pass a package that drops
-        // a key.
-        key_set: r
-            .get::<_, Option<String>>(15)?
-            .map(|ks| serde_json::from_str(&ks))
-            .transpose()
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(e))
-            })?,
+        key_set: match r.get::<_, Option<String>>(15)? {
+            None => KeySet::Absent,
+            Some(ks) => serde_json::from_str(&ks).map_or(KeySet::Unreadable, KeySet::Keys),
+        },
         uploaded_by_label: r.get(16)?,
     })
+}
+
+/// Says once in the log, for a query's rows, which packages' `key_set` can't be read.
+fn log_unreadable<'a>(rows: impl IntoIterator<Item = &'a PackageRow>) {
+    let ids: Vec<&str> = rows
+        .into_iter()
+        .filter(|p| p.key_set == KeySet::Unreadable)
+        .map(|p| p.id.as_str())
+        .collect();
+    if !ids.is_empty() {
+        tracing::error!(
+            packages = %ids.join(", "),
+            "a stored package's key_set can't be read, so it won't be offered; remove the package and add it again"
+        );
+    }
 }
 
 fn offer_row(r: &Row<'_>) -> rusqlite::Result<OfferRow> {
@@ -223,19 +252,22 @@ impl Store {
         let mut st = conn.prepare(&format!(
             "SELECT {PACKAGE_COLUMNS} FROM firmware_packages p ORDER BY p.device_type, p.uploaded_at DESC, p.id"
         ))?;
-        let rows = st.query_map([], package_row)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        let rows = st.query_map([], package_row)?.collect::<Result<Vec<_>, _>>()?;
+        log_unreadable(&rows);
+        Ok(rows)
     }
 
     pub fn firmware_package(&self, id: &str) -> Result<Option<PackageRow>, StoreError> {
         let conn = self.conn();
-        Ok(conn
+        let row = conn
             .query_row(
                 &format!("SELECT {PACKAGE_COLUMNS} FROM firmware_packages p WHERE p.id = ?1"),
                 params![id],
                 package_row,
             )
-            .optional()?)
+            .optional()?;
+        log_unreadable(&row);
+        Ok(row)
     }
 
     /// The ids of packages on offer to some display at `now`.
@@ -274,6 +306,15 @@ impl Store {
         evict: &[String],
         now: Timestamp,
     ) -> Result<(), StoreError> {
+        let key_set = match &row.key_set {
+            KeySet::Absent => None,
+            KeySet::Keys(ks) => Some(serde_json::to_string(ks).expect("serialises")),
+            KeySet::Unreadable => {
+                return Err(StoreError::Invalid(
+                    "A package's key_set must be known to store it.".into(),
+                ))
+            }
+        };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         expire(&tx, now)?;
@@ -311,9 +352,7 @@ impl Store {
                 row.uploaded_at.unix(),
                 row.uploaded_by_role.as_str(),
                 row.uploaded_by,
-                row.key_set
-                    .as_ref()
-                    .map(|ks| serde_json::to_string(ks).expect("serialises")),
+                key_set,
             ],
         )?;
         tx.commit()?;

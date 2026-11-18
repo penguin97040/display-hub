@@ -814,6 +814,8 @@ pub struct Model {
     /// The owner has been shown that the hub's firmware lists couldn't be read, since they were
     /// last readable.
     lists_told: bool,
+    /// The answer being taken brought a refresh that couldn't read the firmware lists.
+    lists_unreadable_now: bool,
 }
 
 /// The one command that sets the hub up, run on the Pi from the folder the files were copied into.
@@ -868,6 +870,7 @@ impl Model {
             fw: FirmwareUi::default(),
             pending_firmware: None,
             lists_told: false,
+            lists_unreadable_now: false,
         }
     }
 
@@ -1749,6 +1752,7 @@ impl Model {
     }
 
     fn take_refresh(&mut self, mut r: Refresh, now: Instant) {
+        self.lists_unreadable_now = r.firmware_error.is_some();
         if r.firmware_error.is_some() {
             // The hub has firmware lists, but they couldn't be read this time: keep the ones it had
             // rather than showing it as a hub without signed updates. The error stays, for
@@ -1791,14 +1795,18 @@ impl Model {
     }
 
     pub fn finish(&mut self, result: Result<Outcome, Failure>, now: Instant) {
+        self.lists_unreadable_now = false;
         self.take_outcome(result, now);
-        self.tell_unreadable_lists();
+        if std::mem::take(&mut self.lists_unreadable_now) {
+            self.tell_unreadable_lists();
+        }
     }
 
-    /// Says the firmware lists couldn't be read at the last refresh: once each time they stop being
-    /// readable, not at every refresh while they stay so, and never over another notice, including
-    /// one the outcome just set. If one is showing, it is said at a later answer, once that notice
-    /// has been dismissed.
+    /// Says the firmware lists couldn't be read by the refresh just taken: once each time they stop
+    /// being readable, not at every refresh while they stay so, and never over another notice,
+    /// including one the outcome just set. If one is showing, the next refresh that still can't
+    /// read them says it instead, once that notice has been dismissed; an answer without a refresh
+    /// never does, so an old failure isn't brought up over something unrelated.
     fn tell_unreadable_lists(&mut self) {
         if self.lists_told || self.notice.is_some() {
             return;
@@ -1824,6 +1832,8 @@ impl Model {
         match result {
             Ok(Outcome::Paired { hub, refresh }) => {
                 self.pairing.clear();
+                // A hub newly paired: its firmware lists haven't been told about yet.
+                self.lists_told = false;
                 self.hub = Some(hub);
                 self.needs_pairing = false;
                 self.section = Section::Overview;

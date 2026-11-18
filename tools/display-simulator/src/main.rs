@@ -46,12 +46,15 @@ impl Target {
     }
 
     /// Sends a heartbeat when paired with a state folder.
-    async fn heartbeat(&self, dir: Option<&std::path::Path>) {
+    /// Sends a heartbeat if paired with a state folder. False only if one was sent and failed.
+    async fn heartbeat(&self, dir: Option<&std::path::Path>) -> bool {
         if let (Target::Paired(s), Some(dir)) = (self, dir) {
             if let Err(e) = paired::heartbeat(s, &paired::device_info(dir)).await {
                 eprintln!("display-simulator: heartbeat not sent: {e}");
+                return false;
             }
         }
+        true
     }
 }
 
@@ -367,8 +370,8 @@ async fn main() -> ExitCode {
                     && !updates.as_ref().is_some_and(Firmware::in_trial)
                     && heartbeats.due(now, attempts)
                 {
-                    hub.heartbeat(conn.state.as_deref()).await;
-                    heartbeats.sent(now, attempts);
+                    let taken = hub.heartbeat(conn.state.as_deref()).await;
+                    heartbeats.sent(now, attempts, taken);
                 }
                 if let Some(max) = max_wait {
                     wait = wait.min(std::time::Duration::from_secs(max));
@@ -418,27 +421,40 @@ async fn main() -> ExitCode {
 const TRIAL_POLL_SECONDS: u64 = 15;
 
 /// When `run` sends a heartbeat: once an hour, and once as soon as the attempts left change, so the
-/// app doesn't show a pause late or keep showing it after the display has recovered. A heartbeat
-/// that fails isn't tried again at the next poll: the hourly one carries the number, which keeps it
-/// to a handful a day however long the hub is away.
+/// app doesn't show a pause late or keep showing it after the display has recovered. If the hub
+/// doesn't take the change, it is tried again every five minutes until it does, never at every
+/// poll, which keeps it to a handful an hour however long the hub is away.
 #[derive(Default)]
 struct Heartbeats {
+    /// When the last heartbeat was sent, taken or not.
     last: Option<std::time::Instant>,
-    /// The attempts left that the last heartbeat carried, whether or not the hub took it.
+    /// The attempts left that the hub last took.
     sent_attempts: Option<u32>,
+    /// When the last heartbeat failed, if the hub hasn't taken one since.
+    failed: Option<std::time::Instant>,
 }
 
 impl Heartbeats {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+    /// How soon a change the hub didn't take is tried again.
+    const RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
     fn due(&self, now: std::time::Instant, attempts: Option<u32>) -> bool {
         self.last.is_none_or(|t| now.duration_since(t) >= Self::EVERY)
-            || (attempts.is_some() && attempts != self.sent_attempts)
+            || (attempts.is_some()
+                && attempts != self.sent_attempts
+                && self.failed.is_none_or(|t| now.duration_since(t) >= Self::RETRY))
     }
 
-    fn sent(&mut self, now: std::time::Instant, attempts: Option<u32>) {
+    /// Records a heartbeat carrying `attempts`, and whether the hub took it.
+    fn sent(&mut self, now: std::time::Instant, attempts: Option<u32>, taken: bool) {
         self.last = Some(now);
-        self.sent_attempts = attempts;
+        if taken {
+            self.sent_attempts = attempts;
+            self.failed = None;
+        } else {
+            self.failed = Some(now);
+        }
     }
 }
 
@@ -770,25 +786,48 @@ mod tests {
     #[test]
     fn a_change_in_attempts_is_sent_once_and_then_hourly() {
         let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
         let mut h = Heartbeats::default();
         assert!(h.due(start, Some(5)), "the first poll");
-        h.sent(start, Some(5));
-        assert!(!h.due(start + Duration::from_secs(300), Some(5)));
-        // A change goes at once. Whether or not the hub took it, the next polls don't repeat it.
-        assert!(h.due(start + Duration::from_secs(300), Some(4)));
-        h.sent(start + Duration::from_secs(300), Some(4));
+        h.sent(start, Some(5), true);
+        assert!(!h.due(at(300), Some(5)));
+        // A change goes at once. Taken, the next polls don't repeat it.
+        assert!(h.due(at(300), Some(4)));
+        h.sent(at(300), Some(4), true);
         for poll in 2..12 {
-            assert!(
-                !h.due(start + Duration::from_secs(300 * poll), Some(4)),
-                "poll {poll}"
-            );
+            assert!(!h.due(at(300 * poll), Some(4)), "poll {poll}");
         }
         // The hourly one carries it again.
-        assert!(h.due(start + Duration::from_secs(300 + 3600), Some(4)));
+        assert!(h.due(at(300 + 3600), Some(4)));
         // A display without a budget to report is heard from hourly.
         let mut h = Heartbeats::default();
-        h.sent(start, None);
-        assert!(!h.due(start + Duration::from_secs(600), None));
-        assert!(h.due(start + Duration::from_secs(3600), None));
+        h.sent(start, None, true);
+        assert!(!h.due(at(600), None));
+        assert!(h.due(at(3600), None));
+    }
+
+    #[test]
+    fn a_change_the_hub_didnt_take_is_tried_again_after_five_minutes() {
+        let start = Instant::now();
+        let at = |s: u64| start + Duration::from_secs(s);
+        let mut h = Heartbeats::default();
+        h.sent(start, Some(5), true);
+        assert!(h.due(at(60), Some(4)));
+        h.sent(at(60), Some(4), false);
+        // Not at the next polls.
+        for s in [75, 120, 300, 359] {
+            assert!(!h.due(at(s), Some(4)), "{s} s");
+        }
+        // Five minutes on, it is sent again; failing again, it waits another five.
+        assert!(h.due(at(360), Some(4)));
+        h.sent(at(360), Some(4), false);
+        assert!(!h.due(at(420), Some(4)));
+        assert!(h.due(at(660), Some(4)));
+        // Taken: that stops it, until the hourly one.
+        h.sent(at(660), Some(4), true);
+        for s in [720, 960, 1260, 3600] {
+            assert!(!h.due(at(s), Some(4)), "{s} s");
+        }
+        assert!(h.due(at(660 + 3600), Some(4)));
     }
 }

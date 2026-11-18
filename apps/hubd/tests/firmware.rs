@@ -548,6 +548,84 @@ async fn a_package_that_drops_a_trusted_key_is_only_offered_with_a_higher_counte
     r.stop().await;
 }
 
+/// A package whose stored key_set can't be read stays on the shelf but is never offered or called
+/// available, and nothing else stops working: the lists, an upload, and a display's snapshot.
+#[tokio::test]
+async fn a_package_whose_key_set_cant_be_read_is_listed_but_never_offered() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = FakeClock::parse(NOW);
+    let r = Running::start(dir.path(), &clock).await;
+    let admin = r.admin().await;
+    let c = r.client();
+    let k = key();
+    let (desk, token) = r
+        .display(&admin, "Desk", REV, Some(trusting(&k, 0, 1 << 20)))
+        .await;
+    let (hall, _) = r
+        .display(&admin, "Hall", REV, Some(trusting(&k, 0, 1 << 20)))
+        .await;
+    let older = c
+        .upload_firmware(&admin, package(&k, "1.1.0", 1).bytes)
+        .await
+        .unwrap()
+        .0;
+    let mut rel = release("1.2.0", 1);
+    rel.key_set = Some(vec![k.public_key()]);
+    let built = build_and_sign(&k, &rel, &image(5000, 7)).unwrap();
+    let newer = c.upload_firmware(&admin, built.bytes.clone()).await.unwrap().0;
+    let offer = c.offer_firmware(&admin, &desk, &newer.package_id).await.unwrap();
+
+    rusqlite::Connection::open(dir.path().join("hub.db"))
+        .unwrap()
+        .execute(
+            "UPDATE firmware_packages SET key_set = 'not json' WHERE id = ?1",
+            [&newer.package_id],
+        )
+        .unwrap();
+
+    // The shelf still lists both, the damaged one with no key_set shown.
+    let shelf = c.firmware_packages(&admin).await.unwrap();
+    assert_eq!(shelf.len(), 2);
+    let listed = shelf.iter().find(|p| p.package_id == newer.package_id).unwrap();
+    assert_eq!(listed.key_set, None);
+    // It is never picked as available, and never offered again.
+    let views = c.displays(&admin).await.unwrap();
+    let available = |id: &str| {
+        views
+            .iter()
+            .find(|d| d.id == id)
+            .and_then(|d| d.firmware.as_ref())
+            .and_then(|f| f.available_package_id.clone())
+    };
+    assert_eq!(available(&hall), Some(older.package_id.clone()));
+    let e = c
+        .offer_firmware(&admin, &hall, &newer.package_id)
+        .await
+        .unwrap_err();
+    assert_eq!((status(&e), code(&e)), (409, Some(ErrorCode::Conflict)));
+    assert!(
+        e.to_string().contains("couldn't read this package's details"),
+        "{e}"
+    );
+    // The offer already made still reaches its display.
+    let shown = c
+        .device_snapshot(Some(&token))
+        .await
+        .unwrap()
+        .firmware_update
+        .unwrap();
+    assert_eq!(shown.offer_id, offer.offer_id);
+    // Another package still uploads, and the same file again puts the damaged row right.
+    c.upload_firmware(&admin, package(&k, "1.3.0", 1).bytes)
+        .await
+        .unwrap();
+    let (again, created) = c.upload_firmware(&admin, built.bytes).await.unwrap();
+    assert!(created);
+    assert_eq!(again.key_set, Some(vec![k.public_key().key_id().to_hex()]));
+    c.offer_firmware(&admin, &hall, &newer.package_id).await.unwrap();
+    r.stop().await;
+}
+
 #[tokio::test]
 async fn one_open_offer_shows_in_the_snapshot_until_it_ends() {
     let dir = tempfile::tempdir().unwrap();
@@ -1550,6 +1628,13 @@ async fn a_download_that_cant_be_served_leaves_the_displays_last_one_running() {
     assert_eq!((status(&e), code(&e)), (503, Some(ErrorCode::Unavailable)));
     assert!(r.hub.is_downloading(&desk));
     assert_eq!(r.hub.download_slots.available_permits(), 1);
+    // Nor with every slot taken, when a new one would take over the running one's slot.
+    let elsewhere = r.hub.download_slots.clone().try_acquire_owned().unwrap();
+    let e = c.firmware_download(&token, &pkg.package_id).await.unwrap_err();
+    assert_eq!((status(&e), code(&e)), (503, Some(ErrorCode::Unavailable)));
+    assert!(r.hub.is_downloading(&desk));
+    assert_eq!(r.hub.download_slots.available_permits(), 0);
+    drop(elsewhere);
     std::fs::rename(&aside, &file).unwrap();
     // It goes on to the end.
     let mut rest = vec![0u8; form as usize];

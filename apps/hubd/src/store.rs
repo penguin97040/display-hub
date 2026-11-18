@@ -2541,7 +2541,7 @@ mod tests {
             size: 300,
             update_size: 280,
             usb_install: false,
-            key_set: None,
+            key_set: firmware::KeySet::Absent,
             uploaded_at: ts(NOW),
             uploaded_by_role: Role::Admin,
             uploaded_by: "a-1".into(),
@@ -2563,9 +2563,10 @@ mod tests {
 
     #[test]
     fn a_packages_key_set_is_kept_in_its_row() {
+        use firmware::KeySet;
         let store = Store::in_memory().unwrap();
         let mut with = package("p1", "test-display", "1.0.0");
-        with.key_set = Some(vec!["a".repeat(64), "b".repeat(64)]);
+        with.key_set = KeySet::Keys(vec!["a".repeat(64), "b".repeat(64)]);
         store.add_firmware_package(&with, &[], ts(NOW)).unwrap();
         store
             .add_firmware_package(&package("p2", "test-display", "1.1.0"), &[], ts(NOW))
@@ -2574,8 +2575,12 @@ mod tests {
             store.firmware_package("p1").unwrap().unwrap().key_set,
             with.key_set
         );
-        assert_eq!(store.firmware_package("p2").unwrap().unwrap().key_set, None);
-        // A key_set that can't be read is an error, never "no key_set".
+        assert_eq!(
+            store.firmware_package("p2").unwrap().unwrap().key_set,
+            KeySet::Absent
+        );
+        // A key_set that can't be read is marked so, never "no key_set", and only that package's
+        // row is: every other still reads.
         store
             .conn()
             .execute(
@@ -2583,8 +2588,20 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(store.firmware_package("p1").is_err());
-        assert!(store.firmware_packages().is_err());
+        assert_eq!(
+            store.firmware_package("p1").unwrap().unwrap().key_set,
+            KeySet::Unreadable
+        );
+        let all = store.firmware_packages().unwrap();
+        assert_eq!(all.len(), 2);
+        let key_sets: Vec<_> = all.iter().map(|p| (p.id.as_str(), &p.key_set)).collect();
+        assert!(key_sets.contains(&("p1", &KeySet::Unreadable)));
+        assert!(key_sets.contains(&("p2", &KeySet::Absent)));
+        // Nor is such a row ever written.
+        let mut bad = package("p3", "test-display", "1.2.0");
+        bad.key_set = KeySet::Unreadable;
+        assert!(store.add_firmware_package(&bad, &[], ts(NOW)).is_err());
+        assert!(store.firmware_package("p3").unwrap().is_none());
     }
 
     #[test]

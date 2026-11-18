@@ -1563,11 +1563,57 @@ mod tests {
         m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
         assert_eq!(title(&m).as_deref(), Some("Removed Weather."));
         assert!(!m.lists_told, "not counted as told");
-        // Once that has been dismissed, the next refresh says it.
+        // Once that has been dismissed, an answer that brings no refresh doesn't say it.
         m.notice = None;
+        ready_to_install(&mut m, false);
+        assert_eq!(title(&m), None);
+        assert!(!m.lists_told);
+        // The next refresh that still can't read them does.
         m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
         assert_eq!(title(&m).as_deref(), Some("Couldn't read the firmware lists"));
         assert!(m.lists_told);
+    }
+
+    #[test]
+    fn an_old_firmware_lists_failure_is_never_told_by_an_answer_without_a_refresh() {
+        let (mut m, now) = with_firmware();
+        let mut r = m.last.clone().unwrap();
+        r.firmware = None;
+        r.firmware_error = Some(std::sync::Arc::new(ClientError::Timeout));
+        m.notice = Some(Guidance::done("Saved", "Something else."));
+        m.finish(Ok(Outcome::Refreshed(Some(r))), now);
+        assert!(m.last.as_ref().unwrap().firmware_error.is_some());
+        m.notice = None;
+        // Loading a package file brings no refresh: the error left from before stays unsaid.
+        let (loaded, _) = usb_package("esp32s3", false);
+        m.finish(Ok(Outcome::PackageLoaded(Box::new(loaded))), now);
+        assert!(m.notice.is_none(), "{:?}", m.notice);
+        assert!(!m.lists_told);
+    }
+
+    #[test]
+    fn pairing_again_tells_about_unreadable_firmware_lists_afresh() {
+        let failing = |m: &Model| {
+            let mut r = m.last.clone().unwrap();
+            r.firmware = None;
+            r.firmware_error = Some(std::sync::Arc::new(ClientError::Timeout));
+            r
+        };
+        let title = |m: &Model| m.notice.as_ref().map(|n| n.title.clone());
+        let (mut m, now) = with_firmware();
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert!(m.lists_told);
+        m.notice = None;
+        // Paired again while the lists still can't be read: the pairing's notice shows first, and
+        // the failure is told again at the next refresh, not taken as already said.
+        let hub = m.hub.clone().unwrap();
+        let refresh = Some(failing(&m));
+        m.finish(Ok(Outcome::Paired { hub, refresh }), now);
+        assert_eq!(title(&m).as_deref(), Some("Paired"));
+        assert!(!m.lists_told);
+        m.notice = None;
+        m.finish(Ok(Outcome::Refreshed(Some(failing(&m)))), now);
+        assert_eq!(title(&m).as_deref(), Some("Couldn't read the firmware lists"));
     }
 
     #[test]

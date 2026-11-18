@@ -16,7 +16,7 @@ use hub_protocol::device::DeviceInfo;
 use hub_protocol::Timestamp;
 
 use crate::secret::Role;
-use crate::store::firmware::{OfferRow, PackageRow};
+use crate::store::firmware::{KeySet, OfferRow, PackageRow};
 use crate::store::{Store, StoreError};
 
 /// The packages folder, inside the data folder.
@@ -347,10 +347,11 @@ pub fn row_from(checked: &CheckedPackage, role: Role, by: &str, now: Timestamp) 
         size: checked.len,
         update_size: checked.update_form_len(),
         usb_install: m.usb_install.is_some(),
-        key_set: m
-            .key_set
-            .as_ref()
-            .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect()),
+        key_set: KeySet::from_keys(
+            m.key_set
+                .as_ref()
+                .map(|ks| ks.iter().map(|k| k.key_id().to_hex()).collect()),
+        ),
         uploaded_at: now,
         uploaded_by_role: role,
         uploaded_by: by.to_string(),
@@ -385,7 +386,11 @@ pub fn package_view(
         update_size: p.update_size,
         image_size: p.image_size,
         usb_install: p.usb_install,
-        key_set: p.key_set.clone(),
+        // One that can't be read is shown as none; such a package is never offered.
+        key_set: match &p.key_set {
+            KeySet::Keys(ks) => Some(ks.clone()),
+            KeySet::Absent | KeySet::Unreadable => None,
+        },
         uploaded_at: p.uploaded_at,
         uploaded_by_role: p.uploaded_by_role.as_str().to_string(),
         uploaded_by: p.uploaded_by.clone(),
@@ -416,6 +421,13 @@ pub fn offer_view(o: &OfferRow, now: Timestamp) -> FirmwareOfferView {
 /// package? A plain sentence if so. The display repeats every check; these only save a pointless
 /// download and say why.
 pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String> {
+    let key_set = match &p.key_set {
+        KeySet::Absent => None,
+        KeySet::Keys(ks) => Some(ks.as_slice()),
+        KeySet::Unreadable => {
+            return Err("The hub couldn't read this package's details. Remove it and add it again.".into())
+        }
+    };
     let Some(info) = info else {
         return Err(
             "This display hasn't reported itself to the hub yet. Wait for it to check in, then try again."
@@ -460,12 +472,7 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String>
             fw.security_floor, p.security_counter
         ));
     }
-    if firmware_package::drops_key_unraised(
-        p.key_set.as_deref(),
-        &fw.key_ids,
-        p.security_counter,
-        fw.security_floor,
-    ) {
+    if firmware_package::drops_key_unraised(key_set, &fw.key_ids, p.security_counter, fw.security_floor) {
         return Err(format!(
             "This package would stop the display trusting one of its firmware keys without a higher \
              security counter (this package's counter is {}, and the display's floor is {}), so it would \
@@ -516,7 +523,7 @@ mod tests {
             size,
             update_size: size,
             usb_install: false,
-            key_set: None,
+            key_set: KeySet::Absent,
             uploaded_at: Timestamp::from_unix(1_800_000_000).unwrap(),
             uploaded_by_role: if by.is_some() {
                 Role::Publisher
