@@ -1,6 +1,6 @@
-//! Tokens in the operating system's credential store: Windows Credential Manager, or the Secret
-//! Service on Linux. Never a plain file. If no store is available, callers say so and refuse to
-//! pair, rather than falling back to one.
+//! Tokens in the operating system's credential store: Windows Credential Manager, the login
+//! keychain on macOS, or the Secret Service on Linux. Never a plain file. If no store is
+//! available, callers say so and refuse to pair, rather than falling back to one.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -26,15 +26,19 @@ fn init() -> &'static Result<(), String> {
     INIT.get_or_init(|| {
         #[cfg(windows)]
         let store = windows_native_keyring_store::Store::new();
+        // The user's login keychain, not the iCloud or "protected data" stores (those need a
+        // signed app with entitlements).
+        #[cfg(target_os = "macos")]
+        let store = apple_native_keyring_store::keychain::Store::new();
         #[cfg(all(unix, not(target_os = "macos")))]
         let store = zbus_secret_service_keyring_store::Store::new();
-        #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
+        #[cfg(any(windows, unix))]
         {
             store
                 .map(|s| keyring_core::set_default_store(s))
                 .map_err(|e| e.to_string())
         }
-        #[cfg(not(any(windows, all(unix, not(target_os = "macos")))))]
+        #[cfg(not(any(windows, unix)))]
         Err("this platform's credential store isn't supported yet".to_string())
     })
 }

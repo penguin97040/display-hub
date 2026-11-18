@@ -536,9 +536,20 @@ fn list_ports() -> Vec<PortInfo> {
             }
         })
         .collect();
+    drop_mac_dial_in_twins(&mut ports);
     // USB ports first: that's where a display is.
     ports.sort_by_key(|p| (!p.description.starts_with("USB"), p.name.clone()));
     ports
+}
+
+/// A Mac lists every serial port twice, as `/dev/cu.NAME` (the one to use) and `/dev/tty.NAME`
+/// (which waits for a signal that a USB display never gives). Keeps only the `cu` one.
+fn drop_mac_dial_in_twins(ports: &mut Vec<PortInfo>) {
+    let names: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+    ports.retain(|p| match p.name.strip_prefix("/dev/tty.") {
+        Some(rest) => !names.contains(&format!("/dev/cu.{rest}")),
+        None => true,
+    });
 }
 
 fn send_usb(port: &str, bundle: &Bundle) -> Result<hub_client::usb::UsbDisplay, hub_client::usb::UsbError> {
@@ -628,6 +639,23 @@ mod tests {
     use crate::model::{Model, Outcome};
     use crate::shown::Shown;
     use os_secrets::MemoryStore;
+
+    #[test]
+    fn a_mac_port_is_listed_once() {
+        let port = |name: &str| PortInfo {
+            name: name.into(),
+            description: "USB".into(),
+        };
+        let mut ports = vec![
+            port("/dev/cu.usbmodem1101"),
+            port("/dev/tty.usbmodem1101"),
+            port("/dev/tty.lonely"),
+            port("/dev/ttyACM0"),
+        ];
+        drop_mac_dial_in_twins(&mut ports);
+        let names: Vec<_> = ports.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["/dev/cu.usbmodem1101", "/dev/tty.lonely", "/dev/ttyACM0"]);
+    }
 
     async fn run(model: &mut Model, ctx: &Arc<Ctx>, op: Option<Op>) {
         let op = op.expect("an operation");

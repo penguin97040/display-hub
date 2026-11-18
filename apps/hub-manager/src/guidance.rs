@@ -277,8 +277,8 @@ pub fn from_store(detail: &str) -> Guidance {
     Guidance::problem(
         "No safe place to keep the hub's credential",
         format!(
-            "This app keeps its credential in the system's credential store (Windows Credential Manager, or the \
-             Secret Service on Linux) and never in a plain file. The store didn't work: {detail}"
+            "This app keeps its credential in the system's credential store (Windows Credential Manager, the \
+             macOS keychain, or the Secret Service on Linux) and never in a plain file. The store didn't work: {detail}"
         ),
         Next::Retry,
     )

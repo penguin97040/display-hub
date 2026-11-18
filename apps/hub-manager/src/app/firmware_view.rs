@@ -733,7 +733,7 @@ impl Manager {
         let other = self.field(
             FieldId::InstallPort,
             "Or type a port",
-            "Such as COM5, or /dev/ttyACM0. Enter goes on.",
+            "Such as COM5, /dev/ttyACM0 or /dev/cu.usbmodem1101. Enter goes on.",
             window,
             cx,
         );

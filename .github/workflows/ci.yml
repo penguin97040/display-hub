@@ -99,6 +99,24 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  macos:
+    # Apple silicon (macos-15 is arm64; the Intel runner is macos-15-intel). The same checks as Linux
+    # except what only makes sense there: the mbedTLS interop, the Pi build and its containers, and
+    # the audit and licence checks. No test needs the keychain, which has no one to answer its prompt
+    # on a runner: they use in-memory token stores. The manager isn't run, so the window isn't
+    # smoke tested here as it is on Windows.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked --no-fail-fast
+
   pi:
     # The Raspberry Pi release build (aarch64 against glibc 2.36, so it runs on Raspberry Pi OS
     # Bookworm and Trixie), then the installer, the hub's service and helpers tested in Debian

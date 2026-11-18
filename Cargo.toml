@@ -82,6 +82,7 @@ zeroize = "=1.9.1"
 # The desktop manager's admin token lives in the OS credential store, never a plain file.
 keyring-core = "=1.0.1"
 windows-native-keyring-store = { version = "=1.1.0", default-features = false }
+apple-native-keyring-store = { version = "=1.0.2", default-features = false, features = ["keychain"] }
 zbus-secret-service-keyring-store = { version = "=1.0.1", features = ["rt-async-io-crypto-rust"] }
 dirs = "=6.0.0"
 jsonschema = { version = "=0.61.1", default-features = false }

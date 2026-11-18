@@ -2391,7 +2391,7 @@ impl Manager {
                     let op = this.model.list_ports();
                     this.run(op, cx);
                 });
-                let other = self.field(FieldId::OtherPort, "Or type a port", "Such as COM5, or /dev/ttyACM0. Enter sends.", window, cx);
+                let other = self.field(FieldId::OtherPort, "Or type a port", "Such as COM5, /dev/ttyACM0 or /dev/cu.usbmodem1101. Enter sends.", window, cx);
                 let save = self.button("bundle-save", "Save as a file", Kind::Quiet, !busy, cx, |this, _, cx| this.prompt_save(cx));
                 let keys = self.pending_keys_block(cx);
                 ui::body(m)
