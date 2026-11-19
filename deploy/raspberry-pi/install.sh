@@ -149,6 +149,15 @@ if ! systemctl is-active --quiet display-hub; then
   fail "the service didn't start; the log is above"
 fi
 
+# "Active" only means the process started. The database is set up before the hub listens, so wait
+# (up to 30 seconds) until its port answers. Commands run before then would race the hub for the
+# new database. If the port is changed in hubd.toml this just runs out of time, and the commands
+# below try again anyway.
+for _ in $(seq 1 30); do
+  timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/8443' 2>/dev/null && break
+  sleep 1
+done
+
 say ""
 say "Display Hub is running: $new_version"
 as_hub "$bin" check || say "(Problems above are worth a look. An unsynchronised clock fixes itself once the Pi reaches a time server.)"
@@ -158,7 +167,17 @@ if [ "$fresh_install" = 1 ]; then
   say "Next, connect the Display Hub app on your PC. Copy the whole line below that starts with"
   say "dh1 and paste it into the app. It works once, within 10 minutes. Don't share it or save it."
   say ""
-  as_hub "$bin" pair-admin || say "(Couldn't make one. Try again with: sudo -u $user hubd pair-admin)"
+  pair_err=$(mktemp)
+  paired=0
+  for _ in 1 2 3 4 5; do
+    if as_hub "$bin" pair-admin 2>"$pair_err"; then paired=1; break; fi
+    sleep 2
+  done
+  if [ "$paired" = 0 ]; then
+    cat "$pair_err" >&2 || true
+    say "(Couldn't make one. Try again with: sudo -u $user hubd pair-admin)"
+  fi
+  rm -f "$pair_err"
 else
   say "To connect another PC to this hub, make a pairing string:"
   say "  sudo -u $user hubd pair-admin"

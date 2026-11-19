@@ -95,6 +95,8 @@ out=$(box bash /root/display-hub/install.sh 2>&1) || { echo "$out"; bad "install
 check "install.sh starts the service" active
 install_pairing=$(grep -oE 'dh1\.[A-Za-z0-9_-]+\.[0-9a-f]{8}' <<<"$out" | head -1 || true)
 check "install.sh prints a pairing string on a first install" test -n "$install_pairing"
+# Show why, if it didn't: the whole install output.
+[ -n "$install_pairing" ] || echo "$out"
 check "install.sh keeps its folder in $share" is_mode "755 root:root" "$share"
 check "install.sh keeps a copy of itself (0755, root's)" is_mode "755 root:root" "$share/install.sh"
 check "install.sh keeps the firewall rule (0644, root's)" is_mode "644 root:root" "$share/nftables-display-hub.conf"

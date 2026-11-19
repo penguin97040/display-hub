@@ -576,6 +576,27 @@ fn ts(t: i64) -> Timestamp {
     Timestamp::from_unix(t).unwrap_or_else(|| Timestamp::from_unix(0).expect("epoch"))
 }
 
+/// Runs `op`, trying again for up to 10 seconds while SQLite says the database is busy or locked.
+/// Most waits are handled by the busy timeout, but not all: switching a brand-new file to WAL
+/// while another connection is setting it up can fail at once with "database is locked", and
+/// the busy timeout is not consulted. A moment later it works.
+fn retry_busy<T>(mut op: impl FnMut() -> rusqlite::Result<T>) -> rusqlite::Result<T> {
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match op() {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < give_up =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
 impl Store {
     /// Opens (creating if needed) the database, checks it and brings its schema up to date.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
@@ -626,7 +647,7 @@ impl Store {
 
     fn prepare(conn: Connection, path: &Path) -> Result<Self, StoreError> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let check: Result<String, _> = conn.query_row("PRAGMA quick_check", [], |r| r.get(0));
+        let check: Result<String, _> = retry_busy(|| conn.query_row("PRAGMA quick_check", [], |r| r.get(0)));
         match check {
             Ok(s) if s == "ok" => {}
             Ok(detail) => {
@@ -642,7 +663,7 @@ impl Store {
                 })
             }
         }
-        conn.pragma_update(None, "journal_mode", "WAL")?;
+        retry_busy(|| conn.pragma_update(None, "journal_mode", "WAL"))?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         let store = Self {
@@ -660,50 +681,69 @@ impl Store {
 
     fn migrate(&self) -> Result<(), StoreError> {
         let mut conn = self.conn();
-        let current: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         let known = MIGRATIONS.len() as i64;
-        if current > known {
-            return Err(StoreError::TooNew {
-                path: self.path.clone(),
-                found: current,
-                known,
-            });
+        let too_new = |found: i64| StoreError::TooNew {
+            path: self.path.clone(),
+            found,
+            known,
+        };
+        // The usual case, an up-to-date database, takes no lock at all.
+        let seen: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if seen > known {
+            return Err(too_new(seen));
         }
-        if current == known {
+        if seen == known {
             return Ok(());
         }
-        // A new database (version 0) has nothing to lose. An existing one is copied first.
-        if current > 0 {
-            let copy = self.copy_before_upgrade(&conn, current)?;
-            tracing::info!(path = %copy.display(), from = current, "saved a copy of the database before upgrading it");
-        }
-        // Every step in one transaction: a failure part-way leaves the database as it was.
-        let upgrade = |conn: &mut Connection| -> Result<(), StoreError> {
+        // Another process (`hubd check` beside `hubd serve`, say) may open the same new database at
+        // the same moment. So the version that decides what to do is the one read under the
+        // exclusive lock: whoever gets the lock second finds the work done and does nothing.
+        let mut copied_from = None;
+        loop {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
-            for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
-                let version = (i + 1) as i64;
-                tx.execute_batch(sql)?;
-                if let Some((_, data_move)) = DATA_MOVES.iter().find(|(v, _)| *v == version) {
-                    data_move(&tx)?;
-                }
+            let current: i64 = tx.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+            if current > known {
+                return Err(too_new(current));
             }
-            tx.pragma_update(None, "user_version", known)?;
-            tx.commit()?;
-            Ok(())
-        };
-        match upgrade(&mut conn) {
-            Ok(()) => {}
-            Err(e) if current > 0 => {
-                return Err(StoreError::UpgradeFailed {
+            if current == known {
+                return Ok(());
+            }
+            // A new database (version 0) has nothing to lose. An existing one is copied first. The
+            // copy can't be made inside the transaction, so let go, copy, and look again: if the
+            // version moved meanwhile, the next pass decides afresh.
+            if current > 0 && copied_from != Some(current) {
+                drop(tx);
+                let copy = self.copy_before_upgrade(&conn, current)?;
+                tracing::info!(path = %copy.display(), from = current, "saved a copy of the database before upgrading it");
+                copied_from = Some(current);
+                continue;
+            }
+            // Every step in one transaction: a failure part-way leaves the database as it was.
+            let run = || -> Result<(), StoreError> {
+                for (i, sql) in MIGRATIONS.iter().enumerate().skip(current as usize) {
+                    let version = (i + 1) as i64;
+                    tx.execute_batch(sql)?;
+                    if let Some((_, data_move)) = DATA_MOVES.iter().find(|(v, _)| *v == version) {
+                        data_move(&tx)?;
+                    }
+                }
+                tx.pragma_update(None, "user_version", known)?;
+                Ok(())
+            };
+            let outcome = run().and_then(|()| tx.commit().map_err(StoreError::from));
+            return match outcome {
+                Ok(()) => {
+                    tracing::info!(from = current, to = known, "database schema upgraded");
+                    Ok(())
+                }
+                Err(e) if current > 0 => Err(StoreError::UpgradeFailed {
                     path: self.path.clone(),
                     from: current,
                     detail: e.to_string(),
-                })
-            }
-            Err(e) => return Err(e),
+                }),
+                Err(e) => Err(e),
+            };
         }
-        tracing::info!(from = current, to = known, "database schema upgraded");
-        Ok(())
     }
 
     /// Saves an online copy of the database beside it, owner-only, named after its schema version
@@ -1651,6 +1691,44 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+
+    /// `hubd check` and `hubd pair-admin` open the database while `hubd serve` is still setting a
+    /// new one up. Every opener must succeed, and the schema must be made exactly once.
+    #[test]
+    fn many_processes_opening_a_new_database_at_once_all_succeed() {
+        for round in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.db");
+            let gate = Arc::new(std::sync::Barrier::new(8));
+            let openers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, gate) = (path.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        Store::open(&path).map(|s| s.schema_version().unwrap())
+                    })
+                })
+                .collect();
+            for opener in openers {
+                let version = opener
+                    .join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e}"));
+                assert_eq!(version, SCHEMA_VERSION);
+            }
+            let copies = std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("before-upgrade")
+                })
+                .count();
+            assert_eq!(copies, 0, "a new database is never copied");
+        }
     }
 
     #[test]
