@@ -58,6 +58,10 @@ void storage_key_assess(const efuse_report_t *efuse, storage_key_status_t *statu
 esp_err_t storage_key_start_nvs(efuse_report_t *efuse, storage_key_status_t *status,
                                 bool *key_made);
 
+// True if this start burnt the key and the burn changed eFuse bits other than KEY5's own (key,
+// purpose and protection). Reported by storage_log() every minute.
+bool storage_key_burn_changed_more(void);
+
 // Prints the state to the console.
 void storage_key_log(const storage_key_status_t *status);
 

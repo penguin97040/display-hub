@@ -182,6 +182,9 @@ static void usb_task(void *arg)
             }
         }
         dh_wipe(chunk, sizeof(chunk));
+        // A dropped line (too long, or not starting with '{') never reaches handle_line(), but
+        // it may have been a bundle. This wipes the buffer only when no line is part-read.
+        dh_usb_line_wipe(s_reader);
     }
 }
 

@@ -43,6 +43,10 @@
 
 static const char *TAG = "storage-key";
 
+// Set if this start burnt the key and the burn changed more of the eFuses than KEY5's own bits.
+// It is permanent by then, so it doesn't stop the display; it is reported every minute instead.
+static bool s_burn_changed_more;
+
 _Static_assert(CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID == STORAGE_KEY_BLOCK,
                "the storage key must be in eFuse key block KEY5");
 
@@ -247,6 +251,7 @@ static esp_err_t make_key(efuse_report_t *efuse)
         ESP_LOGW(TAG, "KEY%d now holds the storage key; nothing else in the eFuses changed",
                  STORAGE_KEY_BLOCK);
     } else {
+        s_burn_changed_more = true;
         ESP_LOGE(TAG, "KEY%d now holds the storage key, but compare the two eFuse reports above",
                  STORAGE_KEY_BLOCK);
     }
@@ -286,6 +291,11 @@ esp_err_t storage_key_start_nvs(efuse_report_t *efuse, storage_key_status_t *sta
                  esp_err_to_name(err));
     }
     return err;
+}
+
+bool storage_key_burn_changed_more(void)
+{
+    return s_burn_changed_more;
 }
 
 void storage_key_log(const storage_key_status_t *status)

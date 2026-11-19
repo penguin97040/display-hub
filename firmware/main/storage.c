@@ -103,40 +103,60 @@ static blob_result_t read_blob(const char *namespace, const char *key, uint8_t *
 
 // Writes one blob and reads it back. `data` is used for the reading back, so it must be a buffer
 // the caller owns; it holds the same bytes afterwards if this returns true. With `erase_if_bad`,
-// a value that didn't read back as written is erased, so it can't be found at the next start.
+// a failed write that may have reached the flash is erased, so it can't be found at the next start;
+// if even that fails, storage is marked failed for the rest of this run.
 static bool write_blob(const char *namespace, const char *key, uint8_t *data, size_t len,
                        bool erase_if_bad)
 {
     uint8_t before[DH_SHA256_LEN], after[DH_SHA256_LEN];
     if (len == 0 || !dh_sha256_of(data, len, before)) {
+        dh_wipe(before, sizeof(before));
         return false;
     }
-    nvs_handle_t nvs;
+    nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(namespace, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "couldn't open %s for writing: %s", namespace, esp_err_to_name(err));
+        dh_wipe(before, sizeof(before));
         return false;
     }
     err = nvs_set_blob(nvs, key, data, len);
-    if (err == ESP_OK) {
+    // From here the new value may be in the flash, whatever happens next.
+    const bool set = err == ESP_OK;
+    if (set) {
         err = nvs_commit(nvs);
     }
     bool ok = err == ESP_OK;
+    bool differs = false;
     if (ok) {
         size_t got = len;
         memset(data, 0, len);
         err = nvs_get_blob(nvs, key, data, &got);
         ok = err == ESP_OK && got == len && dh_sha256_of(data, len, after) &&
              memcmp(before, after, sizeof(before)) == 0;
-        if (!ok && erase_if_bad) {
-            nvs_erase_key(nvs, key);
-            nvs_commit(nvs);
-        }
+        differs = !ok && err == ESP_OK;
     }
-    if (!ok) {
+    if (differs) {
+        ESP_LOGE(TAG, "couldn't write %s/%s: it read back differently", namespace, key);
+    } else if (!ok) {
         ESP_LOGE(TAG, "couldn't write %s/%s: %s", namespace, key, esp_err_to_name(err));
     }
+    if (!ok && set && erase_if_bad) {
+        esp_err_t gone = nvs_erase_key(nvs, key);
+        if (gone == ESP_OK || gone == ESP_ERR_NVS_NOT_FOUND) {
+            gone = nvs_commit(nvs);
+        }
+        if (gone != ESP_OK) {
+            // What is in the flash can't be known now, so take nothing further this run.
+            ESP_LOGE(TAG, "couldn't erase %s/%s after the failed write: %s; storage is now "
+                          "treated as failed until a restart",
+                     namespace, key, esp_err_to_name(gone));
+            s_facts.state = STORAGE_FAILED;
+        }
+    }
     nvs_close(nvs);
+    dh_wipe(before, sizeof(before));
+    dh_wipe(after, sizeof(after));
     return ok;
 }
 
@@ -187,23 +207,23 @@ static bool store_save_setup(void *ctx, const dh_setup *setup)
 static bool store_erase_setup(void *ctx)
 {
     (void)ctx;
-    nvs_handle_t nvs;
+    nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(SETUP_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
         err = nvs_erase_all(nvs);
-    }
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs);
-    }
-    if (err == ESP_OK) {
-        // It must be gone, not merely reported so.
-        size_t stored = 0;
-        const esp_err_t left = nvs_get_blob(nvs, SETUP_KEY, NULL, &stored);
-        if (left != ESP_ERR_NVS_NOT_FOUND) {
-            err = left == ESP_OK ? ESP_FAIL : left;
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
         }
+        if (err == ESP_OK) {
+            // It must be gone, not merely reported so.
+            size_t stored = 0;
+            const esp_err_t left = nvs_get_blob(nvs, SETUP_KEY, NULL, &stored);
+            if (left != ESP_ERR_NVS_NOT_FOUND) {
+                err = left == ESP_OK ? ESP_FAIL : left;
+            }
+        }
+        nvs_close(nvs);
     }
-    nvs_close(nvs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "couldn't erase the setup: %s", esp_err_to_name(err));
         return false;
@@ -423,6 +443,11 @@ uint32_t storage_spare_slot_bytes(void)
 void storage_log(void)
 {
     storage_lock();
+    if (storage_key_burn_changed_more()) {
+        ESP_LOGE(TAG, "making the storage key at this start changed more of the eFuses than "
+                      "KEY%d: compare the eFuse reports printed at start-up",
+                 STORAGE_KEY_BLOCK);
+    }
     switch (s_facts.state) {
     case STORAGE_WORKING:
         if (s_facts.setup_unreadable) {
