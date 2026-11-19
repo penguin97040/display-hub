@@ -1,4 +1,4 @@
-// The board test's screens. See ui_board_test.h.
+// The check build's screens. See ui_board_test.h.
 //
 // White text on black throughout: an AMOLED pixel that is black is off, so this is easy on the
 // screen and on power. Everything here runs in LVGL's task (or under its lock).
@@ -9,17 +9,22 @@
 
 #include "esp_log.h"
 #include "lvgl.h"
+#include "ui_parts.h"
+#include "ui_storage_key.h"
 
 static const char *TAG = "board-test";
 
-#define PAGE_COUNT    3
+#define PAGE_COUNT    4
 #define PAGE_PAD_SIDE 16
 #define PAGE_PAD_TOP  18
 #define DOT_SIZE      36
 
-#define COLOUR_TEXT    lv_color_white()
-#define COLOUR_QUIET   lv_color_hex(0xA0A0A0)
-#define COLOUR_WARNING lv_color_hex(0xFFB000)
+#define COLOUR_TEXT    UI_COLOUR_TEXT
+#define COLOUR_QUIET   UI_COLOUR_QUIET
+#define COLOUR_WARNING UI_COLOUR_WARNING
+
+#define PAGE_EFUSE       2
+#define PAGE_STORAGE_KEY 3
 
 static lv_obj_t *s_pages[PAGE_COUNT];
 static lv_obj_t *s_page_dots[PAGE_COUNT];
@@ -41,8 +46,8 @@ const char *ui_board_test_last_swipe(void)
     return s_last_swipe;
 }
 
-static lv_obj_t *add_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t colour,
-                           const char *text)
+lv_obj_t *ui_add_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t colour,
+                       const char *text)
 {
     lv_obj_t *label = lv_label_create(parent);
     lv_obj_set_width(label, LV_PCT(100));
@@ -75,7 +80,7 @@ static lv_obj_t *add_page(lv_obj_t *screen, bool scroll_up_down)
     return page;
 }
 
-static void add_gap(lv_obj_t *page, int height)
+void ui_add_gap(lv_obj_t *page, int height)
 {
     lv_obj_t *gap = lv_obj_create(page);
     lv_obj_remove_style_all(gap);
@@ -90,6 +95,7 @@ static void show_page(int page)
         lv_obj_set_hidden(s_pages[i], i != page);
         lv_obj_set_style_bg_opa(s_page_dots[i], i == page ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
     }
+    ui_storage_key_page_shown(page == PAGE_STORAGE_KEY);
 }
 
 static void on_gesture(lv_event_t *e)
@@ -99,6 +105,8 @@ static void on_gesture(lv_event_t *e)
     if (indev == NULL) {
         return;
     }
+    // A touch that turned into a swipe must never count as a tap on a button.
+    ui_storage_key_swipe_seen();
     const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
     switch (dir) {
     case LV_DIR_LEFT:
@@ -154,65 +162,65 @@ static void update_memory(lv_timer_t *timer)
 
 static void build_about_page(lv_obj_t *page, const board_t *board, const system_report_t *system)
 {
-    add_label(page, &lv_font_montserrat_36, COLOUR_TEXT, "Display Hub");
-    add_label(page, &lv_font_montserrat_24, COLOUR_QUIET, "Board test");
-    add_gap(page, 10);
+    ui_add_label(page, &lv_font_montserrat_36, COLOUR_TEXT, "Display Hub");
+    ui_add_label(page, &lv_font_montserrat_24, COLOUR_QUIET, "Storage key check");
+    ui_add_gap(page, 10);
 
-    lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, ""),
+    lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, ""),
                           "Firmware %s", system->version);
     if (system->running_known) {
-        lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, ""),
+        lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, ""),
                               "Slot %s at 0x%" PRIx32, system->running_label,
                               system->running_address);
     } else {
-        add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Slot: unknown");
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Slot: unknown");
     }
-    lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_20, COLOUR_QUIET, ""),
+    lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_20, COLOUR_QUIET, ""),
                           "Boot record: %s", system->boot_record);
 
     switch (board->revision) {
     case BOARD_REVISION_V2:
-        add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "Board: V2");
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "Board: V2");
         break;
     case BOARD_REVISION_V1:
-        add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "V1 board: not supported yet");
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "V1 board: not supported yet");
         break;
     default:
-        add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Board: not recognised");
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Board: not recognised");
         break;
     }
 
     if (board->power.found) {
-        add_label(page, &lv_font_montserrat_24, COLOUR_TEXT,
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT,
                   board->power.usb_power_good ? "Power: USB good" : "Power: no USB power");
     } else {
-        add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Power chip: not found");
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Power chip: not found");
     }
     if (!board->expander_found) {
-        add_label(page, &lv_font_montserrat_20, COLOUR_WARNING, "I/O expander: not found");
+        ui_add_label(page, &lv_font_montserrat_20, COLOUR_WARNING, "I/O expander: not found");
     }
 
-    s_psram_label = add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "");
-    s_heap_label = add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "");
+    s_psram_label = ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "");
+    s_heap_label = ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "");
     update_memory(NULL);
 }
 
 static void build_touch_page(lv_obj_t *page, const board_t *board)
 {
-    add_label(page, &lv_font_montserrat_36, COLOUR_TEXT, "Touch test");
+    ui_add_label(page, &lv_font_montserrat_36, COLOUR_TEXT, "Touch test");
     if (board->touch_ready) {
-        add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
+        ui_add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
                   "Touch and drag: the dot follows your finger.");
-        add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
+        ui_add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
                   "Swipe up or down to test a swipe. Swipe left or right for the next screen.");
     } else {
-        add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Touch isn't working.");
-        add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
+        ui_add_label(page, &lv_font_montserrat_24, COLOUR_WARNING, "Touch isn't working.");
+        ui_add_label(page, &lv_font_montserrat_20, COLOUR_QUIET,
                   "No touch chip answered, or it failed to start.");
     }
-    add_gap(page, 10);
-    s_swipe_label = add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "Last swipe: none");
-    s_touch_point_label = add_label(page, &lv_font_montserrat_20, COLOUR_QUIET, "Touch at: -");
+    ui_add_gap(page, 10);
+    s_swipe_label = ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "Last swipe: none");
+    s_touch_point_label = ui_add_label(page, &lv_font_montserrat_20, COLOUR_QUIET, "Touch at: -");
 
     s_touch_dot = lv_obj_create(page);
     lv_obj_remove_style_all(s_touch_dot);
@@ -229,31 +237,32 @@ static void build_touch_page(lv_obj_t *page, const board_t *board)
 
 static void build_efuse_page(lv_obj_t *page, const efuse_report_t *efuse)
 {
-    add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "eFuse keys");
-    add_label(page, &lv_font_montserrat_16, COLOUR_QUIET, "Read only: nothing is written.");
-    add_gap(page, 4);
+    ui_add_label(page, &lv_font_montserrat_24, COLOUR_TEXT, "eFuse keys");
+    ui_add_label(page, &lv_font_montserrat_16, COLOUR_QUIET,
+                 "This screen only reads. The next screen is the one that can burn a key.");
+    ui_add_gap(page, 4);
 
     for (int i = 0; i < EFUSE_REPORT_KEYS; i++) {
         const efuse_key_report_t *key = &efuse->keys[i];
-        lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_20, COLOUR_TEXT, ""),
+        lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_20, COLOUR_TEXT, ""),
                               "KEY%d  %s, %s", i, efuse_purpose_name(key->purpose),
                               key->unused ? "empty" : "in use");
-        lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_16, COLOUR_QUIET, ""),
+        lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_16, COLOUR_QUIET, ""),
                               "read-protected: %s  write-protected: %s",
                               key->read_protected ? "yes" : "no",
                               key->write_protected ? "yes" : "no");
     }
 
-    add_gap(page, 4);
-    lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
+    ui_add_gap(page, 4);
+    lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
                           "Download mode: %s. Secure download mode: %s.",
                           efuse->download_mode_disabled ? "disabled" : "allowed",
                           efuse->secure_download_mode ? "on" : "off");
-    lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
+    lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
                           "USB-Serial-JTAG: %s. USB download: %s.",
                           efuse->usb_serial_jtag_disabled ? "disabled" : "allowed",
                           efuse->usb_download_disabled ? "disabled" : "allowed");
-    lv_label_set_text_fmt(add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
+    lv_label_set_text_fmt(ui_add_label(page, &lv_font_montserrat_16, COLOUR_TEXT, ""),
                           "Secure Boot: %s. Flash encryption: %s.",
                           efuse->secure_boot_on ? "on" : "off",
                           efuse->flash_encryption_on ? "on" : "off");
@@ -294,13 +303,21 @@ void ui_board_test_start(const board_t *board, const system_report_t *system,
 
     s_pages[0] = add_page(screen, true);
     s_pages[1] = add_page(screen, false);
-    s_pages[2] = add_page(screen, true);
+    s_pages[PAGE_EFUSE] = add_page(screen, true);
+    s_pages[PAGE_STORAGE_KEY] = add_page(screen, false);
     build_about_page(s_pages[0], board, system);
     build_touch_page(s_pages[1], board);
-    build_efuse_page(s_pages[2], efuse);
+    build_efuse_page(s_pages[PAGE_EFUSE], efuse);
+    ui_storage_key_build(s_pages[PAGE_STORAGE_KEY]);
     build_page_dots(screen);
     show_page(0);
 
     lv_obj_add_event_cb(screen, on_gesture, LV_EVENT_GESTURE, NULL);
     lv_timer_create(update_memory, 2000, NULL);
+}
+
+void ui_board_test_refresh_efuse(const efuse_report_t *efuse)
+{
+    lv_obj_clean(s_pages[PAGE_EFUSE]);
+    build_efuse_page(s_pages[PAGE_EFUSE], efuse);
 }

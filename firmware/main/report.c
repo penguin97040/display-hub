@@ -75,7 +75,7 @@ void memory_report_read(memory_report_t *report)
 void report_log(const board_t *board, const system_report_t *system, const efuse_report_t *efuse,
                 const char *last_swipe)
 {
-    ESP_LOGI(TAG, "--- Display Hub board test, firmware %s ---", system->version);
+    ESP_LOGI(TAG, "--- Display Hub check build, firmware %s ---", system->version);
     if (system->running_known) {
         ESP_LOGI(TAG, "running from %s at 0x%08" PRIx32 " (%" PRIu32 " bytes); boot record: %s",
                  system->running_label, system->running_address, system->running_size,
@@ -111,20 +111,6 @@ void report_log(const board_t *board, const system_report_t *system, const efuse
              mem.psram_free / 1024, mem.psram_total / 1024, mem.internal_free / 1024,
              mem.internal_smallest / 1024);
 
-    for (int i = 0; i < EFUSE_REPORT_KEYS; i++) {
-        const efuse_key_report_t *key = &efuse->keys[i];
-        ESP_LOGI(TAG,
-                 "eFuse KEY%d: purpose %s (%d); read-protected %s; write-protected %s; "
-                 "purpose locked %s; empty %s",
-                 i, efuse_purpose_name(key->purpose), (int)key->purpose, yes_no(key->read_protected),
-                 yes_no(key->write_protected), yes_no(key->purpose_locked), yes_no(key->unused));
-    }
-    ESP_LOGI(TAG,
-             "eFuse: download mode disabled %s; secure download mode %s; "
-             "USB-Serial-JTAG disabled %s; USB download disabled %s",
-             yes_no(efuse->download_mode_disabled), yes_no(efuse->secure_download_mode),
-             yes_no(efuse->usb_serial_jtag_disabled), yes_no(efuse->usb_download_disabled));
-    ESP_LOGI(TAG, "Secure Boot %s; flash encryption %s", efuse->secure_boot_on ? "on" : "off",
-             efuse->flash_encryption_on ? "on" : "off");
+    efuse_report_log(efuse, "as last read");
     ESP_LOGI(TAG, "touch: last swipe %s", last_swipe);
 }

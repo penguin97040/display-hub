@@ -30,8 +30,16 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # --- Security features that stay off (see docs/firmware-handoff.md, "Storage and NVS") ---
 # CONFIG_SECURE_BOOT is not set
 # CONFIG_SECURE_FLASH_ENC_ENABLED is not set
-# NVS encryption is decided in milestone D2, after checks on a real board. Off until then.
-# CONFIG_NVS_ENCRYPTION is not set
+
+# --- NVS encryption (see docs/firmware-handoff.md, "Storage and NVS") ---
+# NVS is encrypted with the HMAC scheme: its keys are worked out at start-up by the chip's HMAC
+# unit, from a secret key in eFuse key block KEY5. Never change the block between releases: a
+# different block means a different key, and NVS written with the old one can't be read.
+# With these on, ESP-IDF's nvs_flash_init() burns a new key into an empty KEY5 without asking.
+# This check build never calls it: see main/storage_key.c.
+CONFIG_NVS_ENCRYPTION=y
+CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y
+CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=5
 
 # --- Build ---
 # The same source and tools give the same image: no build date, time or local paths in it.
