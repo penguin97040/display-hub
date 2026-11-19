@@ -61,7 +61,14 @@ void efuse_report_read(efuse_report_t *report)
 
     report->write_disable = read_field(ESP_EFUSE_WR_DIS, 32);
     report->read_disable = (uint8_t)read_field(ESP_EFUSE_RD_DIS, 7);
-    if (esp_efuse_read_block(EFUSE_BLK0, report->block0, 0, sizeof(report->block0) * 8) != ESP_OK) {
+    // All of block 0 as one field: esp_efuse_read_block() refuses EFUSE_BLK0 (esp_efuse_api.c:211),
+    // but a field description may cover it. On the ESP32-S3 it is the six registers from
+    // EFUSE_RD_WR_DIS_REG to EFUSE_RD_REPEAT_DATA4_REG (esp32s3/esp_efuse_utility.c:23).
+    static const esp_efuse_desc_t block0_desc = {EFUSE_BLK0, 0, EFUSE_REPORT_BLOCK0_WORDS * 32};
+    static const esp_efuse_desc_t *block0_field[] = {&block0_desc, NULL};
+    report->block0_read =
+        esp_efuse_read_field_blob(block0_field, report->block0, sizeof(report->block0) * 8) == ESP_OK;
+    if (!report->block0_read) {
         memset(report->block0, 0, sizeof(report->block0));
     }
     // esp_efuse_check_errors() always says "fine" on an ESP32-S3
@@ -102,6 +109,10 @@ void efuse_report_log(const efuse_report_t *report, const char *when)
              (unsigned)report->flash_crypt_count, (unsigned)report->damaged_blocks);
     ESP_LOGI(TAG, "  write-disable bits 0x%08" PRIx32 "; read-disable bits 0x%02x",
              report->write_disable, (unsigned)report->read_disable);
+    if (!report->block0_read) {
+        ESP_LOGE(TAG, "  block 0: couldn't be read");
+        return;
+    }
     ESP_LOGI(TAG,
              "  block 0: %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32 " %08" PRIx32
              " %08" PRIx32,

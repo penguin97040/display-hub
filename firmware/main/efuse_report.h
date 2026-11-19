@@ -47,6 +47,7 @@ typedef struct {
     uint32_t write_disable;             // WR_DIS, 32 bits
     uint8_t read_disable;               // RD_DIS, 7 bits
     uint32_t block0[EFUSE_REPORT_BLOCK0_WORDS];
+    bool block0_read;                   // false if block 0 couldn't be read (block0 is then zeros)
     // One bit per eFuse block, 0 to 10, that the chip's own error check flags as damaged. (KEY0
     // to KEY5 are blocks 4 to 9.)
     uint16_t damaged_blocks;

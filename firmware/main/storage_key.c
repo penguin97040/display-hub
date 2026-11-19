@@ -236,7 +236,12 @@ void storage_key_check_burn(const efuse_report_t *before, const efuse_report_t *
     if (!ok) {
         ESP_LOGE(TAG, "something other than KEY%d changed in the burn", STORAGE_KEY_BLOCK);
     }
-    for (int i = 0; i < EFUSE_REPORT_BLOCK0_WORDS; i++) {
+    const bool words_read = before->block0_read && after->block0_read;
+    if (!words_read) {
+        ESP_LOGE(TAG, "eFuse block 0 couldn't be read, so the burn can't be compared");
+        ok = false;
+    }
+    for (int i = 0; words_read && i < EFUSE_REPORT_BLOCK0_WORDS; i++) {
         const uint32_t expected = before->block0[i] | BURN_SETS[i];
         if (after->block0[i] != expected) {
             ESP_LOGE(TAG,
