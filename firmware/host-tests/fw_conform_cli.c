@@ -1,7 +1,7 @@
 /*
- * Runs firmware update vectors (protocol/v1/firmware/README.md) through dh_core's update core and
- * prints what it did as each vector's "expect" object, one JSON line per file.
- * run_conformance.py compares them.
+ * Runs firmware update vectors (protocol/v1/firmware/README.md) through dh_core's update core
+ * (and, for the provision vectors, the whole USB handler in dh_usb.h) and prints what it did as
+ * each vector's "expect" object, one JSON line per file. run_conformance.py compares them.
  *
  *   dh_fw_conform <piece> <vector.json>...
  *
@@ -19,6 +19,7 @@
 #include "dh_json.h"
 #include "dh_snapshot.h"
 #include "dh_update.h"
+#include "dh_usb.h"
 
 #define LIT(s) s, (sizeof s - 1u)
 
@@ -700,6 +701,117 @@ static void run_trial(dh_json_value root)
 
 /* ---- provision ---- */
 
+/* The whole USB handler (dh_usb.h), with a store that keeps everything "in flash": the keys and
+ * the record as their blobs, as above, and the setup as its own. */
+
+static struct {
+    bool held;
+    size_t len;
+    uint8_t blob[DH_SETUP_BLOB_MAX];
+} flash_setup;
+
+static dh_held store_held(void *ctx)
+{
+    (void)ctx;
+    return flash_setup.held ? DH_HELD_SETUP : DH_HELD_NOTHING;
+}
+
+static bool store_save_keys(void *ctx, const dh_fw_keys *k)
+{
+    (void)ctx;
+    dh_fw_keys_encode(k, flash.keys);
+    return true;
+}
+
+static bool store_save_record(void *ctx, const dh_fw_record *r)
+{
+    (void)ctx;
+    dh_fw_record_encode(r, flash.record);
+    record_saves++;
+    return true;
+}
+
+static bool store_save_setup(void *ctx, const dh_setup *s)
+{
+    (void)ctx;
+    flash_setup.len = dh_setup_encode(s, flash_setup.blob);
+    flash_setup.held = flash_setup.len > 0;
+    return flash_setup.held;
+}
+
+static bool store_erase_setup(void *ctx)
+{
+    (void)ctx;
+    memset(&flash_setup, 0, sizeof flash_setup);
+    return true;
+}
+
+static const dh_setup_store store = {NULL,           store_held,       store_save_keys,
+                                     store_save_record, store_save_setup, store_erase_setup};
+static dh_setup work;
+
+/* Everything in a bundle but its firmware member. */
+static const char BUNDLE_START[] =
+    "{\"type\":\"provision\",\"bundle\":{\"format\":\"display-hub.provisioning\",\"version\":1,"
+    "\"hub\":{\"hosts\":[\"hub.local\",\"192.168.1.20\"],\"port\":8443,"
+    "\"server_name\":\"hub.display-hub.internal\",\"trust_anchors\":[{\"certificate_pem\":"
+    "\"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n\",\"spki_sha256\":"
+    "\"9a54396d429aa58fc9ac78413a9e84a0b7a45f125256f91697c977c2acbfde88\"}]},"
+    "\"enrolment\":{\"secret\":\"q3H7cX0f2pS9L1mB8vN4wA\",\"expires_at\":\"2026-11-10T20:10:00Z\"},"
+    "\"wifi\":{\"ssid\":\"Example network\",\"password\":\"example-passphrase\"}";
+
+/* Sends one `provision` line through the handler and returns the answer's name. bundle_firmware
+ * is the vector's member, or a null value for a bundle without one. */
+static const char *send_bundle(dh_json_value bundle_firmware)
+{
+    static char line[2048], reply[DH_USB_REPLY_MAX];
+    size_t n = (size_t)snprintf(line, sizeof line, "%s", BUNDLE_START);
+    if (!is_null(bundle_firmware)) {
+        /* The member as it would arrive: key names written out as hex. */
+        n += (size_t)snprintf(line + n, sizeof line - n, ",\"firmware\":{\"trusted_keys\":[");
+        dh_json_iter it;
+        dh_json_value k;
+        bool first = true;
+        if (!dh_json_array_begin(&doc, get(bundle_firmware, "trusted_keys"), &it)) {
+            die("trusted_keys isn't an array");
+        }
+        while (dh_json_array_next(&doc, &it, &k)) {
+            n += (size_t)snprintf(line + n, sizeof line - n, "%s\"%s\"", first ? "" : ",",
+                                  key_hex(k));
+            first = false;
+            if (n > sizeof line - 200) {
+                die("the bundle is too long for this runner");
+            }
+        }
+        n += (size_t)snprintf(line + n, sizeof line - n, "],\"security_counter\":%" PRIu64 "}",
+                              get_u64(bundle_firmware, "security_counter"));
+    }
+    n += (size_t)snprintf(line + n, sizeof line - n, "}}");
+
+    const dh_usb_display display = {"display-hub-waveshare-amoled-1.8", "0.1.0",
+                                    "waveshare-amoled-1.8-v2", 6291456, &store, &keys, &record,
+                                    &work};
+    dh_usb_answer a = dh_usb_handle_line(&display, (const uint8_t *)line, n, reply, sizeof reply);
+    /* The reply line must say the same as the answer. */
+    char want[DH_USB_REPLY_MAX];
+    switch (a.outcome) {
+    case DH_USB_PROVISIONED:
+        if (strcmp(reply, "{\"type\":\"provisioned\"}\n") != 0 || !flash_setup.held) {
+            die("provisioned, but the reply or the stored setup is wrong");
+        }
+        return "provisioned";
+    case DH_USB_REFUSED:
+        snprintf(want, sizeof want, "{\"type\":\"error\",\"code\":\"%s\",\"message\":\"",
+                 dh_usb_error_name(a.error));
+        if (strncmp(reply, want, strlen(want)) != 0 || flash_setup.held) {
+            die("refused, but the reply is wrong or a setup was stored");
+        }
+        return dh_usb_error_name(a.error);
+    default:
+        die("the handler didn't answer a bundle");
+    }
+}
+
 static void run_provision(dh_json_value root)
 {
     dh_json_value before = get(root, "before"), action = get(root, "action");
@@ -711,57 +823,34 @@ static void run_provision(dh_json_value root)
     dh_fw_record_init(&record);
     record.attempts_left = 2;
     format_flash();
+    memset(&flash_setup, 0, sizeof flash_setup);
     restart(0, false);
 
     const char *answer = NULL;
     if (strcmp(what, "factory_reset") == 0) {
-        /* A factory reset erases the hub details, Wi-Fi settings and token, which this core
-         * never holds. It has no call for it, so the keys, floor and record can't change. */
-        restart(0, false);
-    } else if (strcmp(what, "bundle") == 0) {
-        dh_json_value member = get(action, "bundle_firmware");
-        dh_fw_bundle bundle;
-        const dh_fw_bundle *given = NULL;
-        bool readable = true;
-        if (!is_null(member)) {
-            /* The member as it would arrive: key names written out as hex. */
-            static char text[1024];
-            size_t n = (size_t)snprintf(text, sizeof text, "{\"trusted_keys\":[");
-            dh_json_iter it;
-            dh_json_value k;
-            bool first = true;
-            if (!dh_json_array_begin(&doc, get(member, "trusted_keys"), &it)) {
-                die("trusted_keys isn't an array");
-            }
-            while (dh_json_array_next(&doc, &it, &k)) {
-                n += (size_t)snprintf(text + n, sizeof text - n, "%s\"%s\"", first ? "" : ",",
-                                      key_hex(k));
-                first = false;
-                if (n > sizeof text - 200) {
-                    die("the bundle is too long for this runner");
-                }
-            }
-            n += (size_t)snprintf(text + n, sizeof text - n, "],\"security_counter\":%" PRIu64 "}",
-                                  get_u64(member, "security_counter"));
-            dh_json_doc bundle_doc;
-            dh_json_value bundle_root;
-            if (dh_json_parse(&bundle_doc, (const uint8_t *)text, n, NULL, &bundle_root) !=
-                DH_JSON_OK) {
-                die("the bundle this runner wrote isn't JSON");
-            }
-            readable = dh_fw_bundle_parse(&bundle_doc, bundle_root, &bundle);
-            given = &bundle;
+        /* Set the display up first, so there is a setup for the reset to erase. A bundle without
+         * a firmware member is accepted whatever keys the display has, and changes none. */
+        dh_json_value none = get(action, "bundle_firmware");
+        if (!is_null(none) || strcmp(send_bundle(none), "provisioned") != 0) {
+            die("couldn't set the display up before the factory reset");
         }
-        unsigned to_save = 0;
-        dh_fw_bundle_answer a = readable ? dh_fw_bundle_apply(&record, &keys, given, &to_save)
-                                         : DH_FW_BUNDLE_INVALID;
-        save(to_save);
-        answer = a == DH_FW_BUNDLE_OK        ? "provisioned"
-                 : a == DH_FW_BUNDLE_INVALID ? "invalid_bundle"
-                                             : "firmware_keys_locked";
-        /* Accepting any bundle refills the budget; refusing one changes nothing. */
-        load();
-        if (record.attempts_left != (a == DH_FW_BUNDLE_OK ? DH_FW_FULL_BUDGET : 2u)) {
+        const dh_usb_display display = {"display-hub-waveshare-amoled-1.8", "0.1.0",
+                                        "waveshare-amoled-1.8-v2", 6291456, &store, &keys,
+                                        &record, &work};
+        if (!dh_usb_factory_reset(&display) || flash_setup.held) {
+            die("the factory reset left the setup behind");
+        }
+        restart(0, false);
+        /* The reset leaves the record alone: the budget is as accepting the bundle left it. */
+        if (record.attempts_left != DH_FW_FULL_BUDGET) {
+            die("the budget after the factory reset is wrong");
+        }
+    } else if (strcmp(what, "bundle") == 0) {
+        answer = send_bundle(get(action, "bundle_firmware"));
+        /* Accepting any bundle refills the budget; refusing one changes nothing. Read it back
+         * from flash, as a restart would. */
+        restart(0, false);
+        if (record.attempts_left != (strcmp(answer, "provisioned") == 0 ? DH_FW_FULL_BUDGET : 2u)) {
             die("the budget after the bundle is wrong");
         }
     } else {

@@ -1,5 +1,5 @@
-// What the board test reports: the firmware, where it is running from, and memory. Shown on the
-// screen and printed to the console.
+// The read-only facts about the firmware and the board: where it is running from, the board's
+// parts, memory and the eFuses. Printed to the console.
 
 #pragma once
 
@@ -33,8 +33,7 @@ void system_report_read(system_report_t *report);
 void memory_report_read(memory_report_t *report);
 
 // Prints everything to the console (USB-Serial-JTAG), one fact per line.
-void report_log(const board_t *board, const system_report_t *system, const efuse_report_t *efuse,
-                const char *last_swipe);
+void report_log(const board_t *board, const system_report_t *system, const efuse_report_t *efuse);
 
 #ifdef __cplusplus
 }

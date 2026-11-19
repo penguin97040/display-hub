@@ -60,6 +60,14 @@ esp_err_t board_set_brightness(int percent);
 // Short names for log lines and the screen.
 const char *board_revision_name(board_revision_t revision);
 
+// The `hardware_revision` the display reports to the app and the hub. Only V2 is supported; a V1
+// board says so truthfully, and a board that couldn't be told apart doesn't claim to be either.
+const char *board_hardware_revision(board_revision_t revision);
+
+// The BOOT button's pin. It is a strapping pin read by the chip at reset; once the firmware is
+// running it is an ordinary button, low while pressed.
+#define BOARD_BOOT_BUTTON_GPIO 0
+
 #ifdef __cplusplus
 }
 #endif

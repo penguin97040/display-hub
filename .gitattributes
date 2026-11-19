@@ -7,3 +7,4 @@
 # Fuzz seeds for the signed-update parser are raw package bytes: never convert their line endings.
 firmware/fuzz/corpus/fw_download/** binary
 firmware/fuzz/corpus/fw_manifest/** binary
+firmware/fuzz/corpus/usb/** binary

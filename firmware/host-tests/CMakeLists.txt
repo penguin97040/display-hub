@@ -49,12 +49,25 @@ add_executable(dh_update_tests update_tests.c)
 target_link_libraries(dh_update_tests PRIVATE dh_core)
 target_compile_options(dh_update_tests PRIVATE ${DH_WARNINGS})
 
+add_executable(dh_usb_tests usb_tests.c)
+target_link_libraries(dh_usb_tests PRIVATE dh_core)
+target_compile_options(dh_usb_tests PRIVATE ${DH_WARNINGS})
+target_compile_definitions(dh_usb_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
+
 add_executable(dh_fw_conform fw_conform_cli.c)
 target_link_libraries(dh_fw_conform PRIVATE dh_core)
 target_compile_options(dh_fw_conform PRIVATE ${DH_WARNINGS})
 
+# The USB handler on a pseudo-terminal, for trying the desktop app's sender against it (see
+# usb-e2e/). Linux only, and not part of the tests run here.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(dh_usb_pty_display usb_pty_display.c)
+    target_link_libraries(dh_usb_pty_display PRIVATE dh_core)
+    target_compile_options(dh_usb_pty_display PRIVATE ${DH_WARNINGS})
+endif()
+
 # The fuzz targets, built with a small main that replays a folder of inputs.
-set(DH_FUZZ_TARGETS json snapshot fw_manifest fw_download)
+set(DH_FUZZ_TARGETS json snapshot fw_manifest fw_download usb)
 foreach(target ${DH_FUZZ_TARGETS})
     add_executable(dh_fuzz_${target}_replay
         "${DH_FIRMWARE_DIR}/fuzz/fuzz_${target}.c"
@@ -71,6 +84,7 @@ add_test(NAME vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             vectors $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/vectors")
 add_test(NAME update COMMAND dh_update_tests)
+add_test(NAME usb COMMAND dh_usb_tests)
 add_test(NAME firmware_vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             firmware $<TARGET_FILE:dh_fw_conform> "${DH_PROTOCOL_DIR}/firmware")

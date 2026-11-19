@@ -322,3 +322,15 @@ const char *board_revision_name(board_revision_t revision)
         return "not recognised (no touch chip answered)";
     }
 }
+
+const char *board_hardware_revision(board_revision_t revision)
+{
+    switch (revision) {
+    case BOARD_REVISION_V1:
+        return "waveshare-amoled-1.8-v1";
+    case BOARD_REVISION_V2:
+        return "waveshare-amoled-1.8-v2";
+    default:
+        return "waveshare-amoled-1.8-unknown";
+    }
+}

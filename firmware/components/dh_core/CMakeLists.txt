@@ -9,12 +9,14 @@ set(DH_CORE_SRCS
     src/dh_crypto.c
     src/dh_json.c
     src/dh_poll.c
+    src/dh_setup.c
     src/dh_snapshot.c
     src/dh_text.c
     src/dh_time.c
     src/dh_unicode_tables.c
     src/dh_update_package.c
     src/dh_update_state.c
+    src/dh_usb.c
     src/dh_usb_line.c
 )
 

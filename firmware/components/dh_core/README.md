@@ -1,8 +1,8 @@
 # dh_core
 
-The display's protocol and signed-update core: plain C11, no hardware, no ESP-IDF headers and no heap of its own. It builds as an ESP-IDF component and as a plain library for the host tests in `firmware/host-tests`, which run every snapshot vector in `protocol/v1/vectors`, every example in `protocol/v1/examples` and every firmware update vector in `protocol/v1/firmware`.
+The display's protocol and signed-update core: plain C11, no hardware, no ESP-IDF headers and no heap of its own. It builds as an ESP-IDF component and as a plain library for the host tests in `firmware/host-tests`, which run every snapshot vector in `protocol/v1/vectors`, every example in `protocol/v1/examples` and every firmware update vector in `protocol/v1/firmware`. The firmware itself links it from `firmware/main`.
 
-It follows the reference display, `tools/display-simulator`, with `crates/hub-protocol` and `crates/firmware-package`, including some details the documents leave open (listed at the top of `src/dh_snapshot.c`, `src/dh_update_package.c` and `src/dh_update_state.c`).
+It follows the reference display, `tools/display-simulator`, with `crates/hub-protocol` and `crates/firmware-package`, including some details the documents leave open (listed at the top of `src/dh_snapshot.c`, `src/dh_update_package.c`, `src/dh_update_state.c`, `src/dh_setup.c` and `src/dh_usb.c`).
 
 ## What's here
 
@@ -14,6 +14,8 @@ It follows the reference display, `tools/display-simulator`, with `crates/hub-pr
 | `dh_text.h` | UTF-8, the text rules for titles and labels, and an exact NFC check. |
 | `dh_time.h` | Timestamps in the wire form. |
 | `dh_usb_line.h` | Splits the USB serial stream into JSON lines. |
+| `dh_setup.h` | The provisioning bundle: its rules, the setup it becomes, and that setup's stored form. |
+| `dh_usb.h` | Setup over USB: one line in, the answer out, with whatever must be stored written through the caller's store. A factory reset. |
 | `dh_limits.h` | The protocol's bounds. |
 | `dh_update.h` | Signed firmware updates: the package header and manifest, one download checked as it arrives, the attempt budget, offers, the trial boot, reports, the provisioning bundle's keys, and the stored forms of what a display keeps. |
 | `dh_crypto.h` | SHA-256 a piece at a time and ECDSA P-256 verification, from Mbed TLS. |
@@ -76,9 +78,42 @@ The keys and the floor only ever change in `dh_fw_marked_good()`, in `dh_fw_star
 
 Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`). Everything that touches hardware is the firmware's: NVS, `esp_http_client`, the `esp_ota_*` calls, the two time limits on a download (`dh_fw_download_overdue()` says when to give up) and sending the reports.
 
+## Setup over USB
+
+`dh_usb_handle_line()` takes one line from `dh_usb_line_feed()` and does everything the reference display does with it (`tools/display-simulator/src/usb.rs`): answers a `hello` with the display's own, and settles a `provision`. It writes the reply line into the caller's buffer and says what happened in words that are safe to log.
+
+**The order a bundle is settled in.** The first that applies is the answer:
+
+1. Storage isn't working, or can't say what it holds: `storage_failed`.
+2. A setup or a device token is already held: `already_provisioned`. Nothing changes.
+3. The bundle breaks a rule: `invalid_bundle`.
+4. One of its firmware keys isn't a valid P-256 point: `invalid_bundle`. Nothing is stored.
+5. The display trusts a different set of firmware keys: `firmware_keys_locked`. The same set in any order, or no `firmware` member, is fine.
+6. A write fails: `storage_failed`.
+7. Otherwise `provisioned`.
+
+**The rules** are `Bundle::problems()` in `crates/hub-protocol/src/provisioning.rs`, in its order: the format and version, 1 to 4 hosts of 1 to 253 bytes with no white space or control character, a port that isn't 0, the fixed server name, 1 or 2 anchors whose PEM starts `-----BEGIN CERTIFICATE-----` and is at most 4096 bytes with 64 lower-case hex digits of `spki_sha256`, a secret of 1 to 64 bytes, an SSID of 1 to 32 bytes, a password that is empty or 8 to 63 bytes, the `firmware` member's own rules, and 12288 bytes in all. That last count is exact: the reference counts the bundle as serde_json writes it out again, and `dh_setup.c` works that length out from the same members in the same order, each string escaped serde_json's way.
+
+**The store.** The caller passes a `dh_setup_store`: five functions over whatever it keeps things in (encrypted NVS on the chip, a fake in the tests). Nothing is changed before step 6. There the handler works on copies and writes the firmware keys (only for a display that had none), then the update record (only if the attempt budget wasn't full), then the setup, last. Each copy is taken into the caller's memory as soon as its write succeeds, so memory and flash always agree, and a failed write never leaves a setup behind: the display still reads as not set up, and the same bundle can be sent again. (If the keys were written and a later write failed, the display keeps those keys. They came from the package the app had just installed, and the next bundle names the same ones.)
+
+**A factory reset** is `dh_usb_factory_reset()`: it calls the store's `erase_setup` and nothing else. It is never given the keys or the record, so it can't change them.
+
+**The stored form** of a setup (`dh_setup_encode()`, `dh_setup_decode()`) is one blob of at most 9464 bytes: a format number, then each field with its length. Decoding checks every field against the bundle's own rules and that every byte is accounted for, and encoding refuses a setup that decoding would refuse. A setup holds secrets: `dh_setup_wipe()` and `dh_usb_line_wipe()` clear a copy that is no longer needed, and nothing in the core ever puts bundle content in a reply or a `why`.
+
+**Where it differs from the reference**, on purpose:
+
+- A line the reference can't read into its message type at all gets no answer, as in the reference: a member that is missing, repeated or of the wrong type, a `version` or `security_counter` that isn't a plain integer fitting 32 bits, a `port` that doesn't fit 16 bits, an `expires_at` that isn't a real date. But a line with bytes that aren't UTF-8 is ignored here, where the reference swaps them for U+FFFD and reads on; and an object written as an array of its members in order, which serde also accepts, is unreadable here.
+- An error's `message` names the first broken rule in fixed words (at most 200 bytes, as the schema asks). The reference lists every problem, and passes on a storage error's own text.
+- The reference writes the bundle first, then the keys and the record, so a failure after the first write leaves it set up although it answered `storage_failed`. Here the setup is written last.
+- A store that can't be read refuses a bundle with `storage_failed` before anything else. The reference has no such state before the keys are read.
+
+Note that the protocol document says a display answers a `provision` with `provisioned` or an error; for a bundle of the wrong shape the reference answers nothing, and so does this.
+
 ## Memory
 
 A `dh_snapshot` is about 38 KB and a `dh_text_scratch` about 4.5 KB; keep them in static memory or PSRAM, not on a task's stack. Reading uses about 1 KB of stack of its own (measured with `-fstack-usage` for the ESP32-S3), plus whatever the C library's `strtod` and `snprintf` take. Read into a spare snapshot and swap it in on `DH_OUTCOME_SHOW`, so the last good one survives a refusal.
+
+A `dh_setup` is about 9.5 KB and a `dh_usb_line_reader` 16 KB: keep them in static memory or on the heap. Handling a line needs room for the reply (`DH_USB_REPLY_MAX`, 768 bytes) and under 1 KB of stack of its own, plus Mbed TLS's for each key in a bundle.
 
 A `dh_fw_download` is about 12 KB (the manifest's 4 KB, room to check its text, and the manifest as read); keep it in static memory too. The update core's own functions use under 200 bytes of stack each on the ESP32-S3 (measured with `-fstack-usage`), on top of the JSON reader's. Checking a point or a signature is Mbed TLS's work: it takes a few kilobytes of heap and stack for a moment, once per download and once for each key in a `key_set` or a bundle.
 

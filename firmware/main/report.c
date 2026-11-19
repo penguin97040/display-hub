@@ -1,4 +1,4 @@
-// What the board test reports. See report.h.
+// The read-only facts about the firmware and the board. See report.h.
 
 #include "report.h"
 
@@ -11,7 +11,7 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 
-static const char *TAG = "board-test";
+static const char *TAG = "report";
 
 static const char *yes_no(bool value)
 {
@@ -72,10 +72,9 @@ void memory_report_read(memory_report_t *report)
     report->internal_smallest = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
 }
 
-void report_log(const board_t *board, const system_report_t *system, const efuse_report_t *efuse,
-                const char *last_swipe)
+void report_log(const board_t *board, const system_report_t *system, const efuse_report_t *efuse)
 {
-    ESP_LOGI(TAG, "--- Display Hub check build, firmware %s ---", system->version);
+    ESP_LOGI(TAG, "--- Display Hub firmware %s ---", system->version);
     if (system->running_known) {
         ESP_LOGI(TAG, "running from %s at 0x%08" PRIx32 " (%" PRIu32 " bytes); boot record: %s",
                  system->running_label, system->running_address, system->running_size,
@@ -88,7 +87,7 @@ void report_log(const board_t *board, const system_report_t *system, const efuse
              board_revision_name(board->revision), board->expander_found ? "found" : "not found",
              board->display != NULL ? "running" : "failed", board->touch_ready ? "running" : "off");
     if (board->revision == BOARD_REVISION_V1) {
-        ESP_LOGW(TAG, "V1 board: not supported yet");
+        ESP_LOGW(TAG, "V1 board: this firmware doesn't support it");
     }
 
     board_power_t power;
@@ -112,5 +111,4 @@ void report_log(const board_t *board, const system_report_t *system, const efuse
              mem.internal_smallest / 1024);
 
     efuse_report_log(efuse, "as last read");
-    ESP_LOGI(TAG, "touch: last swipe %s", last_swipe);
 }

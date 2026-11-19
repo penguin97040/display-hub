@@ -37,6 +37,11 @@ void dh_usb_line_init(dh_usb_line_reader *r);
 dh_line_event dh_usb_line_feed(dh_usb_line_reader *r, const uint8_t *data, size_t len,
                                size_t *used, const uint8_t **line, size_t *line_len);
 
+/* Overwrites whatever a finished line left in the buffer with zeros: a `provision` line holds the
+ * Wi-Fi password and the enrolment secret. Call it once a DH_LINE_JSON line has been dealt with
+ * and before the next feed; it does nothing while a line is part-read. */
+void dh_usb_line_wipe(dh_usb_line_reader *r);
+
 #ifdef __cplusplus
 }
 #endif

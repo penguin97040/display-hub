@@ -6,10 +6,11 @@ cmake_minimum_required(VERSION 3.16)
 # package's version against it.
 set(PROJECT_VER "0.1.0")
 
-# Only ESP-IDF's own components and main are looked for. Without this, ESP-IDF also reads every
-# folder under components/, so a component that is still being written there could break this build.
-# Add a component to this list when main starts to use it.
-set(COMPONENT_DIRS "$ENV{IDF_PATH}/components" "${CMAKE_CURRENT_LIST_DIR}/main")
+# Only ESP-IDF's own components, main and the components named here are looked for. Without this,
+# ESP-IDF also reads every folder under components/, so a component that is still being written
+# there could break this build. Add a component to this list when main starts to use it.
+set(COMPONENT_DIRS "$ENV{IDF_PATH}/components" "${CMAKE_CURRENT_LIST_DIR}/main"
+                   "${CMAKE_CURRENT_LIST_DIR}/components/dh_core")
 
 # Keep the generated sdkconfig in the build folder, so sdkconfig.defaults stays the only record of
 # the settings and a build never writes into the source tree.

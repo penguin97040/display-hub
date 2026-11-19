@@ -2,7 +2,7 @@
 
 The official firmware for a Display Hub display, written in C with ESP-IDF. It is also the starter project for anyone making firmware for their own display.
 
-**Status: early.** For now it is the **storage key check build**: the board test's screens, plus one that burns the storage key into the chip and checks encrypted storage on a real board (see [Storage key check](#storage-key-check)). Setup over USB, Wi-Fi, the hub protocol and signed updates follow. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
+**Status: early.** It takes its setup over USB from the desktop app, keeps it in encrypted storage, and can be factory-reset with the BOOT button. It doesn't join Wi-Fi or talk to the hub yet: enrolment, polling, the real screens and signed updates follow. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
 
 ## The board
 
@@ -14,57 +14,86 @@ Waveshare **ESP32-S3-Touch-AMOLED-1.8**, **V2 only** (CO5300 screen, CST820 touc
 | `hardware_revision` | `waveshare-amoled-1.8-v2` |
 | Version | 0.1.0, set by `PROJECT_VER` in [CMakeLists.txt](CMakeLists.txt) |
 
-## Board test
-
-Install it with the desktop app's **Install firmware**. It has four screens; swipe left or right to move between them (the dots at the bottom show which one you're on):
-
-1. **About the board:** the firmware version, the app slot it is running from and its address (`ota_0` at `0x20000` after a first install), what the boot record says (`blank` after a first install), the board revision (V2 if the CST820 touch chip answers; a V1 board shows "not supported yet"), whether USB power is good, and free PSRAM and heap.
-2. **Touch test:** a dot follows your finger, and the last swipe is shown in words.
-3. **eFuse keys:** for each key block KEY0 to KEY5, its purpose, whether it is read-protected or write-protected, and whether it is empty; then whether download mode, secure download mode and USB-Serial-JTAG are turned off by eFuse, and whether Secure Boot and flash encryption are on. This screen only reads.
-4. **Storage key:** see below.
-
-The same facts, and more of the eFuse settings (JTAG, the raw protection bits and all of eFuse block 0), are printed to the console (USB-Serial-JTAG) every 10 seconds, and each swipe as it happens.
+The revision is told at start-up from the touch chip that answers. A V1 board reports `waveshare-amoled-1.8-v1` and says on its screen that it isn't supported; a board whose touch chip doesn't answer reports `waveshare-amoled-1.8-unknown`. Neither is ever reported as a V2.
 
 The board code is in [main/board/](main/board/). It uses the board package's screen, touch and brightness functions, but not its `bsp_display_start()`, which hands this QSPI screen to LVGL as if it were an RGB panel. It pulses the I/O expander's screen power and resets as Waveshare's examples do, and only reads the AXP2101 power chip.
 
-## Storage key check
+## What it does
 
-The firmware will keep the Wi-Fi password and the device token in encrypted storage (NVS), using ESP-IDF's HMAC scheme: a secret key lives in eFuse key block **KEY5**, and the chip's HMAC unit works the encryption keys out from it at each start. The handoff's "[Storage and NVS](../docs/firmware-handoff.md#storage-and-nvs)" says why. eFuses are one-time memory, so **putting the key there is permanent**: KEY5 is used up for good.
+1. **Install it** with the desktop app's **Install firmware**, which erases the flash and writes the package.
+2. **Waiting for setup.** The screen says to open Display Hub and choose **Add a display**. The firmware reads its USB port for as long as it runs and answers every `hello` and every `provision` ([docs/protocol-v1.md](../docs/protocol-v1.md), "Over USB").
+3. **Set up.** Once a bundle is accepted and stored, the screen says so, with how many hub addresses it was given and whether it has Wi-Fi details. Nothing from the bundle itself is ever shown or logged. It stays set up across restarts, and refuses another bundle (`already_provisioned`) until it is factory-reset.
+4. **Factory reset:** hold **BOOT** for 10 seconds (below).
 
-This build does that once, on a real board, and answers two things Espressif's pages don't say: whether the key can be read back out, and whether the board can still be erased and reflashed over USB afterwards.
+What to answer over USB is decided by plain C in [components/dh_core](components/dh_core/README.md) (`dh_usb.h`), which the host tests run without a board. A bundle is settled in this order, and the first that applies is the answer:
 
-### What it will and won't do
+| | Answer |
+|---|---|
+| Storage isn't working | `storage_failed` |
+| Already set up | `already_provisioned`, changing nothing |
+| The bundle breaks a rule | `invalid_bundle` |
+| One of its firmware keys isn't a valid P-256 point | `invalid_bundle`, storing nothing |
+| The display trusts a different set of firmware keys | `firmware_keys_locked` |
+| A write fails | `storage_failed` |
+| Otherwise | `provisioned` |
 
-- **Nothing is burnt without two taps on the screen.** ESP-IDF's `nvs_flash_init()` would burn a key into an empty KEY5 without asking, so this build never calls it (it isn't even linked into the image). The one call that burns is in `storage_key_burn()` in [main/storage_key.c](main/storage_key.c), reached only from the confirmation.
-- **The burn is only offered** when KEY5 is empty with the purpose USER and no protection, no other key block already holds an HMAC_UP key, download mode and USB are allowed, Secure Boot and flash encryption are off, and no eFuse block reads back as damaged. Otherwise the screen says why not.
-- **The key is made by ESP-IDF's own code,** the same function production firmware will use, so it is made in exactly the same way: 32 bytes from the chip's random number generator with its noise source turned on. The firmware never sees the key again and never prints it.
-- **Only KEY5's own bits change:** the key, its purpose (HMAC_UP), and its read- and write-protection. The console shows every key block and security setting before and after, and the build checks that nothing else moved.
+The setup is the last thing written, so a failed write never leaves a display that reads as set up.
 
-### Running it
+### The USB port and the console
 
-1. Install `display-hub-0.1.0-hmaccheck.dhfw` with **Install firmware**. If you want the console's record (worth having), open the serial console now and leave it open: opening it restarts the board, so don't open or close it, or unplug the cable, between the second tap and the result. Each restart adds one to the boot count, however it happens.
-2. Swipe to the fourth screen. With an empty KEY5 it explains the burn and shows **Burn the key**.
-3. Tap **Burn the key**, wait a second, then tap **Yes, burn it now**. (**Cancel** sits where the first button was, so a double tap cancels. Buttons ignore touches in their first second, swipes, and touches that slide on from elsewhere. Left alone for 30 seconds, or swiped away from, the second step goes back to the first.)
-4. The result appears within a second or two: **Storage key: PASS** or **FAIL**, with a line for each check.
-5. Tap **Restart**. The checks run again, and the boot count should be one higher.
-6. Install the same package again with **Install firmware**. That erases and rewrites the whole flash. If the install works and the fourth screen says **PASS** again with the boot count back at 1, the burnt key doesn't get in the way of reflashing, and the key outlived the erase.
+The console's log lines and the setup exchange share the chip's own USB port (USB-Serial-JTAG). The app ignores any line that doesn't start with `{`, so the two can share it as long as a log line never lands inside a reply. [main/usb_setup.c](main/usb_setup.c) makes sure of that: the console and the replies go through one transmit queue, a reply is handed to it whole, and only while the USB task holds the console's own lock, which every log line holds from its first character to its last. Each reply also starts on a line of its own. The top of that file has the detail, and what isn't covered (text the ROM prints directly, such as a crash report).
 
-### The checks
+**The logging rule:** never log or show the Wi-Fi password, the enrolment secret, the device token, a line received over USB, or anything else from a bundle. Log facts that give nothing away: "bundle accepted and stored: 2 hub addresses, Wi-Fi set, firmware keys taken from the bundle". The buffers that held a bundle are wiped once it has been dealt with.
 
-They run at every start once KEY5 holds an HMAC_UP key, and are printed to the console every 10 seconds under `storage-key`.
+## Storage
 
-| Line on the screen | What it means | A failure means |
+Encrypted NVS, with ESP-IDF's HMAC scheme (the handoff's "[Storage and NVS](../docs/firmware-handoff.md#storage-and-nvs)" says why). Two namespaces, so a factory reset can erase one and leave the other:
+
+| Namespace | Key | What |
 |---|---|---|
-| KEY5 purpose is HMAC_UP | The key block is marked for the HMAC unit. | The burn didn't finish. |
-| KEY5 read- and write-protected | The key can't be read or changed, and its purpose is locked. | The key is exposed or could be altered. |
-| Key readable: no | Reading the block as firmware would gives all zeros. | **Key readable: YES**: the key can be read out. Use plain NVS. |
-| Encrypted storage started | The HMAC unit gave keys and encrypted NVS opened. | The scheme doesn't work on this board. |
-| First start since an erase / Last start's data read back | What the last start stored was read back and is right. | Stored data was lost or can't be decrypted. |
-| Boot count N (was N-1), saved | This start's count and marker were written and read back. | Writing encrypted NVS failed. |
-| Marker not found in raw flash | The NVS partition, read exactly as it is in flash, doesn't hold the marker's text or its names. | **Marker FOUND**: the data isn't encrypted. |
-| The burn changed only KEY5 | Shown on the start the key was burnt: nothing else in the eFuses changed. | Something else changed: compare the two eFuse reports in the console. |
+| `dh_setup` | `setup` | The setup from the bundle: hub addresses, port, trust anchors, the enrolment secret and the Wi-Fi details, as one blob (`dh_setup_encode()`, at most 9464 bytes). The device ID, token and saved snapshot will go here too. |
+| `dh_fw` | `keys` | The trusted firmware keys and the security floor (201 bytes). |
+| `dh_fw` | `record` | The update record, with the attempt budget (321 bytes). |
 
-If the key is readable, or the board can't be reflashed afterwards, the handoff says to ship plain NVS instead.
+Each value is one blob written in one go and read back, so a power cut leaves the old value or the new one. A read that fails is never treated as "nothing there": the display shows a storage problem and refuses setup. The partition is 64 KiB; the largest setup takes under three of its sixteen pages. [main/storage.c](main/storage.c) is all of it.
+
+### The storage key
+
+The encryption keys are worked out at each start by the chip's HMAC unit from a secret key in eFuse key block **KEY5**. eFuses are one-time memory. [main/storage_key.c](main/storage_key.c) looks at the eFuses before NVS is started:
+
+- **KEY5 holds an HMAC_UP key:** encrypted NVS starts with it. Nothing is burnt.
+- **KEY5 is empty** (purpose USER, all zeros, no protection), no other key block holds an HMAC_UP key, download mode and USB are allowed, Secure Boot and flash encryption are off, and no eFuse block reads back as damaged: this is **a new board's first start**. The firmware makes a random key with ESP-IDF's own function and **burns it into KEY5, permanently**, without asking. That uses KEY5 up for good, and is the intended behaviour: without it a new board could never be set up. The console says so in capitals, prints every key block and security setting before and after, and checks that nothing but KEY5's own bits changed. The firmware never sees the key again and never prints it.
+- **Anything else** (KEY5 has another purpose or isn't empty, a block is damaged, any condition above fails): nothing is burnt and NVS isn't started. The screen shows **Storage problem** with the reasons, `hello` says `provisioned: false`, and a bundle is refused with `storage_failed`.
+
+ESP-IDF's `nvs_flash_init()` would burn a key into an empty KEY5 whatever state the chip is in, so **this firmware never calls it**, and nothing added later may. It starts NVS with `nvs_flash_read_security_cfg_v2()` and `nvs_flash_secure_init()`, which can't burn anything. It never erases the NVS partition by itself either: if NVS won't start, **Install firmware** (which erases the flash) is the way out.
+
+The scheme was checked on a real V2 board with an earlier build of this firmware: the burnt key reads back as all zeros (it can't be read out), what was stored isn't readable in the raw flash, and the board can still be erased and reflashed over USB, with the key outliving the erase.
+
+What it protects, honestly: a plain read of the flash no longer shows the Wi-Fi password or the token. Someone with a cable who runs their own firmware on the chip can most likely still use its HMAC unit to decrypt.
+
+## Factory reset
+
+**Hold the BOOT button for 10 seconds while the display is running.** After the first second the screen counts down; letting go before the end cancels. (BOOT only puts the chip in its loader if it is held while the chip resets or is plugged in. Once the firmware is running it is an ordinary button.)
+
+- **It erases** the `dh_setup` namespace: the hub addresses, port and trust anchors, the Wi-Fi details, the enrolment secret and, once there are any, the device ID, token and saved snapshot.
+- **It keeps** the `dh_fw` namespace: the trusted firmware keys, the security floor and the update record. So a reset display can be paired with another hub, but still only accepts bundles naming the same firmware keys (or none): anything else is `firmware_keys_locked`, and only **Install firmware** changes the keys.
+- The display goes straight back to **Waiting for setup**. It doesn't restart.
+
+The button is debounced (it must read the same for 100 ms), a button already down at start-up does nothing until it has been let go, and one hold does one reset. The whole NVS partition is never erased.
+
+## The console
+
+Open the board's serial port at any speed (opening it may restart the board). At start-up, and again every minute, the firmware prints read-only facts: the version and the slot it runs from, the board's revision and parts, memory, every eFuse key block and security setting, whether it is set up (with the count of hub addresses and whether Wi-Fi is set, never their values), how many firmware keys it trusts, the security floor, the update attempts left, and how much of the main and USB tasks' stacks has never been used.
+
+## Tests without a board
+
+[host-tests/](host-tests/) builds `dh_core` for a computer and runs it against every protocol vector and example, with gcc and clang and with the sanitisers:
+
+```sh
+cmake -S firmware/host-tests -B /tmp/dh-host && cmake --build /tmp/dh-host && ctest --test-dir /tmp/dh-host --output-on-failure
+```
+
+For setup over USB that is `usb_tests.c` (every bundle rule, every refusal in order, failing writes, the reply lines against `protocol/v1/examples/usb`, the stored form) and the `provision-*` vectors run through the whole handler. [host-tests/usb-e2e/](host-tests/usb-e2e/README.md) goes further on Linux: the desktop app's real sender against the firmware's handler over a pseudo-terminal. [fuzz/](fuzz/README.md) has the fuzz targets.
 
 ## Building
 
@@ -74,6 +103,8 @@ You need **ESP-IDF v5.5.6** exactly, installed with Espressif's [instructions](h
 . "$IDF_PATH/export.sh"
 idf.py -C firmware -B firmware/build build
 ```
+
+A build folder keeps the settings it was first made with. After changing `sdkconfig.defaults`, delete the build folder (or its `sdkconfig`) and build again.
 
 The first build downloads the components listed in [THIRD_PARTY.md](THIRD_PARTY.md) into `firmware/managed_components/`. The outputs land in the build folder: `display-hub.bin` (the app), `bootloader/bootloader.bin`, `partition_table/partition-table.bin`, `ota_data_initial.bin`, and `flasher_args.json`, which says where each goes.
 
@@ -106,4 +137,4 @@ From [partitions.csv](partitions.csv). A first install sets it for good: an over
 | App slot `ota_1` | 0x620000 | 6 MiB |
 | Free | 0xc20000 | about 3.9 MiB |
 
-There is no factory slot. Secure Boot and flash encryption are off. NVS encryption is on, with the HMAC scheme and eFuse key block KEY5 (see [Storage key check](#storage-key-check)).
+There is no factory slot. Secure Boot and flash encryption are off. NVS encryption is on, with the HMAC scheme and eFuse key block KEY5 (see [The storage key](#the-storage-key)).

@@ -67,6 +67,7 @@ desktop.ini
 
 # display-hub: build output, local run data and the unreviewed starter pack
 /target/
+/firmware/host-tests/usb-e2e/target/
 /dist/
 /dev-data/
 # Local plans for the owner to review (agent working notes, never publish)

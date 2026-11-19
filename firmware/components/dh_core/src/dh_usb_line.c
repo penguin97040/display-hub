@@ -43,3 +43,14 @@ dh_line_event dh_usb_line_feed(dh_usb_line_reader *r, const uint8_t *data, size_
     *used = len;
     return DH_LINE_NONE;
 }
+
+void dh_usb_line_wipe(dh_usb_line_reader *r)
+{
+    if (r->len != 0) {
+        return;
+    }
+    volatile uint8_t *b = r->buf;
+    for (size_t i = 0; i < sizeof r->buf; i++) {
+        b[i] = 0;
+    }
+}

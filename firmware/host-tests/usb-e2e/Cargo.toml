@@ -1,0 +1,20 @@
+# An end-to-end check of setup over USB: the desktop app's real sender (hub_client::usb) against
+# the firmware's own handler (dh_core's dh_usb.h), running as ../usb_pty_display.c on a
+# pseudo-terminal. Linux only. See README.md in this folder.
+#
+# It is a workspace of its own, so the main workspace and its checks don't build it.
+[package]
+name = "dh-usb-e2e"
+version = "0.0.0"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+hub-client = { path = "../../../crates/hub-client" }
+hub-protocol = { path = "../../../crates/hub-protocol" }
+# The same exact versions as the main workspace's Cargo.toml.
+serialport = { version = "=4.10.1", default-features = false }
+serde_json = "=1.0.154"
