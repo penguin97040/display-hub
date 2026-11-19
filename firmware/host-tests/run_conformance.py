@@ -6,6 +6,9 @@
       Every example in valid/ and invalid/ must be accepted, tolerated, shown as a card or refused
       as docs/protocol-v1.md, "Conformance", says (crates/hub-protocol/tests/conformance.rs has
       the same table).
+  run_conformance.py firmware <dh_fw_conform> <protocol/v1/firmware>
+      Every firmware update vector must give exactly its "expect", whatever size of piece a
+      download's body arrives in.
 """
 
 import json
@@ -65,6 +68,38 @@ def check_vectors(cli, folder):
     return 1 if failures or len(got) != len(files) else 0
 
 
+# How many bytes of a download's body the display is given at a time: single bytes, sizes that
+# straddle the 137-byte header and each vector's manifest, the reference's own 97, and everything
+# at once.
+PIECES = (1, 2, 3, 7, 64, 97, 136, 137, 138, 255, 1000, 4096, 1 << 20)
+
+
+def check_firmware(cli, folder):
+    files = sorted(pathlib.Path(folder).glob("*.json"))
+    if not files:
+        print(f"no firmware vectors in {folder}")
+        return 1
+    wants = [json.loads(f.read_text(encoding="utf-8"))["expect"] for f in files]
+    failed = set()
+    for piece in PIECES:
+        got = run(cli, [str(piece), *map(str, files)])
+        if len(got) != len(files):
+            print(f"FAIL: {len(got)} answers for {len(files)} vectors")
+            return 1
+        for f, want, g in zip(files, wants, got):
+            if g != want:
+                failed.add(f.name)
+                print(
+                    f"FAIL {f.name} in pieces of {piece}\n"
+                    f"  expected {json.dumps(want)}\n  got      {json.dumps(g)}"
+                )
+    print(
+        f"firmware vectors: {len(files) - len(failed)} of {len(files)} pass, "
+        f"each at {len(PIECES)} piece sizes"
+    )
+    return 1 if failed else 0
+
+
 def problem_with(kind, name, body, got):
     pages = got["pages"]
     if kind == "valid":
@@ -122,11 +157,12 @@ def check_examples(cli, folder):
 
 
 def main():
-    if len(sys.argv) != 4 or sys.argv[1] not in ("vectors", "examples"):
+    checks = {"vectors": check_vectors, "examples": check_examples, "firmware": check_firmware}
+    if len(sys.argv) != 4 or sys.argv[1] not in checks:
         print(__doc__)
         return 2
     mode, cli, folder = sys.argv[1:]
-    return check_vectors(cli, folder) if mode == "vectors" else check_examples(cli, folder)
+    return checks[mode](cli, folder)
 
 
 if __name__ == "__main__":

@@ -3,14 +3,17 @@
 #   cmake --build <dir>
 #   ctest --test-dir <dir> --output-on-failure
 #
+# MBEDTLS_DIR is a built Mbed TLS 3.6 source tree or an install prefix; without it, the system's
+# Mbed TLS is used. The signed-update core needs it for SHA-256 and ECDSA P-256.
+#
 # -DDH_SANITIZE=ON builds everything with AddressSanitizer and UndefinedBehaviorSanitizer, and
 # -DCMAKE_C_COMPILER picks gcc or clang. The vector and example tests need Python 3 (standard
 # library only).
 cmake_minimum_required(VERSION 3.16)
 project(dh_host_tests C)
 
-# Where Mbed TLS is installed. The signed-update tests will need it; nothing here does yet.
-set(MBEDTLS_DIR "" CACHE PATH "Install prefix of Mbed TLS 3.6")
+# Where Mbed TLS is: see components/dh_core/CMakeLists.txt.
+set(MBEDTLS_DIR "" CACHE PATH "A built Mbed TLS 3.6 source tree, or its install prefix")
 
 option(DH_WERROR "Treat compiler warnings as errors" ON)
 option(DH_SANITIZE "Build with AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -42,8 +45,17 @@ add_executable(dh_conform conform_cli.c)
 target_link_libraries(dh_conform PRIVATE dh_core)
 target_compile_options(dh_conform PRIVATE ${DH_WARNINGS})
 
+add_executable(dh_update_tests update_tests.c)
+target_link_libraries(dh_update_tests PRIVATE dh_core)
+target_compile_options(dh_update_tests PRIVATE ${DH_WARNINGS})
+
+add_executable(dh_fw_conform fw_conform_cli.c)
+target_link_libraries(dh_fw_conform PRIVATE dh_core)
+target_compile_options(dh_fw_conform PRIVATE ${DH_WARNINGS})
+
 # The fuzz targets, built with a small main that replays a folder of inputs.
-foreach(target json snapshot)
+set(DH_FUZZ_TARGETS json snapshot fw_manifest fw_download)
+foreach(target ${DH_FUZZ_TARGETS})
     add_executable(dh_fuzz_${target}_replay
         "${DH_FIRMWARE_DIR}/fuzz/fuzz_${target}.c"
         "${DH_FIRMWARE_DIR}/fuzz/replay_main.c")
@@ -58,10 +70,14 @@ add_test(NAME unit COMMAND dh_unit_tests)
 add_test(NAME vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             vectors $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/vectors")
+add_test(NAME update COMMAND dh_update_tests)
+add_test(NAME firmware_vectors
+    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
+            firmware $<TARGET_FILE:dh_fw_conform> "${DH_PROTOCOL_DIR}/firmware")
 add_test(NAME examples
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             examples $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/examples")
-foreach(target json snapshot)
+foreach(target ${DH_FUZZ_TARGETS})
     add_test(NAME fuzz_${target}_corpus
         COMMAND dh_fuzz_${target}_replay "${DH_FIRMWARE_DIR}/fuzz/corpus/${target}")
 endforeach()
