@@ -220,7 +220,8 @@ static void stick(dh_problem problem, hub_detail_t detail)
 // A new snapshot is held (or none): the screen's copy catches up at the next publish(). Every
 // one is passed on, so the screen always works out ages from the latest generated_at and time of
 // arrival. `content` says whether the pages themselves may differ from the ones before; only then
-// does the screen draw them afresh.
+// does the screen draw them afresh. Passing on unchanged pages costs two copies of about 38 KB in
+// PSRAM (here and in the main task), well under a millisecond, once a poll: at most every 30 s.
 static void pages_changed(bool content)
 {
     s_pages_seq++;

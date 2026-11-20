@@ -73,7 +73,8 @@ typedef struct {
 
 // A copy of the pages held, for the screen to draw. It is about 38 KB, so keep it off the stack.
 typedef struct {
-    uint32_t seq;         // changes with every new snapshot, so ages use its generated_at
+    uint32_t seq;         // changes with every new snapshot (so ages use its generated_at) and
+                          // when the pages are dropped
     uint32_t content_seq; // changes only when the pages themselves (may) differ
     bool has_snapshot;   // false: no pages are held, and `snapshot` is all zeros
     // The setup they came with (storage_setup_generation()). Pages from a setup that has since

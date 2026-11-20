@@ -131,6 +131,21 @@ static void draw_dots(size_t views)
 }
 
 // Shows what the state says: the status screen alone, or the view s_view of the swipe row.
+// Room for the scroll bar when the figures don't all fit, so it never covers them. After every
+// change to the page's text: an age that grows onto a second line can make the figures overflow.
+static void make_room_for_scroll_bar(void)
+{
+    if (s_live.figures == NULL) {
+        return;
+    }
+    lv_obj_update_layout(s_page);
+    if (lv_obj_get_scroll_bottom(s_live.figures) > 0 &&
+        lv_obj_get_style_pad_right(s_live.figures, 0) < 10) {
+        lv_obj_set_style_pad_right(s_live.figures, 10, 0);
+        lv_obj_update_layout(s_page);
+    }
+}
+
 static void render(void)
 {
     // The page drawn last, before it is cleared: to keep its place if it is drawn again.
@@ -180,12 +195,7 @@ static void render(void)
         lv_label_set_text(lv_obj_get_child(s_page, -1), s_line);
     }
     if (s_live.figures != NULL) {
-        // Room for the scroll bar when the figures don't all fit, so it never covers them.
-        lv_obj_update_layout(s_page);
-        if (lv_obj_get_scroll_bottom(s_live.figures) > 0) {
-            lv_obj_set_style_pad_right(s_live.figures, 10, 0);
-            lv_obj_update_layout(s_page);
-        }
+        make_room_for_scroll_bar();
         // The same page again: where it was scrolled to.
         if (s_live_page != NULL && strcmp(s_drawn_id, s_live_page->id) == 0 && scroll_y > 0) {
             lv_obj_scroll_to_y(s_live.figures, scroll_y, LV_ANIM_OFF);
@@ -235,6 +245,7 @@ static void on_tick(lv_timer_t *timer)
     }
     if (s_live_page != NULL && s_pages != NULL && !s_counting) {
         ui_page_tick(&s_live, &s_pages->snapshot, s_live_page, s_pages->saved, held_seconds());
+        make_room_for_scroll_bar();
     }
 }
 
@@ -614,6 +625,7 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     } else if (s_live_page != NULL) {
         // The same pages from a later snapshot: its generated_at and time of arrival.
         ui_page_tick(&s_live, &pages->snapshot, s_live_page, pages->saved, held_seconds());
+        make_room_for_scroll_bar();
     }
 }
 
