@@ -21,6 +21,8 @@ pub struct Field {
     pub max_len: usize,
     /// Shown as dots, and never copied out.
     pub secret: bool,
+    /// A secret shown as plain text for now. Reset by [`Field::clear`]. Still never copied out.
+    pub revealed: bool,
 }
 
 impl Field {
@@ -31,6 +33,7 @@ impl Field {
             anchor: 0,
             max_len,
             secret: false,
+            revealed: false,
         }
     }
 
@@ -41,6 +44,7 @@ impl Field {
             anchor: 0,
             max_len,
             secret: true,
+            revealed: false,
         }
     }
 
@@ -69,6 +73,25 @@ impl Field {
         self.text.zeroize();
         self.caret = 0;
         self.anchor = 0;
+        self.revealed = false;
+    }
+
+    /// True while the text is drawn as dots.
+    pub fn masked(&self) -> bool {
+        self.secret && !self.revealed
+    }
+
+    /// Starts a mouse selection at a text offset. With `extend` (shift held) the anchor stays.
+    pub fn begin_drag(&mut self, at: usize, extend: bool) {
+        self.caret = at.min(self.text.len());
+        if !extend {
+            self.anchor = self.caret;
+        }
+    }
+
+    /// Moves the dragged end to a text offset, keeping the anchor.
+    pub fn drag_to(&mut self, at: usize) {
+        self.caret = at.min(self.text.len());
     }
 
     pub fn trimmed(&self) -> &str {
@@ -77,7 +100,7 @@ impl Field {
 
     /// What the field shows: the text, or one dot per character for a secret.
     pub fn shown(&self) -> String {
-        if self.secret {
+        if self.masked() {
             "•".repeat(self.text.chars().count())
         } else {
             self.text.clone()
@@ -86,7 +109,7 @@ impl Field {
 
     /// Maps a byte offset in the text to one in [`Field::shown`].
     pub fn shown_offset(&self, at: usize) -> usize {
-        if self.secret {
+        if self.masked() {
             self.text[..at].chars().count() * '•'.len_utf8()
         } else {
             at
@@ -95,7 +118,7 @@ impl Field {
 
     /// Maps a byte offset in [`Field::shown`] back to the text.
     pub fn text_offset(&self, shown_at: usize) -> usize {
-        if self.secret {
+        if self.masked() {
             let n = shown_at / '•'.len_utf8();
             self.text
                 .char_indices()
@@ -169,7 +192,7 @@ impl Field {
 
     /// Selects the word around a position, for a double-click.
     pub fn select_word(&mut self, at: usize) {
-        if self.secret {
+        if self.masked() {
             return self.select_all();
         }
         for (i, w) in self.text.split_word_bound_indices() {
@@ -197,8 +220,8 @@ impl Field {
             handled: true,
         };
         let has_sel = self.caret != self.anchor;
-        // A secret moves by whole words as if it were one.
-        let word = word && !self.secret;
+        // A hidden secret moves by whole words as if it were one.
+        let word = word && !self.masked();
         let target = match key {
             "left" if !shift && has_sel && !word => Some(self.selection().0),
             "right" if !shift && has_sel && !word => Some(self.selection().1),
@@ -367,6 +390,44 @@ mod tests {
         assert_eq!(f.text_offset(f.shown_offset(3)), 3);
         f.clear();
         assert!(f.text.is_empty());
+    }
+
+    #[test]
+    fn dragging_selects_from_the_press_and_clamps() {
+        let mut f = Field::default();
+        f.set("hello world");
+        f.begin_drag(2, false);
+        f.drag_to(7);
+        assert_eq!(f.selected(), "llo w");
+        f.drag_to(0);
+        assert_eq!(f.selected(), "he", "back past the press point");
+        f.drag_to(999);
+        assert_eq!(f.selected(), "llo world", "clamped to the end");
+        f.begin_drag(4, true);
+        assert_eq!(f.selected(), "ll", "shift extends from the old anchor");
+        f.select_word(1);
+        f.drag_to(11);
+        assert_eq!(f.selected(), "hello world", "a drag after a double-click extends");
+    }
+
+    #[test]
+    fn a_revealed_secret_shows_text_but_is_still_never_copied() {
+        let mut f = Field::secret(63);
+        f.set("hunter22");
+        assert!(f.masked());
+        f.revealed = true;
+        assert!(!f.masked());
+        assert_eq!(f.shown(), "hunter22");
+        assert_eq!(f.shown_offset(3), 3);
+        f.select_word(1);
+        assert_eq!(f.selected(), "hunter22");
+        f.select_all();
+        press(&mut f, "c", false, false, true, None);
+        press(&mut f, "x", false, false, true, None);
+        assert_eq!(f.text, "hunter22", "still not copied or cut");
+        f.clear();
+        assert!(!f.revealed, "hidden again once cleared");
+        assert!(f.masked());
     }
 
     #[test]

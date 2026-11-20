@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use gpui::accesskit::{Role, Toggled};
 use gpui::{
     canvas, div, fill, font, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, CursorStyle,
-    Div, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, ShapedLine,
-    SharedString, Stateful, TextRun, Window,
+    Div, ElementId, FocusHandle, Hsla, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, ShapedLine, SharedString, Stateful, TextRun, Window,
 };
 use hub_core::Source;
 
@@ -93,6 +93,8 @@ pub struct Manager {
     hovered: Option<SharedString>,
     /// Where each field was last drawn, for placing the caret on a click.
     field_bounds: Rc<RefCell<HashMap<FieldId, Bounds<Pixels>>>>,
+    /// The field a pressed mouse button is selecting in, until the button is released.
+    dragging: Option<FieldId>,
     smoke_test: bool,
 }
 
@@ -111,6 +113,7 @@ impl Manager {
             root: cx.focus_handle(),
             hovered: None,
             field_bounds: Rc::default(),
+            dragging: None,
             smoke_test,
         };
         this.run(start, cx);
@@ -197,6 +200,22 @@ impl Manager {
         if lost || window.focused(cx).is_none() {
             window.focus(&self.root, cx);
         }
+    }
+
+    /// The text offset in a field under a window x position, allowing for the field's scroll.
+    /// A position outside the field clamps to its start or end.
+    fn field_at(&mut self, id: FieldId, x: Pixels, window: &Window) -> Option<usize> {
+        let b = *self.field_bounds.borrow().get(&id)?;
+        let f = self.field_mut(id)?;
+        let (shown, caret) = (f.shown(), f.shown_offset(f.caret));
+        let at = caret_index(
+            &shown,
+            caret,
+            f32::from(x - b.origin.x),
+            f32::from(b.size.width),
+            window,
+        );
+        Some(f.text_offset(at))
     }
 
     fn field_mut(&mut self, id: FieldId) -> Option<&mut Field> {
@@ -511,13 +530,12 @@ impl Manager {
         };
         let shown = f.shown();
         let bounds_store = self.field_bounds.clone();
-        let hit_store = self.field_bounds.clone();
         let fh_click = fh.clone();
         let input = div()
             .id(ElementId::Name(key))
             .role(Role::TextInput)
             .aria_label(SharedString::from(label.to_string()))
-            .when(!f.secret, |d| d.aria_value(SharedString::from(f.text.clone())))
+            .when(!f.masked(), |d| d.aria_value(SharedString::from(f.text.clone())))
             .when(!hint.is_empty(), |d| {
                 d.aria_description(SharedString::from(hint.to_string()))
             })
@@ -532,24 +550,17 @@ impl Manager {
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
                     window.focus(&fh_click, cx);
-                    let origin = hit_store.borrow().get(&id).map(|b| f32::from(b.origin.x));
+                    let at = this.field_at(id, e.position.x, window);
                     if let Some(f) = this.field_mut(id) {
                         if e.click_count >= 3 {
                             f.select_all();
+                        } else if e.click_count == 2 {
+                            f.select_word(at.unwrap_or(0));
                         } else {
-                            let x = origin.map_or(0.0, |o| f32::from(e.position.x) - o);
-                            let shown = f.shown();
-                            let at = f.text_offset(caret_index(&shown, x, window));
-                            if e.click_count == 2 {
-                                f.select_word(at);
-                            } else {
-                                f.caret = at;
-                                if !e.modifiers.shift {
-                                    f.anchor = at;
-                                }
-                            }
+                            f.begin_drag(at.unwrap_or(0), e.modifiers.shift);
                         }
                     }
+                    this.dragging = Some(id);
                     cx.notify();
                 }),
             )
@@ -2575,10 +2586,23 @@ impl Manager {
                     this.run(op, cx);
                 });
                 let keys = self.pending_keys_block(cx);
+                let revealed = self.model.enrol.password.revealed;
+                let (word, spoken) = if revealed {
+                    ("Hide", "Hide password")
+                } else {
+                    ("Show", "Show password")
+                };
+                let toggle = self
+                    .button("password-reveal", word, Kind::Quiet, true, cx, |this, _, _| {
+                        let f = &mut this.model.enrol.password;
+                        f.revealed = !f.revealed;
+                    })
+                    .aria_label(spoken)
+                    .mt(px(20.0));
                 ui::body(m)
                     .child(name)
                     .child(ssid)
-                    .child(pw)
+                    .child(div().flex().items_start().gap(px(8.0)).child(pw.flex_1().min_w_0()).child(toggle))
                     .children(keys)
                     .child(div().flex().gap(px(8.0)).child(create).child(cancel))
             }
@@ -3137,6 +3161,28 @@ impl Render for Manager {
             .text_color(c(TEXT))
             .font_family(FONT_MONO)
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, w, cx| this.key_down(e, w, cx)))
+            // A press that began in a field keeps selecting wherever the pointer goes, until release.
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
+                let Some(id) = this.dragging else { return };
+                if !e.dragging() {
+                    this.dragging = None;
+                    return;
+                }
+                if let Some(at) = this.field_at(id, e.position.x, window) {
+                    if let Some(f) = this.field_mut(id) {
+                        f.drag_to(at);
+                    }
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.dragging = None),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.dragging = None),
+            )
             .child(self.rail(m, cx))
             .child(
                 div()
@@ -3235,11 +3281,15 @@ fn shape(text: &str, colour: Hsla, sel: Option<(usize, usize)>, window: &Window)
         .shape_line(text.to_string().into(), px(FIELD_TEXT), &runs, None)
 }
 
-fn caret_index(shown: &str, x: f32, window: &Window) -> usize {
+/// The byte offset in `shown` under `x` (from the field's left edge), given the field is scrolled to
+/// keep the caret at `caret` in view of a `width` wide box (as `field_canvas` draws it).
+fn caret_index(shown: &str, caret: usize, x: f32, width: f32, window: &Window) -> usize {
     if shown.is_empty() {
         return 0;
     }
-    shape(shown, c(TEXT), None, window).closest_index_for_x(px(x.max(0.0)))
+    let line = shape(shown, c(TEXT), None, window);
+    let scroll = (f32::from(line.x_for_index(caret.min(shown.len()))) - width + 2.0).max(0.0);
+    line.closest_index_for_x(px((x + scroll).max(0.0)))
 }
 
 /// The field's text, selection and a steady caret, scrolled so the caret stays in view.
