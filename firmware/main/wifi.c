@@ -14,6 +14,12 @@ static const char *TAG = "wifi-link";
 
 static TaskHandle_t s_wake;
 static bool s_prepared;
+// What wifi_prepare() has done so far, so a call after one that failed part way carries on from
+// there: none of these may be made twice.
+static esp_netif_t *s_netif;
+static esp_event_handler_instance_t s_on_disconnected;
+static esp_event_handler_instance_t s_on_got_ip;
+static esp_event_handler_instance_t s_on_lost_ip;
 static bool s_started;
 static atomic_int s_link = WIFI_LINK_DOWN;
 static atomic_uint s_drops;
@@ -74,18 +80,24 @@ esp_err_t wifi_prepare(TaskHandle_t wake)
     esp_err_t err = esp_netif_init();
     if (err == ESP_OK) {
         err = esp_event_loop_create_default();
+        // Made by an earlier call that failed further on.
+        if (err == ESP_ERR_INVALID_STATE) {
+            err = ESP_OK;
+        }
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "the network stack didn't start: %s", esp_err_to_name(err));
         return err;
     }
-    esp_netif_t *netif = esp_netif_create_default_wifi_sta();
-    if (netif == NULL) {
-        ESP_LOGE(TAG, "couldn't make the Wi-Fi network interface");
-        return ESP_FAIL;
+    if (s_netif == NULL) {
+        s_netif = esp_netif_create_default_wifi_sta();
+        if (s_netif == NULL) {
+            ESP_LOGE(TAG, "couldn't make the Wi-Fi network interface");
+            return ESP_FAIL;
+        }
+        // What a router's list of devices shows. Nothing about the owner or the hub.
+        esp_netif_set_hostname(s_netif, "display-hub-display");
     }
-    // What a router's list of devices shows. Nothing about the owner or the hub.
-    esp_netif_set_hostname(netif, "display-hub-display");
 
     const wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&init);
@@ -97,17 +109,17 @@ esp_err_t wifi_prepare(TaskHandle_t wake)
     if (err == ESP_OK) {
         err = esp_wifi_set_mode(WIFI_MODE_STA);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK && s_on_disconnected == NULL) {
         err = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED,
-                                                  on_event, NULL, NULL);
+                                                  on_event, NULL, &s_on_disconnected);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK && s_on_got_ip == NULL) {
         err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_event, NULL,
-                                                  NULL);
+                                                  &s_on_got_ip);
     }
-    if (err == ESP_OK) {
+    if (err == ESP_OK && s_on_lost_ip == NULL) {
         err = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_LOST_IP, on_event, NULL,
-                                                  NULL);
+                                                  &s_on_lost_ip);
     }
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "the Wi-Fi driver didn't start: %s", esp_err_to_name(err));

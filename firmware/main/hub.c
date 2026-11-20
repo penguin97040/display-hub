@@ -88,11 +88,16 @@ typedef struct {
     dh_heartbeat_state heartbeat;
     int64_t next_try_ms; // the next enrolment attempt or poll
 
+    bool wifi_started; // the radio is on with this setup's Wi-Fi details
     bool wifi_was_up;
-    uint32_t wifi_failures;
+    uint32_t wifi_failures; // failed joins, or failed starts, in a row
     uint32_t wifi_drops_seen;
     int64_t wifi_retry_ms;
     int64_t wifi_join_started_ms;
+    // What the screen said about the hub before a Wi-Fi state took its place: shown again once
+    // the display is back on Wi-Fi, if the hub had asked it to wait.
+    hub_state_t hub_state;
+    hub_detail_t hub_detail;
 
     bool has_snapshot;
     bool saved_pages;
@@ -110,6 +115,13 @@ static session_t s;
 static int64_t now_ms(void)
 {
     return esp_timer_get_time() / 1000;
+}
+
+// PSRAM if there is any, so the internal memory is left for Wi-Fi and TLS.
+static void *big_alloc(size_t bytes)
+{
+    void *p = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p != NULL ? p : heap_caps_calloc(1, bytes, MALLOC_CAP_DEFAULT);
 }
 
 static uint32_t random32(void *ctx)
@@ -144,8 +156,12 @@ static void publish(void)
     static hub_status_t next;
     memset(&next, 0, sizeof(next));
     next.state = s.state;
-    next.problem = s.state == HUB_TROUBLE || s.state == HUB_NEEDS_SETUP ? s.poll.problem
-                                                                         : DH_PROBLEM_NONE;
+    // s.poll.problem is what the hub last said, and is kept while Wi-Fi is the trouble.
+    if (s.detail == HUB_DETAIL_WIFI || s.detail == HUB_DETAIL_WIFI_START) {
+        next.problem = DH_PROBLEM_UNREACHABLE;
+    } else if (s.state == HUB_TROUBLE || s.state == HUB_NEEDS_SETUP) {
+        next.problem = s.poll.problem;
+    }
     next.detail = s.detail;
     next.token_unsaved = s.enrolled && !s.token_saved;
     next.has_snapshot = s.has_snapshot;
@@ -193,6 +209,11 @@ static void stick(dh_problem problem, hub_detail_t detail)
 
 void hub_status(hub_status_t *out)
 {
+    // No lock means hub_start() failed before the task could run: nothing else writes this.
+    if (s_status_lock == NULL) {
+        *out = s_status;
+        return;
+    }
     xSemaphoreTake(s_status_lock, portMAX_DELAY);
     *out = s_status;
     xSemaphoreGive(s_status_lock);
@@ -481,6 +502,88 @@ static void heartbeat_if_due(void)
 
 // ---- Wi-Fi ----
 
+static bool showing_wifi(void)
+{
+    return s.state == HUB_JOINING_WIFI || s.detail == HUB_DETAIL_WIFI ||
+           s.detail == HUB_DETAIL_WIFI_START;
+}
+
+// Shows how Wi-Fi stands in place of what the hub last said, which is kept to go back to.
+static void show_wifi(hub_state_t state, hub_detail_t detail)
+{
+    if (!showing_wifi()) {
+        s.hub_state = s.state;
+        s.hub_detail = s.detail;
+    }
+    set_state(state, detail);
+}
+
+// How long to wait after another failure in a row to join Wi-Fi, or to start it.
+static uint32_t wifi_failed(void)
+{
+    s.wifi_failures++;
+    uint32_t seconds = dh_backoff_seconds(s.wifi_failures);
+    if (seconds > WIFI_RETRY_MAX_SECONDS) {
+        seconds = WIFI_RETRY_MAX_SECONDS;
+    }
+    const uint32_t wait = dh_jitter_ms(seconds * 1000u, 20, random32, NULL);
+    s.wifi_retry_ms = now_ms() + wait;
+    return wait;
+}
+
+// Turns the radio on with `setup`'s Wi-Fi details. If that fails (out of memory, say), it is
+// tried again on the same back-off as joining (start_wifi_again).
+static void start_wifi(const dh_setup *setup)
+{
+    esp_err_t err = wifi_prepare(s_task);
+    if (err == ESP_OK) {
+        err = wifi_start(setup);
+    }
+    if (err != ESP_OK) {
+        const uint32_t wait = wifi_failed();
+        ESP_LOGE(TAG, "Wi-Fi didn't start (%s, %" PRIu32 " in a row); trying again in %" PRIu32
+                      " s",
+                 esp_err_to_name(err), s.wifi_failures, wait / 1000);
+        show_wifi(HUB_TROUBLE, HUB_DETAIL_WIFI_START);
+        return;
+    }
+    s.wifi_started = true;
+    s.wifi_failures = 0;
+    s.wifi_drops_seen = wifi_drops();
+    // Join straight away.
+    s.wifi_retry_ms = now_ms();
+    show_wifi(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
+}
+
+// The session's copy of the setup has had its Wi-Fi details wiped, so another try at starting
+// Wi-Fi reads them from storage again, and wipes them straight after.
+static void start_wifi_again(void)
+{
+    dh_setup *fresh = big_alloc(sizeof(*fresh));
+    if (fresh == NULL) {
+        const uint32_t wait = wifi_failed();
+        ESP_LOGE(TAG, "Wi-Fi didn't start (out of memory to read its details, %" PRIu32
+                      " in a row); trying again in %" PRIu32 " s",
+                 s.wifi_failures, wait / 1000);
+        return;
+    }
+    // Under storage's lock, which it takes itself.
+    uint32_t generation = 0;
+    const bool loaded = storage_load_setup(fresh, &generation);
+    if (generation != s.generation) {
+        // Erased or replaced: the session ends.
+    } else if (!loaded) {
+        const uint32_t wait = wifi_failed();
+        ESP_LOGE(TAG, "Wi-Fi didn't start (its details couldn't be read, %" PRIu32
+                      " in a row); trying again in %" PRIu32 " s",
+                 s.wifi_failures, wait / 1000);
+    } else {
+        start_wifi(fresh);
+    }
+    dh_setup_wipe(fresh);
+    heap_caps_free(fresh);
+}
+
 // Keeps the display on Wi-Fi. True when it is; otherwise it has done the next thing towards
 // joining, or waited, and the caller should come round again.
 static bool wifi_ready(void)
@@ -496,13 +599,7 @@ static bool wifi_ready(void)
             s.wifi_retry_ms = now + 1000;
             ESP_LOGW(TAG, "Wi-Fi dropped (reason %u); joining again", wifi_last_reason());
         } else {
-            s.wifi_failures++;
-            uint32_t seconds = dh_backoff_seconds(s.wifi_failures);
-            if (seconds > WIFI_RETRY_MAX_SECONDS) {
-                seconds = WIFI_RETRY_MAX_SECONDS;
-            }
-            const uint32_t wait = dh_jitter_ms(seconds * 1000u, 20, random32, NULL);
-            s.wifi_retry_ms = now + wait;
+            const uint32_t wait = wifi_failed();
             ESP_LOGW(TAG, "couldn't join Wi-Fi (reason %u, %" PRIu32 " in a row); trying again "
                           "in %" PRIu32 " s",
                      wifi_last_reason(), s.wifi_failures, wait / 1000);
@@ -516,12 +613,19 @@ static bool wifi_ready(void)
             s.wifi_failures = 0;
             ESP_LOGI(TAG, "joined Wi-Fi and was given an address");
             // Straight to the hub, unless the last answer said to wait (the hub is busy, the
-            // display needs setting up again): Wi-Fi coming back doesn't change those.
-            if (s.poll.problem == DH_PROBLEM_NONE || s.poll.problem == DH_PROBLEM_UNREACHABLE) {
+            // display needs setting up again): Wi-Fi coming back doesn't change those, so what
+            // the screen said about them is shown again.
+            const bool hub_waits =
+                s.poll.problem != DH_PROBLEM_NONE && s.poll.problem != DH_PROBLEM_UNREACHABLE;
+            if (!hub_waits) {
                 s.next_try_ms = now;
             }
-            if (s.state == HUB_JOINING_WIFI || s.detail == HUB_DETAIL_WIFI) {
-                set_state(s.enrolled ? HUB_WAITING : HUB_ENROLLING, HUB_DETAIL_NONE);
+            if (showing_wifi()) {
+                if (hub_waits) {
+                    set_state(s.hub_state, s.hub_detail);
+                } else {
+                    set_state(s.enrolled ? HUB_WAITING : HUB_ENROLLING, HUB_DETAIL_NONE);
+                }
             }
         }
         return true;
@@ -540,11 +644,10 @@ static bool wifi_ready(void)
     // Not joined. Say so once it has failed twice: one miss is often just the router being slow.
     if (s.wifi_failures >= 2) {
         if (s.detail != HUB_DETAIL_WIFI) {
-            s.poll.problem = DH_PROBLEM_UNREACHABLE;
-            set_state(HUB_TROUBLE, HUB_DETAIL_WIFI);
+            show_wifi(HUB_TROUBLE, HUB_DETAIL_WIFI);
         }
     } else if (s.state != HUB_JOINING_WIFI) {
-        set_state(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
+        show_wifi(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
     }
     now = now_ms();
     if (now >= s.wifi_retry_ms) {
@@ -658,21 +761,9 @@ static void run_session(void)
         stick(DH_PROBLEM_SETTINGS, HUB_DETAIL_NO_ANCHOR);
     }
     if (!s.stuck) {
-        esp_err_t err = wifi_prepare(s_task);
-        if (err == ESP_OK) {
-            err = wifi_start(s_setup);
-        }
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Wi-Fi didn't start: %s", esp_err_to_name(err));
-            s.poll.problem = DH_PROBLEM_UNREACHABLE;
-            s.stuck = true;
-            set_state(HUB_TROUBLE, HUB_DETAIL_WIFI);
-        } else {
-            s.wifi_drops_seen = wifi_drops();
-            set_state(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
-        }
+        start_wifi(s_setup);
     }
-    // The driver has its own copy now.
+    // The driver has its own copy now. If it didn't start, start_wifi_again reads them again.
     dh_wipe(s_setup->ssid, sizeof(s_setup->ssid));
     dh_wipe(s_setup->password, sizeof(s_setup->password));
     s_setup->ssid_len = 0;
@@ -683,6 +774,15 @@ static void run_session(void)
         minute_log();
         if (s.stuck) {
             wait_ms(MINUTE_MS);
+            continue;
+        }
+        if (!s.wifi_started) {
+            const int64_t now = now_ms();
+            if (now < s.wifi_retry_ms) {
+                wait_ms(s.wifi_retry_ms - now);
+            } else {
+                start_wifi_again();
+            }
             continue;
         }
         if (!wifi_ready()) {
@@ -746,13 +846,6 @@ static void hub_task(void *arg)
     }
 }
 
-// PSRAM if there is any, so the internal memory is left for Wi-Fi and TLS.
-static void *big_alloc(size_t bytes)
-{
-    void *p = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    return p != NULL ? p : heap_caps_calloc(1, bytes, MALLOC_CAP_DEFAULT);
-}
-
 esp_err_t hub_start(const char *firmware_version, const char *hardware_revision,
                     void (*on_change)(void))
 {
@@ -772,11 +865,13 @@ esp_err_t hub_start(const char *firmware_version, const char *hardware_revision,
     if (s_status_lock == NULL || s_setup == NULL || s_body == NULL || s_saved == NULL ||
         s_current == NULL || s_spare == NULL || s_scratch == NULL) {
         ESP_LOGE(TAG, "out of memory for the hub task");
+        s_status.state = HUB_FAILED;
         return ESP_ERR_NO_MEM;
     }
     _Static_assert(DH_MAX_SNAPSHOT_BYTES >= DH_MAX_HUB_ANSWER_BYTES, "one buffer for every answer");
     if (xTaskCreate(hub_task, "hub", TASK_STACK_BYTES, NULL, TASK_PRIORITY, &s_task) != pdPASS) {
         ESP_LOGE(TAG, "the hub task didn't start");
+        s_status.state = HUB_FAILED;
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

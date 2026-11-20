@@ -98,6 +98,9 @@ static const char *advice(const hub_status_t *hub)
         return "This display can't join the Wi-Fi network. Check the network is on and in "
                "range. " RETRYING "\n\n"
                "If the network's name or password has changed, " RESET_HOW;
+    case HUB_DETAIL_WIFI_START:
+        return "This display's Wi-Fi didn't start. " RETRYING "\n\n"
+               "If this doesn't clear, unplug the display and plug it back in.";
     case HUB_DETAIL_NO_WIFI_DETAILS:
         return "It was set up without Wi-Fi details, so it can't join a network.\n\n"
                "To set it up again, " RESET_HOW;
@@ -132,6 +135,7 @@ static const char *advice(const hub_status_t *hub)
         return "The hub and this display's firmware are different versions that can't work "
                "together. Update the one that is older.";
     case DH_PROBLEM_NEEDS_SETUP:
+    case DH_PROBLEM_SETTINGS:
         return "To set it up again, " RESET_HOW;
     default:
         return "";
@@ -198,6 +202,12 @@ static void show_hub(const hub_status_t *hub, const char *note)
         show(dh_problem_headline(hub->problem),
              hub->problem == DH_PROBLEM_WRONG_HUB ? COLOUR_BAD : COLOUR_WARNING, NULL, body, pages,
              note);
+        return;
+    case HUB_FAILED:
+        show("Can't connect", COLOUR_BAD, NULL,
+             "This display couldn't start its connection to the hub.\n\n"
+             "Unplug it and plug it back in.",
+             pages, note);
         return;
     default:
         // HUB_JOINING_WIFI, and the moment before the hub task has looked at a new setup.

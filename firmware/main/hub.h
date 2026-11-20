@@ -38,12 +38,14 @@ typedef enum {
     HUB_ONLINE,       // the last poll succeeded
     HUB_TROUBLE,      // `problem` says what is wrong; the last good pages stay
     HUB_NEEDS_SETUP,  // nothing more can be done until the display is set up again
+    HUB_FAILED,       // the task couldn't start (hub_start failed): only a restart helps
 } hub_state_t;
 
 // More about a problem than its headline says.
 typedef enum {
     HUB_DETAIL_NONE,
     HUB_DETAIL_WIFI,            // can't reach the hub because the display isn't on Wi-Fi
+    HUB_DETAIL_WIFI_START,      // the display's Wi-Fi didn't start; it is tried again
     HUB_DETAIL_NO_WIFI_DETAILS, // the setup came without Wi-Fi details
     HUB_DETAIL_NO_ANCHOR,       // no certificate in the setup can be read
     HUB_DETAIL_ENROL_REFUSED,   // the hub refused the one-time secret (used or expired)
@@ -75,7 +77,8 @@ typedef struct {
 } hub_status_t;
 
 // Starts the task. The two strings must stay valid for good. `on_change` is called from the task
-// whenever the status changes, and should only wake another task.
+// whenever the status changes, and should only wake another task. If it fails, the status says
+// HUB_FAILED from then on.
 esp_err_t hub_start(const char *firmware_version, const char *hardware_revision,
                     void (*on_change)(void));
 

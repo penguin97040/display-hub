@@ -216,7 +216,15 @@ void app_main(void)
                         on_setup_stored);
     }
     reset_button_start(on_reset_button);
-    hub_start(s_system.version, board_hardware_revision(s_board.revision), on_hub_changed);
+    const esp_err_t hub_err =
+        hub_start(s_system.version, board_hardware_revision(s_board.revision), on_hub_changed);
+    if (hub_err != ESP_OK) {
+        // The screen says so (HUB_FAILED) once the display is set up.
+        ESP_LOGE(TAG, "the hub task didn't start (%s): this display can't reach the hub until "
+                      "it restarts",
+                 esp_err_to_name(hub_err));
+        show_state(NULL);
+    }
 
     report_log(&s_board, &s_system, &s_efuse);
     int64_t logged_ms = esp_timer_get_time() / 1000;

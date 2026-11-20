@@ -29,7 +29,8 @@ typedef enum {
 } wifi_link_t;
 
 // Sets the network stack and the Wi-Fi driver up, once. `wake` is the task to wake (with a task
-// notification) whenever the link changes.
+// notification) whenever the link changes. After a failure it may be called again, and carries on
+// from where it stopped.
 esp_err_t wifi_prepare(TaskHandle_t wake);
 
 // Starts the radio with the setup's Wi-Fi details. The setup must have them (has_wifi).
