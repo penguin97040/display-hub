@@ -118,7 +118,7 @@ static void handle_line(const uint8_t *line, size_t len)
     const dh_usb_answer answer =
         dh_usb_handle_line(&display, line, len, s_reply + 1, DH_USB_REPLY_MAX);
     const storage_facts_t facts = storage_facts();
-    // Nothing in this build uses the setup once it is stored, so don't keep a copy in memory.
+    // The hub task reads the stored setup for itself (hub.c), so no copy is kept here.
     dh_setup_wipe(s_work);
     storage_unlock();
     // The line may have been a bundle, with the Wi-Fi password in it.
@@ -194,8 +194,15 @@ esp_err_t usb_setup_start(const char *firmware_version, const char *hardware_rev
     s_firmware_version = firmware_version;
     s_hardware_revision = hardware_revision;
     s_on_stored = on_stored;
-    s_reader = heap_caps_calloc(1, sizeof(*s_reader), MALLOC_CAP_DEFAULT);
-    s_work = heap_caps_calloc(1, sizeof(*s_work), MALLOC_CAP_DEFAULT);
+    // From PSRAM if there is any: the internal memory is wanted for Wi-Fi and TLS.
+    s_reader = heap_caps_calloc(1, sizeof(*s_reader), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_work = heap_caps_calloc(1, sizeof(*s_work), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_reader == NULL) {
+        s_reader = heap_caps_calloc(1, sizeof(*s_reader), MALLOC_CAP_DEFAULT);
+    }
+    if (s_work == NULL) {
+        s_work = heap_caps_calloc(1, sizeof(*s_work), MALLOC_CAP_DEFAULT);
+    }
     if (s_reader == NULL || s_work == NULL) {
         ESP_LOGE(TAG, "out of memory for the USB task");
         return ESP_ERR_NO_MEM;

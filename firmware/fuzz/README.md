@@ -1,14 +1,15 @@
 # Fuzz targets
 
-Five libFuzzer targets for dh_core:
+Six libFuzzer targets for dh_core:
 
 - `fuzz_json.c`: the JSON reader, with and without its strict options, reading every value of an accepted document every way the API allows and checking the answers agree.
 - `fuzz_snapshot.c`: `dh_read_response()` with the input as a 200 body and as an error body, checking everything it returns is safe to draw (text that passes the text rules, counts within bounds, a custom page's data inside the body).
 - `fuzz_fw_manifest.c`: what the signed-update core reads without needing a signature first: the manifest reader, the header check, a bundle's `firmware` member and the stored forms of the keys and the update record, checking that whatever is accepted is within every bound the rest of the core relies on.
 - `fuzz_fw_download.c`: one download through the streaming verifier, in pieces of sizes the input chooses. The input is either a body as a hub might send it, or a manifest and an image that the target signs itself with a key the display trusts (a fuzzer can't forge a signature, so that is the only way past it). It checks that nothing is taken past the `Content-Length`, nothing is written before the manifest has passed, a download finishes only if what was written is the image the manifest names, and the same body ends the same way however it is cut up.
 - `fuzz_usb.c`: setup over USB. The input is bytes from the port, fed to the line reader in pieces and each line to the handler; or a bundle sent as one `provision` line; or a stored setup. Its first byte also chooses how the display starts (set up or not, with a firmware key or without) and which writes fail. It checks that every reply is one line of plain JSON that fits its buffer, that a setup is stored only by `provisioned` and is then exactly what was read, that anything else leaves the scratch wiped and the stored setup alone, and that memory always matches what was written.
+- `fuzz_hub.c`: what a display reads from the hub outside a snapshot. Its first byte says what the rest is: an enrolment response, an error answer with its status, a stored device ID and token, an enrolment secret to send, or two snapshot bodies to compare. It checks that an accepted ID and token are plain ASCII within their lengths and read back the same from their stored form, that a request is JSON holding the secret it was given, that error answers are grouped the same way here as for a snapshot request, and that a refusal keeps nothing.
 
-`corpus/` holds the seed inputs: `json` and `snapshot` are copied from `protocol/v1/examples`, `fw_manifest` and `fw_download` are made from the vectors in `protocol/v1/firmware` by `make_fw_corpus.py`, and `usb` from the USB examples, the example bundles and the provisioning vectors by `make_usb_corpus.py` (run them again when the vectors or examples change). The host tests replay them on every run (`fuzz_json_corpus`, `fuzz_snapshot_corpus`, `fuzz_fw_manifest_corpus`, `fuzz_fw_download_corpus` and `fuzz_usb_corpus`), using `replay_main.c` in place of libFuzzer, so no long fuzz run is part of CI.
+`corpus/` holds the seed inputs: `json` and `snapshot` are copied from `protocol/v1/examples`, `fw_manifest` and `fw_download` are made from the vectors in `protocol/v1/firmware` by `make_fw_corpus.py`, `usb` from the USB examples, the example bundles and the provisioning vectors by `make_usb_corpus.py`, and `hub` from the device examples and two snapshots by `make_hub_corpus.py` (run them again when the vectors or examples change). The host tests replay them on every run (`fuzz_json_corpus`, `fuzz_snapshot_corpus`, `fuzz_fw_manifest_corpus`, `fuzz_fw_download_corpus`, `fuzz_usb_corpus` and `fuzz_hub_corpus`), using `replay_main.c` in place of libFuzzer, so no long fuzz run is part of CI.
 
 ## Running them
 
@@ -18,7 +19,7 @@ You need clang with its runtime libraries (on Debian, `clang` and `libclang-rt-1
 B=/tmp/dh-fuzz
 M=/path/to/mbedtls
 mkdir -p "$B"
-for t in json snapshot fw_manifest fw_download usb; do
+for t in json snapshot fw_manifest fw_download usb hub; do
   clang -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all \
     -I firmware/components/dh_core/include -isystem "$M/include" \
     firmware/fuzz/fuzz_$t.c firmware/components/dh_core/src/*.c \
@@ -30,6 +31,7 @@ done
 "$B/fuzz_fw_manifest" -max_len=4200 -max_total_time=600 -dict=firmware/fuzz/fw_manifest.dict "$B/corpus-fw_manifest"
 "$B/fuzz_fw_download" -max_len=8000 -max_total_time=1800 -dict=firmware/fuzz/fw_manifest.dict "$B/corpus-fw_download"
 "$B/fuzz_usb" -max_len=17000 -max_total_time=1500 -fork=3 -dict=firmware/fuzz/usb.dict "$B/corpus-usb"
+"$B/fuzz_hub" -max_len=9000 -max_total_time=300 -dict=firmware/fuzz/snapshot.dict "$B/corpus-hub"
 ```
 
 `fuzz_fw_download` signs and verifies with real P-256 on every run, so it manages a few hundred runs a second where the others manage tens of thousands; give it longer, or add `-fork=4`. `fuzz_usb` checks a P-256 point for each key in a bundle and manages a couple of thousand.

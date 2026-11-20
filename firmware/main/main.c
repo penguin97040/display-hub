@@ -1,10 +1,12 @@
-// The official Display Hub firmware. For now it takes its setup over USB from the desktop app,
-// keeps it in encrypted storage, and can be factory-reset with the BOOT button (milestone D4).
-// It doesn't join Wi-Fi or talk to the hub yet.
+// The official Display Hub firmware. It takes its setup over USB from the desktop app, keeps it in
+// encrypted storage, joins Wi-Fi, enrols with the hub, polls its pages and sends heartbeats, and
+// can be factory-reset with the BOOT button (milestone D5). It shows how things stand and the
+// titles of its pages; drawing the pages, and installing updates, come later.
 //
 // What runs:
 // - the USB task (usb_setup.c) reads the port and answers `hello` and `provision`;
 // - the button task (reset_button.c) watches BOOT;
+// - the hub task (hub.c) does everything on the network;
 // - LVGL's own task draws;
 // - this task, the main one, owns the screen's contents and does the factory reset. The other
 //   tasks only send it events, so the screen is only ever changed from here.
@@ -18,7 +20,9 @@
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "esp_timer.h"
 #include "freertos/task.h"
+#include "hub.h"
 #include "report.h"
 #include "reset_button.h"
 #include "storage.h"
@@ -38,6 +42,7 @@ typedef enum {
     EVENT_RESET_COUNTING,  // BOOT is held: `value` seconds to go
     EVENT_RESET_CANCELLED, // BOOT was let go in time
     EVENT_RESET_HELD,      // BOOT was held to the end: do the factory reset
+    EVENT_HUB_CHANGED,     // the hub task has something new to show
 } event_type_t;
 
 typedef struct {
@@ -49,6 +54,10 @@ static board_t s_board;
 static system_report_t s_system;
 static efuse_report_t s_efuse;
 static QueueHandle_t s_events;
+// What the hub task last had to show. It holds ten page titles, which is a lot for a stack.
+static hub_status_t s_hub;
+// The factory reset countdown is on the screen: nothing else may draw over it.
+static bool s_counting;
 
 static void send_event(event_type_t type, int value)
 {
@@ -62,6 +71,12 @@ static void send_event(event_type_t type, int value)
 static void on_setup_stored(void)
 {
     send_event(EVENT_SETUP_STORED, 0);
+}
+
+// Runs in the hub task.
+static void on_hub_changed(void)
+{
+    send_event(EVENT_HUB_CHANGED, 0);
 }
 
 // Runs in the button's task.
@@ -86,15 +101,17 @@ static void show_state(const char *note)
         return;
     }
     const storage_facts_t facts = storage_facts();
+    hub_status(&s_hub);
     if (lvgl_port_lock(0)) {
-        ui_show_state(&facts, storage_key_status(), note);
+        ui_show_state(&facts, storage_key_status(), &s_hub, note);
         lvgl_port_unlock();
     }
 }
 
 // The factory reset: erases the setup namespace and nothing else. The firmware keys, the security
 // floor and the update record stay (storage.c, store_erase_setup). No restart is needed: the USB
-// task reads the same facts and goes straight back to accepting a bundle.
+// task reads the same facts and goes straight back to accepting a bundle, and the hub task finds
+// its setup gone, stops Wi-Fi and forgets the token (hub.h). This never waits for the network.
 static void factory_reset(void)
 {
     storage_lock();
@@ -102,6 +119,7 @@ static void factory_reset(void)
     const bool working = display.store != NULL;
     const bool erased = dh_usb_factory_reset(&display);
     storage_unlock();
+    hub_wake();
 
     if (erased) {
         ESP_LOGW(TAG, "factory reset: the setup was erased; firmware keys and update record kept");
@@ -120,18 +138,29 @@ static void handle_event(const event_t *event)
 {
     switch (event->type) {
     case EVENT_SETUP_STORED:
+        hub_wake();
         show_state(NULL);
         break;
+    case EVENT_HUB_CHANGED:
+        // Only a display that is set up shows the hub's status. After a factory reset the
+        // screen already says so, and the hub task winding down must not wipe that note.
+        if (!s_counting && storage_facts().set_up) {
+            show_state(NULL);
+        }
+        break;
     case EVENT_RESET_COUNTING:
+        s_counting = true;
         if (s_board.display != NULL && lvgl_port_lock(0)) {
             ui_show_reset_countdown(event->value);
             lvgl_port_unlock();
         }
         break;
     case EVENT_RESET_CANCELLED:
+        s_counting = false;
         show_state("Factory reset cancelled.");
         break;
     case EVENT_RESET_HELD:
+        s_counting = false;
         factory_reset();
         break;
     }
@@ -173,7 +202,8 @@ void app_main(void)
     } else if (lvgl_port_lock(0)) {
         const storage_facts_t facts = storage_facts();
         ui_start(s_system.version, board_note);
-        ui_show_state(&facts, storage_key_status(), NULL);
+        // Nothing from the hub yet: its task starts below.
+        ui_show_state(&facts, storage_key_status(), &s_hub, NULL);
         // Draw the first screen before turning the brightness up, so nothing left over in the
         // screen's memory is shown brightly.
         lv_refr_now(s_board.display);
@@ -186,19 +216,29 @@ void app_main(void)
                         on_setup_stored);
     }
     reset_button_start(on_reset_button);
+    hub_start(s_system.version, board_hardware_revision(s_board.revision), on_hub_changed);
 
     report_log(&s_board, &s_system, &s_efuse);
+    int64_t logged_ms = esp_timer_get_time() / 1000;
     while (true) {
+        // Events come often once the display is polling, so the minute is counted by the clock
+        // and not by the queue staying quiet.
+        const int64_t since_ms = esp_timer_get_time() / 1000 - logged_ms;
         event_t event;
-        if (xQueueReceive(s_events, &event, pdMS_TO_TICKS(LOG_EVERY_MS)) == pdTRUE) {
+        if (since_ms < LOG_EVERY_MS &&
+            xQueueReceive(s_events, &event, pdMS_TO_TICKS(LOG_EVERY_MS - since_ms)) == pdTRUE) {
             handle_event(&event);
             continue;
         }
+        logged_ms = esp_timer_get_time() / 1000;
+        // Running time earns update attempts back (dh_update.h), set up or not.
+        storage_fw_tick();
         report_log(&s_board, &s_system, &s_efuse);
         storage_log();
         // How close each task has come to the end of its stack, so the headroom is seen, not
         // guessed.
-        ESP_LOGI(TAG, "stack never used: main task %u bytes, USB task %u bytes",
-                 (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused());
+        ESP_LOGI(TAG, "stack never used: main task %u bytes, USB task %u bytes, hub task %u bytes",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused(),
+                 hub_stack_unused());
     }
 }

@@ -7,6 +7,7 @@
 # and lib/); left empty, the system's Mbed TLS is used.
 set(DH_CORE_SRCS
     src/dh_crypto.c
+    src/dh_hub.c
     src/dh_json.c
     src/dh_poll.c
     src/dh_setup.c

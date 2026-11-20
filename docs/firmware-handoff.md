@@ -378,6 +378,12 @@ If either check fails, ship **plain NVS** instead and say so plainly in the firm
 
 **Size the NVS partition.** ESP-IDF limits a blob to 97.6% of the partition size minus 4000 bytes, so a 32 KiB snapshot needs a partition of about 37 KiB at the very least, before anything else is stored. ESP-IDF's ready-made two-OTA table has only 16 KiB. The example layout above gives it 64 KiB. Alternatively, keep the snapshot in its own partition or file system.
 
+**Replacing a large blob needs room for two.** NVS writes a blob's new value before it lets go of the old one. In a 64 KiB partition that also holds the setup, replacing one 32 KiB snapshot with another in a single `nvs_set_blob()` fails with `ESP_ERR_NVS_NOT_ENOUGH_SPACE`, leaving the old one whole (tried with ESP-IDF v5.5.6's NVS code). The official firmware keeps the 64 KiB partition and erases the old snapshot first when the two together are over 40,000 bytes; a bigger partition, or one for the snapshot alone, are the other ways.
+
+**Don't save every snapshot.** `generated_at` moves with every poll, so "only when it has changed" must leave that field out of the comparison, and a page's `updated_at` still moves whenever the hub collects. At the shortest refresh (30 seconds), a 32 KiB write every poll would use up the rated erase cycles of a 64 KiB partition (about 100,000 for each sector) within months. The official firmware replaces the saved copy at most once an hour.
+
+**Keep the Wi-Fi driver out of NVS.** ESP-IDF's Wi-Fi driver stores the network's name and password in a namespace of its own by default, which a factory reset that erases only your setup namespace would leave behind. Turn that off (`CONFIG_ESP_WIFI_NVS_ENABLED`, and `esp_wifi_set_storage(WIFI_STORAGE_RAM)`) and hand the driver the details from your own storage at each start.
+
 ## Factory reset
 
 A deliberate action on the device itself, such as holding a button during start-up: your choice, but document it.

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "dh_hub.h"
 #include "dh_json.h"
 #include "dh_time.h"
 
@@ -300,12 +301,12 @@ static bool read_error_body(const dh_json_doc *doc, dh_json_value root, size_t *
     return true;
 }
 
-static dh_response read_error(int status, const uint8_t *body, size_t len)
+static dh_response read_error(int status, const uint8_t *body, size_t len, size_t max_bytes)
 {
-    if (len <= DH_MAX_SNAPSHOT_BYTES) {
+    if (len <= max_bytes) {
         dh_json_doc doc;
         dh_json_value root;
-        dh_json_options o = {DH_MAX_SNAPSHOT_BYTES, 0, 0};
+        dh_json_options o = {max_bytes, 0, 0};
         size_t which;
         if (dh_json_parse(&doc, body, len, &o, &root) == DH_JSON_OK &&
             read_error_body(&doc, root, &which)) {
@@ -855,7 +856,13 @@ dh_response dh_read_response(int http_status, const uint8_t *body, size_t len,
     if (http_status == 200) {
         return read_snapshot(body, len, opts, out, scratch);
     }
-    return read_error(http_status, body, len);
+    return read_error(http_status, body, len, DH_MAX_SNAPSHOT_BYTES);
+}
+
+/* Declared in dh_hub.h: an error answer from any route, with the smaller limit. */
+dh_response dh_read_error_response(int http_status, const uint8_t *body, size_t len)
+{
+    return read_error(http_status, body, len, DH_MAX_HUB_ANSWER_BYTES);
 }
 
 /* ----- on the hub's clock ----- */

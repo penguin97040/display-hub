@@ -11,6 +11,7 @@ It follows the reference display, `tools/display-simulator`, with `crates/hub-pr
 | `dh_json.h` | A small, strict JSON reader for untrusted input. |
 | `dh_snapshot.h` | `dh_read_response()`: an HTTP status and body in; what to do, and the snapshot as plain structs, out. Ages, staleness and reset countdowns on the hub's clock. |
 | `dh_poll.h` | When to poll next (refresh ±10%, back-off from 15 s to 15 minutes ±20%, hourly), and the problem to show. Randomness comes from the caller. |
+| `dh_hub.h` | Everything else said to the hub: the enrolment request and the heartbeat, the enrolment response, error answers from any route, the device ID and token with their stored form, which hub address and trust anchor to try next, when a heartbeat is due, and when the last good snapshot is worth saving. |
 | `dh_text.h` | UTF-8, the text rules for titles and labels, and an exact NFC check. |
 | `dh_time.h` | Timestamps in the wire form. |
 | `dh_usb_line.h` | Splits the USB serial stream into JSON lines. |
@@ -109,9 +110,26 @@ Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`).
 
 Note that the protocol document says a display answers a `provision` with `provisioned` or an error; for a bundle of the wrong shape the reference answers nothing, and so does this.
 
+## Talking to the hub
+
+`dh_hub.h` is what a display needs once it is set up, beside the snapshot reader and the poll schedule. Like the rest, it follows the reference (`tools/display-simulator/src/paired.rs` and `main.rs`, and `crates/hub-client`).
+
+- **The requests.** `dh_enrol_request()` and `dh_heartbeat_request()` write the JSON bodies, with the `firmware` member (key ids, security floor, spare slot size, attempts left) whenever the keys and the record are known. The same code writes the USB `hello`, so the three can't drift apart. A secret is written as any text may be: quotes, control characters and longer characters all survive.
+- **The answers.** `dh_read_enrol_response()` takes any 2xx status with a readable body as success, and groups anything else as `dh_read_error_response()` does: the four groups of the protocol's error table, for any route. Both stop at 8 KiB.
+- **The device ID and token** are taken as 1 to 64 and 1 to 128 printable ASCII characters with no space, which is wider than the schema (so a hub may change how it makes them) and narrow enough to put a token in a header as it is. `dh_device_encode()` and `dh_device_decode()` are the stored form.
+- **Which address** (`dh_hub_walk`): each hub address in order; at an address, each trust anchor while the certificate doesn't match; an address with no answer isn't tried with the other anchor; the first real answer ends it. With no answer anywhere, the problem is the last address's, as in the reference.
+- **Heartbeats** (`dh_heartbeat_due()`): after start-up, hourly, and when the attempts left change; a change the hub didn't take is sent again every five minutes, never at every poll. The reference's own test cases are in `hub_tests.c`.
+- **Saving the last good snapshot** (`dh_snapshot_bodies_match()`, `dh_snapshot_save_due()`): only when something other than `generated_at` differs from the saved copy, and then at most hourly.
+
+`dh_poll.h` has one problem the reference words but the handoff's list doesn't: `DH_PROBLEM_SETTINGS`, "This display's settings are wrong", for a setup with no Wi-Fi details or no certificate that can be read.
+
+**Where it differs from the reference**, on purpose: an ID or token outside the characters above makes the response unreadable (the reference takes any string); an error answer over 8 KiB counts as having no body (the reference fails the read); and at one address, a certificate mismatch from the first anchor isn't forgotten if the second anchor's try gets no answer.
+
 ## Memory
 
 A `dh_snapshot` is about 38 KB and a `dh_text_scratch` about 4.5 KB; keep them in static memory or PSRAM, not on a task's stack. Reading uses about 1 KB of stack of its own (measured with `-fstack-usage` for the ESP32-S3), plus whatever the C library's `strtod` and `snprintf` take. Read into a spare snapshot and swap it in on `DH_OUTCOME_SHOW`, so the last good one survives a refusal.
+
+A request body needs `DH_HUB_REQUEST_MAX` (1024) bytes, and a `dh_device` is under 200. `dh_snapshot_bodies_match()` parses both bodies in place and copies nothing.
 
 A `dh_setup` is about 9.5 KB and a `dh_usb_line_reader` 16 KB: keep them in static memory or on the heap. Handling a line needs room for the reply (`DH_USB_REPLY_MAX`, 768 bytes) and under 1 KB of stack of its own, plus Mbed TLS's for each key in a bundle.
 

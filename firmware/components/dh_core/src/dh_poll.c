@@ -28,6 +28,7 @@ const char *dh_problem_headline(dh_problem p)
     case DH_PROBLEM_BUSY: return "The hub is busy";
     case DH_PROBLEM_NEEDS_SETUP: return "This display needs setting up again";
     case DH_PROBLEM_INCOMPATIBLE: return "Hub and display versions don't match";
+    case DH_PROBLEM_SETTINGS: return "This display's settings are wrong";
     }
     return "";
 }
@@ -66,5 +67,5 @@ uint32_t dh_poll_answered(dh_poll_state *st, const dh_response *r, uint32_t refr
 
 uint32_t dh_poll_failed(dh_poll_state *st, dh_problem problem, dh_random_fn rnd, void *ctx)
 {
-    return failed(st, problem, false, rnd, ctx);
+    return failed(st, problem, problem == DH_PROBLEM_SETTINGS, rnd, ctx);
 }

@@ -51,6 +51,18 @@ CONFIG_APP_REPRODUCIBLE_BUILD=y
 # the board's USB-C socket was seen to use (docs/firmware-handoff.md, "Lessons from a real board").
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
+# --- Wi-Fi ---
+# The Wi-Fi driver must never keep the network's name and password in its own NVS namespace: a
+# factory reset erases only this firmware's setup namespace, so they would outlive it. The
+# firmware hands them to the driver from its own encrypted setup at each start (main/wifi.c).
+# CONFIG_ESP_WIFI_NVS_ENABLED is not set
+# A display only ever joins a network. It is never an access point.
+# CONFIG_ESP_WIFI_SOFTAP_SUPPORT is not set
+# A hub address such as raspberrypi.local is looked up with a one-shot mDNS query by lwIP's own
+# resolver, which esp_http_client uses. This is ESP-IDF's default; it is set here because finding
+# the hub by name depends on it.
+CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y
+
 # --- TLS (see docs/firmware-handoff.md, "TLS, exactly") ---
 # The hub's records are at most 4 KiB, so a 4 KiB receive buffer is enough (the default is 16 KiB).
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
@@ -76,6 +88,11 @@ CONFIG_MBEDTLS_GCM_C=y
 # CONFIG_CODEC_ZL38063_SUPPORT is not set
 
 # --- Screen (LVGL 9) ---
+# LVGL takes its memory from the C library's heap, not from a fixed 64 KB pool of its own. That
+# pool sat in internal memory whether it was used or not, and Wi-Fi and TLS need internal memory
+# (Mbed TLS is kept to it: CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC, ESP-IDF's default). Now LVGL uses
+# only what it needs, and anything that doesn't fit in internal memory goes to PSRAM.
+CONFIG_LV_USE_CLIB_MALLOC=y
 # The sizes of Montserrat the screens use. Others are left out to save flash.
 CONFIG_LV_FONT_MONTSERRAT_16=y
 CONFIG_LV_FONT_MONTSERRAT_20=y

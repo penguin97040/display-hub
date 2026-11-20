@@ -54,6 +54,11 @@ target_link_libraries(dh_usb_tests PRIVATE dh_core)
 target_compile_options(dh_usb_tests PRIVATE ${DH_WARNINGS})
 target_compile_definitions(dh_usb_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
 
+add_executable(dh_hub_tests hub_tests.c)
+target_link_libraries(dh_hub_tests PRIVATE dh_core)
+target_compile_options(dh_hub_tests PRIVATE ${DH_WARNINGS})
+target_compile_definitions(dh_hub_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
+
 add_executable(dh_fw_conform fw_conform_cli.c)
 target_link_libraries(dh_fw_conform PRIVATE dh_core)
 target_compile_options(dh_fw_conform PRIVATE ${DH_WARNINGS})
@@ -67,7 +72,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 # The fuzz targets, built with a small main that replays a folder of inputs.
-set(DH_FUZZ_TARGETS json snapshot fw_manifest fw_download usb)
+set(DH_FUZZ_TARGETS json snapshot fw_manifest fw_download usb hub)
 foreach(target ${DH_FUZZ_TARGETS})
     add_executable(dh_fuzz_${target}_replay
         "${DH_FIRMWARE_DIR}/fuzz/fuzz_${target}.c"
@@ -85,6 +90,7 @@ add_test(NAME vectors
             vectors $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/vectors")
 add_test(NAME update COMMAND dh_update_tests)
 add_test(NAME usb COMMAND dh_usb_tests)
+add_test(NAME hub COMMAND dh_hub_tests)
 add_test(NAME firmware_vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             firmware $<TARGET_FILE:dh_fw_conform> "${DH_PROTOCOL_DIR}/firmware")

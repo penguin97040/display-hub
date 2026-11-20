@@ -3,7 +3,7 @@
  *
  * After a success: refresh_after_seconds, +-10%. After a failure: 15 s, doubling with each failure
  * in a row to at most 15 minutes, +-20%; or an hour, +-20%, when the display needs setting up
- * again or the versions don't match. This is the reference display's schedule
+ * again, the versions don't match or its settings can't be used. This is the reference display's schedule
  * (tools/display-simulator, src/device.rs).
  *
  * Randomness comes from the caller, so tests can fix it and firmware can use its own source.
@@ -41,6 +41,9 @@ typedef enum {
     DH_PROBLEM_BUSY,         /* the hub is busy */
     DH_PROBLEM_NEEDS_SETUP,  /* this display needs setting up again */
     DH_PROBLEM_INCOMPATIBLE, /* hub and display versions don't match */
+    /* What the display was set up with can't be used: no Wi-Fi details, or no trust anchor that
+     * reads as a certificate (set by the caller). Only setting it up again changes that. */
+    DH_PROBLEM_SETTINGS,
 } dh_problem;
 
 const char *dh_problem_headline(dh_problem p);
@@ -56,7 +59,8 @@ uint32_t dh_poll_answered(dh_poll_state *st, const dh_response *r, uint32_t refr
                           dh_random_fn rnd, void *ctx);
 
 /* Records a poll that got no answer, or one from a hub that isn't ours (problem is
- * DH_PROBLEM_UNREACHABLE or DH_PROBLEM_WRONG_HUB), and returns the wait in milliseconds. */
+ * DH_PROBLEM_UNREACHABLE or DH_PROBLEM_WRONG_HUB), and returns the wait in milliseconds. For
+ * DH_PROBLEM_SETTINGS the wait is an hour, as the reference waits when its settings are wrong. */
 uint32_t dh_poll_failed(dh_poll_state *st, dh_problem problem, dh_random_fn rnd, void *ctx);
 
 #ifdef __cplusplus

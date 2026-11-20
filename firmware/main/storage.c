@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -28,17 +29,43 @@ static const char *TAG = "storage";
 
 #define SETUP_NAMESPACE "dh_setup"
 #define SETUP_KEY       "setup"
+#define DEVICE_KEY      "device"
+#define SNAPSHOT_KEY    "snapshot"
 #define FW_NAMESPACE    "dh_fw"
 #define FW_KEY_KEYS     "keys"
 #define FW_KEY_RECORD   "record"
 // What the storage key check build (milestone D2) left behind: a boot count and a marker.
 #define D2_NAMESPACE "dh_d2_check"
 
-// The partition is 64 KiB (partitions.csv): 16 pages of 4096 bytes, one kept free by NVS, 126
-// entries of 32 bytes in each of the rest. The largest setup is 9464 bytes: 296 entries of data
-// and a few of overhead, under 3 pages. The keys and the record take about 20 entries between
-// them. That leaves over 11 pages for the 32 KiB snapshot a later milestone saves.
+// ROOM. The partition is 64 KiB (partitions.csv): 16 pages of 4096 bytes, one kept free by NVS,
+// 126 entries of 32 bytes in each of the rest, so 1890 entries. A blob takes one entry for each
+// 32 bytes, one more for each page it touches and one for its index.
+//
+//   the largest setup, 9464 bytes        about 300 entries
+//   the keys, the record, the device     about 30
+//   the largest snapshot, 32768 bytes    about 1035
+//   ESP-IDF's radio calibration data     about 70 (its own namespace, "phy"; see below)
+//
+// So everything fits at once, with over 400 entries spare. What doesn't fit is two large
+// snapshots: NVS writes a blob's new value before it lets go of the old one
+// (nvs_storage.cpp, Storage::writeItem), so replacing a 32 KiB snapshot with another would need
+// 2070 entries for the two, and fails with ESP_ERR_NVS_NOT_ENOUGH_SPACE (leaving the old one
+// whole: writeMultiPageBlob erases what it had written of the new one). storage_save_snapshot()
+// therefore erases the old snapshot first whenever the two together are over
+// SNAPSHOT_REPLACE_BYTES, and again if NVS still says there is no room. Everything else is small
+// and is always replaced in one step. This was tried against ESP-IDF v5.5.6's own NVS code built
+// for a computer, with a 64 KiB partition holding the largest of everything: one step from 32768
+// bytes to 32768 failed as above with the old snapshot left whole, and 1500 saves this way
+// (300 of them 32768 over 32768) all succeeded with every other value unchanged.
+//
+// The radio's calibration data is the one thing here this firmware doesn't write: ESP-IDF's PHY
+// code keeps it in the same partition (so it is encrypted too) and writes it at the first start
+// of Wi-Fi. It holds nothing from a bundle, and a factory reset leaves it.
 _Static_assert(DH_SETUP_BLOB_MAX < 3 * 126 * 32, "the largest setup must fit in three NVS pages");
+// Old and new together under this are replaced in one step: about 1300 entries with their
+// overhead, which fits beside everything else above.
+#define SNAPSHOT_REPLACE_BYTES 40000u
+_Static_assert(DH_MAX_SNAPSHOT_BYTES <= 15u * 125u * 32u, "a snapshot must be a size NVS takes");
 
 static SemaphoreHandle_t s_lock;
 static storage_facts_t s_facts = {.state = STORAGE_FAILED};
@@ -48,6 +75,8 @@ static dh_fw_keys s_keys;
 static dh_fw_record s_record;
 static dh_fw_session s_session;
 static uint32_t s_spare_slot_bytes;
+// See storage.h, "The setup's generation".
+static uint32_t s_generation;
 
 // Scratch for the setup, as a struct and as its stored form. Both hold secrets while in use and
 // are wiped straight afterwards. They are too big for a task's stack, so they are taken from the
@@ -195,10 +224,13 @@ static bool store_save_setup(void *ctx, const dh_setup *setup)
     const bool ok = len > 0 && write_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, len, true);
     dh_wipe(s_blob, DH_SETUP_BLOB_MAX);
     if (ok) {
+        s_generation++;
         s_facts.set_up = true;
         s_facts.setup_unreadable = false;
         s_facts.hub_hosts = setup->host_count;
         s_facts.wifi_set = setup->has_wifi;
+        s_facts.enrolled = false;
+        s_facts.snapshot_bytes = 0;
     }
     return ok;
 }
@@ -207,6 +239,8 @@ static bool store_save_setup(void *ctx, const dh_setup *setup)
 static bool store_erase_setup(void *ctx)
 {
     (void)ctx;
+    // Whatever happens next, nothing more is written for the setup that was held.
+    s_generation++;
     nvs_handle_t nvs = 0;
     esp_err_t err = nvs_open(SETUP_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
@@ -214,10 +248,11 @@ static bool store_erase_setup(void *ctx)
         if (err == ESP_OK) {
             err = nvs_commit(nvs);
         }
-        if (err == ESP_OK) {
-            // It must be gone, not merely reported so.
+        // They must be gone, not merely reported so: the setup, the token and the saved pages.
+        static const char *const keys[] = {SETUP_KEY, DEVICE_KEY, SNAPSHOT_KEY};
+        for (size_t i = 0; err == ESP_OK && i < sizeof(keys) / sizeof(keys[0]); i++) {
             size_t stored = 0;
-            const esp_err_t left = nvs_get_blob(nvs, SETUP_KEY, NULL, &stored);
+            const esp_err_t left = nvs_get_blob(nvs, keys[i], NULL, &stored);
             if (left != ESP_ERR_NVS_NOT_FOUND) {
                 err = left == ESP_OK ? ESP_FAIL : left;
             }
@@ -232,6 +267,8 @@ static bool store_erase_setup(void *ctx)
     s_facts.setup_unreadable = false;
     s_facts.hub_hosts = 0;
     s_facts.wifi_set = false;
+    s_facts.enrolled = false;
+    s_facts.snapshot_bytes = 0;
     return true;
 }
 
@@ -327,6 +364,48 @@ static bool load_firmware_state(void)
     return true;
 }
 
+// How long a stored value is, without reading it. 0 if there is none; false if NVS couldn't say.
+static bool stored_length(const char *namespace, const char *key, size_t *len)
+{
+    *len = 0;
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(namespace, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+    err = nvs_get_blob(nvs, key, NULL, len);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        *len = 0;
+        return true;
+    }
+    return err == ESP_OK;
+}
+
+// Whether a device ID and token and a saved snapshot are held. A token is "held" even if it
+// turns out not to read: `hello` must go on saying the display is set up.
+static bool load_presence(void)
+{
+    size_t device = 0, snapshot = 0;
+    if (!stored_length(SETUP_NAMESPACE, DEVICE_KEY, &device) ||
+        !stored_length(SETUP_NAMESPACE, SNAPSHOT_KEY, &snapshot)) {
+        ESP_LOGE(TAG, "couldn't tell whether a device token and a saved snapshot are stored");
+        return false;
+    }
+    s_facts.enrolled = device > 0;
+    s_facts.snapshot_bytes = (uint32_t)snapshot;
+    if (s_facts.enrolled && !s_facts.set_up) {
+        // Never written this way round, but a display holding a token is set up all the same:
+        // it refuses another bundle until a factory reset.
+        s_facts.set_up = true;
+        s_facts.setup_unreadable = true;
+    }
+    return true;
+}
+
 // Loads the setup, keeping only the facts about it. False if it couldn't be read.
 static bool load_setup(void)
 {
@@ -361,14 +440,21 @@ static bool load_setup(void)
         ESP_LOGE(TAG, "a setup is stored, but not in a form this firmware reads; "
                       "a factory reset (hold BOOT for 10 seconds) clears it");
     }
-    return ok;
+    return ok && load_presence();
+}
+
+// From PSRAM if there is any: the internal memory is wanted for Wi-Fi and TLS.
+static void *scratch_alloc(size_t bytes)
+{
+    void *p = heap_caps_calloc(1, bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p != NULL ? p : heap_caps_calloc(1, bytes, MALLOC_CAP_DEFAULT);
 }
 
 void storage_start(efuse_report_t *efuse)
 {
     s_lock = xSemaphoreCreateRecursiveMutex();
-    s_setup_scratch = heap_caps_calloc(1, sizeof(*s_setup_scratch), MALLOC_CAP_DEFAULT);
-    s_blob = heap_caps_calloc(1, DH_SETUP_BLOB_MAX, MALLOC_CAP_DEFAULT);
+    s_setup_scratch = scratch_alloc(sizeof(*s_setup_scratch));
+    s_blob = scratch_alloc(DH_SETUP_BLOB_MAX);
     s_facts = (storage_facts_t){.state = STORAGE_FAILED};
     dh_fw_keys_init(&s_keys);
     dh_fw_record_init(&s_record);
@@ -440,6 +526,218 @@ uint32_t storage_spare_slot_bytes(void)
     return s_spare_slot_bytes;
 }
 
+// ---- For the task that talks to the hub ----
+
+uint32_t storage_setup_generation(void)
+{
+    storage_lock();
+    const uint32_t generation = s_generation;
+    storage_unlock();
+    return generation;
+}
+
+// Whether a readable setup with this number is held. Call with the lock held.
+static bool setup_is(uint32_t generation)
+{
+    return s_facts.state == STORAGE_WORKING && s_facts.set_up && !s_facts.setup_unreadable &&
+           generation == s_generation;
+}
+
+bool storage_load_setup(dh_setup *out, uint32_t *generation)
+{
+    storage_lock();
+    bool ok = setup_is(s_generation);
+    if (ok) {
+        size_t len = 0;
+        ok = read_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, DH_SETUP_BLOB_MAX, &len) ==
+                 BLOB_FOUND &&
+             dh_setup_decode(out, s_blob, len);
+        dh_wipe(s_blob, DH_SETUP_BLOB_MAX);
+    }
+    if (!ok) {
+        dh_setup_wipe(out);
+    }
+    *generation = s_generation;
+    storage_unlock();
+    return ok;
+}
+
+storage_held_t storage_load_device(uint32_t generation, dh_device *out)
+{
+    uint8_t blob[DH_DEVICE_BLOB_MAX];
+    size_t len = 0;
+    storage_held_t held = STORAGE_UNREADABLE;
+    dh_device_wipe(out);
+    storage_lock();
+    if (setup_is(generation)) {
+        switch (read_blob(SETUP_NAMESPACE, DEVICE_KEY, blob, sizeof(blob), &len)) {
+        case BLOB_MISSING:
+            held = STORAGE_NOT_HELD;
+            break;
+        case BLOB_FOUND:
+            if (dh_device_decode(out, blob, len)) {
+                held = STORAGE_HELD;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    storage_unlock();
+    dh_wipe(blob, sizeof(blob));
+    return held;
+}
+
+bool storage_save_device(uint32_t generation, const dh_device *device)
+{
+    uint8_t blob[DH_DEVICE_BLOB_MAX];
+    const size_t len = dh_device_encode(device, blob);
+    bool ok = false;
+    storage_lock();
+    if (len > 0 && setup_is(generation)) {
+        // A token that didn't read back whole must not be found at the next start.
+        ok = write_blob(SETUP_NAMESPACE, DEVICE_KEY, blob, len, true);
+        if (ok) {
+            s_facts.enrolled = true;
+        }
+    }
+    storage_unlock();
+    dh_wipe(blob, sizeof(blob));
+    return ok;
+}
+
+bool storage_clear_secret(uint32_t generation)
+{
+    bool ok = false;
+    storage_lock();
+    if (setup_is(generation)) {
+        size_t len = 0;
+        ok = read_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, DH_SETUP_BLOB_MAX, &len) ==
+                 BLOB_FOUND &&
+             dh_setup_decode(s_setup_scratch, s_blob, len);
+        if (ok && s_setup_scratch->secret_len > 0) {
+            dh_wipe(s_setup_scratch->secret, sizeof(s_setup_scratch->secret));
+            s_setup_scratch->secret_len = 0;
+            len = dh_setup_encode(s_setup_scratch, s_blob);
+            // Never erased if the write goes wrong: the old setup, secret and all, is better
+            // than none, and the secret is of no use to anyone once the hub has seen it.
+            ok = len > 0 && write_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, len, false);
+        }
+        dh_setup_wipe(s_setup_scratch);
+        dh_wipe(s_blob, DH_SETUP_BLOB_MAX);
+    }
+    storage_unlock();
+    return ok;
+}
+
+size_t storage_load_snapshot(uint32_t generation, uint8_t *out, size_t cap)
+{
+    size_t len = 0;
+    storage_lock();
+    if (setup_is(generation) &&
+        read_blob(SETUP_NAMESPACE, SNAPSHOT_KEY, out, cap, &len) != BLOB_FOUND) {
+        len = 0;
+    }
+    storage_unlock();
+    return len;
+}
+
+bool storage_save_snapshot(uint32_t generation, uint8_t *body, size_t len)
+{
+    if (len == 0 || len > DH_MAX_SNAPSHOT_BYTES) {
+        return false;
+    }
+    uint8_t before[DH_SHA256_LEN], after[DH_SHA256_LEN];
+    if (!dh_sha256_of(body, len, before)) {
+        return false;
+    }
+    bool ok = false;
+    storage_lock();
+    nvs_handle_t nvs = 0;
+    if (setup_is(generation) && nvs_open(SETUP_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        // See "Room" at the top of this file. Erasing first means a power cut between the two
+        // steps leaves no saved snapshot, which only costs the pages shown before the first poll.
+        bool erased = false;
+        esp_err_t err = ESP_OK;
+        if (s_facts.snapshot_bytes + len > SNAPSHOT_REPLACE_BYTES) {
+            err = nvs_erase_key(nvs, SNAPSHOT_KEY);
+            if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+                err = nvs_commit(nvs);
+            }
+            erased = true;
+        }
+        if (err == ESP_OK) {
+            err = nvs_set_blob(nvs, SNAPSHOT_KEY, body, len);
+        }
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !erased) {
+            err = nvs_erase_key(nvs, SNAPSHOT_KEY);
+            if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
+                err = nvs_commit(nvs);
+            }
+            if (err == ESP_OK) {
+                err = nvs_set_blob(nvs, SNAPSHOT_KEY, body, len);
+            }
+        }
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        if (err == ESP_OK) {
+            size_t got = len;
+            memset(body, 0, len);
+            err = nvs_get_blob(nvs, SNAPSHOT_KEY, body, &got);
+            ok = err == ESP_OK && got == len && dh_sha256_of(body, len, after) &&
+                 memcmp(before, after, sizeof(before)) == 0;
+        }
+        if (!ok) {
+            ESP_LOGE(TAG, "couldn't save the snapshot (%u bytes): %s", (unsigned)len,
+                     err == ESP_OK ? "it read back differently" : esp_err_to_name(err));
+            // Leave none, never part of one or an old one that reads as current.
+            if (nvs_erase_key(nvs, SNAPSHOT_KEY) == ESP_OK) {
+                nvs_commit(nvs);
+            }
+        }
+        s_facts.snapshot_bytes = ok ? (uint32_t)len : 0;
+        nvs_close(nvs);
+    }
+    storage_unlock();
+    return ok;
+}
+
+void storage_fw_tick(void)
+{
+    storage_lock();
+    if (s_facts.state == STORAGE_WORKING) {
+        const uint8_t attempts = s_record.attempts_left;
+        const uint64_t uptime_s = (uint64_t)(esp_timer_get_time() / 1000000);
+        if ((dh_fw_tick(&s_session, &s_record, uptime_s) & DH_FW_SAVE_RECORD) != 0) {
+            // If the write fails, the same hour is counted again after the next start.
+            if (!store_save_record(NULL, &s_record)) {
+                ESP_LOGE(TAG, "couldn't save the update record after counting running time");
+            }
+            if (s_record.attempts_left != attempts) {
+                ESP_LOGI(TAG, "update attempts left: %u", (unsigned)s_record.attempts_left);
+            }
+        }
+    }
+    storage_unlock();
+}
+
+uint8_t storage_fw_attempts_left(void)
+{
+    storage_lock();
+    const uint8_t attempts = s_record.attempts_left;
+    storage_unlock();
+    return attempts;
+}
+
+bool storage_fw_on_trial(void)
+{
+    storage_lock();
+    const bool trial = s_session.trial;
+    storage_unlock();
+    return trial;
+}
+
 void storage_log(void)
 {
     storage_lock();
@@ -453,9 +751,12 @@ void storage_log(void)
         if (s_facts.setup_unreadable) {
             ESP_LOGW(TAG, "set up: yes, but the stored setup can't be read");
         } else if (s_facts.set_up) {
-            ESP_LOGI(TAG, "set up: yes (%u hub %s, Wi-Fi %s)", (unsigned)s_facts.hub_hosts,
-                     s_facts.hub_hosts == 1 ? "address" : "addresses",
-                     s_facts.wifi_set ? "set" : "not set");
+            ESP_LOGI(TAG,
+                     "set up: yes (%u hub %s, Wi-Fi %s, device token %s, saved snapshot %" PRIu32
+                     " bytes)",
+                     (unsigned)s_facts.hub_hosts, s_facts.hub_hosts == 1 ? "address" : "addresses",
+                     s_facts.wifi_set ? "set" : "not set", s_facts.enrolled ? "held" : "not held",
+                     s_facts.snapshot_bytes);
         } else {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB");
         }
