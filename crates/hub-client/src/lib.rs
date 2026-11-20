@@ -839,14 +839,20 @@ impl HubClient {
 
     /// Sends a request, and a plain read (a GET with no body) is sent once more if the hub couldn't be
     /// reached. A connection that failed is dropped, never reused, so the second try opens a new one.
-    /// Anything else, a changed hub key and a refusal from the hub included, is reported as it was.
+    /// A read that timed out is sent again only with the usual short timeout: a long download that
+    /// stalled isn't made to wait twice. Anything else, a changed hub key and a refusal from the hub
+    /// included, is reported as it was.
     async fn execute(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ClientError> {
         let req = req.build().map_err(classify)?;
+        let short = req.timeout().is_none();
         let again = (req.method() == Method::GET && req.body().is_none())
             .then(|| req.try_clone())
             .flatten();
         match self.http.execute(req).await.map_err(classify) {
-            Err(ClientError::Unreachable(_) | ClientError::Timeout) if again.is_some() => {
+            Err(ClientError::Unreachable(_)) if again.is_some() => {
+                self.http.execute(again.expect("checked")).await.map_err(classify)
+            }
+            Err(ClientError::Timeout) if short && again.is_some() => {
                 self.http.execute(again.expect("checked")).await.map_err(classify)
             }
             r => r,

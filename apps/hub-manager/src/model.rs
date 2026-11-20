@@ -2478,7 +2478,6 @@ impl Model {
                         .unwrap_or_default(),
                 };
                 if e.is_connection() {
-                    self.missed_refreshes = 0;
                     self.online = Some(false);
                     // Don't retry straight away.
                     self.refreshed_at = Some(now);
@@ -2508,6 +2507,8 @@ impl Model {
                 guidance::from_install(e, &port)
             }
         };
+        // Only the quiet miss above waits for a quick second try; after anything else, the usual wait.
+        self.missed_refreshes = 0;
         if matches!(busy, Some(Busy::Installing { .. })) {
             self.install_failed();
         }
@@ -3580,6 +3581,23 @@ mod tests {
         m.finish(Err(miss()), t);
         assert_eq!(m.online, Some(false));
         assert!(m.notice.is_some());
+
+        // A miss followed by another kind of failure goes back to the usual wait.
+        let (mut m, now) = connected(vec![]);
+        m.refreshed_at = None;
+        m.refresh_due(now).unwrap();
+        m.finish(Err(miss()), now);
+        m.refresh_due(now + RETRY_SOON).unwrap();
+        m.finish(
+            Err(Failure::Client(ClientError::Status {
+                status: 503,
+                body: None,
+            })),
+            now + RETRY_SOON,
+        );
+        let t = now + RETRY_SOON;
+        assert!(m.refresh_due(t + RETRY_SOON).is_none(), "not every 5 seconds");
+        assert!(m.refresh_due(t + REFRESH_EVERY).is_some());
 
         // A changed hub key is never put down to a hiccup.
         let (mut m, now) = connected(vec![]);

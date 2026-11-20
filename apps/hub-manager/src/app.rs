@@ -560,7 +560,9 @@ impl Manager {
                             f.begin_drag(at.unwrap_or(0), e.modifiers.shift);
                         }
                     }
-                    this.dragging = Some(id);
+                    // Only a single click starts a drag: a double or triple click keeps its word or
+                    // whole selection however the pointer moves before the button is let go.
+                    this.dragging = (e.click_count == 1).then_some(id);
                     cx.notify();
                 }),
             )
