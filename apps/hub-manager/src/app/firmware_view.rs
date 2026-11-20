@@ -685,6 +685,32 @@ impl Manager {
             window,
             cx,
         );
+        let revealed = self.model.fw.install.password.revealed;
+        let (word, spoken) = if revealed {
+            ("Hide", "Hide password")
+        } else {
+            ("Show", "Show password")
+        };
+        let toggle = self
+            .button(
+                "install-password-reveal",
+                word,
+                Kind::Quiet,
+                true,
+                cx,
+                |this, _, _| {
+                    let f = &mut this.model.fw.install.password;
+                    f.revealed = !f.revealed;
+                },
+            )
+            .aria_label(spoken)
+            .mt(px(20.0));
+        let pw = div()
+            .flex()
+            .items_start()
+            .gap(px(8.0))
+            .child(pw.flex_1().min_w_0())
+            .child(toggle);
         let ports = self.model.enrol.ports.clone();
         let mut list = div().flex().flex_col().gap(px(8.0));
         if ports.is_empty() {
