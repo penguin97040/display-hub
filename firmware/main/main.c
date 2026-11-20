@@ -1,21 +1,23 @@
 // The official Display Hub firmware. It takes its setup over USB from the desktop app, keeps it in
 // encrypted storage, joins Wi-Fi, enrols with the hub, polls its pages and sends heartbeats, and
-// can be factory-reset with the BOOT button (milestone D5). It shows how things stand and the
-// titles of its pages; drawing the pages, and installing updates, come later.
+// can be factory-reset with the BOOT button (milestone D5). It draws the pages, one at a time with
+// a swipe between them, and says how things stand (D6). Installing updates comes later.
 //
 // What runs:
 // - the USB task (usb_setup.c) reads the port and answers `hello` and `provision`;
 // - the button task (reset_button.c) watches BOOT;
 // - the hub task (hub.c) does everything on the network;
-// - LVGL's own task draws;
-// - this task, the main one, owns the screen's contents and does the factory reset. The other
-//   tasks only send it events, so the screen is only ever changed from here.
+// - LVGL's own task draws, and also turns the pages when the screen is swiped and keeps their
+//   ages up to date (ui.c);
+// - this task, the main one, decides what the screen shows and does the factory reset. The other
+//   tasks only send it events. Everything that touches the screen holds the LVGL lock.
 
 #include <stdbool.h>
 
 #include "board/board.h"
 #include "dh_usb.h"
 #include "efuse_report.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_lvgl_port.h"
 #include "freertos/FreeRTOS.h"
@@ -54,8 +56,11 @@ static board_t s_board;
 static system_report_t s_system;
 static efuse_report_t s_efuse;
 static QueueHandle_t s_events;
-// What the hub task last had to show. It holds ten page titles, which is a lot for a stack.
+// What the hub task last had to show.
 static hub_status_t s_hub;
+// The screen's copy of the pages (about 38 KB, in PSRAM). The screen draws from it whenever it
+// likes, so it is only ever changed while holding the LVGL lock. NULL if there was no memory.
+static hub_pages_t *s_pages;
 // The factory reset countdown is on the screen: nothing else may draw over it.
 static bool s_counting;
 
@@ -103,7 +108,10 @@ static void show_state(const char *note)
     const storage_facts_t facts = storage_facts();
     hub_status(&s_hub);
     if (lvgl_port_lock(0)) {
-        ui_show_state(&facts, storage_key_status(), &s_hub, note);
+        if (s_pages != NULL) {
+            hub_pages(s_pages);
+        }
+        ui_show_state(&facts, storage_key_status(), &s_hub, s_pages, note);
         lvgl_port_unlock();
     }
 }
@@ -201,9 +209,14 @@ void app_main(void)
                  esp_err_to_name(board_err));
     } else if (lvgl_port_lock(0)) {
         const storage_facts_t facts = storage_facts();
+        s_pages = heap_caps_calloc(1, sizeof(*s_pages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_pages == NULL) {
+            ESP_LOGE(TAG, "out of memory for the screen's copy of the pages; showing the status "
+                          "only");
+        }
         ui_start(s_system.version, board_note);
         // Nothing from the hub yet: its task starts below.
-        ui_show_state(&facts, storage_key_status(), &s_hub, NULL);
+        ui_show_state(&facts, storage_key_status(), &s_hub, s_pages, NULL);
         // Draw the first screen before turning the brightness up, so nothing left over in the
         // screen's memory is shown brightly.
         lv_refr_now(s_board.display);

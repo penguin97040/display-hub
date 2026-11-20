@@ -88,16 +88,22 @@ CONFIG_MBEDTLS_GCM_C=y
 # CONFIG_CODEC_ZL38063_SUPPORT is not set
 
 # --- Screen (LVGL 9) ---
-# LVGL takes its memory from the C library's heap, not from a fixed 64 KB pool of its own. That
-# pool sat in internal memory whether it was used or not, and Wi-Fi and TLS need internal memory
-# (Mbed TLS is kept to it: CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC, ESP-IDF's default). Now LVGL uses
-# only what it needs, and anything that doesn't fit in internal memory goes to PSRAM.
-CONFIG_LV_USE_CLIB_MALLOC=y
-# The sizes of Montserrat the screens use. Others are left out to save flash.
-CONFIG_LV_FONT_MONTSERRAT_16=y
+# LVGL takes its memory from main/ui_font.c (LV_USE_CUSTOM_MALLOC): PSRAM first, then any memory.
+# Its own fixed 64 KB pool would sit in internal memory whether it was used or not, and Wi-Fi and
+# TLS need internal memory (Mbed TLS is kept to it: CONFIG_MBEDTLS_INTERNAL_MEM_ALLOC, ESP-IDF's
+# default). The C library's malloc would put LVGL's many small blocks (widgets, glyphs) in
+# internal memory too. The screen's draw buffers don't come from here (main/board/board.c).
+CONFIG_LV_USE_CUSTOM_MALLOC=y
+# The screens draw Geist, the desktop app's font, from its TrueType files with LVGL's built-in
+# Tiny TTF (stb_truetype), so any size can be drawn and every character Geist has is there,
+# macrons included. The files are built into the app (main/CMakeLists.txt); nothing is read from
+# a file system.
+CONFIG_LV_USE_TINY_TTF=y
+# CONFIG_LV_TINY_TTF_FILE_SUPPORT is not set
+# A character a font lacks is drawn as a hollow box, so it is plain that something is missing.
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
+# LVGL needs one built-in font as its default. It only shows if a Geist size couldn't be made.
 CONFIG_LV_FONT_MONTSERRAT_20=y
-CONFIG_LV_FONT_MONTSERRAT_24=y
-CONFIG_LV_FONT_MONTSERRAT_36=y
 CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20=y
 # CONFIG_LV_FONT_MONTSERRAT_14 is not set
 # Dark is the starting point for anything not styled by hand: black pixels are off on an AMOLED.

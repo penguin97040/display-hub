@@ -2,7 +2,7 @@
 
 The official firmware for a Display Hub display, written in C with ESP-IDF. It is also the starter project for anyone making firmware for their own display.
 
-**Status: early.** It takes its setup over USB from the desktop app, keeps it in encrypted storage, joins Wi-Fi, enrols with the hub, polls for its pages, sends heartbeats, and can be factory-reset with the BOOT button. Its screen says how things stand and lists the titles of the pages it was sent: drawing the pages, and installing signed updates, follow. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
+**Status: early.** It takes its setup over USB from the desktop app, keeps it in encrypted storage, joins Wi-Fi, enrols with the hub, polls for its pages, draws them, sends heartbeats, and can be factory-reset with the BOOT button. Installing signed updates follows. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
 
 ## The board
 
@@ -23,7 +23,7 @@ The board code is in [main/board/](main/board/). It uses the board package's scr
 1. **Install it** with the desktop app's **Install firmware**, which erases the flash and writes the package.
 2. **Waiting for setup.** The screen says to open Display Hub and choose **Add a display**. The firmware reads its USB port for as long as it runs and answers every `hello` and every `provision` ([docs/protocol-v1.md](../docs/protocol-v1.md), "Over USB").
 3. **Set up.** Once a bundle is accepted and stored, the display joins the Wi-Fi network in it and enrols with the hub, once, with the bundle's one-time secret. Nothing from the bundle itself is ever shown or logged. It stays set up across restarts, and refuses another bundle (`already_provisioned`) until it is factory-reset.
-4. **Running.** It asks the hub for its snapshot as often as the hub says, keeps the last good one, and sends a heartbeat after start-up, hourly, and when its update attempts left change. The screen shows **Connected to the hub** and the titles of the pages. When something is wrong it keeps the last pages and says what, in plain words ([Talking to the hub](#talking-to-the-hub)).
+4. **Running.** It asks the hub for its snapshot as often as the hub says, keeps the last good one, and sends a heartbeat after start-up, hourly, and when its update attempts left change. The screen shows the pages, one at a time ([The screen](#the-screen)). When something is wrong it keeps the last pages and says what, in plain words ([Talking to the hub](#talking-to-the-hub)).
 5. **Factory reset:** hold **BOOT** for 10 seconds (below).
 
 What to answer over USB is decided by plain C in [components/dh_core](components/dh_core/README.md) (`dh_usb.h`), which the host tests run without a board. A bundle is settled in this order, and the first that applies is the answer:
@@ -73,6 +73,19 @@ The console's log lines and the setup exchange share the chip's own USB port (US
 **Errors** follow the handoff's table, and the screen uses its words: can't reach the hub; something else is answering as the hub (a certificate that doesn't match); the hub sent data this display can't read; the hub is busy; this display needs setting up again; hub and display versions don't match. After a failure it waits 15 seconds, doubling to 15 minutes (±20%), or an hour for the last two.
 
 **Firmware offers** in a snapshot are read and left alone for now. `dh_fw_tick()` runs every minute, so running time earns update attempts back as the rules say.
+
+## The screen
+
+[main/ui.c](main/ui.c) decides what shows, [main/ui_page.c](main/ui_page.c) draws a page, and the words and figures come from plain C in [main/ui_text.c](main/ui_text.c), which the host tests run without a board. The wording follows the desktop app's preview of a page.
+
+- **One page at a time, in the hub's order.** Swipe left for the next, right for the one before; the row doesn't wrap round. Dots along the bottom say where you are. After the last page comes the **status screen**: how things stand with the hub and, when something is wrong, what to do about it. When new pages arrive, the page being looked at stays on screen by its `id`, wherever it has moved to; if it has gone, its nearest neighbour that is still there takes its place. With no pages, the screen says "No pages yet" and to choose this display's pages in Display Hub.
+- **The four shapes.** A meter has a line for each bar (1 to 6) with its share, or "unknown" and an empty bar for a share that isn't known (never 0%), and "Resets in 3 h 20 min" or "Reset due" if it has a reset time. A big number is drawn as large as fits on one line, with its decimal places and unit, a dash when it isn't known (never 0), and its caption; the widest figure the hub can send wraps rather than being cut off. A text page is its paragraph; a list is its lines, each with its detail at the end.
+- **What can't be drawn** gets the handoff's card: the title, "This display can't show this page." and, for a kind this firmware doesn't know, "It may need a firmware update." Nothing else about the page. An unavailable page with no data shows its title, its note (or "No data available") and UNAVAILABLE, with no figures.
+- **Every other page** shows its data quality (DEMO, REPORTED, ESTIMATE, MANUAL or UNAVAILABLE; one from a newer hub reads as UNAVAILABLE), its note, and its age: "Updated 10 min ago", or "Stale. Updated 2 d ago" in amber. Ages and countdowns are on the hub's clock (the snapshot's `generated_at` and the page's `updated_at`, plus how long the snapshot has been held by `esp_timer`), never the display's own date, and they are brought up to date every 30 seconds. Pages restored from flash after a restart say "Saved; age unknown", and show no countdowns, until a poll succeeds.
+- **Problems** show as one short coloured line at the foot of every page (the headlines in [Talking to the hub](#talking-to-the-hub), and "Can't join Wi-Fi"), and the status screen's dot takes the same colour. Without pages, or before the display is set up, or with a storage problem, the status screen is all there is. The factory reset countdown always covers everything.
+- **The font** is Geist, as in the desktop app: its Regular and SemiBold TrueType files are built into the app and drawn at any size by LVGL's built-in Tiny TTF (stb_truetype); each glyph is drawn once and kept in a cache. Titles, labels and notes can hold any Unicode: Geist covers Latin with its accents (macrons included) and basic Cyrillic, and anything it lacks is drawn as a hollow box without upsetting the rest of the line. LVGL takes its memory from PSRAM first ([main/ui_font.c](main/ui_font.c)), so the widgets and glyph caches leave the internal memory to Wi-Fi and TLS.
+- **Burn-in care.** Everything is white or grey on black (a black AMOLED pixel is off), and every 3 minutes the whole picture moves a few pixels, round a small square and back, so nothing stays lit in one place. Everything is laid out far enough in from the edges that this never cuts anything off.
+- **Threads.** The hub task never draws. It keeps a copy of its pages for the screen, and the main task copies them (about 38 KB, into PSRAM) only when they have changed, while holding the LVGL lock. Swipes and the 30-second refresh run in LVGL's own task, which holds the same lock.
 
 ## Storage
 
@@ -130,7 +143,7 @@ Open the board's serial port at any speed (opening it may restart the board). At
 cmake -S firmware/host-tests -B /tmp/dh-host && cmake --build /tmp/dh-host && ctest --test-dir /tmp/dh-host --output-on-failure
 ```
 
-For talking to the hub that is `hub_tests.c` (the enrolment request and the heartbeat, the enrolment response and every error group, the stored device ID and token, which address and anchor to try next, when a heartbeat is due and when a snapshot is saved). For setup over USB it is `usb_tests.c` (every bundle rule, every refusal in order, failing writes, the reply lines against `protocol/v1/examples/usb`, the stored form) and the `provision-*` vectors run through the whole handler. [host-tests/usb-e2e/](host-tests/usb-e2e/README.md) goes further on Linux: the desktop app's real sender against the firmware's handler over a pseudo-terminal. [fuzz/](fuzz/README.md) has the fuzz targets.
+For the screen it is `ui_tests.c` (ages and countdowns on the hub's clock, saved pages, shares and big numbers with every edge of their range, how each page is drawn, which page is kept when the pages change, and the burn-in shift). For talking to the hub it is `hub_tests.c` (the enrolment request and the heartbeat, the enrolment response and every error group, the stored device ID and token, which address and anchor to try next, when a heartbeat is due and when a snapshot is saved). For setup over USB it is `usb_tests.c` (every bundle rule, every refusal in order, failing writes, the reply lines against `protocol/v1/examples/usb`, the stored form) and the `provision-*` vectors run through the whole handler. [host-tests/usb-e2e/](host-tests/usb-e2e/README.md) goes further on Linux: the desktop app's real sender against the firmware's handler over a pseudo-terminal. [fuzz/](fuzz/README.md) has the fuzz targets.
 
 ## Building
 

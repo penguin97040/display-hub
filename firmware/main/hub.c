@@ -59,6 +59,10 @@ static TaskHandle_t s_task;
 
 static SemaphoreHandle_t s_status_lock;
 static hub_status_t s_status;
+// The copy of the pages that hub_pages() hands out, under s_status_lock. s_pages_seq counts the
+// changes to the pages held (s_current), and the copy catches up with it at the next publish().
+static hub_pages_t *s_shown;
+static uint32_t s_pages_seq;
 
 // Too big for a stack: taken from PSRAM once, at start-up.
 static dh_setup *s_setup;         // this session's copy of the setup; secrets wiped as they are used
@@ -167,25 +171,24 @@ static void publish(void)
     next.token_unsaved = s.enrolled && !s.token_saved;
     next.has_snapshot = s.has_snapshot;
     next.saved_pages = s.has_snapshot && s.saved_pages;
-    if (s.has_snapshot) {
-        const int64_t held_s = (now_ms() - s.received_ms) / 1000;
-        next.page_count = (uint8_t)s_current->page_count;
-        for (size_t i = 0; i < s_current->page_count && i < DH_MAX_PAGES; i++) {
-            const dh_page *page = &s_current->pages[i];
-            hub_page_t *out = &next.pages[i];
-            strlcpy(out->title, page->title, sizeof(out->title));
-            out->quality = dh_quality_label(page->quality);
-            out->cant_show = page->cant_show != DH_CANT_SHOW_NONE;
-            // A saved snapshot's age isn't known, so nothing is said about it.
-            out->stale = !s.saved_pages && !out->cant_show &&
-                         dh_page_freshness(s_current, page, held_s).stale;
-        }
-    }
 
     xSemaphoreTake(s_status_lock, portMAX_DELAY);
-    const bool changed = memcmp(&next, &s_status, sizeof(next)) != 0;
+    bool changed = memcmp(&next, &s_status, sizeof(next)) != 0;
     if (changed) {
         memcpy(&s_status, &next, sizeof(next));
+    }
+    if (s_shown->seq != s_pages_seq) {
+        // Only this task writes s_current, so it can be read here without a lock of its own.
+        if (s.has_snapshot) {
+            s_shown->has_snapshot = true;
+            s_shown->saved = s.saved_pages;
+            s_shown->received_ms = s.received_ms;
+            memcpy(&s_shown->snapshot, s_current, sizeof(s_shown->snapshot));
+        } else {
+            dh_wipe(s_shown, sizeof(*s_shown));
+        }
+        s_shown->seq = s_pages_seq;
+        changed = true;
     }
     xSemaphoreGive(s_status_lock);
     if (changed && s_on_change != NULL) {
@@ -208,6 +211,12 @@ static void stick(dh_problem problem, hub_detail_t detail)
     set_state(problem == DH_PROBLEM_NEEDS_SETUP ? HUB_NEEDS_SETUP : HUB_TROUBLE, detail);
 }
 
+// The pages held have changed: the screen's copy catches up at the next publish().
+static void pages_changed(void)
+{
+    s_pages_seq++;
+}
+
 void hub_status(hub_status_t *out)
 {
     // No lock means hub_start() failed before the task could run: nothing else writes this.
@@ -218,6 +227,20 @@ void hub_status(hub_status_t *out)
     xSemaphoreTake(s_status_lock, portMAX_DELAY);
     *out = s_status;
     xSemaphoreGive(s_status_lock);
+}
+
+bool hub_pages(hub_pages_t *out)
+{
+    if (s_status_lock == NULL || s_shown == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_status_lock, portMAX_DELAY);
+    const bool changed = out->seq != s_shown->seq;
+    if (changed) {
+        memcpy(out, s_shown, sizeof(*out));
+    }
+    xSemaphoreGive(s_status_lock);
+    return changed;
 }
 
 // ---- One request, at each address in turn ----
@@ -436,6 +459,7 @@ static void poll(void)
         s.has_snapshot = true;
         s.saved_pages = false;
         s.received_ms = now_ms();
+        pages_changed();
         refresh = s_current->refresh_after_seconds;
         save_snapshot_if_due(answer.len);
         const dh_firmware_offer *offer = &s_current->firmware_update;
@@ -718,6 +742,7 @@ static void load_saved_snapshot(void)
         s.has_snapshot = true;
         s.saved_pages = true;
         s.received_ms = now_ms();
+        pages_changed();
         ESP_LOGI(TAG, "showing the saved snapshot (%u bytes, %u pages) until the hub answers",
                  (unsigned)s.saved_len, (unsigned)s_current->page_count);
     } else {
@@ -733,7 +758,7 @@ static void minute_log(void)
         return;
     }
     s.minute_ms = now;
-    // A page may have gone stale since it was last looked at.
+    // The screen works out the pages' ages itself; this only makes sure nothing is missed.
     publish();
 }
 
@@ -838,6 +863,7 @@ static void end_session(void)
     memset(&s, 0, sizeof(s));
     s.minute_ms = minute;
     s.state = HUB_IDLE;
+    pages_changed();
     publish();
 }
 
@@ -880,8 +906,9 @@ esp_err_t hub_start(const char *firmware_version, const char *hardware_revision,
     s_current = big_alloc(sizeof(*s_current));
     s_spare = big_alloc(sizeof(*s_spare));
     s_scratch = big_alloc(sizeof(*s_scratch));
+    s_shown = big_alloc(sizeof(*s_shown));
     if (s_status_lock == NULL || s_setup == NULL || s_body == NULL || s_saved == NULL ||
-        s_current == NULL || s_spare == NULL || s_scratch == NULL) {
+        s_current == NULL || s_spare == NULL || s_scratch == NULL || s_shown == NULL) {
         ESP_LOGE(TAG, "out of memory for the hub task");
         s_status.state = HUB_FAILED;
         return ESP_ERR_NO_MEM;

@@ -11,7 +11,14 @@ idf_component_register(
         "hub.c"
         "reset_button.c"
         "ui.c"
+        "ui_font.c"
+        "ui_page.c"
+        "ui_text.c"
         "board/board.c"
+    # Geist, the desktop app's font, for the screens (ui_font.c; licence in THIRD_PARTY.md).
+    EMBED_FILES
+        "../../assets/fonts/Geist-Regular.ttf"
+        "../../assets/fonts/Geist-SemiBold.ttf"
     # The components from main/idf_component.yml (the board package, LVGL and the drivers) are
     # added as requirements by the component manager.
     PRIV_REQUIRES app_update esp_app_format log efuse bootloader_support heap esp_driver_i2c

@@ -1,4 +1,4 @@
-# Host tests for dh_core. CI runs:
+# Host tests for dh_core and the screens' words and figures. CI runs:
 #   cmake -S firmware/host-tests -B <dir> -DMBEDTLS_DIR=<prefix>
 #   cmake --build <dir>
 #   ctest --test-dir <dir> --output-on-failure
@@ -59,6 +59,13 @@ target_link_libraries(dh_hub_tests PRIVATE dh_core)
 target_compile_options(dh_hub_tests PRIVATE ${DH_WARNINGS})
 target_compile_definitions(dh_hub_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
 
+# The screens' words and figures (main/ui_text.c), which use nothing from ESP-IDF or LVGL.
+add_executable(dh_ui_tests ui_tests.c "${DH_FIRMWARE_DIR}/main/ui_text.c")
+target_include_directories(dh_ui_tests PRIVATE "${DH_FIRMWARE_DIR}/main")
+target_link_libraries(dh_ui_tests PRIVATE dh_core)
+target_compile_options(dh_ui_tests PRIVATE ${DH_WARNINGS})
+target_compile_definitions(dh_ui_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
+
 add_executable(dh_fw_conform fw_conform_cli.c)
 target_link_libraries(dh_fw_conform PRIVATE dh_core)
 target_compile_options(dh_fw_conform PRIVATE ${DH_WARNINGS})
@@ -91,6 +98,7 @@ add_test(NAME vectors
 add_test(NAME update COMMAND dh_update_tests)
 add_test(NAME usb COMMAND dh_usb_tests)
 add_test(NAME hub COMMAND dh_hub_tests)
+add_test(NAME ui COMMAND dh_ui_tests)
 add_test(NAME firmware_vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             firmware $<TARGET_FILE:dh_fw_conform> "${DH_PROTOCOL_DIR}/firmware")

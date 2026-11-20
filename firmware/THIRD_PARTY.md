@@ -47,9 +47,17 @@ The board code ([main/board/board.c](main/board/board.c)) calls the board packag
 - Waveshare's examples for this board, https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8 (Apache-2.0), commit `01fd3200370a4417b257e8a4c185a04ef931342a`: the I/O expander's pins and start-up pulse, the V2 screen's 16-pixel column offset, and that their AXP2101 example changes no power output.
 - XPowersLib's AXP2101 register list (MIT), as bundled in those examples: the addresses of the chip ID, status and output on/off registers, which the board test only reads. No XPowersLib code is used.
 
+## The font
+
+| Name | Version | Licence | Source |
+|---|---|---|---|
+| Geist Regular and SemiBold | 1.800 | SIL Open Font License 1.1, with no Reserved Font Name ([`assets/fonts/OFL-Geist.txt`](../assets/fonts/OFL-Geist.txt)) | https://github.com/vercel/geist-font |
+
+The screens draw Geist, the font the desktop app uses. The two TrueType files are the repository's own copies in [`assets/fonts/`](../assets/fonts/) (`Geist-Regular.ttf`, SHA-256 `85a1c6b1…b8a117`; `Geist-SemiBold.ttf`, `b9f52322…f489b2`), built into the app unchanged by `main/CMakeLists.txt` (`EMBED_FILES`) and drawn by LVGL's Tiny TTF. The licence allows them to be bundled with software, unchanged or not, as long as the licence goes with them and the fonts aren't sold on their own; the licence file is in the repository beside them. They cover 728 characters: Latin with its accents (ā ē ī ō ū and their capitals included), the basic Cyrillic alphabet and common symbols, but not Greek, Chinese, Japanese or emoji. A character outside them is drawn as a hollow box.
+
 ## Libraries bundled inside LVGL
 
-LVGL's `COPYRIGHTS.md` lists the libraries it carries. Only those turned on in the settings are built. All are permissive: BSD-2-Clause (barcode, LZ4), BSD-3-Clause (TLSF), MIT (QR code, ThorVG, RapidJSON with a BSD-3-Clause part, printf, FT800 driver), Zlib (LodePNG), MIT or Unlicense (TinyTTF), Apache-2.0 (AnimatedGIF), and TJpgDec's own permissive licence. FreeType support needs the separate FreeType component, which isn't used, and the demo font beside it is OFL-1.1.
+LVGL's `COPYRIGHTS.md` lists the libraries it carries. Only those turned on in the settings are built. All are permissive: BSD-2-Clause (barcode, LZ4), BSD-3-Clause (TLSF), MIT (QR code, ThorVG, RapidJSON with a BSD-3-Clause part, printf, FT800 driver), Zlib (LodePNG), MIT or Unlicense (TinyTTF), Apache-2.0 (AnimatedGIF), and TJpgDec's own permissive licence. The firmware turns on Tiny TTF (`CONFIG_LV_USE_TINY_TTF`), which is stb_truetype, MIT or Unlicense. FreeType support needs the separate FreeType component, which isn't used, and the demo font beside it is OFL-1.1.
 
 ## Updating a component
 

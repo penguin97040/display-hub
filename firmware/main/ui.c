@@ -2,28 +2,57 @@
 
 #include "ui.h"
 
-#include "dh_poll.h"
-
 #include <stdio.h>
 #include <string.h>
 
+#include "dh_poll.h"
+#include "esp_timer.h"
 #include "lvgl.h"
+#include "ui_font.h"
+#include "ui_page.h"
+#include "ui_text.h"
 
-#define COLOUR_TEXT    lv_color_white()
-#define COLOUR_QUIET   lv_color_hex(0xA0A0A0)
-#define COLOUR_WARNING lv_color_hex(0xFFB000)
-#define COLOUR_GOOD    lv_color_hex(0x40D060)
-#define COLOUR_BAD     lv_color_hex(0xFF5040)
+// How far in from the screen's edges everything is laid out, with the burn-in shift at rest.
+#define PAD_SIDE   16
+#define PAD_TOP    22
+#define PAD_BOTTOM 14
 
-#define PAD_SIDE 16
-#define PAD_TOP  22
+// Ages and countdowns are brought up to date this often, and the picture moves one step of its
+// burn-in cycle every SHIFT_TICKS of these: every 3 minutes, round the cycle in under half an hour.
+#define TICK_MS     30000
+#define SHIFT_TICKS 6
 
+static lv_obj_t *s_root;   // everything; moved a few pixels now and then (ui_shift)
+static lv_obj_t *s_status; // the status screen: a column of text, as it always was
 static lv_obj_t *s_title;
 static lv_obj_t *s_number;
 static lv_obj_t *s_body;
-static lv_obj_t *s_pages;
+static lv_obj_t *s_extra;
 static lv_obj_t *s_note;
 static lv_obj_t *s_footer;
+static lv_obj_t *s_page; // one page, drawn afresh each time it changes
+static lv_obj_t *s_dots; // where in the swipe row this is
+
+static const hub_pages_t *s_pages; // the pages to draw, or NULL
+static bool s_with_pages;          // set up and holding pages: the swipe row shows
+static bool s_counting;            // the factory reset countdown covers everything
+static size_t s_view;              // which view of the row: a page, or the status screen last
+static uint32_t s_drawn_seq;       // the pages' seq when s_ids was taken
+static ui_page_ids s_ids;          // the ids of the pages in the row, to keep the view by
+static char s_drawn_id[DH_MAX_ID_BYTES + 1]; // the page drawn last, to keep its scroll position
+
+// The labels on the page shown that change with time, and the page they belong to.
+static ui_page_live_t s_live;
+static const dh_page *s_live_page;
+
+// The short line on each page saying what is wrong, if anything, and whether it is a problem
+// (which also colours the status screen's dot).
+static char s_line[DH_UTF8_ROOM(80)];
+static lv_color_t s_line_colour;
+static bool s_line_problem;
+
+static unsigned s_ticks;
+static unsigned s_shift_step;
 
 // A label as wide as its parent, with wrapped text.
 static lv_obj_t *add_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t colour)
@@ -37,51 +66,247 @@ static lv_obj_t *add_label(lv_obj_t *parent, const lv_font_t *font, lv_color_t c
     return label;
 }
 
+static lv_obj_t *add_column(lv_obj_t *parent)
+{
+    lv_obj_t *column = lv_obj_create(parent);
+    lv_obj_remove_style_all(column);
+    lv_obj_set_width(column, LV_PCT(100));
+    lv_obj_set_flex_grow(column, 1);
+    lv_obj_set_flex_flow(column, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_scrollable(column, false);
+    return column;
+}
+
+static void place_root(void)
+{
+    int32_t dx, dy;
+    ui_shift(s_shift_step, &dx, &dy);
+    lv_obj_set_pos(s_root, UI_SHIFT_MAX + dx, UI_SHIFT_MAX + dy);
+}
+
+static int64_t held_seconds(void)
+{
+    if (s_pages == NULL) {
+        return 0;
+    }
+    const int64_t held_ms = esp_timer_get_time() / 1000 - s_pages->received_ms;
+    return held_ms > 0 ? held_ms / 1000 : 0;
+}
+
+static size_t page_count(void)
+{
+    return s_pages != NULL && s_pages->snapshot.page_count <= DH_MAX_PAGES
+               ? s_pages->snapshot.page_count
+               : 0;
+}
+
+static void draw_dots(size_t views)
+{
+    lv_obj_clean(s_dots);
+    for (size_t i = 0; i < views; i++) {
+        lv_obj_t *dot = lv_obj_create(s_dots);
+        lv_obj_remove_style_all(dot);
+        const bool here = i == s_view;
+        const bool status = i == views - 1;
+        lv_obj_set_size(dot, here ? 8 : 6, here ? 8 : 6);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(dot, status && s_line_problem ? s_line_colour
+                                       : here                   ? UI_COLOUR_TEXT
+                                                                : UI_COLOUR_DIM,
+                                  0);
+        lv_obj_set_clickable(dot, false);
+    }
+}
+
+// Shows what the state says: the status screen alone, or the view s_view of the swipe row.
+static void render(void)
+{
+    // The page drawn last, before it is cleared: to keep its place if it is drawn again.
+    int32_t scroll_y = 0;
+    if (s_live.figures != NULL) {
+        scroll_y = lv_obj_get_scroll_y(s_live.figures);
+    }
+    memset(&s_live, 0, sizeof(s_live));
+    s_live_page = NULL;
+
+    if (s_counting || !s_with_pages) {
+        s_drawn_id[0] = '\0';
+        lv_obj_clean(s_page);
+        lv_obj_set_hidden(s_page, true);
+        lv_obj_set_hidden(s_dots, true);
+        lv_obj_set_hidden(s_status, false);
+        return;
+    }
+
+    const size_t count = page_count();
+    const size_t views = ui_view_count(count);
+    if (s_view >= views) {
+        s_view = views - 1;
+    }
+    lv_obj_set_hidden(s_dots, false);
+    draw_dots(views);
+    lv_obj_clean(s_page);
+    if (s_view == views - 1) {
+        s_drawn_id[0] = '\0';
+        lv_obj_set_hidden(s_page, true);
+        lv_obj_set_hidden(s_status, false);
+        lv_obj_scroll_to_y(s_status, 0, LV_ANIM_OFF);
+        return;
+    }
+    lv_obj_set_hidden(s_status, true);
+    lv_obj_set_hidden(s_page, false);
+
+    if (count == 0) {
+        ui_no_pages_draw(s_page);
+    } else {
+        const dh_page *page = &s_pages->snapshot.pages[s_view];
+        ui_page_draw(s_page, &s_pages->snapshot, page, s_pages->saved, held_seconds(), &s_live);
+        s_live_page = page;
+    }
+    if (s_line[0] != '\0') {
+        add_label(s_page, ui_fonts()->small_bold, s_line_colour);
+        lv_label_set_text(lv_obj_get_child(s_page, -1), s_line);
+    }
+    if (s_live.figures != NULL) {
+        // Room for the scroll bar when the figures don't all fit, so it never covers them.
+        lv_obj_update_layout(s_page);
+        if (lv_obj_get_scroll_bottom(s_live.figures) > 0) {
+            lv_obj_set_style_pad_right(s_live.figures, 10, 0);
+            lv_obj_update_layout(s_page);
+        }
+        // The same page again: where it was scrolled to.
+        if (s_live_page != NULL && strcmp(s_drawn_id, s_live_page->id) == 0 && scroll_y > 0) {
+            lv_obj_scroll_to_y(s_live.figures, scroll_y, LV_ANIM_OFF);
+        }
+    }
+    snprintf(s_drawn_id, sizeof(s_drawn_id), "%s", s_live_page != NULL ? s_live_page->id : "");
+}
+
+static void render_later(void *arg)
+{
+    (void)arg;
+    render();
+}
+
+// A swipe left shows the next view, a swipe right the one before. The row doesn't wrap round.
+static void on_gesture(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_t *indev = lv_indev_active();
+    if (indev == NULL || s_counting || !s_with_pages) {
+        return;
+    }
+    const size_t views = ui_view_count(page_count());
+    const lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+    size_t next = s_view;
+    if (dir == LV_DIR_LEFT && s_view + 1 < views) {
+        next = s_view + 1;
+    } else if (dir == LV_DIR_RIGHT && s_view > 0) {
+        next = s_view - 1;
+    }
+    if (next == s_view) {
+        return;
+    }
+    s_view = next;
+    lv_indev_wait_release(indev);
+    // Not from inside the touch's own event: the object touched is about to be deleted.
+    lv_async_call(render_later, NULL);
+}
+
+// Runs in LVGL's task, which holds the LVGL lock while it does.
+static void on_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (++s_ticks % SHIFT_TICKS == 0) {
+        s_shift_step++;
+        place_root();
+    }
+    if (s_live_page != NULL && s_pages != NULL && !s_counting) {
+        ui_page_tick(&s_live, &s_pages->snapshot, s_live_page, s_pages->saved, held_seconds());
+    }
+}
+
 void ui_start(const char *version, const char *board_note)
 {
+    ui_fonts_start();
+    const ui_fonts_t *f = ui_fonts();
+
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
-    lv_obj_set_style_text_color(screen, COLOUR_TEXT, 0);
+    lv_obj_set_style_text_color(screen, UI_COLOUR_TEXT, 0);
+    lv_obj_set_style_text_font(screen, f->body, 0);
     lv_obj_set_scrollable(screen, false);
+    lv_obj_add_event_cb(screen, on_gesture, LV_EVENT_GESTURE, NULL);
 
-    // One plain column, which scrolls up and down if a message is longer than the screen.
-    lv_obj_t *page = lv_obj_create(screen);
-    lv_obj_remove_style_all(page);
-    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_flex_flow(page, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_style_pad_hor(page, PAD_SIDE, 0);
-    lv_obj_set_style_pad_top(page, PAD_TOP, 0);
-    lv_obj_set_style_pad_bottom(page, PAD_TOP, 0);
-    lv_obj_set_style_pad_row(page, 14, 0);
-    lv_obj_set_scroll_dir(page, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
+    // Everything is laid out UI_SHIFT_MAX in from each edge, so the burn-in shift never pushes
+    // anything off the screen.
+    lv_display_t *display = lv_obj_get_display(screen);
+    s_root = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_root);
+    lv_obj_set_size(s_root, lv_display_get_horizontal_resolution(display) - 2 * UI_SHIFT_MAX,
+                    lv_display_get_vertical_resolution(display) - 2 * UI_SHIFT_MAX);
+    lv_obj_set_flex_flow(s_root, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_hor(s_root, PAD_SIDE - UI_SHIFT_MAX, 0);
+    lv_obj_set_style_pad_top(s_root, PAD_TOP - UI_SHIFT_MAX, 0);
+    lv_obj_set_style_pad_bottom(s_root, PAD_BOTTOM - UI_SHIFT_MAX, 0);
+    lv_obj_set_style_pad_row(s_root, 8, 0);
+    lv_obj_set_scrollable(s_root, false);
+    place_root();
 
-    s_title = add_label(page, &lv_font_montserrat_24, COLOUR_TEXT);
-    s_number = add_label(page, &lv_font_montserrat_36, COLOUR_WARNING);
-    s_body = add_label(page, &lv_font_montserrat_20, COLOUR_TEXT);
-    s_pages = add_label(page, &lv_font_montserrat_16, COLOUR_TEXT);
-    s_note = add_label(page, &lv_font_montserrat_20, COLOUR_WARNING);
-    s_footer = add_label(page, &lv_font_montserrat_16, COLOUR_QUIET);
+    // The status screen: one plain column, which scrolls up and down if a message is longer
+    // than the screen.
+    s_status = add_column(s_root);
+    lv_obj_set_style_pad_row(s_status, 14, 0);
+    lv_obj_set_scrollable(s_status, true);
+    lv_obj_set_scroll_dir(s_status, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_status, LV_SCROLLBAR_MODE_OFF);
+    s_title = add_label(s_status, f->title, UI_COLOUR_TEXT);
+    s_number = add_label(s_status, f->big[0], UI_COLOUR_WARNING);
+    s_body = add_label(s_status, f->body, UI_COLOUR_TEXT);
+    s_extra = add_label(s_status, f->small, UI_COLOUR_QUIET);
+    s_note = add_label(s_status, f->body, UI_COLOUR_WARNING);
+    s_footer = add_label(s_status, f->small, UI_COLOUR_QUIET);
+
+    // A page.
+    s_page = add_column(s_root);
+    lv_obj_set_style_pad_row(s_page, 8, 0);
+    lv_obj_set_clickable(s_page, false);
+    lv_obj_set_hidden(s_page, true);
+
+    // The dots along the bottom, one for each view of the row.
+    s_dots = lv_obj_create(s_root);
+    lv_obj_remove_style_all(s_dots);
+    lv_obj_set_size(s_dots, LV_PCT(100), 8);
+    lv_obj_set_flex_flow(s_dots, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_dots, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_column(s_dots, 8, 0);
+    lv_obj_set_scrollable(s_dots, false);
+    lv_obj_set_clickable(s_dots, false);
+    lv_obj_set_hidden(s_dots, true);
 
     if (board_note != NULL) {
         lv_label_set_text_fmt(s_footer, "Display Hub firmware %s\n%s", version, board_note);
     } else {
         lv_label_set_text_fmt(s_footer, "Display Hub firmware %s", version);
     }
+
+    lv_timer_create(on_tick, TICK_MS, NULL);
 }
 
-// `pages` is NULL or the list of pages, shown under the body in smaller text.
+// The status screen's words. `extra` is NULL or a line in smaller text under the body.
 static void show(const char *title, lv_color_t title_colour, const char *number, const char *body,
-                 const char *pages, const char *note)
+                 const char *extra, const char *note)
 {
     lv_label_set_text(s_title, title);
     lv_obj_set_style_text_color(s_title, title_colour, 0);
     lv_label_set_text(s_number, number != NULL ? number : "");
     lv_obj_set_hidden(s_number, number == NULL);
     lv_label_set_text(s_body, body);
-    lv_label_set_text(s_pages, pages != NULL ? pages : "");
-    lv_obj_set_hidden(s_pages, pages == NULL);
+    lv_label_set_text(s_extra, extra != NULL ? extra : "");
+    lv_obj_set_hidden(s_extra, extra == NULL);
     lv_label_set_text(s_note, note != NULL ? note : "");
     lv_obj_set_hidden(s_note, note == NULL);
 }
@@ -161,56 +386,81 @@ static const char *advice(const hub_status_t *hub)
     }
 }
 
-// The pages the hub sent, by title: drawing them comes later.
-static const char *page_list(const hub_status_t *hub)
+#define TOKEN_UNSAVED "This display couldn't save its place with the hub. If it restarts now, " \
+                      "it will need setting up again."
+
+// The short line each page shows about the hub: a problem in its colour, what the display is
+// doing while it isn't yet talking to the hub, or the note about what just happened.
+static void set_line(const hub_status_t *hub, const char *note)
 {
-    // Ten titles of up to 48 characters of up to four bytes, with their labels.
-    static char text[160 + DH_MAX_PAGES * (DH_UTF8_ROOM(DH_MAX_TITLE_CHARS) + 48)];
-    if (!hub->has_snapshot) {
-        return NULL;
+    const char *line = NULL;
+    lv_color_t colour = UI_COLOUR_QUIET;
+    bool problem = false;
+    switch (hub->state) {
+    case HUB_TROUBLE:
+    case HUB_NEEDS_SETUP:
+        line = headline(hub);
+        colour = hub->problem == DH_PROBLEM_WRONG_HUB ? UI_COLOUR_BAD : UI_COLOUR_WARNING;
+        problem = true;
+        break;
+    case HUB_FAILED:
+        line = "Can't connect";
+        colour = UI_COLOUR_BAD;
+        problem = true;
+        break;
+    case HUB_JOINING_WIFI:
+        line = "Joining Wi-Fi";
+        break;
+    case HUB_ENROLLING:
+    case HUB_WAITING:
+        line = "Joining the hub";
+        break;
+    default:
+        break;
     }
-    size_t at = 0;
-    if (hub->page_count == 0) {
-        at = (size_t)snprintf(text, sizeof(text),
-                              "No pages yet. Choose this display's pages in Display Hub.");
-    } else {
-        at = (size_t)snprintf(text, sizeof(text), "%u %s from the hub:", (unsigned)hub->page_count,
-                              hub->page_count == 1 ? "page" : "pages");
+    if (!problem && hub->token_unsaved) {
+        line = "Couldn't save its place with the hub";
+        colour = UI_COLOUR_WARNING;
+        problem = true;
     }
-    for (unsigned i = 0; i < hub->page_count && at < sizeof(text); i++) {
-        const hub_page_t *page = &hub->pages[i];
-        at += (size_t)snprintf(text + at, sizeof(text) - at, "\n%u. %s (%s%s)", i + 1, page->title,
-                               page->cant_show ? "can't be shown" : page->quality,
-                               page->stale ? ", stale" : "");
+    if (line == NULL && note != NULL) {
+        line = note;
     }
-    if (hub->saved_pages && at < sizeof(text)) {
-        snprintf(text + at, sizeof(text) - at, "\nSaved before the last restart; age unknown.");
-    }
-    return text;
+    snprintf(s_line, sizeof(s_line), "%s", line != NULL ? line : "");
+    s_line_colour = colour;
+    s_line_problem = problem;
 }
 
-// A display that is set up: how things stand with the hub.
-static void show_hub(const hub_status_t *hub, const char *note)
+// A display that is set up: how things stand with the hub. With pages, this is the screen at
+// the end of the swipe row.
+static void show_hub(const hub_status_t *hub, size_t pages, const char *note)
 {
     static char body[640];
-    const char *pages = page_list(hub);
+    const char *saved = hub->has_snapshot && hub->saved_pages
+                            ? "The pages shown were saved before the last restart, so their age "
+                              "isn't known until the hub answers."
+                            : NULL;
     // A token that isn't in flash matters more than whatever just happened.
     if (hub->token_unsaved) {
-        note = "This display couldn't save its place with the hub. If it restarts now, it will "
-               "need setting up again.";
+        note = TOKEN_UNSAVED;
     }
     switch (hub->state) {
     case HUB_ONLINE:
-        show("Connected to the hub", COLOUR_GOOD, NULL,
-             "The pages themselves come with a later version of this firmware.", pages, note);
+        if (pages == 0) {
+            snprintf(body, sizeof(body), "The hub hasn't given this display any pages yet.");
+        } else {
+            snprintf(body, sizeof(body), "Showing the %u %s the hub sent. Swipe right to see %s.",
+                     (unsigned)pages, pages == 1 ? "page" : "pages", pages == 1 ? "it" : "them");
+        }
+        show("Connected to the hub", UI_COLOUR_GOOD, NULL, body, saved, note);
         return;
     case HUB_ENROLLING:
-        show("Joining the hub", COLOUR_TEXT, NULL,
-             "On Wi-Fi. Asking the hub to add this display.", pages, note);
+        show("Joining the hub", UI_COLOUR_TEXT, NULL,
+             "On Wi-Fi. Asking the hub to add this display.", saved, note);
         return;
     case HUB_WAITING:
-        show("Joined the hub", COLOUR_TEXT, NULL, "Asking the hub for this display's pages.",
-             pages, note);
+        show("Joined the hub", UI_COLOUR_TEXT, NULL, "Asking the hub for this display's pages.",
+             saved, note);
         return;
     case HUB_TROUBLE:
     case HUB_NEEDS_SETUP:
@@ -219,25 +469,27 @@ static void show_hub(const hub_status_t *hub, const char *note)
                      ? "\n\nShowing the last pages it was sent."
                      : "");
         show(headline(hub),
-             hub->problem == DH_PROBLEM_WRONG_HUB ? COLOUR_BAD : COLOUR_WARNING, NULL, body, pages,
-             note);
+             hub->problem == DH_PROBLEM_WRONG_HUB ? UI_COLOUR_BAD : UI_COLOUR_WARNING, NULL, body,
+             saved, note);
         return;
     case HUB_FAILED:
-        show("Can't connect", COLOUR_BAD, NULL,
+        show("Can't connect", UI_COLOUR_BAD, NULL,
              "This display couldn't start its connection to the hub.\n\n"
              "Unplug it and plug it back in.",
-             pages, note);
+             saved, note);
         return;
     default:
         // HUB_JOINING_WIFI, and the moment before the hub task has looked at a new setup.
-        show("Joining Wi-Fi", COLOUR_TEXT, NULL,
-             "This display has its setup and is joining your Wi-Fi network.", pages, note);
+        show("Joining Wi-Fi", UI_COLOUR_TEXT, NULL,
+             "This display has its setup and is joining your Wi-Fi network.", saved, note);
         return;
     }
 }
 
-void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
-                   const hub_status_t *hub, const char *note)
+// The status screen alone, for a display that isn't set up and running: the storage problem,
+// an unreadable setup, or waiting for setup. Returns false for a display that is set up.
+static bool show_not_running(const storage_facts_t *facts, const storage_key_status_t *key,
+                             const char *note)
 {
     static char body[640];
 
@@ -249,38 +501,68 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
         for (int i = 0; i < key->blocker_count && at < sizeof(body); i++) {
             at += (size_t)snprintf(body + at, sizeof(body) - at, "\n%s", key->blockers[i]);
         }
-        show("Storage problem", COLOUR_BAD, NULL, body, NULL, note);
-        return;
+        show("Storage problem", UI_COLOUR_BAD, NULL, body, NULL, note);
+        return true;
     }
     if (facts->state != STORAGE_WORKING) {
-        show("Storage problem", COLOUR_BAD, NULL,
+        show("Storage problem", UI_COLOUR_BAD, NULL,
              "This display's storage didn't start or couldn't be read, so it can't be set up.\n\n"
              "Open Display Hub on your computer and use Install firmware to install it again. "
              "That erases the display's storage.",
              NULL, note);
-        return;
+        return true;
     }
     if (facts->setup_unreadable) {
-        show("Setup can't be read", COLOUR_WARNING, NULL,
+        show("Setup can't be read", UI_COLOUR_WARNING, NULL,
              "This display holds a setup that this firmware can't read.\n\n"
              "Hold the BOOT button for 10 seconds to erase it, then set the display up again.",
              NULL, note);
-        return;
+        return true;
     }
-    if (facts->set_up) {
-        show_hub(hub, note);
-        return;
+    if (!facts->set_up) {
+        show("Waiting for setup", UI_COLOUR_TEXT, NULL,
+             "Open Display Hub on your computer and choose Add a display.\n\n"
+             "Keep this display plugged in to the computer with its USB cable.",
+             NULL, note);
+        return true;
     }
-    show("Waiting for setup", COLOUR_TEXT, NULL,
-         "Open Display Hub on your computer and choose Add a display.\n\n"
-         "Keep this display plugged in to the computer with its USB cable.",
-         NULL, note);
+    return false;
+}
+
+void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
+                   const hub_status_t *hub, const hub_pages_t *pages, const char *note)
+{
+    s_counting = false;
+    s_pages = pages;
+
+    const bool running = !show_not_running(facts, key, note);
+    const bool with_pages = running && pages != NULL && pages->has_snapshot;
+    if (with_pages) {
+        if (!s_with_pages) {
+            s_view = 0; // the first page, whenever the row appears
+        } else if (pages->seq != s_drawn_seq) {
+            s_view = ui_keep_view(&s_ids, s_view, &pages->snapshot);
+        }
+        ui_page_ids_of(&pages->snapshot, &s_ids);
+        s_drawn_seq = pages->seq;
+    }
+    s_with_pages = with_pages;
+    if (running) {
+        show_hub(hub, with_pages ? page_count() : 0, note);
+        set_line(hub, note);
+    } else {
+        s_line[0] = '\0';
+        s_line_problem = false;
+    }
+    render();
 }
 
 void ui_show_reset_countdown(int seconds_left)
 {
     char number[16];
     snprintf(number, sizeof(number), "%d", seconds_left);
-    show("Factory reset", COLOUR_WARNING, number,
+    show("Factory reset", UI_COLOUR_WARNING, number,
          "Keep holding BOOT to erase this display's setup.\n\nLet go now to cancel.", NULL, NULL);
+    s_counting = true;
+    render();
 }

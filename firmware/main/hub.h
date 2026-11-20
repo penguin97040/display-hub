@@ -3,8 +3,9 @@
 // device ID and token, poll the snapshot, send heartbeats, and say plainly what is wrong.
 //
 // One task does all of it, and it is the only one that touches Wi-Fi or the network. It never
-// draws: it keeps a small status that the main task reads and shows. What to send, what an
-// answer means and when to try next are decided by dh_core (dh_hub.h, dh_snapshot.h, dh_poll.h).
+// draws: it keeps a small status and a copy of the pages, which the main task reads and shows.
+// What to send, what an answer means and when to try next are decided by dh_core (dh_hub.h,
+// dh_snapshot.h, dh_poll.h).
 //
 // A FACTORY RESET never waits for this task. The task works from its own copy of the setup and
 // holds storage's lock only for a moment at a time, never across the network. A reset erases
@@ -54,27 +55,27 @@ typedef enum {
 } hub_detail_t;
 
 typedef struct {
-    char title[DH_UTF8_ROOM(DH_MAX_TITLE_CHARS)];
-    const char *quality; // DEMO, REPORTED, ESTIMATE, MANUAL or UNAVAILABLE
-    bool cant_show;      // a "can't show this" card
-    bool stale;          // by the hub's clock; never set for saved pages
-} hub_page_t;
-
-typedef struct {
     hub_state_t state;
     dh_problem problem;
     hub_detail_t detail;
     // The device ID and token couldn't be written to flash: they are kept in memory, and the
     // display will need setting up again if it restarts before a write succeeds.
     bool token_unsaved;
-    // The pages held: the last good snapshot.
+    // The pages held: the last good snapshot. hub_pages() gives a copy of them to draw.
     bool has_snapshot;
     // They are the ones saved before this start, and no poll has succeeded since: their age
     // isn't known.
     bool saved_pages;
-    uint8_t page_count;
-    hub_page_t pages[DH_MAX_PAGES];
 } hub_status_t;
+
+// A copy of the pages held, for the screen to draw. It is about 38 KB, so keep it off the stack.
+typedef struct {
+    uint32_t seq;        // changes whenever anything below does
+    bool has_snapshot;   // false: no pages are held, and `snapshot` is all zeros
+    bool saved;          // restored from flash, and no poll has succeeded since: age unknown
+    int64_t received_ms; // when it arrived, or was restored, by esp_timer_get_time() / 1000
+    dh_snapshot snapshot;
+} hub_pages_t;
 
 // Starts the task. The two strings must stay valid for good. `on_change` is called from the task
 // whenever the status changes, and should only wake another task. If it fails, the status says
@@ -86,6 +87,10 @@ esp_err_t hub_start(const char *firmware_version, const char *hardware_revision,
 void hub_wake(void);
 
 void hub_status(hub_status_t *out);
+
+// Brings *out up to date with the pages held, copying them only if they have changed since *out
+// was last brought up to date (by `seq`; start with *out all zeros). Returns whether it copied.
+bool hub_pages(hub_pages_t *out);
 
 // How many bytes of the task's stack have never been used. 0 before it has started.
 unsigned hub_stack_unused(void);
