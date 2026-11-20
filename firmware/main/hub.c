@@ -27,6 +27,7 @@
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
+#include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -609,6 +610,24 @@ static void start_wifi_again(void)
     heap_caps_free(fresh);
 }
 
+// The signal that came with a failed join or a drop, for the log. Only when an access point was
+// actually reached: with reason 0 (this firmware gave up, or the address lapsed) the driver gave
+// none, and with "not found" reasons it describes no access point. 0 dBm is a real reading.
+static void signal_words(unsigned reason, int rssi, char *out, size_t size)
+{
+    switch (reason) {
+    case 0:
+    case WIFI_REASON_NO_AP_FOUND:
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        snprintf(out, size, "none");
+        return;
+    default:
+        snprintf(out, size, "%d dBm", rssi);
+        return;
+    }
+}
+
 // Keeps the display on Wi-Fi. True when it is; otherwise it has done the next thing towards
 // joining, or waited, and the caller should come round again.
 static bool wifi_ready(void)
@@ -623,17 +642,16 @@ static bool wifi_ready(void)
             s.wifi_was_up = false;
             s.wifi_failures = 0;
             s.wifi_retry_ms = now + 1000;
-            ESP_LOGW(TAG, "Wi-Fi dropped (reason %u); joining again", wifi_last_reason());
+            const unsigned reason = wifi_last_reason();
+            char signal[16];
+            signal_words(reason, wifi_last_rssi(), signal, sizeof(signal));
+            ESP_LOGW(TAG, "Wi-Fi dropped (reason %u: %s; signal %s); joining again", reason,
+                     wifi_reason_words(reason), signal);
         } else {
             const uint32_t wait = wifi_failed();
             const unsigned reason = wifi_last_reason();
-            const int rssi = wifi_last_rssi();
             char signal[16];
-            if (rssi != 0) {
-                snprintf(signal, sizeof(signal), "%d dBm", rssi);
-            } else {
-                snprintf(signal, sizeof(signal), "unknown");
-            }
+            signal_words(reason, wifi_last_rssi(), signal, sizeof(signal));
             ESP_LOGW(TAG, "couldn't join Wi-Fi (reason %u: %s; signal %s; %" PRIu32 " in a row); "
                           "trying again in %" PRIu32 " s",
                      reason, wifi_reason_words(reason), signal, s.wifi_failures, wait / 1000);

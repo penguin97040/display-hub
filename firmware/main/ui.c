@@ -321,9 +321,12 @@ static const char *headline(const hub_status_t *hub)
 {
     switch (hub->detail) {
     case HUB_DETAIL_WIFI:
-    case HUB_DETAIL_WIFI_START:
-    case HUB_DETAIL_NO_WIFI_DETAILS:
         return "Can't join Wi-Fi";
+    case HUB_DETAIL_WIFI_START:
+        return "Wi-Fi didn't start";
+    case HUB_DETAIL_NO_WIFI_DETAILS:
+        // Not something to look for at the router: the setup itself has to be done again.
+        return "No Wi-Fi details in its setup";
     default:
         return dh_problem_headline(hub->problem);
     }

@@ -48,7 +48,7 @@ wifi_link_t wifi_link(void);
 uint32_t wifi_drops(void);
 // The driver's reason number for the last one (wifi_err_reason_t), for the log.
 unsigned wifi_last_reason(void);
-// The signal strength the driver reported with it, in dBm, or 0 if it gave none (a join this
+// The signal strength the driver reported with it, in dBm; 0 when it gave none (a join this
 // firmware gave up on, an address that lapsed).
 int wifi_last_rssi(void);
 // What a reason number from a failed join usually means, in a few words, for the log.
