@@ -58,7 +58,11 @@ static lv_obj_t *figures_area(lv_obj_t *parent)
     lv_obj_t *area = box(parent, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_grow(area, 1);
     lv_obj_set_style_pad_row(area, 10, 0);
-    // Up and down only, so a sideways swipe still moves between pages.
+    // Up and down only, so a sideways swipe still moves between pages. It must be clickable for
+    // a touch to find it (LVGL's hit test passes over objects that aren't), so it can be
+    // scrolled; a sideways swipe on it still bubbles up to the screen.
+    lv_obj_set_clickable(area, true);
+    lv_obj_set_gesture_bubble(area, true);
     lv_obj_set_scrollable(area, true);
     lv_obj_set_scroll_dir(area, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(area, LV_SCROLLBAR_MODE_AUTO);

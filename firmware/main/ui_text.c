@@ -42,13 +42,20 @@ ui_age ui_age_text(const dh_snapshot *s, const dh_page *p, bool saved, int64_t h
         snprintf(out, size, "Never updated");
         return UI_AGE_NEVER;
     }
-    char age[UI_TEXT_ROOM];
-    ui_duration(f.age_seconds, age, sizeof(age));
+    // The screen brings this up to date every 30 seconds, so seconds would only ever be wrong.
+    char age[UI_TEXT_ROOM + 8];
+    if (f.age_seconds < 60) {
+        snprintf(age, sizeof(age), "just now");
+    } else {
+        char d[UI_TEXT_ROOM];
+        ui_duration(f.age_seconds, d, sizeof(d));
+        snprintf(age, sizeof(age), "%s ago", d);
+    }
     if (f.stale) {
-        snprintf(out, size, "Stale. Updated %s ago", age);
+        snprintf(out, size, "Stale. Updated %s", age);
         return UI_AGE_STALE;
     }
-    snprintf(out, size, "Updated %s ago", age);
+    snprintf(out, size, "Updated %s", age);
     return UI_AGE_FRESH;
 }
 
@@ -63,7 +70,9 @@ void ui_reset_text(const dh_snapshot *s, const dh_meter_item *item, bool saved,
         return;
     }
     const dh_reset r = dh_meter_item_reset(s, item, held_seconds);
-    if (r.counting) {
+    if (r.counting && r.resets_in_seconds < 60) {
+        snprintf(out, size, "Resets in under a minute");
+    } else if (r.counting) {
         char left[UI_TEXT_ROOM];
         ui_duration(r.resets_in_seconds, left, sizeof(left));
         snprintf(out, size, "Resets in %s", left);

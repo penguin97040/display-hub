@@ -3,7 +3,9 @@
 //
 // The wording follows the desktop app's preview of a page (apps/hub-manager/src/shown.rs, and
 // hub_core's short_duration): "Updated 10 min ago", "Stale. Updated 2 d ago", "Resets in 3 h 20
-// min", "Reset due", and a dash for a figure that isn't known. Ages and countdowns are on the
+// min", "Reset due", and a dash for a figure that isn't known. One difference: the screen
+// brings ages and countdowns up to date every 30 seconds, so under a minute it says "Updated just
+// now" and "Resets in under a minute" where the app would count the seconds. Ages and countdowns are on the
 // hub's clock: the snapshot's own times, plus how long it has been held by a monotonic timer.
 // The display's own date is never used.
 
@@ -30,7 +32,7 @@ extern "C" {
 void ui_duration(int64_t seconds, char *out, size_t size);
 
 typedef enum {
-    UI_AGE_FRESH,   // "Updated 10 min ago"
+    UI_AGE_FRESH,   // "Updated 10 min ago", or "Updated just now" under a minute
     UI_AGE_STALE,   // "Stale. Updated 2 d ago"
     UI_AGE_NEVER,   // "Never updated": the page has never had figures
     UI_AGE_UNKNOWN, // "Saved; age unknown": restored from flash, and no poll has succeeded since
@@ -42,8 +44,8 @@ typedef enum {
 ui_age ui_age_text(const dh_snapshot *s, const dh_page *p, bool saved, int64_t held_seconds,
                    char *out, size_t size);
 
-// "Resets in 3 h 20 min", "Reset due", or "" when the item has no reset time or the hub's clock
-// isn't known (saved pages).
+// "Resets in 3 h 20 min", "Resets in under a minute", "Reset due", or "" when the item has no
+// reset time or the hub's clock isn't known (saved pages).
 void ui_reset_text(const dh_snapshot *s, const dh_meter_item *item, bool saved,
                    int64_t held_seconds, char *out, size_t size);
 

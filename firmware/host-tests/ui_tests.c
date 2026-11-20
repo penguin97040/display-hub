@@ -171,14 +171,26 @@ static void test_meter(void)
     CHECK_STR(s, "Resets in 3 h 20 min");
     ui_reset_text(&snap, &it[0], false, 1200, s, sizeof s); /* held 20 minutes */
     CHECK_STR(s, "Resets in 3 h");
-    ui_reset_text(&snap, &it[0], false, 11999, s, sizeof s);
-    CHECK_STR(s, "Resets in 1 s");
+    /* Under a minute: the screen refreshes every 30 s, so no seconds are counted. */
+    ui_reset_text(&snap, &it[0], false, 11940, s, sizeof s); /* 60 s to go */
+    CHECK_STR(s, "Resets in 1 min");
+    ui_reset_text(&snap, &it[0], false, 11941, s, sizeof s); /* 59 s */
+    CHECK_STR(s, "Resets in under a minute");
+    ui_reset_text(&snap, &it[0], false, 11999, s, sizeof s); /* 1 s */
+    CHECK_STR(s, "Resets in under a minute");
     ui_reset_text(&snap, &it[0], false, 12000, s, sizeof s);
     CHECK_STR(s, "Reset due");
     ui_reset_text(&snap, &it[2], false, 0, s, sizeof s); /* passed already */
     CHECK_STR(s, "Reset due");
     ui_reset_text(&snap, &it[5], false, 0, s, sizeof s); /* due this second */
     CHECK_STR(s, "Reset due");
+    /* Its age, updated this second: no seconds counted under a minute either. */
+    CHECK(ui_age_text(&snap, p, false, 0, s, sizeof s) == UI_AGE_FRESH);
+    CHECK_STR(s, "Updated just now");
+    CHECK(ui_age_text(&snap, p, false, 59, s, sizeof s) == UI_AGE_FRESH);
+    CHECK_STR(s, "Updated just now");
+    CHECK(ui_age_text(&snap, p, false, 60, s, sizeof s) == UI_AGE_FRESH);
+    CHECK_STR(s, "Updated 1 min ago");
     ui_reset_text(&snap, &it[1], false, 0, s, sizeof s); /* no reset time */
     CHECK_STR(s, "");
     /* Saved pages: the hub's clock now isn't known, so no countdown is made up. */

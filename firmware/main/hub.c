@@ -182,6 +182,7 @@ static void publish(void)
         // Only this task writes s_current, so it can be read here without a lock of its own.
         if (s.has_snapshot) {
             s_shown->has_snapshot = true;
+            s_shown->generation = s.generation;
             s_shown->saved = s.saved_pages;
             s_shown->received_ms = s.received_ms;
             memcpy(&s_shown->snapshot, s_current, sizeof(s_shown->snapshot));
@@ -216,6 +217,15 @@ static void stick(dh_problem problem, hub_detail_t detail)
 static void pages_changed(void)
 {
     s_pages_seq++;
+}
+
+// Whether two snapshots hold the same pages, whatever their generated_at. dh_read_response()
+// zeroes a snapshot before filling it, so equal pages are equal bytes. (Bytes that differ but
+// mean the same could only make this say "changed", which costs no more than a redraw.)
+static bool same_pages(const dh_snapshot *a, const dh_snapshot *b)
+{
+    return a->page_count == b->page_count && a->page_count <= DH_MAX_PAGES &&
+           memcmp(a->pages, b->pages, a->page_count * sizeof(a->pages[0])) == 0;
 }
 
 void hub_status(hub_status_t *out)
@@ -454,13 +464,19 @@ static void poll(void)
             : dh_read_error_response(answer.status, s_body, answer.len);
     uint32_t refresh = 0;
     if (response.outcome == DH_OUTCOME_SHOW) {
+        // The same pages as before need no redraw (which would also drop a swipe in progress).
+        // The screen's copy keeps the earlier generated_at and time of arrival, so its ages
+        // stay right. Pages restored from flash are always replaced: their age becomes known.
+        const bool same = s.has_snapshot && !s.saved_pages && same_pages(s_current, s_spare);
         dh_snapshot *const shown = s_spare;
         s_spare = s_current;
         s_current = shown;
         s.has_snapshot = true;
         s.saved_pages = false;
         s.received_ms = now_ms();
-        pages_changed();
+        if (!same) {
+            pages_changed();
+        }
         refresh = s_current->refresh_after_seconds;
         save_snapshot_if_due(answer.len);
         const dh_firmware_offer *offer = &s_current->firmware_update;
@@ -645,8 +661,10 @@ static bool wifi_ready(void)
             const unsigned reason = wifi_last_reason();
             char signal[16];
             signal_words(reason, wifi_last_rssi(), signal, sizeof(signal));
+            // A drop with reason 0 is the address lapsing (wifi.c records the lost address so),
+            // not the "no answer in time" that reason 0 means for a join.
             ESP_LOGW(TAG, "Wi-Fi dropped (reason %u: %s; signal %s); joining again", reason,
-                     wifi_reason_words(reason), signal);
+                     reason == 0 ? "the address lapsed" : wifi_reason_words(reason), signal);
         } else {
             const uint32_t wait = wifi_failed();
             const unsigned reason = wifi_last_reason();

@@ -72,6 +72,9 @@ typedef struct {
 typedef struct {
     uint32_t seq;        // changes whenever anything below does
     bool has_snapshot;   // false: no pages are held, and `snapshot` is all zeros
+    // The setup they came with (storage_setup_generation()). Pages from a setup that has since
+    // been erased or replaced must never be drawn: the hub task may take a few seconds to notice.
+    uint32_t generation;
     bool saved;          // restored from flash, and no poll has succeeded since: age unknown
     int64_t received_ms; // when it arrived, or was restored, by esp_timer_get_time() / 1000
     dh_snapshot snapshot;

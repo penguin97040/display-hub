@@ -13,6 +13,7 @@
 //   tasks only send it events. Everything that touches the screen holds the LVGL lock.
 
 #include <stdbool.h>
+#include <string.h>
 
 #include "board/board.h"
 #include "dh_usb.h"
@@ -100,6 +101,18 @@ static void on_reset_button(reset_button_event_t event, int seconds_left)
     }
 }
 
+// Forgets the screen's copy of the pages, but not its seq, so that hub_pages() doesn't copy the
+// same pages straight back: it copies again only once the hub task's pages change. Call it while
+// holding the LVGL lock.
+static void forget_pages(void)
+{
+    if (s_pages != NULL) {
+        const uint32_t seq = s_pages->seq;
+        memset(s_pages, 0, sizeof(*s_pages));
+        s_pages->seq = seq;
+    }
+}
+
 static void show_state(const char *note)
 {
     if (s_board.display == NULL) {
@@ -110,6 +123,12 @@ static void show_state(const char *note)
     if (lvgl_port_lock(0)) {
         if (s_pages != NULL) {
             hub_pages(s_pages);
+            // Pages that came with a setup that has since been erased or replaced are never
+            // drawn. The hub task can take a few seconds to notice, and until it does it still
+            // holds them.
+            if (s_pages->has_snapshot && s_pages->generation != storage_setup_generation()) {
+                forget_pages();
+            }
         }
         ui_show_state(&facts, storage_key_status(), &s_hub, s_pages, note);
         lvgl_port_unlock();
@@ -128,6 +147,12 @@ static void factory_reset(void)
     const bool erased = dh_usb_factory_reset(&display);
     storage_unlock();
     hub_wake();
+    // The pages went with the setup (and an erase that failed part-way still ends that setup's
+    // session). show_state() would find them out of date too; this doesn't depend on it.
+    if (s_board.display != NULL && lvgl_port_lock(0)) {
+        forget_pages();
+        lvgl_port_unlock();
+    }
 
     if (erased) {
         ESP_LOGW(TAG, "factory reset: the setup was erased; firmware keys and update record kept");

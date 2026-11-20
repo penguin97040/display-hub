@@ -435,56 +435,68 @@ static void set_line(const hub_status_t *hub, const char *note)
 }
 
 // A display that is set up: how things stand with the hub. With pages, this is the screen at
-// the end of the swipe row.
-static void show_hub(const hub_status_t *hub, size_t pages, const char *note)
+// the end of the swipe row. `drawn` is NULL or the pages in the row; `no_memory` says there
+// was no memory for the screen's copy of them, so none can be shown.
+static void show_hub(const hub_status_t *hub, const hub_pages_t *drawn, bool no_memory,
+                     const char *note)
 {
     static char body[640];
-    const char *saved = hub->has_snapshot && hub->saved_pages
-                            ? "The pages shown were saved before the last restart, so their age "
-                              "isn't known until the hub answers."
-                            : NULL;
+    // What is said about the pages is about the ones on the screen.
+    const size_t pages = drawn != NULL ? page_count() : 0;
+    const char *extra = NULL;
+    if (no_memory) {
+        extra = "This display hasn't the memory to show its pages. Unplug it and plug it back "
+                "in.";
+    } else if (drawn != NULL && drawn->saved) {
+        extra = "The pages shown were saved before the last restart, so their age isn't known "
+                "until the hub answers.";
+    }
     // A token that isn't in flash matters more than whatever just happened.
     if (hub->token_unsaved) {
         note = TOKEN_UNSAVED;
     }
     switch (hub->state) {
     case HUB_ONLINE:
-        if (pages == 0) {
+        if (drawn == NULL && no_memory) {
+            snprintf(body, sizeof(body), "This display is talking to the hub.");
+        } else if (drawn == NULL) {
+            snprintf(body, sizeof(body), "Asking the hub for this display's pages.");
+        } else if (pages == 0) {
             snprintf(body, sizeof(body), "The hub hasn't given this display any pages yet.");
         } else {
             snprintf(body, sizeof(body), "Showing the %u %s the hub sent. Swipe right to see %s.",
                      (unsigned)pages, pages == 1 ? "page" : "pages", pages == 1 ? "it" : "them");
         }
-        show("Connected to the hub", UI_COLOUR_GOOD, NULL, body, saved, note);
+        show("Connected to the hub", UI_COLOUR_GOOD, NULL, body, extra, note);
         return;
     case HUB_ENROLLING:
         show("Joining the hub", UI_COLOUR_TEXT, NULL,
-             "On Wi-Fi. Asking the hub to add this display.", saved, note);
+             "On Wi-Fi. Asking the hub to add this display.", extra, note);
         return;
     case HUB_WAITING:
         show("Joined the hub", UI_COLOUR_TEXT, NULL, "Asking the hub for this display's pages.",
-             saved, note);
+             extra, note);
         return;
     case HUB_TROUBLE:
     case HUB_NEEDS_SETUP:
         snprintf(body, sizeof(body), "%s%s", advice(hub),
-                 hub->has_snapshot && hub->state == HUB_TROUBLE
+                 pages > 0 && hub->state == HUB_TROUBLE
                      ? "\n\nShowing the last pages it was sent."
                      : "");
         show(headline(hub),
              hub->problem == DH_PROBLEM_WRONG_HUB ? UI_COLOUR_BAD : UI_COLOUR_WARNING, NULL, body,
-             saved, note);
+             extra, note);
         return;
     case HUB_FAILED:
         show("Can't connect", UI_COLOUR_BAD, NULL,
              "This display couldn't start its connection to the hub.\n\n"
              "Unplug it and plug it back in.",
-             saved, note);
+             extra, note);
         return;
     default:
         // HUB_JOINING_WIFI, and the moment before the hub task has looked at a new setup.
         show("Joining Wi-Fi", UI_COLOUR_TEXT, NULL,
-             "This display has its setup and is joining your Wi-Fi network.", saved, note);
+             "This display has its setup and is joining your Wi-Fi network.", extra, note);
         return;
     }
 }
@@ -551,7 +563,7 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     }
     s_with_pages = with_pages;
     if (running) {
-        show_hub(hub, with_pages ? page_count() : 0, note);
+        show_hub(hub, with_pages ? pages : NULL, pages == NULL, note);
         set_line(hub, note);
     } else {
         s_line[0] = '\0';
