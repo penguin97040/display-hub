@@ -35,7 +35,8 @@
  *                             esp_ota_set_boot_partition() and restart
  *   dh_fw_trial_check_in()    on the new firmware's trial boot, for each answer from the hub
  *   dh_fw_marked_good()       after esp_ota_mark_app_valid_cancel_rollback(); save, then report
- *   dh_fw_report_next()       what to report, repeated until dh_fw_report_answered()
+ *   dh_fw_report_next()       what to report, sent again after later polls until an answer
+ *                             settles it; then dh_fw_report_answered()
  */
 #ifndef DH_UPDATE_H
 #define DH_UPDATE_H
@@ -484,11 +485,15 @@ typedef struct {
 
 /* The final report that is waiting for an answer, if any: the record's, then a refusal made from
  * the offer alone. False on a trial boot, when nothing may be sent. Send it with the running
- * firmware's version, and again later until the hub answers. */
+ * firmware's version, and again later (after the next poll, never in a loop) until an answer
+ * settles it. */
 bool dh_fw_report_next(const dh_fw_session *s, const dh_fw_record *rec, dh_fw_report *out);
 
-/* The hub answered *sent, with anything at all (even not_found): only a request that got no
- * answer leaves it to send again. Returns DH_FW_SAVE_RECORD if the record changed. */
+/* The hub's answer settled *sent: it won't be sent again. Call this only for an answer that
+ * settles a report, which dh_firmware_report_settled() in dh_hub.h decides: success, `not_found`
+ * (the hub has no such offer) and the two "set up again" errors. No answer, and every other
+ * error, leave the report waiting. (The reference display counts any answer at all.) Returns
+ * DH_FW_SAVE_RECORD if the record changed. */
 unsigned dh_fw_report_answered(dh_fw_session *s, dh_fw_record *rec, const dh_fw_report *sent);
 
 /* ---- The provisioning bundle over USB ("What each action may change") ---- */

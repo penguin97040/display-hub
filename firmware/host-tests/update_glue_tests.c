@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "dh_hub.h"
 #include "dh_json.h"
 #include "dh_update.h"
 #include "esp_err.h"
@@ -436,6 +437,14 @@ static void test_failed_saves(void)
     CHECK(!storage_fw_report_next(&report) && glue.writes[0] == '\0');
 }
 
+/* Uses up the copy storage_fw.c keeps for putting the record back, as if something else had
+ * changed the record between the save and the partition being set to boot. */
+static void record_changes_behind_its_back(void)
+{
+    (void)storage_fw_attempt_not_set_to_boot();
+    storage_fw_record()->stage = DH_FW_STAGE_PENDING;
+}
+
 /* esp_ota_set_boot_partition() fails after the record was saved. */
 static void test_not_set_to_boot(void)
 {
@@ -483,6 +492,20 @@ static void test_not_set_to_boot(void)
     CHECK(flash_record().stage == DH_FW_STAGE_PENDING && strcmp(glue.writes, "rr") == 0);
     CHECK(glue_restart(0, false));
     CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
+
+    /* The OTA data still names the running firmware, but the record in memory is no longer the
+     * one this attempt saved, so it can't be put back and ended here. The display restarts, and
+     * the start settles it from flash: nothing new is saved before that. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    glue.on_set_boot = record_changes_behind_its_back;
+    CHECK(receive() == DH_FW_REASON_NONE);
+    CHECK(!glue.set_to_boot && strcmp(glue.writes, "rr") == 0);
+    CHECK(flash_record().stage == DH_FW_STAGE_PENDING);
+    CHECK(glue_restart(0, false));
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
+    CHECK(flash_keys().security_floor == 3);
 
     /* Nothing to put back when no release is waiting. */
     fresh_display();
@@ -533,6 +556,60 @@ static void test_facts(void)
     CHECK(storage_fw_facts().last_result == DH_FW_REPORT_FAILED &&
           storage_fw_facts().last_reason == DH_FW_REASON_IMAGE_HASH);
     CHECK(storage_fw_facts().attempts_left == 4 && !storage_fw_facts().on_trial);
+
+    /* Setup over USB changes the keys or the record: a refusal remembered from before is
+     * forgotten, on the screen and for the offer, which is then looked at afresh. */
+    glue_reset();
+    glue_start(&none, &record, 0, false);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_REFUSE);
+    /* Nothing new is acted on while its report waits, and the offer itself is remembered. */
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_BUSY);
+    CHECK(storage_fw_report_next(&report));
+    storage_fw_report_answered(&report);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_IGNORE);
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_REFUSED);
+    /* A bundle is accepted: the display takes its keys (dh_usb.h writes them and takes them
+     * into memory). */
+    storage_lock();
+    *storage_fw_keys() = display_keys;
+    storage_fw_changed_by_setup();
+    storage_unlock();
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_NONE);
+    CHECK(!storage_fw_report_next(&report));
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
+
+    /* What an enrolment or a heartbeat may say about firmware: the keys and the record while
+     * they are known to match flash, and nothing once a write has failed. */
+    const dh_fw_keys *keys = NULL;
+    const dh_fw_record *rec = NULL;
+    fresh_display();
+    storage_lock();
+    CHECK(storage_fw_reportable(&keys, &rec) && keys == storage_fw_keys() &&
+          rec == storage_fw_record() && !storage_fw_stopped());
+    storage_unlock();
+    char body[DH_HUB_REQUEST_MAX];
+    dh_device_info info = {"llm-usage-display", "1.1.0", "simulated", 65536, keys, rec};
+    CHECK(dh_heartbeat_request(&info, body, sizeof body) > 0 && strstr(body, "\"firmware\":{"));
+    glue.record_write_fails = true;
+    CHECK(!storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    storage_lock();
+    CHECK(!storage_fw_reportable(&keys, &rec) && keys == NULL && rec == NULL &&
+          storage_fw_stopped());
+    storage_unlock();
+    info.keys = keys;
+    info.record = rec;
+    CHECK(dh_heartbeat_request(&info, body, sizeof body) > 0 && !strstr(body, "firmware\""));
+    CHECK(dh_enrol_request(&info, "s", 1, body, sizeof body) > 0 && !strstr(body, "firmware\""));
+    /* Storage that isn't working at all: the same. */
+    fresh_display();
+    glue.storage_unusable = true;
+    storage_lock();
+    CHECK(!storage_fw_reportable(&keys, &rec) && keys == NULL && rec == NULL);
+    storage_unlock();
 }
 
 /* ---- The trial boot ---- */

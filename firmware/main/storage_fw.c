@@ -50,6 +50,28 @@ void storage_fw_write_failed(void)
     }
 }
 
+bool storage_fw_stopped(void)
+{
+    return s_stopped;
+}
+
+void storage_fw_changed_by_setup(void)
+{
+    s_refusal_is_latest = false;
+    s_session.early_refusal = false;
+    s_session.early_answered = false;
+    s_session.early_reason = DH_FW_REASON_NONE;
+    memset(s_session.early_offer_id, 0, sizeof(s_session.early_offer_id));
+}
+
+bool storage_fw_reportable(const dh_fw_keys **keys, const dh_fw_record **record)
+{
+    const bool ok = storage_fw_usable() && !s_stopped;
+    *keys = ok ? &s_keys : NULL;
+    *record = ok ? &s_record : NULL;
+    return ok;
+}
+
 // Whether update work may go on: storage works, and no write has failed.
 static bool working(void)
 {

@@ -453,8 +453,8 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
                "hub. If it can't, this display goes back to the version it had before.";
     }
     if (fw->stopped) {
-        return "This display couldn't save to its storage, so it takes no firmware updates "
-               "until it restarts. Unplug it and plug it back in.";
+        return "This display couldn't save to its storage, so it takes no firmware updates, "
+               "and can't be set up again, until it restarts. Unplug it and plug it back in.";
     }
     switch (fw->last_result) {
     case DH_FW_REPORT_INSTALLED:
@@ -607,7 +607,7 @@ static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
 // The status screen alone, for a display that isn't set up and running: the storage problem,
 // an unreadable setup, or waiting for setup. Returns false for a display that is set up.
 static bool show_not_running(const storage_facts_t *facts, const storage_key_status_t *key,
-                             const char *note)
+                             const storage_fw_facts_t *fw, const char *note)
 {
     static char body[640];
 
@@ -637,6 +637,15 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
              NULL, note);
         return true;
     }
+    if (!facts->set_up && fw->stopped) {
+        // A write to its storage failed, so it takes no setup until it has started afresh.
+        show("Restart this display", UI_COLOUR_WARNING, NULL,
+             "This display couldn't save to its storage, so it can't be set up just now.\n\n"
+             "Unplug it and plug it back in, then choose Add a display in Display Hub on your "
+             "computer.",
+             NULL, note);
+        return true;
+    }
     if (!facts->set_up) {
         show("Waiting for setup", UI_COLOUR_TEXT, NULL,
              "Open Display Hub on your computer and choose Add a display.\n\n"
@@ -656,7 +665,7 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     s_counting = false;
     s_pages = pages;
 
-    const bool running = !show_not_running(facts, key, note);
+    const bool running = !show_not_running(facts, key, fw, note);
     const bool with_pages = running && pages != NULL && pages->has_snapshot;
     if (with_pages) {
         const bool fresh = !s_with_pages || pages->content_seq != s_drawn_content ||

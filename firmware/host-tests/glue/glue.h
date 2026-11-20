@@ -46,6 +46,9 @@ typedef struct {
      * and was reported as failed), or can't be read at all. */
     bool set_boot_lands;
     bool boot_unreadable;
+    /* Called from inside esp_ota_set_boot_partition(), before it answers: for a test to change
+     * something behind the firmware's back at that moment. */
+    void (*on_set_boot)(void);
     /* A write that would take the bytes written past this fails. */
     size_t write_fails_after;
     /* A piece that isn't in internal memory (see update.c): a write of one fails the test. */

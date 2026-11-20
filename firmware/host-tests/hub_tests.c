@@ -312,21 +312,78 @@ static void test_firmware_requests(void)
     CHECK(dh_firmware_report_request(&report, "0.1.0", out, n) == 0 && out[0] == '\0');
     CHECK(dh_firmware_report_request(&report, "0.1.0", out, n + 1) == n);
 
-    /* Which answers settle a final report. A hub that couldn't take it just now is asked
-     * again; one that says the report can never be taken is not. */
-    for (int status = 0; status <= 700; status++) {
-        bool settles = (status >= 200 && status <= 299) ||
-                    (status >= 400 && status <= 499 && status != 429);
-        if (dh_firmware_report_settled(status) != settles) {
-            FAIL("a status settles a firmware report when it shouldn't, or doesn't when it should");
+    /* Which answers settle a final report: success, "no such offer", and a hub that no longer
+     * knows this display. Everything else is sent again after a later poll. */
+    static const struct {
+        int status;
+        const char *code; /* NULL: no error body */
+        bool settles;
+    } answers[] = {
+        {200, NULL, true},
+        {204, NULL, true},
+        {299, NULL, true},
+        {204, "unavailable", true},
+        {404, "not_found", true},
+        {401, "token_revoked", true},
+        {403, "token_revoked", true},
+        {401, "unknown_device", true},
+        {404, "unknown_device", true},
+        /* A 404 that isn't the hub's own "no such offer" (a proxy's page, another code). */
+        {404, NULL, false},
+        {404, "bad_request", false},
+        {404, "a_code_from_a_newer_hub", false},
+        {400, "not_found", false},
+        /* The faults the protocol says to retry. */
+        {401, "unauthorised", false},
+        {403, "forbidden", false},
+        {400, "bad_request", false},
+        {413, "payload_too_large", false},
+        {409, "conflict", false},
+        /* A hub that couldn't take it just now, and codes this firmware doesn't know. */
+        {429, "rate_limited", false},
+        {503, "unavailable", false},
+        {500, NULL, false},
+        {502, NULL, false},
+        {400, NULL, false},
+        {401, NULL, false},
+        {418, "a_code_from_a_newer_hub", false},
+        {426, "incompatible_version", false},
+        {409, "enrolment_used", false},
+        /* Not an answer a hub gives. */
+        {302, NULL, false},
+        {199, NULL, false},
+        {0, NULL, false},
+        {-1, NULL, false},
+    };
+    for (size_t i = 0; i < sizeof answers / sizeof answers[0]; i++) {
+        char body[200] = "";
+        int len = 0;
+        if (answers[i].code != NULL) {
+            len = snprintf(body, sizeof body, "{\"error\":{\"code\":\"%s\",\"message\":\"m\"}}",
+                           answers[i].code);
+        }
+        if (dh_firmware_report_settled(answers[i].status, (const uint8_t *)body, (size_t)len) !=
+            answers[i].settles) {
+            fprintf(stderr, "status %d, code %s\n", answers[i].status,
+                    answers[i].code != NULL ? answers[i].code : "(none)");
+            FAIL("an answer settles a firmware report when it shouldn't, or the other way");
+        }
+    }
+    /* No status but a 2xx settles a report by itself, and a body may be missing altogether. */
+    for (int status = -1; status <= 700; status++) {
+        bool settles = status >= 200 && status <= 299;
+        if (dh_firmware_report_settled(status, NULL, 0) != settles ||
+            dh_firmware_report_settled(status, (const uint8_t *)"not json", 8) != settles) {
+            FAIL("a status with no error body settles a firmware report, or a 2xx doesn't");
             break;
         }
     }
-    CHECK(dh_firmware_report_settled(204) && dh_firmware_report_settled(404) &&
-          dh_firmware_report_settled(401) && dh_firmware_report_settled(400));
-    CHECK(!dh_firmware_report_settled(429) && !dh_firmware_report_settled(500) &&
-          !dh_firmware_report_settled(503) && !dh_firmware_report_settled(302) &&
-          !dh_firmware_report_settled(-1));
+    /* A body over the limit for an error answer counts as no body. */
+    static uint8_t huge[DH_MAX_HUB_ANSWER_BYTES + 1];
+    memset(huge, ' ', sizeof huge);
+    memcpy(huge, "{\"error\":{\"code\":\"not_found\",\"message\":\"m\"}}", 44);
+    CHECK(dh_firmware_report_settled(404, huge, 44));
+    CHECK(!dh_firmware_report_settled(404, huge, sizeof huge));
 
     /* The download's path. */
     char path[DH_FIRMWARE_PATH_MAX];

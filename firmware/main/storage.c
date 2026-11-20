@@ -199,12 +199,24 @@ static dh_held store_held(void *ctx)
     if (s_facts.state != STORAGE_WORKING) {
         return DH_HELD_UNKNOWN;
     }
-    return s_facts.set_up ? DH_HELD_SETUP : DH_HELD_NOTHING;
+    if (s_facts.set_up) {
+        return DH_HELD_SETUP;
+    }
+    // After a failed write of the firmware keys or the update record, what flash holds of them
+    // isn't known (storage_fw.h, "When a write fails"). A bundle would write them from memory
+    // over it, so none is taken until the display has restarted: it is answered `storage_failed`
+    // before anything is looked at or written.
+    return storage_fw_stopped() ? DH_HELD_UNKNOWN : DH_HELD_NOTHING;
 }
 
-static bool store_save_keys(void *ctx, const dh_fw_keys *keys)
+// One write of the firmware keys, for an update (storage_fw.c) or for setup over USB.
+static bool write_fw_keys(const dh_fw_keys *keys)
 {
-    (void)ctx;
+    // Never while update work is stopped, whoever asks: see store_held().
+    if (storage_fw_stopped()) {
+        ESP_LOGE(TAG, "not writing the firmware keys: updates are off until a restart");
+        return false;
+    }
     uint8_t blob[DH_FW_KEYS_BLOB_LEN];
     dh_fw_keys_encode(keys, blob);
     // Never erased if the write goes wrong: a missing set of keys would read as none.
@@ -216,17 +228,41 @@ static bool store_save_keys(void *ctx, const dh_fw_keys *keys)
     return ok;
 }
 
-static bool store_save_record(void *ctx, const dh_fw_record *record)
+static bool write_fw_record(const dh_fw_record *record)
 {
-    (void)ctx;
+    if (storage_fw_stopped()) {
+        ESP_LOGE(TAG, "not writing the update record: updates are off until a restart");
+        return false;
+    }
     uint8_t blob[DH_FW_RECORD_BLOB_LEN];
     dh_fw_record_encode(record, blob);
     // Never erased if the write goes wrong: a missing record would read as a new one, with a
     // full attempt budget.
     const bool ok = write_blob(FW_NAMESPACE, FW_KEY_RECORD, blob, sizeof(blob), false);
     if (!ok) {
-        // What flash holds now is unknown: no more update work in this run (storage_fw.h).
         storage_fw_write_failed();
+    }
+    return ok;
+}
+
+// For setup over USB (dh_usb.h). A bundle that is accepted takes its keys and refills the
+// attempt budget, so what this start remembered of an offer it refused no longer holds.
+static bool store_save_keys(void *ctx, const dh_fw_keys *keys)
+{
+    (void)ctx;
+    const bool ok = write_fw_keys(keys);
+    if (ok) {
+        storage_fw_changed_by_setup();
+    }
+    return ok;
+}
+
+static bool store_save_record(void *ctx, const dh_fw_record *record)
+{
+    (void)ctx;
+    const bool ok = write_fw_record(record);
+    if (ok) {
+        storage_fw_changed_by_setup();
     }
     return ok;
 }
@@ -234,6 +270,10 @@ static bool store_save_record(void *ctx, const dh_fw_record *record)
 static bool store_save_setup(void *ctx, const dh_setup *setup)
 {
     (void)ctx;
+    // See store_held(): no bundle is taken while update work is stopped.
+    if (storage_fw_stopped()) {
+        return false;
+    }
     const size_t len = dh_setup_encode(setup, s_blob);
     // A setup that didn't read back whole must not be left to read as "set up".
     const bool ok = len > 0 && write_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, len, true);
@@ -530,12 +570,12 @@ bool storage_fw_usable(void)
 
 bool storage_fw_write_keys(const dh_fw_keys *keys)
 {
-    return store_save_keys(NULL, keys);
+    return write_fw_keys(keys);
 }
 
 bool storage_fw_write_record(const dh_fw_record *record)
 {
-    return store_save_record(NULL, record);
+    return write_fw_record(record);
 }
 
 bool storage_image_on_trial(void)

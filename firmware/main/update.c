@@ -231,7 +231,9 @@ static void log_memory(const char *when, uint64_t read, uint64_t length)
 // esp_ota_set_boot_partition() failed after the record was saved. What happens next is decided
 // by what the OTA data really says now, not by the error:
 //  - it still names the running partition: the new image will not be started. The record goes
-//    back to an attempt, which the caller ends as failed with `flash`, and there is no restart;
+//    back to an attempt, which the caller ends as failed with `flash`, and there is no restart.
+//    (If the record can't be put back, because it is no longer the one this attempt saved, the
+//    display restarts instead and the start settles it from flash);
 //  - it names the spare partition after all (the write landed and was then reported as failed):
 //    this is an ordinary install, so restart into the trial boot;
 //  - it can't be read, or names something else: the record is left as it is (a release waiting
@@ -244,12 +246,26 @@ static bool boot_not_set(const esp_partition_t *spare, esp_err_t err)
     const esp_partition_t *boots = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
     const bool boots_spare = boots != NULL && boots->address == spare->address;
-    if (boots != NULL && running != NULL && boots->address == running->address && !boots_spare &&
-        storage_fw_attempt_not_set_to_boot()) {
+    const bool boots_running = boots != NULL && running != NULL && !boots_spare &&
+                               boots->address == running->address;
+    if (boots_running && storage_fw_attempt_not_set_to_boot()) {
         ESP_LOGE(TAG, "couldn't set the new firmware to start (%s). The display still starts "
                       "the firmware it is running, so the update ends here as failed",
                  esp_err_to_name(err));
         return false;
+    }
+    if (boots_running) {
+        // The new image won't be started, but the record in memory isn't the one this attempt
+        // saved a moment ago (something else changed it), so it can't be put back and ended
+        // here: ending it would save nothing, and the record would go on saying a release is
+        // waiting, with no new offer acted on, for the rest of this run. Flash holds the saved
+        // record, and a start settles it from there by the usual rule: this same firmware
+        // starts again, drops the release's keys and reports that the update didn't start.
+        ESP_LOGE(TAG, "couldn't set the new firmware to start (%s). The display still starts "
+                      "the firmware it is running, but the update record in memory isn't this "
+                      "attempt's any more: restarting, so it is settled from what is in flash",
+                 esp_err_to_name(err));
+        return true;
     }
     if (boots_spare) {
         ESP_LOGW(TAG, "setting the new firmware to start reported a failure (%s), but it is set: "

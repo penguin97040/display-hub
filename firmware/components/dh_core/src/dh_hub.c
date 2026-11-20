@@ -118,12 +118,23 @@ size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmwa
     return finish(&w);
 }
 
-bool dh_firmware_report_settled(int http_status)
+bool dh_firmware_report_settled(int http_status, const uint8_t *body, size_t len)
 {
     if (http_status >= 200 && http_status < 300) {
         return true;
     }
-    return http_status >= 400 && http_status < 500 && http_status != 429;
+    static const uint8_t none[1] = {0};
+    dh_response r = dh_read_error_response(http_status, body != NULL ? body : none,
+                                           body != NULL ? len : 0);
+    switch (r.error_code) {
+    case DH_ERROR_NOT_FOUND:
+        return http_status == 404;
+    case DH_ERROR_TOKEN_REVOKED:
+    case DH_ERROR_UNKNOWN_DEVICE:
+        return true;
+    default:
+        return false;
+    }
 }
 
 /* ---- The device ID and token ---- */

@@ -44,6 +44,20 @@ void storage_fw_log(void);
 // A write of the keys or the record failed somewhere else (setup over USB writes them through
 // storage.c). See "When a write fails" below.
 void storage_fw_write_failed(void);
+// Whether update work has stopped after a failed write. Setup over USB is refused then too
+// (storage.c): a bundle would write the keys and the record from memory, which may not be what
+// flash holds, over whatever flash does hold. Call it with the lock held.
+bool storage_fw_stopped(void);
+// Setup over USB has just written the keys or the record (a bundle was accepted, which takes
+// its keys and refills the attempt budget). What this start remembered about an offer it
+// refused from the offer alone no longer holds: it is forgotten, so the screen stops saying so
+// and the same offer is looked at afresh. Call it with the lock held.
+void storage_fw_changed_by_setup(void);
+// The keys and the record to report in the `firmware` member of an enrolment or a heartbeat.
+// False, and both NULL, when storage isn't working or update work has stopped: memory may then
+// not match flash, and the member is left out rather than report a guess. Call it with the lock
+// held, and use the pointers only while holding it.
+bool storage_fw_reportable(const dh_fw_keys **keys, const dh_fw_record **record);
 
 // ---- For the tasks that install updates ----
 //

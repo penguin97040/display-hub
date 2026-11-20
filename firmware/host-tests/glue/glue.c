@@ -277,6 +277,9 @@ esp_err_t esp_ota_abort(esp_ota_handle_t handle)
 
 esp_err_t esp_ota_set_boot_partition(const esp_partition_t *partition)
 {
+    if (glue.on_set_boot != NULL) {
+        glue.on_set_boot();
+    }
     if (partition != &SPARE || glue.set_boot_fails) {
         return ESP_FAIL;
     }

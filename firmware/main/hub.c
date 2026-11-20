@@ -407,14 +407,18 @@ static dh_problem ask_hub_for_download(const char *path, hub_download_answer_t *
 static size_t build_request(bool enrol)
 {
     storage_lock();
-    const bool working = storage_store() != NULL;
+    // The `firmware` member is left out when the keys and the record in memory may not be what
+    // flash holds (storage_fw_reportable), so the hub is never told a guess.
+    const dh_fw_keys *keys = NULL;
+    const dh_fw_record *record = NULL;
+    (void)storage_fw_reportable(&keys, &record);
     const dh_device_info info = {
         .device_type = USB_SETUP_DEVICE_TYPE,
         .firmware_version = s_firmware_version,
         .hardware_revision = s_hardware_revision,
         .slot_bytes = storage_spare_slot_bytes(),
-        .keys = working ? storage_fw_keys() : NULL,
-        .record = working ? storage_fw_record() : NULL,
+        .keys = keys,
+        .record = record,
     };
     const size_t len =
         enrol ? dh_enrol_request(&info, s_setup->secret, s_setup->secret_len, s_request,
@@ -654,9 +658,9 @@ static void heartbeat_if_due(void)
 // ---- Signed updates ----
 
 // Sends one firmware report. True if the hub's answer settles it (dh_firmware_report_settled):
-// success, or a refusal that sending it again can't change (`not_found` means the hub has no
-// such offer any more; a report for an offer already settled is answered 204). False if it is
-// to be sent again after a later poll: no answer, a 5xx or `rate_limited`.
+// success (a report for an offer already settled is answered 204), `not_found` (the hub has no
+// such offer any more), or a hub that no longer knows this display. False if it is to be sent
+// again after a later poll: no answer, and every other error.
 static bool send_report(const dh_fw_report *report)
 {
     const size_t len =
@@ -677,7 +681,7 @@ static bool send_report(const dh_fw_report *report)
         ESP_LOGW(TAG, "update report (%s) not sent: %s", state, dh_problem_headline(problem));
         return false;
     }
-    const bool settled = dh_firmware_report_settled(answer.status);
+    const bool settled = dh_firmware_report_settled(answer.status, s_body, answer.len);
     if (answer.status >= 200 && answer.status < 300) {
         ESP_LOGI(TAG, "update report taken: %s%s%s", state, reason != NULL ? ", " : "",
                  reason != NULL ? reason : "");
