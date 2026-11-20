@@ -48,6 +48,19 @@ wifi_link_t wifi_link(void);
 uint32_t wifi_drops(void);
 // The driver's reason number for the last one (wifi_err_reason_t), for the log.
 unsigned wifi_last_reason(void);
+// The signal strength the driver reported with it, in dBm, or 0 if it gave none (a join this
+// firmware gave up on, an address that lapsed).
+int wifi_last_rssi(void);
+// What a reason number from a failed join usually means, in a few words, for the log.
+const char *wifi_reason_words(unsigned reason);
+
+// After a failed join, looks for the network's access points and logs one line for each (its
+// channel, signal, security and Wi-Fi standards, never its name or address), so the console
+// shows what the display can actually hear. Blocks for a few seconds. Only when the radio is on
+// and the link is down: never while a join is under way.
+void wifi_log_survey(void);
+// Logs the signal, channel and security of the access point just joined.
+void wifi_log_joined(void);
 
 #ifdef __cplusplus
 }

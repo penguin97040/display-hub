@@ -18,6 +18,7 @@
 #include "hub.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "dh_hub.h"
@@ -589,6 +590,7 @@ static void start_wifi_again(void)
 static bool wifi_ready(void)
 {
     int64_t now = now_ms();
+    bool join_failed = false;
     const uint32_t drops = wifi_drops();
     if (drops != s.wifi_drops_seen) {
         s.wifi_drops_seen = drops;
@@ -600,9 +602,18 @@ static bool wifi_ready(void)
             ESP_LOGW(TAG, "Wi-Fi dropped (reason %u); joining again", wifi_last_reason());
         } else {
             const uint32_t wait = wifi_failed();
-            ESP_LOGW(TAG, "couldn't join Wi-Fi (reason %u, %" PRIu32 " in a row); trying again "
-                          "in %" PRIu32 " s",
-                     wifi_last_reason(), s.wifi_failures, wait / 1000);
+            const unsigned reason = wifi_last_reason();
+            const int rssi = wifi_last_rssi();
+            char signal[16];
+            if (rssi != 0) {
+                snprintf(signal, sizeof(signal), "%d dBm", rssi);
+            } else {
+                snprintf(signal, sizeof(signal), "unknown");
+            }
+            ESP_LOGW(TAG, "couldn't join Wi-Fi (reason %u: %s; signal %s; %" PRIu32 " in a row); "
+                          "trying again in %" PRIu32 " s",
+                     reason, wifi_reason_words(reason), signal, s.wifi_failures, wait / 1000);
+            join_failed = true;
         }
     }
 
@@ -612,6 +623,7 @@ static bool wifi_ready(void)
             s.wifi_was_up = true;
             s.wifi_failures = 0;
             ESP_LOGI(TAG, "joined Wi-Fi and was given an address");
+            wifi_log_joined();
             // Straight to the hub, unless the last answer said to wait (the hub is busy, the
             // display needs setting up again): Wi-Fi coming back doesn't change those, so what
             // the screen said about them is shown again.
@@ -648,6 +660,12 @@ static bool wifi_ready(void)
         }
     } else if (s.state != HUB_JOINING_WIFI) {
         show_wifi(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
+    }
+    // Once for each failed join, after the screen has been told, and inside the wait before the
+    // next try (at least 12 s): the link is down here and only this task starts a join, so the
+    // scan can't overlap one.
+    if (join_failed) {
+        wifi_log_survey();
     }
     now = now_ms();
     if (now >= s.wifi_retry_ms) {

@@ -3,9 +3,11 @@
 #include "wifi.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -24,6 +26,11 @@ static bool s_started;
 static atomic_int s_link = WIFI_LINK_DOWN;
 static atomic_uint s_drops;
 static atomic_uint s_reason;
+static atomic_int s_rssi;
+
+// At most this many access points are logged after a failed join: plenty for one network, and
+// each record is about 90 bytes.
+#define SURVEY_MAX_APS 10
 
 // Runs on the system's event task, which has a small stack: record and wake, nothing more.
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -39,6 +46,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         }
         const wifi_event_sta_disconnected_t *event = data;
         atomic_store(&s_reason, event != NULL ? event->reason : 0u);
+        atomic_store(&s_rssi, event != NULL ? event->rssi : 0);
         atomic_store(&s_link, WIFI_LINK_DOWN);
         atomic_fetch_add(&s_drops, 1u);
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
@@ -53,6 +61,7 @@ static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
             return;
         }
         atomic_store(&s_reason, 0u);
+        atomic_store(&s_rssi, 0);
         atomic_store(&s_link, WIFI_LINK_DOWN);
         atomic_fetch_add(&s_drops, 1u);
         esp_wifi_disconnect();
@@ -191,6 +200,7 @@ void wifi_give_up(void)
     // Count it here: the driver only reports a disconnection if it had got as far as the
     // access point.
     atomic_store(&s_reason, 0u);
+    atomic_store(&s_rssi, 0);
     atomic_store(&s_link, WIFI_LINK_DOWN);
     atomic_fetch_add(&s_drops, 1u);
     esp_wifi_disconnect();
@@ -232,4 +242,206 @@ uint32_t wifi_drops(void)
 unsigned wifi_last_reason(void)
 {
     return atomic_load(&s_reason);
+}
+
+int wifi_last_rssi(void)
+{
+    return atomic_load(&s_rssi);
+}
+
+const char *wifi_reason_words(unsigned reason)
+{
+    switch (reason) {
+    case 0:
+        return "no answer in time";
+    case WIFI_REASON_AUTH_EXPIRE:
+        return "no answer from the access point while authenticating";
+    case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+    case WIFI_REASON_HANDSHAKE_TIMEOUT:
+        return "the password handshake failed, often a wrong password";
+    case WIFI_REASON_NO_AP_FOUND:
+        return "network not found";
+    case WIFI_REASON_CONNECTION_FAIL:
+        return "connection failed";
+    case WIFI_REASON_NO_AP_FOUND_W_COMPATIBLE_SECURITY:
+    case WIFI_REASON_NO_AP_FOUND_IN_AUTHMODE_THRESHOLD:
+        return "no access point with acceptable security";
+    default:
+        return "other";
+    }
+}
+
+static const char *auth_words(wifi_auth_mode_t mode)
+{
+    switch (mode) {
+    case WIFI_AUTH_OPEN:
+        return "open";
+    case WIFI_AUTH_WEP:
+        return "WEP";
+    case WIFI_AUTH_WPA_PSK:
+        return "WPA-PSK";
+    case WIFI_AUTH_WPA2_PSK:
+        return "WPA2-PSK";
+    case WIFI_AUTH_WPA_WPA2_PSK:
+        return "WPA/WPA2-PSK";
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+        return "WPA2/WPA3 mixed";
+    case WIFI_AUTH_WPA3_PSK:
+    case WIFI_AUTH_WPA3_EXT_PSK:
+    case WIFI_AUTH_WPA3_EXT_PSK_MIXED_MODE:
+        return "WPA3-SAE";
+    case WIFI_AUTH_OWE:
+        return "OWE";
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+    case WIFI_AUTH_WPA3_ENT_192:
+    case WIFI_AUTH_WPA3_ENTERPRISE:
+    case WIFI_AUTH_WPA2_WPA3_ENTERPRISE:
+    case WIFI_AUTH_WPA_ENTERPRISE:
+        return "enterprise";
+    default:
+        return "other";
+    }
+}
+
+static const char *cipher_words(wifi_cipher_type_t cipher)
+{
+    switch (cipher) {
+    case WIFI_CIPHER_TYPE_NONE:
+        return "none";
+    case WIFI_CIPHER_TYPE_WEP40:
+    case WIFI_CIPHER_TYPE_WEP104:
+        return "WEP";
+    case WIFI_CIPHER_TYPE_TKIP:
+        return "TKIP";
+    case WIFI_CIPHER_TYPE_CCMP:
+        return "CCMP";
+    case WIFI_CIPHER_TYPE_TKIP_CCMP:
+        return "TKIP+CCMP";
+    case WIFI_CIPHER_TYPE_GCMP:
+        return "GCMP";
+    case WIFI_CIPHER_TYPE_GCMP256:
+        return "GCMP-256";
+    default:
+        return "other";
+    }
+}
+
+// The Wi-Fi standards an access point offers, as "b/g/n/ax" (or "none").
+static void phy_words(const wifi_ap_record_t *ap, char *out, size_t size)
+{
+    size_t at = 0;
+    out[0] = '\0';
+    const struct {
+        bool on;
+        const char *name;
+    } flags[] = {
+        {ap->phy_11b, "b"}, {ap->phy_11g, "g"}, {ap->phy_11n, "n"},
+        {ap->phy_11ax, "ax"}, {ap->phy_lr, "LR"},
+    };
+    for (size_t i = 0; i < sizeof(flags) / sizeof(flags[0]) && at < size; i++) {
+        if (flags[i].on) {
+            const int n = snprintf(out + at, size - at, "%s%s", at > 0 ? "/" : "", flags[i].name);
+            if (n < 0) {
+                break;
+            }
+            at += (size_t)n;
+        }
+    }
+    if (at == 0) {
+        snprintf(out, size, "none");
+    }
+}
+
+static void log_ap(const char *what, const wifi_ap_record_t *ap)
+{
+    char phy[24];
+    phy_words(ap, phy, sizeof(phy));
+    ESP_LOGI(TAG, "%s: channel %u, %d dBm, %s, cipher %s, 802.11%s", what, (unsigned)ap->primary,
+             (int)ap->rssi, auth_words(ap->authmode), cipher_words(ap->pairwise_cipher), phy);
+}
+
+void wifi_log_survey(void)
+{
+    // A scan while a join is under way is refused by the driver (ESP_ERR_WIFI_STATE), and one
+    // while joined would only tell us about the link we have.
+    if (!s_started || atomic_load(&s_link) != WIFI_LINK_DOWN) {
+        return;
+    }
+    // The network's name, from the driver: the hub task wiped its own copy once Wi-Fi started.
+    // The driver's config holds the password too, so it is static (as in wifi_start) and wiped
+    // as soon as the name has been copied out.
+    static wifi_config_t config;
+    uint8_t ssid[sizeof(config.sta.ssid) + 1];
+    memset(ssid, 0, sizeof(ssid));
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_STA, &config);
+    if (err == ESP_OK) {
+        memcpy(ssid, config.sta.ssid, sizeof(config.sta.ssid));
+    }
+    dh_wipe(&config, sizeof(config));
+    if (err != ESP_OK || ssid[0] == 0) {
+        dh_wipe(ssid, sizeof(ssid));
+        ESP_LOGW(TAG, "couldn't look for the network: %s",
+                 err != ESP_OK ? esp_err_to_name(err) : "no network name in the driver");
+        return;
+    }
+
+    // Every channel, asking for this name only, so a hidden network answers too. About 13
+    // channels at up to 250 ms each.
+    wifi_scan_config_t scan;
+    memset(&scan, 0, sizeof(scan));
+    scan.ssid = ssid;
+    scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    scan.scan_time.active.min = 100;
+    scan.scan_time.active.max = 250;
+    err = esp_wifi_scan_start(&scan, true);
+    dh_wipe(ssid, sizeof(ssid));
+    if (err != ESP_OK) {
+        // Nothing was found, so there is no list to free.
+        ESP_LOGW(TAG, "couldn't look for the network: %s", esp_err_to_name(err));
+        return;
+    }
+
+    uint16_t found = 0;
+    esp_wifi_scan_get_ap_num(&found);
+    // PSRAM if there is any, so the internal memory is left for Wi-Fi and TLS.
+    wifi_ap_record_t *aps = heap_caps_calloc(SURVEY_MAX_APS, sizeof(*aps),
+                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (aps == NULL) {
+        aps = heap_caps_calloc(SURVEY_MAX_APS, sizeof(*aps), MALLOC_CAP_DEFAULT);
+    }
+    uint16_t count = SURVEY_MAX_APS;
+    // Either call frees the driver's whole list.
+    err = aps != NULL ? esp_wifi_scan_get_ap_records(&count, aps) : ESP_ERR_NO_MEM;
+    if (err != ESP_OK) {
+        esp_wifi_clear_ap_list();
+        ESP_LOGW(TAG, "%u access points for this network, but their details couldn't be read: %s",
+                 (unsigned)found, esp_err_to_name(err));
+    } else if (count == 0) {
+        ESP_LOGI(TAG, "no access points for this network found on 2.4 GHz");
+    } else {
+        unsigned strongest = 0;
+        for (uint16_t i = 0; i < count; i++) {
+            log_ap("access point for this network", &aps[i]);
+            if (aps[i].rssi > aps[strongest].rssi) {
+                strongest = i;
+            }
+        }
+        ESP_LOGI(TAG, "%u access points for this network; strongest %d dBm on channel %u",
+                 (unsigned)found, (int)aps[strongest].rssi, (unsigned)aps[strongest].primary);
+    }
+    if (aps != NULL) {
+        // Each record holds the network's name and the access point's address.
+        dh_wipe(aps, SURVEY_MAX_APS * sizeof(*aps));
+        heap_caps_free(aps);
+    }
+}
+
+void wifi_log_joined(void)
+{
+    // Holds the network's name and the access point's address: static, and wiped below.
+    static wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        log_ap("joined an access point", &ap);
+    }
+    dh_wipe(&ap, sizeof(ap));
 }

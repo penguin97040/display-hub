@@ -90,13 +90,27 @@ static void show(const char *title, lv_color_t title_colour, const char *number,
                   "display in Display Hub on your computer."
 #define RETRYING  "It keeps trying by itself."
 
-// What to do about a problem, in plain words. The headline is dh_problem_headline()'s.
+// The headline for a problem: dh_problem_headline()'s, except when the trouble is Wi-Fi, which
+// is kept apart from what the hub last said.
+static const char *headline(const hub_status_t *hub)
+{
+    switch (hub->detail) {
+    case HUB_DETAIL_WIFI:
+    case HUB_DETAIL_WIFI_START:
+    case HUB_DETAIL_NO_WIFI_DETAILS:
+        return "Can't join Wi-Fi";
+    default:
+        return dh_problem_headline(hub->problem);
+    }
+}
+
+// What to do about a problem, in plain words, under headline()'s headline.
 static const char *advice(const hub_status_t *hub)
 {
     switch (hub->detail) {
     case HUB_DETAIL_WIFI:
-        return "This display can't join the Wi-Fi network. Check the network is on and in "
-               "range. " RETRYING "\n\n"
+        return "This display can't join the Wi-Fi network. It uses 2.4 GHz Wi-Fi only, so check "
+               "the network offers 2.4 GHz and is in range. " RETRYING "\n\n"
                "If the network's name or password has changed, " RESET_HOW;
     case HUB_DETAIL_WIFI_START:
         return "This display's Wi-Fi didn't start. " RETRYING "\n\n"
@@ -204,7 +218,7 @@ static void show_hub(const hub_status_t *hub, const char *note)
                  hub->has_snapshot && hub->state == HUB_TROUBLE
                      ? "\n\nShowing the last pages it was sent."
                      : "");
-        show(dh_problem_headline(hub->problem),
+        show(headline(hub),
              hub->problem == DH_PROBLEM_WRONG_HUB ? COLOUR_BAD : COLOUR_WARNING, NULL, body, pages,
              note);
         return;
