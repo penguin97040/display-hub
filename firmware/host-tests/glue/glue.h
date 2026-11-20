@@ -17,11 +17,17 @@ typedef struct {
     size_t body_len;
     /* The most one read hands out. */
     size_t piece;
-    /* After the body: true, the connection stays open and sends nothing (each read waits five
-     * seconds and gives nothing); false, it has ended. */
+    /* After the body: true, the connection stays open and sends nothing (each read waits 50 ms
+     * and gives nothing); false, it has ended. */
     bool stalls;
-    /* How long a read that gives bytes takes. */
+    /* How long a read that gives bytes takes, and how much longer for each byte it gives (a hub
+     * that trickles: the firmware can't cut one read short). */
     int64_t read_takes_us;
+    int64_t read_takes_us_per_byte;
+    /* After each read that gives bytes, the next gives nothing for 50 ms, once: bytes that
+     * arrive in bursts. */
+    bool pauses;
+    bool paused;
     /* How many bytes have been handed out, and the most that were ever asked for at once. */
     size_t handed;
     size_t most_asked;
@@ -36,6 +42,10 @@ typedef struct {
     bool begin_fails;
     bool end_fails;
     bool set_boot_fails;
+    /* With set_boot_fails: the OTA data names the spare partition all the same (the write landed
+     * and was reported as failed), or can't be read at all. */
+    bool set_boot_lands;
+    bool boot_unreadable;
     /* A write that would take the bytes written past this fails. */
     size_t write_fails_after;
     /* A piece that isn't in internal memory (see update.c): a write of one fails the test. */
@@ -55,9 +65,11 @@ typedef struct {
 
     /* ---- Storage: what storage.c provides to storage_fw.c, with flash as two arrays ---- */
     bool storage_unusable;
-    /* Writes of the keys, or of the record, fail from now on. */
+    /* Writes of the keys, or of the record, fail from now on. With failed_write_lands, a write
+     * that fails has reached flash all the same (committed, then read back wrong). */
     bool keys_write_fails;
     bool record_write_fails;
+    bool failed_write_lands;
     uint8_t flash_keys[DH_FW_KEYS_BLOB_LEN];
     uint8_t flash_record[DH_FW_RECORD_BLOB_LEN];
     unsigned keys_writes;

@@ -12,6 +12,7 @@ typedef enum {
 
 typedef struct {
     esp_partition_subtype_t subtype;
+    uint32_t address;
     uint32_t size;
     char label[17];
 } esp_partition_t;

@@ -187,14 +187,32 @@ void vTaskDelete(TaskHandle_t task)
 
 /* ---- esp_ota_ops.h: the spare partition is an array ---- */
 
-static const esp_partition_t SPARE = {ESP_PARTITION_SUBTYPE_APP_OTA_1, 6u * 1024u * 1024u,
-                                      "ota_1"};
+static const esp_partition_t RUNNING = {ESP_PARTITION_SUBTYPE_APP_OTA_0, 0x20000,
+                                        6u * 1024u * 1024u, "ota_0"};
+static const esp_partition_t SPARE = {ESP_PARTITION_SUBTYPE_APP_OTA_1, 0x620000,
+                                      6u * 1024u * 1024u, "ota_1"};
 #define OTA_HANDLE 7u
 
 const esp_partition_t *esp_ota_get_next_update_partition(const esp_partition_t *start_from)
 {
     (void)start_from;
     return &SPARE;
+}
+
+const esp_partition_t *esp_ota_get_running_partition(void)
+{
+    return &RUNNING;
+}
+
+const esp_partition_t *esp_ota_get_boot_partition(void)
+{
+    /* Copies, as ESP-IDF may hand out: only what they say can be compared. */
+    static esp_partition_t boots;
+    if (glue.boot_unreadable) {
+        return NULL;
+    }
+    boots = glue.set_to_boot || (glue.set_boot_fails && glue.set_boot_lands) ? SPARE : RUNNING;
+    return &boots;
 }
 
 esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size,
@@ -299,12 +317,17 @@ int hub_http_download_read(hub_download_t *download, uint8_t *out, size_t cap)
         glue.read_past_the_form = true;
     }
     size_t left = glue.body_len - glue.handed;
+    if (glue.pauses && glue.paused && left > 0) {
+        glue.paused = false;
+        glue.now_us += 50000;
+        return 0;
+    }
     if (left == 0) {
         if (!glue.stalls) {
             return -1;
         }
         /* One wait that ran out with nothing read. */
-        glue.now_us += 5000000;
+        glue.now_us += 50000;
         return 0;
     }
     size_t n = left < cap ? left : cap;
@@ -313,7 +336,8 @@ int hub_http_download_read(hub_download_t *download, uint8_t *out, size_t cap)
     }
     memcpy(out, glue.body + glue.handed, n);
     glue.handed += n;
-    glue.now_us += glue.read_takes_us;
+    glue.paused = true;
+    glue.now_us += glue.read_takes_us + (int64_t)n * glue.read_takes_us_per_byte;
     return (int)n;
 }
 
@@ -350,6 +374,9 @@ bool storage_fw_write_keys(const dh_fw_keys *keys)
         glue.lock_misused = true;
     }
     if (glue.keys_write_fails) {
+        if (glue.failed_write_lands) {
+            dh_fw_keys_encode(keys, glue.flash_keys);
+        }
         return false;
     }
     dh_fw_keys_encode(keys, glue.flash_keys);
@@ -364,6 +391,9 @@ bool storage_fw_write_record(const dh_fw_record *record)
         glue.lock_misused = true;
     }
     if (glue.record_write_fails) {
+        if (glue.failed_write_lands) {
+            dh_fw_record_encode(record, glue.flash_record);
+        }
         return false;
     }
     dh_fw_record_encode(record, glue.flash_record);

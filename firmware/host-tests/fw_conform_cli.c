@@ -355,6 +355,8 @@ static void run_package(dh_json_value root, size_t piece)
         glue.body = body;
         glue.body_len = body_len;
         glue.piece = piece;
+        /* A pause after every read, so the update core is handed pieces of this size too. */
+        glue.pauses = true;
         glue.stalls = strcmp(after_body, "stalls") == 0;
         glue.may_read = has_length ? content_length : 0;
         glue.keep_next_free = true;

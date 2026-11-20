@@ -14,10 +14,20 @@
 //   the response chunked when there is no Content-Length above zero (line 1608), so "chunked" is
 //   also how a missing length reads; esp_http_client_read() never asks the transport for more
 //   than the caller wants or the receive buffer holds, stops at the Content-Length, and answers
-//   -ESP_ERR_HTTP_EAGAIN when a wait runs out with nothing read (line 1403).
+//   -ESP_ERR_HTTP_EAGAIN when a wait runs out with nothing read (line 1403). But it reads the
+//   connection again and again until it has all it was asked for.
+// - esp-tls/esp_tls.c and mbedtls/port/net_sockets.c, for a download: the socket is a blocking
+//   one whose every recv() waits up to the connect timeout (SO_RCVTIMEO, esp_tls.c line 306),
+//   and Mbed TLS calls recv() until it has a whole TLS record, however slowly its bytes come.
+//   So one read of a blocking connection can't be bounded from outside. With the socket made
+//   non-blocking (esp_http_client_get_socket() hands it out), a record that isn't all there
+//   yet reads as "nothing yet" (net_sockets.c line 354, transport_ssl.c line 277), Mbed TLS
+//   keeps what it has, and the read comes straight back. hub_http_download_open() does that
+//   once the headers are in.
 
 #include "hub_http.h"
 
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,9 +48,18 @@ static const char *TAG = "hub-http";
 // The hub's response headers are a few hundred bytes; the request's are under 400.
 #define RX_BUFFER_BYTES 2048
 #define TX_BUFFER_BYTES 1024
-// How long one read of a download waits before it hands back to the caller, which keeps the
-// download's own time limits and looks for a factory reset in between.
-#define DOWNLOAD_STEP_TIMEOUT_MS 5000
+// How long one read of a download's connection waits for bytes before esp_http_client_read()
+// hands back to the caller, which keeps the download's own time limits and looks for a factory
+// reset in between. It is short because that call reads the connection again and again until it
+// has all it was asked for, and gives up only when one of those reads waits this long for
+// nothing: see update.c, "How long one read can take".
+#define DOWNLOAD_STEP_TIMEOUT_MS 50
+// ESP-IDF's own log tags for the connection. With a non-blocking socket they print an error
+// each time part of a TLS record has arrived and the rest hasn't, which is many times a
+// download and means nothing. They are turned off while a download is read; what goes wrong
+// is logged here and in update.c.
+#define TRANSPORT_LOG_TAG   "transport_base"
+#define HTTP_CLIENT_LOG_TAG "HTTP_CLIENT"
 
 static bool stopped(const hub_request_t *request)
 {
@@ -216,10 +235,21 @@ hub_answer_t hub_http_request(const hub_request_t *request)
 
 // ---- A firmware download ----
 
-// A download is its connection and nothing else.
+// A download is its connection, and the log levels to put back when it is closed.
 struct hub_download {
     esp_http_client_handle_t client;
+    esp_log_level_t transport_level;
+    esp_log_level_t http_client_level;
 };
+
+// Makes the connection's socket non-blocking, so no read of it can be held open by a hub that
+// sends a TLS record a byte at a time (see the top of this file).
+static bool make_non_blocking(esp_http_client_handle_t client)
+{
+    const int fd = esp_http_client_get_socket(client);
+    const int flags = fd >= 0 ? fcntl(fd, F_GETFL, 0) : -1;
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
 
 hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_download_t **out)
 {
@@ -250,9 +280,14 @@ hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_d
             answer.status = status;
             answer.has_length = content_length > 0 && !esp_http_client_is_chunked_response(client);
             answer.length = answer.has_length ? (uint64_t)content_length : 0;
-            // Shorter waits from here, so the caller's own time limits are looked at often.
-            keep = whole = esp_http_client_set_timeout_ms(client, DOWNLOAD_STEP_TIMEOUT_MS) ==
-                           ESP_OK;
+            // Short waits and a non-blocking socket from here, so no read can be held open and
+            // the caller's own time limits are looked at often.
+            keep = whole = make_non_blocking(client) &&
+                           esp_http_client_set_timeout_ms(client, DOWNLOAD_STEP_TIMEOUT_MS) ==
+                               ESP_OK;
+            if (!keep) {
+                ESP_LOGE(TAG, "couldn't ready the connection for a download");
+            }
         } else {
             // An error answer, read like any other.
             hub_answer_t error = {.result = DH_TRY_NO_ANSWER};
@@ -268,6 +303,10 @@ hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_d
         hub_download_t *download = calloc(1, sizeof(*download));
         if (download != NULL) {
             download->client = client;
+            download->transport_level = esp_log_level_get(TRANSPORT_LOG_TAG);
+            download->http_client_level = esp_log_level_get(HTTP_CLIENT_LOG_TAG);
+            esp_log_level_set(TRANSPORT_LOG_TAG, ESP_LOG_NONE);
+            esp_log_level_set(HTTP_CLIENT_LOG_TAG, ESP_LOG_NONE);
             *out = download;
             answer.result = DH_TRY_ANSWERED;
             return answer;
@@ -310,5 +349,7 @@ void hub_http_download_close(hub_download_t *download)
     }
     esp_http_client_close(download->client);
     esp_http_client_cleanup(download->client);
+    esp_log_level_set(TRANSPORT_LOG_TAG, download->transport_level);
+    esp_log_level_set(HTTP_CLIENT_LOG_TAG, download->http_client_level);
     free(download);
 }

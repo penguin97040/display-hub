@@ -89,6 +89,13 @@ size_t dh_firmware_path(const char *package_id, char *out, size_t cap);
 size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmware_version,
                                   char *out, size_t cap);
 
+/* Whether the hub's answer to a final report settles it, so it isn't sent again: any 2xx (a hub
+ * answers 204, also for an offer already settled), and any 4xx but 429, which sending the same
+ * report again can't change (`not_found`: the hub has no such offer; a token it no longer
+ * takes; a report it can't read). A 5xx, a 429 (`rate_limited`) and anything else are a hub
+ * that couldn't take it just now: like no answer at all, the report is sent again later. */
+bool dh_firmware_report_settled(int http_status);
+
 /* ---- The device ID and token ---- */
 
 #define DH_DEVICE_MAX_ID_BYTES 64u

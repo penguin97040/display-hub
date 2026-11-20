@@ -207,7 +207,13 @@ static bool store_save_keys(void *ctx, const dh_fw_keys *keys)
     (void)ctx;
     uint8_t blob[DH_FW_KEYS_BLOB_LEN];
     dh_fw_keys_encode(keys, blob);
-    return write_blob(FW_NAMESPACE, FW_KEY_KEYS, blob, sizeof(blob), false);
+    // Never erased if the write goes wrong: a missing set of keys would read as none.
+    const bool ok = write_blob(FW_NAMESPACE, FW_KEY_KEYS, blob, sizeof(blob), false);
+    if (!ok) {
+        // What flash holds now is unknown: no more update work in this run (storage_fw.h).
+        storage_fw_write_failed();
+    }
+    return ok;
 }
 
 static bool store_save_record(void *ctx, const dh_fw_record *record)
@@ -215,7 +221,14 @@ static bool store_save_record(void *ctx, const dh_fw_record *record)
     (void)ctx;
     uint8_t blob[DH_FW_RECORD_BLOB_LEN];
     dh_fw_record_encode(record, blob);
-    return write_blob(FW_NAMESPACE, FW_KEY_RECORD, blob, sizeof(blob), false);
+    // Never erased if the write goes wrong: a missing record would read as a new one, with a
+    // full attempt budget.
+    const bool ok = write_blob(FW_NAMESPACE, FW_KEY_RECORD, blob, sizeof(blob), false);
+    if (!ok) {
+        // What flash holds now is unknown: no more update work in this run (storage_fw.h).
+        storage_fw_write_failed();
+    }
+    return ok;
 }
 
 static bool store_save_setup(void *ctx, const dh_setup *setup)

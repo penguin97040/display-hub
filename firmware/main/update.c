@@ -21,6 +21,27 @@
 //   to go back to, and esp_ota_mark_app_invalid_rollback_and_reboot() finds it. A reset of any
 //   kind on a trial boot makes the bootloader mark the image aborted and start the other.
 //
+// HOW LONG ONE READ CAN TAKE. Two things in ESP-IDF stand between a download and its time limits,
+// and neither can be interrupted from outside once it has been called:
+// - Mbed TLS reads the socket until it has a whole TLS record, and on the blocking socket
+//   esp-tls sets up each of those reads may wait 10 seconds for one byte. hub_http.c makes the
+//   download's socket non-blocking, so a record that isn't all there yet reads as "nothing yet"
+//   and the call comes straight back (what was read in ESP-IDF for that is at the top of
+//   hub_http.c);
+// - esp_http_client_read() (esp_http_client.c, line 1346) reads the connection again until it
+//   has every byte it was asked for, and stops early only when one of those reads waits its
+//   whole timeout for nothing. So a hub that sends tiny whole records, each just inside the
+//   timeout, can hold one call open for (bytes asked for) x (timeout).
+// So each call asks for at most READ_BYTES (256) with a timeout of 50 ms (hub_http.c,
+// DOWNLOAD_STEP_TIMEOUT_MS): one call can take 12.8 seconds at the very worst. The two time
+// limits and a factory reset are looked at between calls, so that is how far past the 30
+// seconds, the 15 minutes or a factory reset a download can run, and only against a hub that
+// trickles bytes on purpose; a hub that simply goes quiet is seen within 50 ms. An honest
+// download isn't slowed: the hub's TLS records are up to 4 KiB, a read never waits while part
+// of a decrypted record is still in hand (tcp_transport/transport_ssl.c, base_poll_read, line
+// 173), and sixteen short calls a record cost microseconds beside the 45 ms a flash sector
+// takes.
+//
 // WHAT A FLASH WRITE DOES TO EVERYTHING ELSE. This firmware runs from flash (not from PSRAM:
 // CONFIG_SPIRAM_XIP_FROM_PSRAM is off), so while a sector is erased or written the cache is off
 // and both cores stop running anything that isn't in internal memory. Each erase of a sector
@@ -58,6 +79,11 @@ static const char *TAG = "update";
 #define PIECE_BYTES 4096
 static uint8_t s_piece[PIECE_BYTES];
 
+// How many bytes one read of the connection asks for: see "How long one read can take" at the
+// top. Reads go on filling s_piece until it is full, so the flash is still written a sector's
+// worth at a time.
+#define READ_BYTES 256
+
 // How often a download's progress, and the internal memory left, are logged.
 #define PROGRESS_EVERY_BYTES (256u * 1024u)
 
@@ -90,8 +116,11 @@ static void roll_back(void)
     const esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
     if (err == ESP_ERR_OTA_ROLLBACK_FAILED) {
         // No other image passes its check. Restarting would only start this one again, so it
-        // stays as it is: on trial, sending no heartbeat and no report.
-        ESP_LOGE(TAG, "there is no other firmware to go back to: carrying on, still on trial");
+        // carries on. It is the only firmware that works, so from now on the first answer from
+        // the hub marks it good, however late (update_trial_check_in).
+        ESP_LOGE(TAG, "there is no other firmware to go back to: carrying on with this one, "
+                      "which is marked good as soon as it reaches the hub");
+        storage_fw_trial_no_way_back();
         return;
     }
     // The OTA data couldn't be written. A restart does the same job: the bootloader takes an
@@ -124,7 +153,7 @@ static void trial_task(void *arg)
         const dh_fw_session on_trial = {.trial = true};
         if (dh_fw_trial_tick(&on_trial, uptime_seconds()) == DH_FW_TRIAL_ROLL_BACK) {
             roll_back();
-            // Nothing to go back to: stop asking.
+            // Nothing to go back to: the clock has nothing more to do.
             xSemaphoreGive(s_trial_lock);
             break;
         }
@@ -199,6 +228,41 @@ static void log_memory(const char *when, uint64_t read, uint64_t length)
              (unsigned)(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL) / 1024));
 }
 
+// esp_ota_set_boot_partition() failed after the record was saved. What happens next is decided
+// by what the OTA data really says now, not by the error:
+//  - it still names the running partition: the new image will not be started. The record goes
+//    back to an attempt, which the caller ends as failed with `flash`, and there is no restart;
+//  - it names the spare partition after all (the write landed and was then reported as failed):
+//    this is an ordinary install, so restart into the trial boot;
+//  - it can't be read, or names something else: the record is left as it is (a release waiting
+//    for its trial boot) and the display restarts. Whichever image the bootloader starts then
+//    settles it by the update core's rules: the new one on trial has its record, and the old one
+//    reports that the update didn't start.
+// Returns whether the display must restart. False: the attempt has ended as failed.
+static bool boot_not_set(const esp_partition_t *spare, esp_err_t err)
+{
+    const esp_partition_t *boots = esp_ota_get_boot_partition();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const bool boots_spare = boots != NULL && boots->address == spare->address;
+    if (boots != NULL && running != NULL && boots->address == running->address && !boots_spare &&
+        storage_fw_attempt_not_set_to_boot()) {
+        ESP_LOGE(TAG, "couldn't set the new firmware to start (%s). The display still starts "
+                      "the firmware it is running, so the update ends here as failed",
+                 esp_err_to_name(err));
+        return false;
+    }
+    if (boots_spare) {
+        ESP_LOGW(TAG, "setting the new firmware to start reported a failure (%s), but it is set: "
+                      "restarting into it on trial",
+                 esp_err_to_name(err));
+    } else {
+        ESP_LOGE(TAG, "couldn't set the new firmware to start (%s), and can't tell which "
+                      "firmware starts next: restarting, so that whichever starts settles it",
+                 esp_err_to_name(err));
+    }
+    return true;
+}
+
 dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device,
                             uint64_t offer_size, bool has_length, uint64_t length,
                             int64_t started_ms, bool (*stop)(void))
@@ -230,97 +294,122 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     const uint64_t started_s = (uint64_t)(started_ms / 1000);
     uint64_t last_byte_s = uptime_seconds();
     uint64_t logged_at = 0;
+    // How much of s_piece is filled and not yet handed to the update core.
+    size_t filled = 0;
 
     while (!finished && reason == DH_FW_REASON_NONE) {
+        // The setup, and both time limits, are looked at before every read (see "How long one
+        // read can take" at the top).
         if (stop != NULL && stop()) {
             ESP_LOGW(TAG, "the setup has gone: giving the download up");
             reason = dh_fw_download_fail(d, DH_FW_REASON_DOWNLOAD);
             break;
         }
-        if (dh_fw_download_overdue(started_s, last_byte_s, uptime_seconds())) {
+        const bool overdue = dh_fw_download_overdue(started_s, last_byte_s, uptime_seconds());
+        // Never ask the connection for a byte past the update form.
+        const uint64_t left = length - dh_fw_download_bytes_read(d) - filled;
+        size_t got = 0;
+        bool ended = false;
+        if (!overdue && left > 0 && filled < sizeof(s_piece)) {
+            size_t want = sizeof(s_piece) - filled;
+            if (want > READ_BYTES) {
+                want = READ_BYTES;
+            }
+            if ((uint64_t)want > left) {
+                want = (size_t)left;
+            }
+            const int read = hub_http_download_read(download, s_piece + filled, want);
+            if (read < 0) {
+                ended = true;
+            } else if (read > 0) {
+                got = (size_t)read;
+                filled += got;
+                last_byte_s = uptime_seconds();
+            }
+        }
+        // A piece goes to the update core when it is full or holds the last of the form, and
+        // also when nothing more is coming just now, so what has arrived is checked (and
+        // written) before any wait.
+        const bool whole = filled == sizeof(s_piece) || (uint64_t)got == left;
+        if (filled > 0 && (whole || got == 0)) {
+            const uint8_t *piece = s_piece;
+            size_t n = filled;
+            filled = 0;
+            while (n > 0 && !finished && reason == DH_FW_REASON_NONE) {
+                const dh_fw_push push = dh_fw_download_push(d, piece, n);
+                piece += push.used;
+                n -= push.used;
+                // The update core only ever names bytes to write after it has said to open the
+                // partition, which it says only once the manifest has passed every check.
+                if (push.write_len > 0) {
+                    const esp_err_t err = ota_open && esp_ptr_internal(push.write)
+                                              ? esp_ota_write(ota, push.write, push.write_len)
+                                              : ESP_ERR_INVALID_STATE;
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "couldn't write to the spare partition: %s",
+                                 esp_err_to_name(err));
+                        reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
+                        break;
+                    }
+                }
+                switch (push.step) {
+                case DH_FW_STEP_OPEN_SLOT: {
+                    const dh_fw_manifest *manifest = dh_fw_download_manifest(d);
+                    ESP_LOGI(TAG,
+                             "the package is genuine and for this display: firmware %s, "
+                             "security counter %" PRIu32 ", %" PRIu32 " bytes. Writing it to %s",
+                             manifest != NULL ? manifest->firmware_version : "?",
+                             manifest != NULL ? manifest->security_counter : 0,
+                             manifest != NULL ? manifest->image_size : 0,
+                             spare != NULL ? spare->label : "no partition");
+                    const esp_err_t err =
+                        spare != NULL ? esp_ota_begin(spare, OTA_WITH_SEQUENTIAL_WRITES, &ota)
+                                      : ESP_ERR_NOT_FOUND;
+                    if (err != ESP_OK) {
+                        ESP_LOGE(TAG, "couldn't open the spare partition: %s",
+                                 esp_err_to_name(err));
+                        reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
+                    } else {
+                        ota_open = true;
+                    }
+                    break;
+                }
+                case DH_FW_STEP_FINISH:
+                    finished = true;
+                    break;
+                case DH_FW_STEP_ENDED:
+                    reason = push.reason;
+                    break;
+                default:
+                    break;
+                }
+            }
+            const uint64_t read = dh_fw_download_bytes_read(d);
+            if (read - logged_at >= PROGRESS_EVERY_BYTES) {
+                logged_at = read;
+                log_memory("downloading", read, length);
+            }
+        }
+        if (finished || reason != DH_FW_REASON_NONE) {
+            break;
+        }
+        // Only now, with everything that arrived handed over, is the download given up.
+        if (ended) {
+            ESP_LOGW(TAG, "the download broke off");
+            reason = dh_fw_download_fail(d, DH_FW_REASON_DOWNLOAD);
+        } else if (overdue) {
             ESP_LOGW(TAG, "the download sent nothing for %u s, or has taken %u minutes: giving "
                           "it up",
                      (unsigned)DH_FW_DOWNLOAD_STALL_SECONDS,
                      (unsigned)(DH_FW_DOWNLOAD_TIMEOUT_SECONDS / 60u));
             reason = dh_fw_download_fail(d, DH_FW_REASON_DOWNLOAD);
-            break;
-        }
-        // Never ask the connection for a byte past the update form.
-        const uint64_t left = length - dh_fw_download_bytes_read(d);
-        if (left == 0) {
+        } else if (left == 0) {
             // Everything the answer said it had was read, and the update form isn't complete.
             reason = dh_fw_download_fail(d, DH_FW_REASON_DOWNLOAD);
-            break;
-        }
-        const size_t want = left < sizeof(s_piece) ? (size_t)left : sizeof(s_piece);
-        const int got = hub_http_download_read(download, s_piece, want);
-        if (got < 0) {
-            ESP_LOGW(TAG, "the download broke off");
-            reason = dh_fw_download_fail(d, DH_FW_REASON_DOWNLOAD);
-            break;
-        }
-        if (got == 0) {
-            continue;
-        }
-        last_byte_s = uptime_seconds();
-
-        const uint8_t *piece = s_piece;
-        size_t n = (size_t)got;
-        while (n > 0 && !finished && reason == DH_FW_REASON_NONE) {
-            const dh_fw_push push = dh_fw_download_push(d, piece, n);
-            piece += push.used;
-            n -= push.used;
-            // The update core only ever names bytes to write after it has said to open the
-            // partition, which it says only once the manifest has passed every check.
-            if (push.write_len > 0) {
-                const esp_err_t err = ota_open && esp_ptr_internal(push.write)
-                                          ? esp_ota_write(ota, push.write, push.write_len)
-                                          : ESP_ERR_INVALID_STATE;
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "couldn't write to the spare partition: %s",
-                             esp_err_to_name(err));
-                    reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
-                    break;
-                }
-            }
-            switch (push.step) {
-            case DH_FW_STEP_OPEN_SLOT: {
-                const dh_fw_manifest *manifest = dh_fw_download_manifest(d);
-                ESP_LOGI(TAG,
-                         "the package is genuine and for this display: firmware %s, security "
-                         "counter %" PRIu32 ", %" PRIu32 " bytes. Writing it to %s",
-                         manifest != NULL ? manifest->firmware_version : "?",
-                         manifest != NULL ? manifest->security_counter : 0,
-                         manifest != NULL ? manifest->image_size : 0,
-                         spare != NULL ? spare->label : "no partition");
-                const esp_err_t err =
-                    spare != NULL ? esp_ota_begin(spare, OTA_WITH_SEQUENTIAL_WRITES, &ota)
-                                  : ESP_ERR_NOT_FOUND;
-                if (err != ESP_OK) {
-                    ESP_LOGE(TAG, "couldn't open the spare partition: %s", esp_err_to_name(err));
-                    reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
-                } else {
-                    ota_open = true;
-                }
-                break;
-            }
-            case DH_FW_STEP_FINISH:
-                finished = true;
-                break;
-            case DH_FW_STEP_ENDED:
-                reason = push.reason;
-                break;
-            default:
-                break;
-            }
-        }
-        const uint64_t read = dh_fw_download_bytes_read(d);
-        if (read - logged_at >= PROGRESS_EVERY_BYTES) {
-            logged_at = read;
-            log_memory("downloading", read, length);
         }
     }
 
+    bool restart = false;
     if (finished && reason == DH_FW_REASON_NONE) {
         log_memory("downloaded", dh_fw_download_bytes_read(d), length);
         // Step 9. esp_ota_end() checks that what was written is a whole, valid app image.
@@ -341,15 +430,13 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
         } else {
             // The record is saved. Only now is the new image set to boot.
             err = esp_ota_set_boot_partition(spare);
-            if (err != ESP_OK) {
-                // The record says a release is waiting in a partition that won't be started.
-                // The restart settles that as the update core's rules say: the same firmware
-                // starts again, drops the release's keys and reports that it went back.
-                ESP_LOGE(TAG, "couldn't set the new firmware to start (%s): it will be reported "
-                              "as not having started",
-                         esp_err_to_name(err));
-            } else {
+            if (err == ESP_OK) {
                 ESP_LOGI(TAG, "the new firmware is written, checked and set to start on trial");
+                restart = true;
+            } else if (boot_not_set(spare, err)) {
+                restart = true;
+            } else {
+                reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
             }
         }
     }
@@ -364,5 +451,6 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
                  dh_fw_download_bytes_read(d));
     }
     heap_caps_free(d);
-    return reason;
+    // DH_FW_REASON_NONE is only ever returned for "restart now".
+    return restart ? DH_FW_REASON_NONE : reason != DH_FW_REASON_NONE ? reason : DH_FW_REASON_FLASH;
 }

@@ -3,8 +3,9 @@
  * download, writing the spare partition, the trial boot's clock) and main/storage_fw.c (the
  * saves, in their order), over the stand-in for the board in glue/. The firmware vectors run
  * through the same code as dh_fw_conform_glue; these are the cases a vector can't describe: the
- * two time limits, flash calls and saves that fail, a setup that goes mid-download, and the
- * trial boot's five minutes against a check-in.
+ * two time limits (also against a hub that trickles bytes), flash calls and saves that fail, a
+ * partition that can't be set to boot, a setup that goes mid-download, a refusal made from the
+ * offer alone, and the trial boot's five minutes against a check-in.
  *
  * The package is the one in protocol/v1/firmware/package-01-valid.json: version 1.2.0, security
  * counter 4, for a display that trusts `maker` and `recovery` with a floor of 3.
@@ -121,16 +122,22 @@ static void take_offer(void)
     CHECK(strcmp(glue.writes, "r") == 0);
 }
 
+/* The setup goes (a factory reset) now, or once the display's clock reaches stop_at_us. */
 static bool stop_now;
+static int64_t stop_at_us;
 static bool stop(void)
 {
-    return stop_now;
+    return stop_now || (stop_at_us != 0 && glue.now_us >= stop_at_us);
 }
+
+/* How long before now the download's request was made. */
+static int64_t asked_ago_us;
 
 static dh_fw_reason receive(void)
 {
     glue.keep_next_free = true;
-    return update_receive(NULL, &DEVICE, form_len, true, form_len, glue.now_us / 1000, stop);
+    return update_receive(NULL, &DEVICE, form_len, true, form_len,
+                          (glue.now_us - asked_ago_us) / 1000, stop);
 }
 
 /* What is in flash, read as a restart would read it. */
@@ -153,7 +160,8 @@ static void check_tidy(void)
 {
     CHECK(!glue.wrote_while_closed && !glue.lock_misused && !glue.mutex_misused);
     CHECK(glue.lock_depth == 0 && !glue.open);
-    CHECK(!glue.read_past_the_form && glue.most_asked <= 4096);
+    /* One read never asks for more than 256 bytes (update.c, "How long one read can take"). */
+    CHECK(!glue.read_past_the_form && glue.most_asked <= 256);
 }
 
 /* ---- A download ---- */
@@ -161,10 +169,12 @@ static void check_tidy(void)
 static void test_install(void)
 {
     static const size_t pieces[] = {1, 137, 4096};
-    for (size_t i = 0; i < sizeof pieces / sizeof pieces[0]; i++) {
+    for (size_t i = 0; i < 2 * sizeof pieces / sizeof pieces[0]; i++) {
         fresh_display();
         take_offer();
-        glue.piece = pieces[i];
+        glue.piece = pieces[i / 2];
+        /* Bytes that come in one run, and bytes that come in bursts with pauses between. */
+        glue.pauses = i % 2 == 1;
         CHECK(receive() == DH_FW_REASON_NONE);
         check_tidy();
         const dh_fw_manifest *m = dh_fw_download_manifest(glue.download);
@@ -238,6 +248,33 @@ static void test_time_limits(void)
     CHECK(glue.handed >= 44 && glue.handed <= 46);
     check_ended(DH_FW_REASON_DOWNLOAD, false);
 
+    /* A hub that trickles on purpose: every read is kept open as long as it can be, a byte
+     * just inside each wait. One read can't be cut short, so the limits are overshot, but by
+     * no more than one read: 256 bytes of 50 ms each, 12.8 seconds. */
+    fresh_display();
+    take_offer();
+    glue.piece = 256;
+    glue.read_takes_us_per_byte = 49999;
+    /* Finding the hub took 880 of the 900 seconds, so the limit falls inside the second read. */
+    glue.now_us = 880 * 1000000LL;
+    asked_ago_us = 880 * 1000000LL;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    CHECK(glue.now_us >= 900 * 1000000LL && glue.now_us < 900 * 1000000LL + 12800000LL);
+    CHECK(glue.handed == 512);
+    asked_ago_us = 0;
+    check_ended(DH_FW_REASON_DOWNLOAD, glue.begun);
+
+    /* The same hub, and a factory reset part-way: seen within one read. */
+    fresh_display();
+    take_offer();
+    glue.piece = 256;
+    glue.read_takes_us_per_byte = 49999;
+    stop_at_us = 20 * 1000000LL;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    CHECK(glue.now_us >= 20 * 1000000LL && glue.now_us < 20 * 1000000LL + 12800000LL);
+    stop_at_us = 0;
+    check_ended(DH_FW_REASON_DOWNLOAD, glue.begun);
+
     /* The same pace is fine for a download that is done within the 15 minutes. */
     fresh_display();
     take_offer();
@@ -299,62 +336,203 @@ static void test_flash_failures(void)
     check_ended(DH_FW_REASON_FLASH, true);
 }
 
+/* After a write failed, nothing about updates is done until the display restarts. */
+static void check_stopped(const char *writes_so_far)
+{
+    dh_fw_offer_decision decision;
+    dh_fw_report report;
+    CHECK(storage_fw_facts().stopped);
+    /* Later writes would work, and none is made. */
+    glue.keys_write_fails = false;
+    glue.record_write_fails = false;
+    CHECK(!storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_IGNORE);
+    CHECK(!storage_fw_report_next(&report));
+    storage_fw_attempt_ended(DH_FW_REASON_FLASH);
+    storage_fw_report_answered(&report);
+    glue.now_us += 5 * 3600 * 1000000LL;
+    storage_fw_tick();
+    CHECK(!storage_fw_attempt_installed(NULL, 1));
+    CHECK(!storage_fw_report_next(&report));
+    CHECK(strcmp(glue.writes, writes_so_far) == 0);
+    check_tidy();
+}
+
 static void test_failed_saves(void)
 {
     dh_fw_offer_decision decision;
     dh_fw_report report;
 
-    /* The spent attempt can't be saved: there is no attempt, and nothing may be requested. */
+    /* The spent attempt can't be saved: nothing may be requested, and update work stops. */
     fresh_display();
     glue.record_write_fails = true;
+    CHECK(!storage_fw_facts().stopped);
     CHECK(!storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
-    CHECK(glue.writes[0] == '\0' && storage_fw_attempts_left() == 5);
-    CHECK(storage_fw_record()->stage == DH_FW_STAGE_IDLE && !storage_fw_record()->has_last_offer);
-    /* The same offer is taken at the next poll, once the write works. */
-    glue.record_write_fails = false;
+    CHECK(decision.action == DH_FW_OFFER_IGNORE && storage_fw_attempts_left() == 5);
+    check_stopped("");
+    /* Flash was never written, so the restart starts clean and takes the offer. */
+    CHECK(glue_restart(0, false) && !storage_fw_facts().stopped);
     CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
-    CHECK(decision.action == DH_FW_OFFER_ATTEMPT && storage_fw_attempts_left() == 4);
-    CHECK(strcmp(glue.writes, "r") == 0);
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT && strcmp(glue.writes, "r") == 0);
+
+    /* The same, but the write that "failed" reached flash (committed, then read back wrong).
+     * This run does nothing more; the next start finds a spent attempt and reports it as cut
+     * short. Memory was never trusted to say which record flash holds. */
+    fresh_display();
+    glue.record_write_fails = true;
+    glue.failed_write_lands = true;
+    CHECK(!storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(flash_record().stage == DH_FW_STAGE_ATTEMPT && flash_record().attempts_left == 4);
+    check_stopped("");
+    CHECK(glue_restart(0, false));
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_FAILED &&
+          report.reason == DH_FW_REASON_DOWNLOAD && storage_fw_attempts_left() == 4);
 
     /* The image is written and checked, but the record can't be saved: the partition is never
-     * set to boot, and the attempt ends as failed with `flash`. */
+     * set to boot, nothing is reported, and the next start settles the attempt. */
     fresh_display();
     take_offer();
     glue.record_write_fails = true;
     CHECK(receive() == DH_FW_REASON_FLASH);
-    CHECK(glue.ended && !glue.set_to_boot && strcmp(glue.writes, "r") == 0);
+    CHECK(glue.ended && !glue.set_to_boot);
     CHECK(flash_record().stage == DH_FW_STAGE_ATTEMPT);
-    CHECK(storage_fw_record()->stage == DH_FW_STAGE_ATTEMPT);
-    /* The result can't be saved either, so it isn't reported yet... */
-    storage_fw_attempt_ended(DH_FW_REASON_FLASH);
-    CHECK(!storage_fw_report_next(&report));
-    CHECK(!storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
-    /* ...and a restart now reads the attempt as cut short, as the rules say. */
-    dh_fw_record cut = flash_record();
-    CHECK(cut.stage == DH_FW_STAGE_ATTEMPT);
-    /* Once the write works, the result is saved before it is reported. */
-    glue.record_write_fails = false;
+    check_stopped("r");
+    CHECK(glue_restart(0, false));
     CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_FAILED &&
-          report.reason == DH_FW_REASON_FLASH);
-    CHECK(strcmp(glue.writes, "rr") == 0 && flash_record().result_reason == DH_FW_REASON_FLASH);
-    check_tidy();
+          report.reason == DH_FW_REASON_DOWNLOAD);
 
-    /* The partition can't be set to boot after the record was saved: the display restarts all
-     * the same, and the same firmware then reports that the update didn't start. */
+    /* The same, with the failed write in flash after all: the record says a release is waiting
+     * in a partition that was never set to boot, which the next start reports as gone back. */
     fresh_display();
     take_offer();
-    glue.set_boot_fails = true;
-    CHECK(receive() == DH_FW_REASON_NONE);
+    glue.record_write_fails = true;
+    glue.failed_write_lands = true;
+    CHECK(receive() == DH_FW_REASON_FLASH);
     CHECK(!glue.set_to_boot && flash_record().stage == DH_FW_STAGE_PENDING);
+    check_stopped("r");
     CHECK(glue_restart(0, false));
     CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
     CHECK(flash_keys().security_floor == 3);
+
+    /* A result that can't be saved isn't reported in this run. */
+    fresh_display();
+    take_offer();
+    glue.body_len = 500;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    glue.record_write_fails = true;
+    storage_fw_attempt_ended(DH_FW_REASON_DOWNLOAD);
+    CHECK(!storage_fw_report_next(&report));
+    check_stopped("r");
+
+    /* A write that fails somewhere else (setup over USB) stops update work too. */
+    fresh_display();
+    storage_fw_write_failed();
+    check_stopped("");
 
     /* Storage that isn't working takes no offer and gives no report. */
     fresh_display();
     glue.storage_unusable = true;
     CHECK(!storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
     CHECK(!storage_fw_report_next(&report) && glue.writes[0] == '\0');
+}
+
+/* esp_ota_set_boot_partition() fails after the record was saved. */
+static void test_not_set_to_boot(void)
+{
+    dh_fw_report report;
+
+    /* The OTA data still names the running firmware: the update ends as failed with `flash`,
+     * with no restart, and that is what is saved and reported. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    CHECK(receive() == DH_FW_REASON_FLASH);
+    CHECK(!glue.set_to_boot && strcmp(glue.writes, "rr") == 0);
+    CHECK(flash_record().stage == DH_FW_STAGE_PENDING);
+    CHECK(storage_fw_record()->stage == DH_FW_STAGE_ATTEMPT &&
+          storage_fw_record()->pending_version[0] == '\0');
+    check_ended(DH_FW_REASON_FLASH, true);
+    CHECK(flash_keys().security_floor == 3);
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_FAILED);
+
+    /* A power cut before that result was saved is the "saved, but not set to boot" case. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    CHECK(receive() == DH_FW_REASON_FLASH);
+    CHECK(glue_restart(0, false));
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
+
+    /* The write landed and was reported as failed: the OTA data names the new firmware, so
+     * this is an install. Restart, with the record of the release kept for its trial boot. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    glue.set_boot_lands = true;
+    CHECK(receive() == DH_FW_REASON_NONE);
+    CHECK(flash_record().stage == DH_FW_STAGE_PENDING && strcmp(glue.writes, "rr") == 0);
+    CHECK(glue_restart(1, true) && storage_fw_on_trial());
+
+    /* The OTA data can't be read: the record is left as it is and the display restarts, so
+     * whichever firmware starts settles it. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    glue.boot_unreadable = true;
+    CHECK(receive() == DH_FW_REASON_NONE);
+    CHECK(flash_record().stage == DH_FW_STAGE_PENDING && strcmp(glue.writes, "rr") == 0);
+    CHECK(glue_restart(0, false));
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
+
+    /* Nothing to put back when no release is waiting. */
+    fresh_display();
+    CHECK(!storage_fw_attempt_not_set_to_boot());
+    take_offer();
+    CHECK(!storage_fw_attempt_not_set_to_boot());
+    CHECK(storage_fw_record()->stage == DH_FW_STAGE_ATTEMPT);
+}
+
+/* What the screen is told. */
+static void test_facts(void)
+{
+    dh_fw_offer_decision decision;
+    dh_fw_report report;
+    dh_fw_keys none;
+    dh_fw_record record;
+
+    /* A display with no keys refuses from the offer alone: nothing is written, and the refusal
+     * is the last result all the same. */
+    dh_fw_keys_init(&none);
+    dh_fw_record_init(&record);
+    glue_reset();
+    glue_start(&none, &record, 0, false);
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_NONE);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_REFUSE && glue.writes[0] == '\0');
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_REFUSED &&
+          storage_fw_facts().last_reason == DH_FW_REASON_NO_TRUSTED_KEYS);
+    /* It stays the last result once the hub has the report, and is gone after a restart. */
+    CHECK(storage_fw_report_next(&report) && report.reason == DH_FW_REASON_NO_TRUSTED_KEYS);
+    storage_fw_report_answered(&report);
+    CHECK(!storage_fw_report_next(&report));
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_REFUSED);
+    CHECK(glue_restart(0, false) && storage_fw_facts().last_result == DH_FW_REPORT_NONE);
+
+    /* Too large for the display, then an offer that is attempted and fails: the later one is
+     * the last result. */
+    fresh_display();
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, 137u + 4096u + 65537u, &decision));
+    CHECK(decision.action == DH_FW_OFFER_REFUSE);
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_REFUSED &&
+          storage_fw_facts().last_reason == DH_FW_REASON_TOO_LARGE);
+    CHECK(storage_fw_report_next(&report));
+    storage_fw_report_answered(&report);
+    CHECK(storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
+    storage_fw_attempt_ended(DH_FW_REASON_IMAGE_HASH);
+    CHECK(storage_fw_facts().last_result == DH_FW_REPORT_FAILED &&
+          storage_fw_facts().last_reason == DH_FW_REASON_IMAGE_HASH);
+    CHECK(storage_fw_facts().attempts_left == 4 && !storage_fw_facts().on_trial);
 }
 
 /* ---- The trial boot ---- */
@@ -447,34 +625,47 @@ static void test_trial(void)
     CHECK(glue_run_until_restart(check_in, &marked));
     CHECK(glue.restarts == 1 && glue.writes[0] == '\0' && glue.marked_valid == 0);
 
-    /* Marked good, but the keys can't be saved: the record isn't written ahead of them, and
-     * nothing is reported until both are in flash. */
+    /* Marked good, but the keys can't be saved: the record is never written ahead of them,
+     * nothing is reported, and update work stops. The next start finds the release waiting in
+     * the running partition, no longer on trial, and finishes the job. */
     start_trial();
     glue.keys_write_fails = true;
     CHECK(update_trial_check_in(DH_FW_CHECK_IN_ANSWERED) && glue.marked_valid == 1);
-    CHECK(glue.writes[0] == '\0' && !storage_fw_report_next(&report));
     CHECK(flash_record().stage == DH_FW_STAGE_PENDING && flash_keys().security_floor == 3);
-    glue.keys_write_fails = false;
-    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_INSTALLED);
+    check_stopped("");
+    CHECK(glue_restart(1, false));
     CHECK(strcmp(glue.writes, "kr") == 0 && flash_keys().security_floor == 4);
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_INSTALLED);
 
-    /* The keys are saved but the record isn't, and the display restarts: the next start finds
-     * the release waiting in the running partition, no longer on trial, and finishes the job. */
+    /* The keys are saved but the record isn't: the same. */
     start_trial();
     glue.record_write_fails = true;
     CHECK(update_trial_check_in(DH_FW_CHECK_IN_ANSWERED));
-    CHECK(strcmp(glue.writes, "k") == 0 && !storage_fw_report_next(&report));
-    glue.record_write_fails = false;
+    check_stopped("k");
     forget_writes();
     CHECK(glue_restart(1, false));
     CHECK(flash_keys().security_floor == 4 && flash_record().stage == DH_FW_STAGE_IDLE);
     CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_INSTALLED);
 
-    /* Nothing to go back to: the task stops asking, and the display carries on, on trial. */
+    /* Nothing to go back to: the clock stops, and the display carries on, on trial. It is the
+     * only firmware that works, so the next answer from the hub marks it good, however late. */
     start_trial();
     glue.roll_back_error = ESP_ERR_OTA_ROLLBACK_FAILED;
+    CHECK(!storage_fw_facts().no_way_back);
     CHECK(glue_run_task() && glue.task_ended && glue.restarts == 0 && glue.rolled_back == 0);
-    CHECK(storage_fw_on_trial() && glue.writes[0] == '\0');
+    CHECK(storage_fw_on_trial() && storage_fw_facts().no_way_back && glue.writes[0] == '\0');
+    glue.now_us = 3600 * 1000000LL;
+    CHECK(!update_trial_check_in(DH_FW_CHECK_IN_FAILED) && glue.marked_valid == 0);
+    CHECK(!storage_fw_report_next(&report));
+    CHECK(update_trial_check_in(DH_FW_CHECK_IN_ANSWERED) && glue.marked_valid == 1);
+    CHECK(strcmp(glue.writes, "kr") == 0 && glue.writes_at_marked_valid == 0);
+    CHECK(!storage_fw_on_trial() && !storage_fw_facts().no_way_back);
+    CHECK(flash_keys().security_floor == 4);
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_INSTALLED);
+    /* A late answer only counts when there was nothing to go back to. */
+    start_trial();
+    glue.now_us = 3600 * 1000000LL;
+    CHECK(!update_trial_check_in(DH_FW_CHECK_IN_ANSWERED) && glue.marked_valid == 0);
 
     /* The OTA data can't be written: a restart does the same job. */
     start_trial();
@@ -490,6 +681,8 @@ int main(void)
     test_time_limits();
     test_flash_failures();
     test_failed_saves();
+    test_not_set_to_boot();
+    test_facts();
     test_trial();
     glue_reset();
     printf("update glue tests: %d checks, %d failures\n", checks, failures);

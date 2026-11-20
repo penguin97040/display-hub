@@ -80,9 +80,10 @@ typedef struct {
 // *out set, to a download the caller must close; none of its body has been handed over yet.
 hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_download_t **out);
 
-// Reads up to `cap` bytes of the body, waiting at most a few seconds. Returns how many were
-// read; 0 if none came in that time (ask again: the caller keeps the time limits); or a negative
-// number if the connection broke or the body has ended.
+// Reads up to `cap` bytes of the body. Returns how many were read; 0 if none came within 50 ms
+// (ask again: the caller keeps the time limits); or a negative number if the connection broke
+// or the body has ended. One call can take up to `cap` x 50 ms if the hub sends a byte at a
+// time, so ask for little at once (update.c, "How long one read can take").
 int hub_http_download_read(hub_download_t *download, uint8_t *out, size_t cap);
 
 void hub_http_download_close(hub_download_t *download);

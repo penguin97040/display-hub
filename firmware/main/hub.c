@@ -653,9 +653,10 @@ static void heartbeat_if_due(void)
 
 // ---- Signed updates ----
 
-// Sends one firmware report. True if the hub answered it with anything at all: a final report
-// is only sent again when there was no answer (docs/protocol-v1.md: `not_found` means the hub
-// has no such offer any more, and a report for an offer already settled is answered 204).
+// Sends one firmware report. True if the hub's answer settles it (dh_firmware_report_settled):
+// success, or a refusal that sending it again can't change (`not_found` means the hub has no
+// such offer any more; a report for an offer already settled is answered 204). False if it is
+// to be sent again after a later poll: no answer, a 5xx or `rate_limited`.
 static bool send_report(const dh_fw_report *report)
 {
     const size_t len =
@@ -676,20 +677,37 @@ static bool send_report(const dh_fw_report *report)
         ESP_LOGW(TAG, "update report (%s) not sent: %s", state, dh_problem_headline(problem));
         return false;
     }
+    const bool settled = dh_firmware_report_settled(answer.status);
     if (answer.status >= 200 && answer.status < 300) {
         ESP_LOGI(TAG, "update report taken: %s%s%s", state, reason != NULL ? ", " : "",
                  reason != NULL ? reason : "");
     } else {
         const dh_response response = dh_read_error_response(answer.status, s_body, answer.len);
         const char *code = dh_error_code_name(response.error_code);
-        ESP_LOGW(TAG, "update report (%s) answered with status %d (%s): not sent again", state,
-                 answer.status, code != NULL ? code : "no code");
+        ESP_LOGW(TAG, "update report (%s) answered with status %d (%s): %s", state,
+                 answer.status, code != NULL ? code : "no code",
+                 settled ? "not sent again" : "sent again after a later poll");
     }
-    return true;
+    return settled;
+}
+
+// Tells the screen when what storage says about updates has changed without this task doing
+// it: update work stopped after a failed write, or a trial boot found nothing to go back to.
+static void watch_fw_facts(void)
+{
+    static bool stopped, no_way_back;
+    const storage_fw_facts_t facts = storage_fw_facts();
+    if (facts.stopped != stopped || facts.no_way_back != no_way_back) {
+        stopped = facts.stopped;
+        no_way_back = facts.no_way_back;
+        s_fw_seq++;
+        publish();
+    }
 }
 
 // Sends the final reports that are waiting: the record's, then a refusal made from an offer
-// alone. One that gets no answer is left for the next poll. Nothing is given out on a trial boot.
+// alone. One the hub couldn't take is left for the next poll, never sent again straight away.
+// Nothing is given out on a trial boot.
 static void send_reports(void)
 {
     dh_fw_report report;
@@ -699,6 +717,7 @@ static void send_reports(void)
         }
         storage_fw_report_answered(&report);
         s_fw_seq++;
+        publish();
     }
 }
 
@@ -792,6 +811,7 @@ static void act_on_offer(void)
                       "or written",
                  dh_fw_reason_name(decision.reason));
         s_fw_seq++;
+        publish();
         send_reports();
         return;
     case DH_FW_OFFER_WAIT:
@@ -819,6 +839,7 @@ static void updates(void)
     if (s.fresh_snapshot && !gone()) {
         act_on_offer();
     }
+    watch_fw_facts();
 }
 
 // ---- Wi-Fi ----
@@ -1074,6 +1095,7 @@ static void minute_log(void)
     }
     s.minute_ms = now;
     // The screen works out the pages' ages itself; this only makes sure nothing is missed.
+    watch_fw_facts();
     publish();
 }
 

@@ -1,9 +1,9 @@
 // What storage keeps for signed updates, and every call that changes it. See storage_fw.h.
 //
 // THE ORDER OF THE WRITES is the safety argument (dh_core's README, "Save points"): whatever
-// the update core says to save is written before the step it guards, the keys before the record,
-// and a write that failed is tried again before any later one. Nothing here touches NVS itself:
-// storage.c writes the two blobs.
+// the update core says to save is written before the step it guards, the keys before the record.
+// A write that fails stops all update work for the rest of the run (storage_fw.h, "When a write
+// fails"). Nothing here touches NVS itself: storage.c writes the two blobs.
 
 #include "storage_fw.h"
 
@@ -18,8 +18,17 @@ static const char *TAG = "storage";
 static dh_fw_keys s_keys;
 static dh_fw_record s_record;
 static dh_fw_session s_session;
-// What the update core said to save that isn't in flash yet (DH_FW_SAVE_KEYS, DH_FW_SAVE_RECORD).
-static unsigned s_unsaved;
+// A write of the keys or the record failed: what flash holds is unknown, and all update work
+// has stopped until the next start (storage_fw.h, "When a write fails").
+static bool s_stopped;
+// On trial, past the five minutes, with no other firmware to go back to.
+static bool s_no_way_back;
+// The latest result is a refusal made from an offer alone, which only the session holds.
+static bool s_refusal_is_latest;
+// The record as it stood just before the release was recorded as waiting for its trial boot,
+// in case the partition can't be set to boot after all.
+static bool s_has_attempt;
+static dh_fw_record s_attempt;
 
 dh_fw_keys *storage_fw_keys(void)
 {
@@ -31,31 +40,56 @@ dh_fw_record *storage_fw_record(void)
     return &s_record;
 }
 
-// Writes what the update core named, and whatever an earlier write left unwritten: the keys
-// first, and the record only once the keys are in flash. A record that says "installed" must
-// never be in flash ahead of the floor and the keys that came with it. True when nothing is
-// left to write.
+void storage_fw_write_failed(void)
+{
+    if (!s_stopped) {
+        s_stopped = true;
+        ESP_LOGE(TAG, "a write of the firmware keys or the update record failed, so what is in "
+                      "flash is no longer known: no updates, saves or update reports until "
+                      "this display restarts. Its pages carry on");
+    }
+}
+
+// Whether update work may go on: storage works, and no write has failed.
+static bool working(void)
+{
+    return storage_fw_usable() && !s_stopped;
+}
+
+// Writes what the update core named: the keys first, and the record only once the keys are in
+// flash. A record that says "installed" must never be in flash ahead of the floor and the keys
+// that came with it. True if everything named was written (or nothing was). After a write has
+// failed, nothing is written again in this run.
 static bool fw_save(unsigned what)
 {
-    s_unsaved |= what & (DH_FW_SAVE_KEYS | DH_FW_SAVE_RECORD);
-    if ((s_unsaved & DH_FW_SAVE_KEYS) != 0 && storage_fw_write_keys(&s_keys)) {
-        s_unsaved &= ~DH_FW_SAVE_KEYS;
+    what &= DH_FW_SAVE_KEYS | DH_FW_SAVE_RECORD;
+    if (what == 0) {
+        return true;
     }
-    if ((s_unsaved & DH_FW_SAVE_KEYS) == 0 && (s_unsaved & DH_FW_SAVE_RECORD) != 0 &&
-        storage_fw_write_record(&s_record)) {
-        s_unsaved &= ~DH_FW_SAVE_RECORD;
+    if (s_stopped) {
+        return false;
     }
-    return s_unsaved == 0;
+    if ((what & DH_FW_SAVE_KEYS) != 0 && !storage_fw_write_keys(&s_keys)) {
+        storage_fw_write_failed();
+        return false;
+    }
+    if ((what & DH_FW_SAVE_RECORD) != 0 && !storage_fw_write_record(&s_record)) {
+        storage_fw_write_failed();
+        return false;
+    }
+    return true;
 }
 
 void storage_fw_settle_start(uint8_t running_slot, bool on_trial)
 {
     unsigned save = 0;
-    s_unsaved = 0;
+    s_stopped = false;
+    s_no_way_back = false;
+    s_refusal_is_latest = false;
+    s_has_attempt = false;
     const dh_fw_start_result started =
         dh_fw_start(&s_session, &s_record, &s_keys, running_slot, on_trial, &save);
-    // The keys first, then the record. If a write fails it is tried again before the next one,
-    // and the same is settled at the next start.
+    // The keys first, then the record. If a write fails, the same is settled at the next start.
     if (!fw_save(save)) {
         ESP_LOGE(TAG, "couldn't save what the update record needed settling at start-up");
     }
@@ -89,12 +123,15 @@ void storage_fw_log(void)
              (unsigned)s_keys.key_count, s_keys.security_floor,
              (unsigned)s_record.attempts_left);
     ESP_LOGI(TAG, "updates: %s; last result: %s%s%s%s%s",
-             s_session.trial ? "on trial, not yet marked good" : "not on trial",
+             !s_session.trial ? "not on trial"
+             : s_no_way_back  ? "on trial, with no other firmware to go back to"
+                              : "on trial, not yet marked good",
              result != NULL ? result : "none", reason != NULL ? " (" : "",
              reason != NULL ? reason : "", reason != NULL ? ")" : "",
              result != NULL && !s_record.result_answered ? ", not yet answered by the hub" : "");
-    if (s_unsaved != 0) {
-        ESP_LOGE(TAG, "updates: a write to storage failed and is still owed");
+    if (s_stopped) {
+        ESP_LOGE(TAG, "updates: off until this display restarts, because a write to storage "
+                      "failed");
     }
 }
 
@@ -106,14 +143,10 @@ static uint64_t uptime_seconds(void)
 void storage_fw_tick(void)
 {
     storage_lock();
-    if (storage_fw_usable()) {
+    if (working()) {
         const uint8_t attempts = s_record.attempts_left;
-        const unsigned save = dh_fw_tick(&s_session, &s_record, uptime_seconds());
-        // If the write fails, it is tried again here every minute; a restart before it succeeds
-        // counts the same hour again.
-        if ((save != 0 || s_unsaved != 0) && !fw_save(save)) {
-            ESP_LOGE(TAG, "couldn't save the update record or the firmware keys");
-        }
+        // If the write fails, the same hour is counted again after the next start.
+        (void)fw_save(dh_fw_tick(&s_session, &s_record, uptime_seconds()));
         if (s_record.attempts_left != attempts) {
             ESP_LOGI(TAG, "update attempts left: %u", (unsigned)s_record.attempts_left);
         }
@@ -143,24 +176,22 @@ bool storage_fw_on_offer(const dh_fw_device *device, const char *offer_id, uint6
     *decision = (dh_fw_offer_decision){.action = DH_FW_OFFER_IGNORE};
     bool ok = false;
     storage_lock();
-    // Nothing new while an earlier save is still owed: an attempt must start from what is in
-    // flash.
-    if (storage_fw_usable() && fw_save(0)) {
+    if (working()) {
         const dh_fw_record record_before = s_record;
         const dh_fw_session session_before = s_session;
         *decision = dh_fw_on_offer(&s_session, &s_record, &s_keys, device, offer_id, size,
                                    uptime_seconds());
         ok = fw_save(decision->save);
-        if (!ok && decision->action == DH_FW_OFFER_ATTEMPT) {
-            // The spent attempt isn't in flash, so there is no attempt: memory goes back to what
-            // flash holds, and nothing is requested.
+        if (!ok) {
+            // Nothing is requested. Memory goes back to what it held, so the display doesn't
+            // tell the hub of an attempt it never made; what flash holds is for the next start.
             s_record = record_before;
             s_session = session_before;
-            s_unsaved = 0;
-            ESP_LOGE(TAG, "couldn't save the update record before a download: not requesting it");
-        } else {
-            // Anything else saved here was only a credit hour, which is tried again later.
-            ok = true;
+            *decision = (dh_fw_offer_decision){.action = DH_FW_OFFER_IGNORE};
+        } else if (decision->action == DH_FW_OFFER_REFUSE) {
+            s_refusal_is_latest = true;
+        } else if (decision->action == DH_FW_OFFER_ATTEMPT) {
+            s_refusal_is_latest = false;
         }
     }
     storage_unlock();
@@ -181,9 +212,10 @@ dh_fw_reason storage_fw_download_begin(dh_fw_download *download, const dh_fw_dev
 void storage_fw_attempt_ended(dh_fw_reason reason)
 {
     storage_lock();
+    s_has_attempt = false;
     if (!fw_save(dh_fw_attempt_ended(&s_record, reason))) {
-        ESP_LOGE(TAG, "couldn't save the update's result: if the display restarts first, it "
-                      "will be reported as a download cut short");
+        ESP_LOGE(TAG, "the update's result isn't saved: the next start will settle the attempt "
+                      "from what is in flash");
     }
     storage_unlock();
 }
@@ -192,17 +224,40 @@ bool storage_fw_attempt_installed(const dh_fw_manifest *manifest, uint8_t slot)
 {
     storage_lock();
     const dh_fw_record record_before = s_record;
-    const unsigned unsaved_before = s_unsaved;
-    const unsigned save = dh_fw_attempt_installed(&s_record, manifest, slot);
+    const unsigned save = working() ? dh_fw_attempt_installed(&s_record, manifest, slot) : 0;
     // No save named means the record wasn't one for an attempt: nothing may be set to boot.
     const bool ok = save != 0 && fw_save(save);
-    if (!ok) {
-        // The record goes back to what it was: an attempt still running, which the caller now
-        // ends as failed (storage_fw_attempt_ended). Left as it was, it would say a release is
-        // waiting for a trial boot that will never be started.
+    if (ok) {
+        s_attempt = record_before;
+        s_has_attempt = true;
+    } else {
+        // In memory the record goes back to an attempt still running, which the caller now ends
+        // as failed (storage_fw_attempt_ended).
         s_record = record_before;
-        s_unsaved = unsaved_before;
     }
+    storage_unlock();
+    return ok;
+}
+
+bool storage_fw_attempt_not_set_to_boot(void)
+{
+    storage_lock();
+    const bool ok = s_has_attempt && s_record.stage == DH_FW_STAGE_PENDING &&
+                    s_attempt.stage == DH_FW_STAGE_ATTEMPT;
+    if (ok) {
+        // Only what dh_fw_attempt_installed() changed goes back: the budget may have earned a
+        // credit hour since.
+        s_record.stage = s_attempt.stage;
+        s_record.pending_slot = s_attempt.pending_slot;
+        memcpy(s_record.pending_version, s_attempt.pending_version,
+               sizeof(s_record.pending_version));
+        s_record.pending_security_counter = s_attempt.pending_security_counter;
+        s_record.pending_has_key_set = s_attempt.pending_has_key_set;
+        s_record.pending_key_count = s_attempt.pending_key_count;
+        memcpy(s_record.pending_key_set, s_attempt.pending_key_set,
+               sizeof(s_record.pending_key_set));
+    }
+    s_has_attempt = false;
     storage_unlock();
     return ok;
 }
@@ -210,22 +265,34 @@ bool storage_fw_attempt_installed(const dh_fw_manifest *manifest, uint8_t slot)
 dh_fw_trial_step storage_fw_trial_check_in(dh_fw_check_in answer)
 {
     storage_lock();
-    const dh_fw_trial_step step = dh_fw_trial_check_in(&s_session, uptime_seconds(), answer);
+    // With nothing to go back to, the five minutes no longer count: the update core is asked
+    // as at the start of the trial, so the same answers mark the image good.
+    const dh_fw_trial_step step =
+        dh_fw_trial_check_in(&s_session, s_no_way_back ? 0 : uptime_seconds(), answer);
     storage_unlock();
     return step;
+}
+
+void storage_fw_trial_no_way_back(void)
+{
+    storage_lock();
+    s_no_way_back = s_session.trial;
+    storage_unlock();
 }
 
 bool storage_fw_marked_good(void)
 {
     storage_lock();
+    s_no_way_back = false;
     const bool ok = fw_save(dh_fw_marked_good(&s_session, &s_record, &s_keys));
     if (ok) {
         ESP_LOGI(TAG, "the new firmware's security floor (%" PRIu32 ") and keys (%u) are stored",
                  s_keys.security_floor, (unsigned)s_keys.key_count);
     } else {
         // The next start finds the release waiting in the running partition, no longer on
-        // trial, and finishes the job (dh_fw_start); the writes are also tried again here.
-        ESP_LOGE(TAG, "couldn't save the new firmware's security floor, keys or record yet");
+        // trial, and finishes the job (dh_fw_start).
+        ESP_LOGE(TAG, "the new firmware's security floor, keys and record aren't all saved: "
+                      "the next start finishes that, and reports the update then");
     }
     storage_unlock();
     return ok;
@@ -234,8 +301,7 @@ bool storage_fw_marked_good(void)
 bool storage_fw_report_next(dh_fw_report *out)
 {
     storage_lock();
-    const bool waiting = storage_fw_usable() && fw_save(0) &&
-                         dh_fw_report_next(&s_session, &s_record, out);
+    const bool waiting = working() && dh_fw_report_next(&s_session, &s_record, out);
     storage_unlock();
     if (!waiting) {
         memset(out, 0, sizeof(*out));
@@ -248,22 +314,25 @@ void storage_fw_report_answered(const dh_fw_report *sent)
     storage_lock();
     // If the write fails, the report is sent again after the next start, and the hub answers a
     // final report it has already had with 204.
-    if (!fw_save(dh_fw_report_answered(&s_session, &s_record, sent))) {
-        ESP_LOGE(TAG, "couldn't save that the hub has the update's result");
-    }
+    (void)fw_save(dh_fw_report_answered(&s_session, &s_record, sent));
     storage_unlock();
 }
 
 storage_fw_facts_t storage_fw_facts(void)
 {
     storage_lock();
-    const storage_fw_facts_t facts = {
+    storage_fw_facts_t facts = {
         .on_trial = s_session.trial,
+        .no_way_back = s_session.trial && s_no_way_back,
+        .stopped = s_stopped,
         .last_result = s_record.result_state,
         .last_reason = s_record.result_reason,
         .attempts_left = s_record.attempts_left,
     };
+    if (s_refusal_is_latest && s_session.early_refusal) {
+        facts.last_result = DH_FW_REPORT_REFUSED;
+        facts.last_reason = s_session.early_reason;
+    }
     storage_unlock();
     return facts;
 }
-

@@ -443,9 +443,18 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
     if (hub->update == HUB_UPDATE_RESTARTING) {
         return "The firmware update is ready. Restarting now.";
     }
+    if (fw->no_way_back) {
+        return "This is new firmware, on trial. It didn't reach the hub in its first 5 minutes, "
+               "and there is no earlier version to go back to, so it carries on and keeps "
+               "trying. The update counts as installed once it reaches the hub.";
+    }
     if (fw->on_trial) {
         return "This is new firmware, on trial. It has 5 minutes from starting to reach the "
                "hub. If it can't, this display goes back to the version it had before.";
+    }
+    if (fw->stopped) {
+        return "This display couldn't save to its storage, so it takes no firmware updates "
+               "until it restarts. Unplug it and plug it back in.";
     }
     switch (fw->last_result) {
     case DH_FW_REPORT_INSTALLED:
@@ -457,6 +466,15 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
         return "The last firmware update didn't finish, so this display kept the version it "
                "had. Nothing was lost.";
     case DH_FW_REPORT_REFUSED:
+        if (fw->last_reason == DH_FW_REASON_NO_TRUSTED_KEYS) {
+            return "This display refused the last firmware update it was offered, because it "
+                   "trusts no firmware keys. Use Install firmware in Display Hub, over USB, to "
+                   "give it its maker's keys.";
+        }
+        if (fw->last_reason == DH_FW_REASON_TOO_LARGE) {
+            return "This display refused the last firmware update it was offered: it is too "
+                   "big for the display. Nothing was changed.";
+        }
         return "This display refused the last firmware update it was offered. Nothing was "
                "changed.";
     default:

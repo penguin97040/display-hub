@@ -118,6 +118,14 @@ size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmwa
     return finish(&w);
 }
 
+bool dh_firmware_report_settled(int http_status)
+{
+    if (http_status >= 200 && http_status < 300) {
+        return true;
+    }
+    return http_status >= 400 && http_status < 500 && http_status != 429;
+}
+
 /* ---- The device ID and token ---- */
 
 /* Printable ASCII with no space: safe in a log line (the ID) and in a header (the token). */

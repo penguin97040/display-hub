@@ -73,6 +73,8 @@ A power cut anywhere is safe, because `dh_fw_start()` settles whatever it finds 
 | After the image was marked good, before the keys or the record were saved | a release waiting, in the partition that is running, no longer on trial | Raises the floor, takes the `key_set` and reports `installed`: what `dh_fw_marked_good()` does, again. It is safe to repeat. |
 | Before a credit hour, or a report's answer, was saved | the record as it was | The hour is counted again from zero, or the report is sent again. |
 
+A write that *fails* is a different thing from a power cut: it may have reached flash all the same, so the firmware can't know which row it is in. It doesn't guess: `main/storage_fw.c` stops all update work for the rest of that run, and the next start reads flash and lands in one of the rows above.
+
 The keys and the floor only ever change in `dh_fw_marked_good()`, in `dh_fw_start()` finishing the same job, and in `dh_fw_bundle_apply()` for a display that has no keys.
 
 ### What isn't here
@@ -123,7 +125,7 @@ Note that the protocol document says a display answers a `provision` with `provi
 
 `dh_poll.h` has one problem the reference words but the handoff's list doesn't: `DH_PROBLEM_SETTINGS`, "This display's settings are wrong", for a setup with no Wi-Fi details or no certificate that can be read.
 
-**Where it differs from the reference**, on purpose: an ID or token outside the characters above makes the response unreadable (the reference takes any string); an error answer over 8 KiB counts as having no body (the reference fails the read); at one address, a certificate mismatch from the first anchor isn't forgotten if the second anchor's try gets no answer; and the address that answered last is tried first (the reference always walks in the bundle's order), because on a board a name that can't be looked up costs several seconds at every request.
+**Where it differs from the reference**, on purpose: an ID or token outside the characters above makes the response unreadable (the reference takes any string); an error answer over 8 KiB counts as having no body (the reference fails the read); at one address, a certificate mismatch from the first anchor isn't forgotten if the second anchor's try gets no answer; the address that answered last is tried first (the reference always walks in the bundle's order), because on a board a name that can't be looked up costs several seconds at every request; and a final firmware report is settled only by a `2xx` answer or a `4xx` other than `429` (`dh_firmware_report_settled()`), and sent again after a `5xx` or a `429`, where the reference counts any answer at all as delivered.
 
 ## Memory
 

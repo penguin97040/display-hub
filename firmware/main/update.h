@@ -31,7 +31,9 @@ void update_trial_start(void);
 // or an answer that only setting the display up again would change, the running image is marked
 // good, and then the release's security floor and keys are saved, and then its record. True if
 // this call marked it good. False, and nothing done, when the display isn't on trial, the
-// answer doesn't count, or the five minutes are up.
+// answer doesn't count, or the five minutes are up. (If they ran out and there turned out to be
+// no other firmware to go back to, the five minutes no longer count: the next answer marks this
+// one good, since it is the only image that works.)
 bool update_trial_check_in(dh_fw_check_in answer);
 
 // Reads a download to its end, checking it as it arrives (dh_fw_download_push): nothing is
@@ -41,10 +43,13 @@ bool update_trial_check_in(dh_fw_check_in answer);
 // download is given up when it sends nothing for 30 seconds or takes 15 minutes in all, or when
 // `stop` says the setup has gone.
 //
-// Returns DH_FW_REASON_NONE once the image is written and verified, the record is saved and the
-// spare partition is set to boot: restart now. Otherwise the reason the attempt ended, with the
-// spare partition abandoned; the caller ends the attempt (storage_fw_attempt_ended) and reports
-// it. The caller closes the download either way.
+// Returns DH_FW_REASON_NONE when the display must restart now: the image is written and
+// verified, the record is saved and the spare partition is set to boot (or, if setting it failed
+// in a way that leaves the next start unknown, the record is saved and the restart settles it).
+// Otherwise the reason the attempt ended, with nothing set to boot; the caller ends the attempt
+// (storage_fw_attempt_ended) and reports it. That includes the spare partition failing to be
+// set to boot while the running one is still the one that starts: `flash`, and no restart. The
+// caller closes the download either way.
 dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device,
                             uint64_t offer_size, bool has_length, uint64_t length,
                             int64_t started_ms, bool (*stop)(void));

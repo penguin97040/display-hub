@@ -312,6 +312,22 @@ static void test_firmware_requests(void)
     CHECK(dh_firmware_report_request(&report, "0.1.0", out, n) == 0 && out[0] == '\0');
     CHECK(dh_firmware_report_request(&report, "0.1.0", out, n + 1) == n);
 
+    /* Which answers settle a final report. A hub that couldn't take it just now is asked
+     * again; one that says the report can never be taken is not. */
+    for (int status = 0; status <= 700; status++) {
+        bool settles = (status >= 200 && status <= 299) ||
+                    (status >= 400 && status <= 499 && status != 429);
+        if (dh_firmware_report_settled(status) != settles) {
+            FAIL("a status settles a firmware report when it shouldn't, or doesn't when it should");
+            break;
+        }
+    }
+    CHECK(dh_firmware_report_settled(204) && dh_firmware_report_settled(404) &&
+          dh_firmware_report_settled(401) && dh_firmware_report_settled(400));
+    CHECK(!dh_firmware_report_settled(429) && !dh_firmware_report_settled(500) &&
+          !dh_firmware_report_settled(503) && !dh_firmware_report_settled(302) &&
+          !dh_firmware_report_settled(-1));
+
     /* The download's path. */
     char path[DH_FIRMWARE_PATH_MAX];
     char id[DH_PACKAGE_ID_HEX_LEN + 2];
