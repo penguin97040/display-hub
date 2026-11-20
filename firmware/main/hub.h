@@ -56,6 +56,9 @@ typedef enum {
 
 typedef struct {
     hub_state_t state;
+    // The setup this is about (storage_setup_generation()). After a setup is erased or replaced,
+    // the task takes a few seconds to notice: until then this still describes the old one.
+    uint32_t generation;
     dh_problem problem;
     hub_detail_t detail;
     // The device ID and token couldn't be written to flash: they are kept in memory, and the
@@ -70,7 +73,8 @@ typedef struct {
 
 // A copy of the pages held, for the screen to draw. It is about 38 KB, so keep it off the stack.
 typedef struct {
-    uint32_t seq;        // changes whenever anything below does
+    uint32_t seq;         // changes with every new snapshot, so ages use its generated_at
+    uint32_t content_seq; // changes only when the pages themselves (may) differ
     bool has_snapshot;   // false: no pages are held, and `snapshot` is all zeros
     // The setup they came with (storage_setup_generation()). Pages from a setup that has since
     // been erased or replaced must never be drawn: the hub task may take a few seconds to notice.

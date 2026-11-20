@@ -4,10 +4,10 @@
 // The wording follows the desktop app's preview of a page (apps/hub-manager/src/shown.rs, and
 // hub_core's short_duration): "Updated 10 min ago", "Stale. Updated 2 d ago", "Resets in 3 h 20
 // min", "Reset due", and a dash for a figure that isn't known. One difference: the screen
-// brings ages and countdowns up to date every 30 seconds, so under a minute it says "Updated just
-// now" and "Resets in under a minute" where the app would count the seconds. Ages and countdowns are on the
-// hub's clock: the snapshot's own times, plus how long it has been held by a monotonic timer.
-// The display's own date is never used.
+// brings ages and countdowns up to date every 30 seconds, so under a minute it says "Updated
+// just now" and "Resets in under a minute" where the app would count the seconds. Ages and
+// countdowns are on the hub's clock: the snapshot's own times, plus how long it has been held by
+// a monotonic timer. The display's own date is never used.
 
 #pragma once
 

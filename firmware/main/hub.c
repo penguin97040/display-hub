@@ -60,10 +60,12 @@ static TaskHandle_t s_task;
 
 static SemaphoreHandle_t s_status_lock;
 static hub_status_t s_status;
-// The copy of the pages that hub_pages() hands out, under s_status_lock. s_pages_seq counts the
-// changes to the pages held (s_current), and the copy catches up with it at the next publish().
+// The copy of the pages that hub_pages() hands out, under s_status_lock. s_pages_seq counts every
+// new snapshot held (s_current), and the copy catches up with it at the next publish();
+// s_content_seq counts only those whose pages differ from the ones before.
 static hub_pages_t *s_shown;
 static uint32_t s_pages_seq;
+static uint32_t s_content_seq;
 
 // Too big for a stack: taken from PSRAM once, at start-up.
 static dh_setup *s_setup;         // this session's copy of the setup; secrets wiped as they are used
@@ -170,6 +172,7 @@ static void publish(void)
     }
     next.detail = s.detail;
     next.token_unsaved = s.enrolled && !s.token_saved;
+    next.generation = s.generation;
     next.has_snapshot = s.has_snapshot;
     next.saved_pages = s.has_snapshot && s.saved_pages;
 
@@ -190,6 +193,7 @@ static void publish(void)
             dh_wipe(s_shown, sizeof(*s_shown));
         }
         s_shown->seq = s_pages_seq;
+        s_shown->content_seq = s_content_seq;
         changed = true;
     }
     xSemaphoreGive(s_status_lock);
@@ -213,10 +217,16 @@ static void stick(dh_problem problem, hub_detail_t detail)
     set_state(problem == DH_PROBLEM_NEEDS_SETUP ? HUB_NEEDS_SETUP : HUB_TROUBLE, detail);
 }
 
-// The pages held have changed: the screen's copy catches up at the next publish().
-static void pages_changed(void)
+// A new snapshot is held (or none): the screen's copy catches up at the next publish(). Every
+// one is passed on, so the screen always works out ages from the latest generated_at and time of
+// arrival. `content` says whether the pages themselves may differ from the ones before; only then
+// does the screen draw them afresh.
+static void pages_changed(bool content)
 {
     s_pages_seq++;
+    if (content) {
+        s_content_seq++;
+    }
 }
 
 // Whether two snapshots hold the same pages, whatever their generated_at. dh_read_response()
@@ -464,9 +474,9 @@ static void poll(void)
             : dh_read_error_response(answer.status, s_body, answer.len);
     uint32_t refresh = 0;
     if (response.outcome == DH_OUTCOME_SHOW) {
-        // The same pages as before need no redraw (which would also drop a swipe in progress).
-        // The screen's copy keeps the earlier generated_at and time of arrival, so its ages
-        // stay right. Pages restored from flash are always replaced: their age becomes known.
+        // The same pages as before need no redraw (which would also drop a swipe in progress),
+        // only their ages brought up to date. Pages restored from flash count as changed: their
+        // age becomes known.
         const bool same = s.has_snapshot && !s.saved_pages && same_pages(s_current, s_spare);
         dh_snapshot *const shown = s_spare;
         s_spare = s_current;
@@ -474,9 +484,7 @@ static void poll(void)
         s.has_snapshot = true;
         s.saved_pages = false;
         s.received_ms = now_ms();
-        if (!same) {
-            pages_changed();
-        }
+        pages_changed(!same);
         refresh = s_current->refresh_after_seconds;
         save_snapshot_if_due(answer.len);
         const dh_firmware_offer *offer = &s_current->firmware_update;
@@ -778,7 +786,7 @@ static void load_saved_snapshot(void)
         s.has_snapshot = true;
         s.saved_pages = true;
         s.received_ms = now_ms();
-        pages_changed();
+        pages_changed(true);
         ESP_LOGI(TAG, "showing the saved snapshot (%u bytes, %u pages) until the hub answers",
                  (unsigned)s.saved_len, (unsigned)s_current->page_count);
     } else {
@@ -899,7 +907,7 @@ static void end_session(void)
     memset(&s, 0, sizeof(s));
     s.minute_ms = minute;
     s.state = HUB_IDLE;
-    pages_changed();
+    pages_changed(true);
     publish();
 }
 

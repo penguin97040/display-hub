@@ -102,8 +102,11 @@ static void on_reset_button(reset_button_event_t event, int seconds_left)
 }
 
 // Forgets the screen's copy of the pages, but not its seq, so that hub_pages() doesn't copy the
-// same pages straight back: it copies again only once the hub task's pages change. Call it while
-// holding the LVGL lock.
+// same pages straight back. It copies again at the hub task's next change: every snapshot it
+// takes, or the end of its session. If that is still the old setup's (a poll that finished just
+// before the task noticed the setup had gone), show_state() finds it out of date and forgets it
+// again; a new setup's pages come with the right generation. Call it while holding the LVGL
+// lock.
 static void forget_pages(void)
 {
     if (s_pages != NULL) {
@@ -120,6 +123,14 @@ static void show_state(const char *note)
     }
     const storage_facts_t facts = storage_facts();
     hub_status(&s_hub);
+    // A status about a setup that has since been erased or replaced says nothing about the one
+    // there is now. Until the hub task takes the new one up, it is joining, as for any new setup.
+    // (HUB_FAILED is about the task, not the setup, and stays.)
+    if (s_hub.state != HUB_FAILED && s_hub.generation != storage_setup_generation()) {
+        const hub_status_t joining = {.state = HUB_JOINING_WIFI,
+                                      .generation = storage_setup_generation()};
+        s_hub = joining;
+    }
     if (lvgl_port_lock(0)) {
         if (s_pages != NULL) {
             hub_pages(s_pages);

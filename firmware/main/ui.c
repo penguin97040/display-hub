@@ -22,6 +22,12 @@
 #define TICK_MS     30000
 #define SHIFT_TICKS 6
 
+// How far a finger must move before LVGL starts to scroll a long page up or down (its default is
+// 10 px). LVGL takes whichever way the finger has moved further when this is reached, and a
+// scroll that has started stops the swipe that turns the page. A sideways swipe often starts
+// with a few pixels' wobble up or down, so a little more room keeps it a swipe.
+#define SCROLL_START_PX 20
+
 static lv_obj_t *s_root;   // everything; moved a few pixels now and then (ui_shift)
 static lv_obj_t *s_status; // the status screen: a column of text, as it always was
 static lv_obj_t *s_title;
@@ -37,7 +43,12 @@ static const hub_pages_t *s_pages; // the pages to draw, or NULL
 static bool s_with_pages;          // set up and holding pages: the swipe row shows
 static bool s_counting;            // the factory reset countdown covers everything
 static size_t s_view;              // which view of the row: a page, or the status screen last
-static uint32_t s_drawn_seq;       // the pages' seq when s_ids was taken
+// The pages in the row, as last drawn: a new snapshot with the same pages (the same content_seq,
+// setup and saved flag) only brings the ages up to date, so a swipe or a scroll in progress isn't
+// lost.
+static uint32_t s_drawn_content;
+static uint32_t s_drawn_generation;
+static bool s_drawn_saved;
 static ui_page_ids s_ids;          // the ids of the pages in the row, to keep the view by
 static char s_drawn_id[DH_MAX_ID_BYTES + 1]; // the page drawn last, to keep its scroll position
 
@@ -239,6 +250,12 @@ void ui_start(const char *version, const char *board_note)
     lv_obj_set_style_text_font(screen, f->body, 0);
     lv_obj_set_scrollable(screen, false);
     lv_obj_add_event_cb(screen, on_gesture, LV_EVENT_GESTURE, NULL);
+    for (lv_indev_t *indev = lv_indev_get_next(NULL); indev != NULL;
+         indev = lv_indev_get_next(indev)) {
+        if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+            lv_indev_set_scroll_limit(indev, SCROLL_START_PX);
+        }
+    }
 
     // Everything is laid out UI_SHIFT_MAX in from each edge, so the burn-in shift never pushes
     // anything off the screen.
@@ -547,21 +564,39 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
                    const hub_status_t *hub, const hub_pages_t *pages, const char *note)
 {
+    // Whatever was on the screen is drawn afresh unless only the ages have moved on.
+    bool redraw = s_counting || !s_with_pages;
     s_counting = false;
     s_pages = pages;
 
     const bool running = !show_not_running(facts, key, note);
     const bool with_pages = running && pages != NULL && pages->has_snapshot;
     if (with_pages) {
+        const bool fresh = !s_with_pages || pages->content_seq != s_drawn_content ||
+                           pages->generation != s_drawn_generation ||
+                           pages->saved != s_drawn_saved;
         if (!s_with_pages) {
             s_view = 0; // the first page, whenever the row appears
-        } else if (pages->seq != s_drawn_seq) {
+        } else if (fresh) {
             s_view = ui_keep_view(&s_ids, s_view, &pages->snapshot);
         }
-        ui_page_ids_of(&pages->snapshot, &s_ids);
-        s_drawn_seq = pages->seq;
+        if (fresh) {
+            ui_page_ids_of(&pages->snapshot, &s_ids);
+            s_drawn_content = pages->content_seq;
+            s_drawn_generation = pages->generation;
+            s_drawn_saved = pages->saved;
+            redraw = true;
+        }
+    } else {
+        redraw = true;
     }
     s_with_pages = with_pages;
+
+    // The line about the hub is part of the page: a new one means drawing the page again.
+    char line_before[sizeof(s_line)];
+    memcpy(line_before, s_line, sizeof(line_before));
+    const lv_color_t colour_before = s_line_colour;
+    const bool problem_before = s_line_problem;
     if (running) {
         show_hub(hub, with_pages ? pages : NULL, pages == NULL, note);
         set_line(hub, note);
@@ -569,7 +604,17 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
         s_line[0] = '\0';
         s_line_problem = false;
     }
-    render();
+    if (strcmp(line_before, s_line) != 0 || !lv_color_eq(colour_before, s_line_colour) ||
+        problem_before != s_line_problem) {
+        redraw = true;
+    }
+
+    if (redraw) {
+        render();
+    } else if (s_live_page != NULL) {
+        // The same pages from a later snapshot: its generated_at and time of arrival.
+        ui_page_tick(&s_live, &pages->snapshot, s_live_page, pages->saved, held_seconds());
+    }
 }
 
 void ui_show_reset_countdown(int seconds_left)
