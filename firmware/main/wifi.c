@@ -31,6 +31,12 @@ static atomic_int s_rssi;
 // At most this many access points are logged after a failed join: plenty for one network, and
 // each record is about 90 bytes.
 #define SURVEY_MAX_APS 10
+// A survey after each of the first few failed joins, then after every tenth, so a network that
+// stays away all night doesn't fill the log (or hold up the hub task) every minute.
+#define SURVEY_EVERY_FIRST 3
+#define SURVEY_EVERY_LATER 10
+// Failed joins since Wi-Fi started or last joined. Only the hub task touches it.
+static unsigned s_failed_joins;
 
 // Runs on the system's event task, which has a small stack: record and wake, nothing more.
 static void on_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -174,6 +180,7 @@ esp_err_t wifi_start(const dh_setup *setup)
         return err;
     }
     s_started = true;
+    s_failed_joins = 0;
     atomic_store(&s_link, WIFI_LINK_DOWN);
     return ESP_OK;
 }
@@ -255,7 +262,10 @@ const char *wifi_reason_words(unsigned reason)
     case 0:
         return "no answer in time";
     case WIFI_REASON_AUTH_EXPIRE:
-        return "no answer from the access point while authenticating";
+        // Also what the driver says when an access point turns the display away (WPA3 or
+        // protected management frames it can't agree on, some wrong passwords).
+        return "authentication didn't finish: the access point didn't answer, or turned the "
+               "display away";
     case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
     case WIFI_REASON_HANDSHAKE_TIMEOUT:
         return "the password handshake failed, often a wrong password";
@@ -367,6 +377,10 @@ void wifi_log_survey(void)
     if (!s_started || atomic_load(&s_link) != WIFI_LINK_DOWN) {
         return;
     }
+    s_failed_joins++;
+    if (s_failed_joins > SURVEY_EVERY_FIRST && s_failed_joins % SURVEY_EVERY_LATER != 0) {
+        return;
+    }
     // The network's name, from the driver: the hub task wiped its own copy once Wi-Fi started.
     // The driver's config holds the password too, so it is static (as in wifi_start) and wiped
     // as soon as the name has been copied out.
@@ -393,7 +407,13 @@ void wifi_log_survey(void)
     scan.scan_type = WIFI_SCAN_TYPE_ACTIVE;
     scan.scan_time.active.min = 100;
     scan.scan_time.active.max = 250;
+    // Straight after a join this firmware gave up on, the driver may still be leaving it and
+    // refuse a scan for a moment: wait and ask again, a few times.
     err = esp_wifi_scan_start(&scan, true);
+    for (int tries = 0; err == ESP_ERR_WIFI_STATE && tries < 3; tries++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        err = esp_wifi_scan_start(&scan, true);
+    }
     dh_wipe(ssid, sizeof(ssid));
     if (err != ESP_OK) {
         // Nothing was found, so there is no list to free.
@@ -440,6 +460,7 @@ void wifi_log_joined(void)
 {
     // Holds the network's name and the access point's address: static, and wiped below.
     static wifi_ap_record_t ap;
+    s_failed_joins = 0;
     if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
         log_ap("joined an access point", &ap);
     }

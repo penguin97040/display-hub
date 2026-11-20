@@ -57,7 +57,8 @@ const char *wifi_reason_words(unsigned reason);
 // After a failed join, looks for the network's access points and logs one line for each (its
 // channel, signal, security and Wi-Fi standards, never its name or address), so the console
 // shows what the display can actually hear. Blocks for a few seconds. Only when the radio is on
-// and the link is down: never while a join is under way.
+// and the link is down: never while a join is under way. Call it once for each failed join: it
+// surveys after the first three since Wi-Fi started or last joined, then after every tenth.
 void wifi_log_survey(void);
 // Logs the signal, channel and security of the access point just joined.
 void wifi_log_joined(void);
