@@ -44,6 +44,11 @@ pub const HUB_PAGE_LIMIT: usize = 50;
 /// How often the open app checks the hub, and how often while waiting for a new display to appear.
 pub const REFRESH_EVERY: Duration = Duration::from_secs(30);
 pub const WATCH_EVERY: Duration = Duration::from_secs(5);
+/// How soon a background refresh is tried again after its first miss, before anything is said.
+pub const RETRY_SOON: Duration = Duration::from_secs(5);
+/// Background refreshes that must miss in a row before the manager says the hub can't be reached.
+/// One miss is usually a VPN or Wi-Fi hiccup on a single connection.
+pub const QUIET_MISSES: u8 = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Section {
@@ -907,6 +912,10 @@ pub struct Model {
     pub refreshed_at: Option<Instant>,
     /// Whether the last call reached the hub. `None` before the first.
     pub online: Option<bool>,
+    /// The running refresh was started by the timer, not by the person.
+    background_refresh: bool,
+    /// Background refreshes in a row that couldn't reach the hub and were not shown.
+    missed_refreshes: u8,
     pub notice: Option<Guidance>,
     pub busy: Option<Busy>,
     pub confirm: Option<Confirm>,
@@ -964,6 +973,8 @@ impl Model {
             last: None,
             refreshed_at: None,
             online: None,
+            background_refresh: false,
+            missed_refreshes: 0,
             notice: None,
             busy: None,
             confirm: None,
@@ -1143,7 +1154,11 @@ impl Model {
         if !self.connected() {
             return None;
         }
-        self.start(Busy::Refreshing, Op::Refresh)
+        let op = self.start(Busy::Refreshing, Op::Refresh);
+        if op.is_some() {
+            self.background_refresh = false;
+        }
+        op
     }
 
     /// A background refresh, when one is due and nothing else is running.
@@ -1155,11 +1170,18 @@ impl Model {
         } else {
             REFRESH_EVERY
         };
+        let every = if self.missed_refreshes > 0 {
+            every.min(RETRY_SOON)
+        } else {
+            every
+        };
         let due = self
             .refreshed_at
             .is_none_or(|t| now.saturating_duration_since(t) >= every);
         if due && self.confirm.is_none() {
-            self.refresh()
+            let op = self.refresh();
+            self.background_refresh = op.is_some();
+            op
         } else {
             None
         }
@@ -2152,6 +2174,7 @@ impl Model {
         self.last = Some(r);
         self.refreshed_at = Some(now);
         self.online = Some(true);
+        self.missed_refreshes = 0;
         self.prune_tick_changes();
         self.prune_helper_feeds();
         unreadable
@@ -2439,7 +2462,14 @@ impl Model {
             Some(Busy::Naming { .. }) => Doing::Naming,
             _ => Doing::Other,
         };
+        let quiet = self.background_refresh && busy == Some(Busy::Refreshing) && self.online != Some(false);
         let g = match &f {
+            Failure::Client(e) if quiet && is_blip(e) && self.missed_refreshes < QUIET_MISSES => {
+                // The first background miss keeps what is on screen and tries again soon.
+                self.missed_refreshes += 1;
+                self.refreshed_at = Some(now);
+                return;
+            }
             Failure::Client(e) => {
                 let address = match (&busy, &self.hub) {
                     (_, Some(h)) => format!("{}:{}", h.host, h.port),
@@ -2448,6 +2478,7 @@ impl Model {
                         .unwrap_or_default(),
                 };
                 if e.is_connection() {
+                    self.missed_refreshes = 0;
                     self.online = Some(false);
                     // Don't retry straight away.
                     self.refreshed_at = Some(now);
@@ -2533,6 +2564,11 @@ impl Model {
         }
         out.join("\n")
     }
+}
+
+/// A reachability failure that may be a passing hiccup. A changed hub key is never one.
+fn is_blip(e: &ClientError) -> bool {
+    e.is_connection() && !matches!(e, ClientError::IdentityMismatch)
 }
 
 fn bad_title() -> Guidance {
@@ -3486,11 +3522,24 @@ mod tests {
         m.refreshed_at = None;
         m.refresh_due(now).unwrap();
         m.finish(Err(Failure::Client(ClientError::Unreachable("x".into()))), now);
+        assert_eq!(m.online, Some(true), "one missed background refresh is not shown");
+        assert!(m.notice.is_none());
+        assert!(m.refresh_due(now).is_none(), "no instant retry loop");
+        let later = now + RETRY_SOON;
+        m.refresh_due(later).unwrap();
+        m.finish(Err(Failure::Client(ClientError::Unreachable("x".into()))), later);
         assert_eq!(m.online, Some(false));
         assert!(m.notice.as_ref().unwrap().detail.contains("192.168.1.20:8443"));
-        assert!(m.refresh_due(now).is_none(), "no instant retry loop");
-        m.refresh_due(now + REFRESH_EVERY).unwrap();
-        m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now + REFRESH_EVERY);
+        assert!(m.refresh_due(later).is_none(), "no instant retry loop");
+        assert!(
+            m.refresh_due(later + RETRY_SOON).is_none(),
+            "once shown, back to the full wait"
+        );
+        m.refresh_due(later + REFRESH_EVERY).unwrap();
+        m.finish(
+            Ok(Outcome::Refreshed(Some(refresh(vec![])))),
+            later + REFRESH_EVERY,
+        );
         assert!(m.notice.is_none(), "back online clears the problem");
 
         m.refresh().unwrap();
@@ -3506,6 +3555,38 @@ mod tests {
             m.needs_pairing && !m.connected(),
             "a revoked PC is asked to pair again"
         );
+    }
+
+    #[test]
+    fn a_missed_background_refresh_is_only_shown_when_it_repeats() {
+        let miss = || Failure::Client(ClientError::Timeout);
+        let (mut m, now) = connected(vec![]);
+        m.refreshed_at = None;
+        m.refresh_due(now).unwrap();
+        m.finish(Err(miss()), now);
+        assert!(m.notice.is_none() && m.online == Some(true));
+        // A success starts the count again.
+        m.refresh_due(now + RETRY_SOON).unwrap();
+        m.finish(Ok(Outcome::Refreshed(Some(refresh(vec![])))), now + RETRY_SOON);
+        let t = now + RETRY_SOON + REFRESH_EVERY;
+        m.refresh_due(t).unwrap();
+        m.finish(Err(miss()), t);
+        assert!(
+            m.notice.is_none() && m.online == Some(true),
+            "the count was reset"
+        );
+        // The person's own refresh says so at once.
+        m.refresh().unwrap();
+        m.finish(Err(miss()), t);
+        assert_eq!(m.online, Some(false));
+        assert!(m.notice.is_some());
+
+        // A changed hub key is never put down to a hiccup.
+        let (mut m, now) = connected(vec![]);
+        m.refreshed_at = None;
+        m.refresh_due(now).unwrap();
+        m.finish(Err(Failure::Client(ClientError::IdentityMismatch)), now);
+        assert!(m.notice.is_some());
     }
 
     #[test]

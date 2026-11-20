@@ -27,6 +27,10 @@ pub const FIRMWARE_TIMEOUT: Duration =
     Duration::from_secs(hub_protocol::limits::FIRMWARE_DOWNLOAD_TIMEOUT_SECONDS);
 const TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an idle connection is kept for reuse. The hub gives up on a quiet connection after about
+/// 10 seconds, so this is well under that: a connection that has sat longer may already be dead at
+/// the other end (a VPN can lose the close), and is better replaced than tried.
+const POOL_IDLE: Duration = Duration::from_secs(4);
 
 /// Why a call to the hub failed, in terms a person can act on.
 #[derive(Debug, thiserror::Error)]
@@ -108,6 +112,7 @@ impl HubClient {
             .use_preconfigured_tls(pin::client_config(Vec::new()))
             .timeout(TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -135,6 +140,7 @@ impl HubClient {
             .https_only(true)
             .timeout(TIMEOUT)
             .connect_timeout(CONNECT_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -831,9 +837,25 @@ impl HubClient {
         .map(|_| ())
     }
 
+    /// Sends a request, and a plain read (a GET with no body) is sent once more if the hub couldn't be
+    /// reached. A connection that failed is dropped, never reused, so the second try opens a new one.
+    /// Anything else, a changed hub key and a refusal from the hub included, is reported as it was.
+    async fn execute(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ClientError> {
+        let req = req.build().map_err(classify)?;
+        let again = (req.method() == Method::GET && req.body().is_none())
+            .then(|| req.try_clone())
+            .flatten();
+        match self.http.execute(req).await.map_err(classify) {
+            Err(ClientError::Unreachable(_) | ClientError::Timeout) if again.is_some() => {
+                self.http.execute(again.expect("checked")).await.map_err(classify)
+            }
+            r => r,
+        }
+    }
+
     /// Sends a request and reads at most `cap` bytes of a successful body.
     async fn send(&self, req: reqwest::RequestBuilder, cap: usize) -> Result<Vec<u8>, ClientError> {
-        let resp = req.send().await.map_err(classify)?;
+        let resp = self.execute(req).await?;
         let status = resp.status();
         if !status.is_success() {
             let body = read_capped(resp, 8192).await.ok();
