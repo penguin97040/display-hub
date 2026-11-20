@@ -131,11 +131,12 @@ bool storage_fw_marked_good(void);
 bool storage_fw_report_next(dh_fw_report *out);
 // The hub's answer settled a report (dh_fw_report_answered): it isn't sent again.
 void storage_fw_report_answered(const dh_fw_report *sent);
-// The hub answered a final report without settling it (dh_firmware_report_settled said no). Not
-// for a request that got no answer. Counts such answers to this report in this run, and after
-// DH_FW_REPORT_MAX_REFUSALS of them gives it up: the report is settled as if taken, and true is
-// returned, so one hub fault can't keep new offers waiting for good. False: it is sent again
-// after a later poll.
+// The hub refused a final report in a way that may never change (dh_firmware_report_refused
+// said so). Never for a request that got no answer, or a hub that was busy or away: an outage
+// of any length must not cost a report. Counts such refusals of this report in this run, and
+// after DH_FW_REPORT_MAX_REFUSALS of them gives it up: the report is settled as if taken, and
+// true is returned, so one hub fault can't keep new offers waiting for good. False: it is sent
+// again after a later poll.
 bool storage_fw_report_not_taken(const dh_fw_report *sent);
 
 // What the screen says about updates.

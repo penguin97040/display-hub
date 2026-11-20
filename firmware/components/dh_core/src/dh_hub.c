@@ -137,6 +137,18 @@ bool dh_firmware_report_settled(int http_status, const uint8_t *body, size_t len
     }
 }
 
+bool dh_firmware_report_refused(int http_status, const uint8_t *body, size_t len)
+{
+    if (http_status < 400 || http_status > 499 || http_status == 408 || http_status == 429 ||
+        dh_firmware_report_settled(http_status, body, len)) {
+        return false;
+    }
+    static const uint8_t none[1] = {0};
+    dh_response r = dh_read_error_response(http_status, body != NULL ? body : none,
+                                           body != NULL ? len : 0);
+    return r.error_code != DH_ERROR_RATE_LIMITED && r.error_code != DH_ERROR_UNAVAILABLE;
+}
+
 /* ---- The device ID and token ---- */
 
 /* Printable ASCII with no space: safe in a log line (the ID) and in a header (the token). */

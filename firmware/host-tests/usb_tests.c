@@ -80,6 +80,9 @@ typedef struct {
     /* Test switches and counters. */
     bool unreadable;
     bool restart_needed;
+    /* A failed write of the keys or the record sets restart_needed, as the firmware's store
+     * does. */
+    bool restart_after_failure;
     bool fail_keys, fail_record, fail_setup, fail_erase;
     unsigned key_writes, record_writes, setup_writes, erases;
 } fake_store;
@@ -100,6 +103,9 @@ static bool fake_save_keys(void *ctx, const dh_fw_keys *keys)
 {
     fake_store *f = ctx;
     f->key_writes++;
+    if (f->fail_keys && f->restart_after_failure) {
+        f->restart_needed = true;
+    }
     if (f->fail_keys) {
         return false;
     }
@@ -111,6 +117,9 @@ static bool fake_save_record(void *ctx, const dh_fw_record *record)
 {
     fake_store *f = ctx;
     f->record_writes++;
+    if (f->fail_record && f->restart_after_failure) {
+        f->restart_needed = true;
+    }
     if (f->fail_record) {
         return false;
     }
@@ -943,6 +952,33 @@ static void test_storage(void)
     CHECK(d->flash.key_writes == 0 && d->flash.setup_writes == 0);
     CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
     CHECK(strstr(d->reply, "\"provisioned\":false") != NULL);
+
+    /* A write of the keys or the record fails, and the store then needs a restart (as the
+     * firmware's does): the answer to that very bundle says so, not "try again". */
+    for (int which = 0; which < 2; which++) {
+        d = new_display();
+        spend_budget(d, 1);
+        d->flash.fail_keys = which == 0;
+        d->flash.fail_record = which == 1;
+        d->flash.restart_after_failure = true;
+        CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+        CHECK(strstr(d->reply, "until it restarts") != NULL);
+        CHECK(strstr(d->reply, "Try again.") == NULL && !d->flash.has_setup);
+        CHECK(d->flash.setup_writes == 0 && memcmp(&d->work, &zero, sizeof zero) == 0);
+        /* And so does the answer to the next one, with nothing more written. */
+        d->flash.fail_keys = d->flash.fail_record = false;
+        fake_store after = d->flash;
+        CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+        CHECK(strstr(d->reply, "until it restarts") != NULL);
+        CHECK(memcmp(&after, &d->flash, sizeof after) == 0);
+    }
+    /* A setup write that fails by itself doesn't need a restart: the same bundle may be sent
+     * again. */
+    d = new_display();
+    d->flash.fail_setup = true;
+    d->flash.restart_after_failure = true;
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "Try again.") != NULL && strstr(d->reply, "restarts") == NULL);
 
     /* A write failed earlier in this run, so what is stored isn't known until a restart: every
      * bundle is refused before anything is written, with the protocol's only code for it and

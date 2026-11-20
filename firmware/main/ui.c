@@ -448,7 +448,7 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
     }
     if (hub->update == HUB_UPDATE_RESTARTING_TO_SETTLE) {
         return "The firmware update couldn't be set to start. This display is restarting to "
-               "tidy up, and should come back on the version it has.";
+               "sort that out. This screen says how it ended once it is back.";
     }
     if (fw->no_way_back) {
         return "This is new firmware, on trial. It didn't reach the hub in its first 5 minutes, "

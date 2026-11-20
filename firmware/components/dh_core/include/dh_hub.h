@@ -99,18 +99,27 @@ size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmwa
  * later poll: a 5xx, `rate_limited`, `unavailable`, the faults the protocol says to retry
  * (`unauthorised`, `forbidden`, `bad_request`, `payload_too_large`, `conflict`, and `not_found`
  * with any status but 404), a "set up again" code with a status that isn't 4xx, a code this
- * firmware doesn't know, and an answer with no error body. The caller bounds how often: see
- * DH_FW_REPORT_MAX_REFUSALS.
+ * firmware doesn't know, and an answer with no error body. How often a hub may refuse one is
+ * bounded: see DH_FW_REPORT_MAX_REFUSALS.
  * body is the answer's body, len bytes (it may be NULL when len is 0). */
 bool dh_firmware_report_settled(int http_status, const uint8_t *body, size_t len);
 
-/* A final report the hub answers but never takes would wait for good, and while one waits no
- * new offer is acted on: one hub fault could stop a display updating for ever. So once the hub
- * has answered the same report this many times without settling it (answers only: a request
- * that got no answer doesn't count), the display stops sending it and treats it as settled. The
- * count is kept in memory, so it starts again at a restart. The reference display has no such
- * limit, because it settles a report on any answer at all. */
+/* A final report the hub refuses every time would wait for good, and while one waits no new
+ * offer is acted on: one hub fault could stop a display updating for ever. So once the hub has
+ * refused the same report this many times (dh_firmware_report_refused), the display stops
+ * sending it and treats it as settled. The count is kept in memory, so it starts again at a
+ * restart. The reference display has no such limit, because it settles a report on any answer
+ * at all. */
 #define DH_FW_REPORT_MAX_REFUSALS 10u
+
+/* Whether an answer that didn't settle a final report is a refusal that counts towards
+ * DH_FW_REPORT_MAX_REFUSALS: a 4xx status, with one of the faults the protocol says to retry, a
+ * code this firmware doesn't know, or no error body. Never a hub that is only busy or away,
+ * which may last any length of time and must never cost a report: any status that isn't 4xx (a
+ * 5xx above all), 408, 429, and the codes `rate_limited` and `unavailable` with any status. No
+ * answer at all doesn't count either; the caller never asks about that. False, too, for an
+ * answer that settles the report. */
+bool dh_firmware_report_refused(int http_status, const uint8_t *body, size_t len);
 
 /* ---- The device ID and token ---- */
 

@@ -658,9 +658,14 @@ static void heartbeat_if_due(void)
 // ---- Signed updates ----
 
 typedef enum {
-    REPORT_NO_ANSWER, // nothing reached the hub, or nothing came back: sent again later
-    REPORT_NOT_TAKEN, // the hub answered, and the answer doesn't settle it: sent again later
-    REPORT_SETTLED,   // not sent again
+    // Nothing reached the hub, nothing came back, or the hub is busy or away (a 5xx, a 429,
+    // `rate_limited`, `unavailable`): sent again later, however long that lasts.
+    REPORT_NOT_NOW,
+    // The hub refused it in a way that may never change (dh_firmware_report_refused): sent
+    // again later, but only DH_FW_REPORT_MAX_REFUSALS times in all.
+    REPORT_REFUSED,
+    REPORT_SETTLED,  // not sent again
+    REPORT_UNSENDABLE, // it can't even be written: given up at once
 } report_result_t;
 
 // Sends one firmware report. What the hub's answer means is dh_firmware_report_settled()'s to
@@ -673,20 +678,24 @@ static report_result_t send_report(const dh_fw_report *report)
     const size_t len =
         dh_firmware_report_request(report, s_firmware_version, s_request, sizeof(s_request));
     if (len == 0) {
-        ESP_LOGE(TAG, "a firmware report couldn't be written");
-        return REPORT_NO_ANSWER;
+        // Trying again would fail the same way for ever, and a report that waits holds every
+        // later offer back.
+        ESP_LOGE(TAG, "an update report couldn't be written (state %d): giving it up, so that "
+                      "later updates aren't held back",
+                 (int)report->state);
+        return REPORT_UNSENDABLE;
     }
     hub_answer_t answer;
     const dh_problem problem =
         ask_hub(DH_PATH_FIRMWARE_REPORT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, &answer);
     if (answer.stopped || gone()) {
-        return REPORT_NO_ANSWER;
+        return REPORT_NOT_NOW;
     }
     const char *state = dh_fw_report_state_name(report->state);
     const char *reason = dh_fw_reason_name(report->reason);
     if (problem != DH_PROBLEM_NONE) {
         ESP_LOGW(TAG, "update report (%s) not sent: %s", state, dh_problem_headline(problem));
-        return REPORT_NO_ANSWER;
+        return REPORT_NOT_NOW;
     }
     const bool settled = dh_firmware_report_settled(answer.status, s_body, answer.len);
     if (answer.status >= 200 && answer.status < 300) {
@@ -699,7 +708,11 @@ static report_result_t send_report(const dh_fw_report *report)
                  answer.status, code != NULL ? code : "no code",
                  settled ? "not sent again" : "sent again after a later poll");
     }
-    return settled ? REPORT_SETTLED : REPORT_NOT_TAKEN;
+    if (settled) {
+        return REPORT_SETTLED;
+    }
+    return dh_firmware_report_refused(answer.status, s_body, answer.len) ? REPORT_REFUSED
+                                                                         : REPORT_NOT_NOW;
 }
 
 // Tells the screen when what storage says about updates has changed without this task doing
@@ -724,12 +737,13 @@ static void send_reports(void)
     dh_fw_report report;
     for (int i = 0; i < 2 && !gone() && storage_fw_report_next(&report); i++) {
         const report_result_t result = send_report(&report);
-        if (result == REPORT_SETTLED) {
+        if (result == REPORT_SETTLED || result == REPORT_UNSENDABLE) {
             storage_fw_report_answered(&report);
-        } else if (result != REPORT_NOT_TAKEN || !storage_fw_report_not_taken(&report)) {
-            // Left for the next poll. (An answer that didn't settle it is counted, and after
-            // DH_FW_REPORT_MAX_REFUSALS of those the report is given up, so that a hub fault
-            // can't hold later updates back for good.)
+        } else if (result != REPORT_REFUSED || !storage_fw_report_not_taken(&report)) {
+            // Left for the next poll. (A refusal is counted, and after
+            // DH_FW_REPORT_MAX_REFUSALS of them the report is given up, so that a hub fault
+            // can't hold later updates back for good. A hub that is busy or away is never
+            // counted: an outage of any length costs no report.)
             return;
         }
         s_fw_seq++;
@@ -738,7 +752,8 @@ static void send_reports(void)
 }
 
 // Restarts: into the new firmware, or (when it couldn't be set to start) so that the start
-// settles the update record from what is in flash.
+// settles the update record from what is in flash. Nothing is said then about which firmware
+// that will be: sometimes it is known to be this one, and sometimes it can't be told.
 static void restart_for_update(update_restart_t restart)
 {
     const bool into_new = restart == UPDATE_RESTART_INTO_NEW;
@@ -746,7 +761,7 @@ static void restart_for_update(update_restart_t restart)
     publish();
     ESP_LOGW(TAG, "%s", into_new ? "restarting into the new firmware"
                                  : "restarting to settle an update that couldn't be set to "
-                                   "start: the new firmware is not expected to start");
+                                   "start: whichever firmware starts next settles it");
     vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
     esp_restart();
 }

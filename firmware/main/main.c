@@ -70,6 +70,9 @@ static hub_status_t s_hub;
 static hub_pages_t *s_pages;
 // The factory reset countdown is on the screen: nothing else may draw over it.
 static bool s_counting;
+// Update work has stopped after a failed write (storage_fw.h), and the screen hasn't said so
+// yet. Set from whichever task the write was on; read and cleared by the main task only.
+static volatile bool s_updates_stopped;
 // LVGL's own task (esp_lvgl_port names it), for its stack headroom in the log. Tiny TTF draws
 // each new glyph on that stack.
 static TaskHandle_t s_lvgl_task;
@@ -92,6 +95,9 @@ static void on_setup_stored(void)
 // with storage's lock held: it only queues the event.
 static void on_updates_stopped(void)
 {
+    // The flag is what counts: the event only wakes the main task, and may be dropped if the
+    // queue is full (in which case the task is awake anyway).
+    s_updates_stopped = true;
     send_event(EVENT_UPDATES_STOPPED, 0);
 }
 
@@ -210,10 +216,7 @@ static void handle_event(const event_t *event)
         }
         break;
     case EVENT_UPDATES_STOPPED:
-        // Whatever the display is doing, set up or not: the screen says a restart is needed.
-        if (!s_counting) {
-            show_state(NULL);
-        }
+        // Only a wake-up: the main loop looks at s_updates_stopped on every pass.
         break;
     case EVENT_RESET_COUNTING:
         s_counting = true;
@@ -306,6 +309,14 @@ void app_main(void)
     report_log(&s_board, &s_system, &s_efuse);
     int64_t logged_ms = esp_timer_get_time() / 1000;
     while (true) {
+        // Whatever the display is doing, set up or not: the screen says a restart is needed.
+        // Looked at on every pass, so it doesn't depend on its event reaching the queue. (While
+        // the factory reset countdown is up it waits; whatever is drawn after that says it
+        // too, since every screen is drawn from the same facts.)
+        if (s_updates_stopped && !s_counting) {
+            s_updates_stopped = false;
+            show_state(NULL);
+        }
         // Events come often once the display is polling, so the minute is counted by the clock
         // and not by the queue staying quiet.
         const int64_t since_ms = esp_timer_get_time() / 1000 - logged_ms;

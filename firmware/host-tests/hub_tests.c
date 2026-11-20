@@ -345,7 +345,15 @@ static void test_firmware_requests(void)
         {409, "conflict", false},
         /* A hub that couldn't take it just now, and codes this firmware doesn't know. */
         {429, "rate_limited", false},
+        {429, NULL, false},
+        {429, "bad_request", false},
+        {400, "rate_limited", false},
         {503, "unavailable", false},
+        {404, "unavailable", false},
+        {408, NULL, false},
+        {408, "bad_request", false},
+        {500, "bad_request", false},
+        {599, NULL, false},
         {500, NULL, false},
         {502, NULL, false},
         {400, NULL, false},
@@ -366,11 +374,40 @@ static void test_firmware_requests(void)
             len = snprintf(body, sizeof body, "{\"error\":{\"code\":\"%s\",\"message\":\"m\"}}",
                            answers[i].code);
         }
+        /* What counts towards giving a report up: a 4xx that doesn't settle it, but never a
+         * hub that is only busy or away (408, 429, `rate_limited`, `unavailable`), and never
+         * any other status, a 5xx above all. */
+        const char *code = answers[i].code != NULL ? answers[i].code : "";
+        bool refuses = answers[i].status >= 400 && answers[i].status <= 499 &&
+                       answers[i].status != 408 && answers[i].status != 429 &&
+                       !answers[i].settles && strcmp(code, "rate_limited") != 0 &&
+                       strcmp(code, "unavailable") != 0;
+        if (dh_firmware_report_refused(answers[i].status, (const uint8_t *)body, (size_t)len) !=
+            refuses) {
+            fprintf(stderr, "status %d, code %s\n", answers[i].status,
+                    answers[i].code != NULL ? answers[i].code : "(none)");
+            FAIL("an answer counts as a refusal when it shouldn't, or the other way");
+        }
         if (dh_firmware_report_settled(answers[i].status, (const uint8_t *)body, (size_t)len) !=
             answers[i].settles) {
             fprintf(stderr, "status %d, code %s\n", answers[i].status,
                     answers[i].code != NULL ? answers[i].code : "(none)");
             FAIL("an answer settles a firmware report when it shouldn't, or the other way");
+        }
+    }
+    /* Spelt out: the faults count, a busy or absent hub never does, and nor does success. */
+    static const char FAULT[] = "{\"error\":{\"code\":\"bad_request\",\"message\":\"m\"}}";
+    static const char BUSY[] = "{\"error\":{\"code\":\"unavailable\",\"message\":\"m\"}}";
+    CHECK(dh_firmware_report_refused(400, (const uint8_t *)FAULT, sizeof FAULT - 1));
+    CHECK(dh_firmware_report_refused(404, NULL, 0) && dh_firmware_report_refused(401, NULL, 0));
+    CHECK(!dh_firmware_report_refused(503, (const uint8_t *)BUSY, sizeof BUSY - 1));
+    CHECK(!dh_firmware_report_refused(503, (const uint8_t *)FAULT, sizeof FAULT - 1));
+    CHECK(!dh_firmware_report_refused(400, (const uint8_t *)BUSY, sizeof BUSY - 1));
+    for (int status = -1; status <= 700; status++) {
+        bool refuses = status >= 400 && status <= 499 && status != 408 && status != 429;
+        if (dh_firmware_report_refused(status, NULL, 0) != refuses) {
+            FAIL("a bare status counts as a refusal when it shouldn't, or the other way");
+            break;
         }
     }
     /* No status but a 2xx settles a report by itself, and a body may be missing altogether. */

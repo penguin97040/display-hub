@@ -363,8 +363,12 @@ static void run_package(dh_json_value root, size_t piece)
         update_restart_t restarts = UPDATE_NO_RESTART;
         dh_fw_reason reason = update_receive(NULL, &device, offer_size, has_length,
                                              content_length, 0, NULL, &restarts);
-        if ((reason == DH_FW_REASON_NONE) != (restarts == UPDATE_RESTART_INTO_NEW)) {
-            die("a restart into the new firmware without an install, or the other way");
+        if ((reason == DH_FW_REASON_NONE) != (restarts != UPDATE_NO_RESTART)) {
+            die("a restart without a reason to, or an ended attempt that restarts");
+        }
+        /* Nothing fails to be set to boot in a vector, so a restart here is a real install. */
+        if (reason == DH_FW_REASON_NONE && restarts != UPDATE_RESTART_INTO_NEW) {
+            die("an install that doesn't restart into the new firmware");
         }
         finished = reason == DH_FW_REASON_NONE;
         begun = glue.begun;

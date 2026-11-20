@@ -94,6 +94,11 @@ static dh_usb_answer refuse(dh_usb_error error, const char *why, char *reply, si
 
 /* ---- A bundle ---- */
 
+/* The message for DH_HELD_RESTART_NEEDED. */
+static const char RESTART_NEEDED[] =
+    "This display couldn't save to its storage, so it can't be set up until it restarts. "
+    "Unplug it, plug it back in, then try again.";
+
 static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
                                dh_json_value bundle, char *reply, size_t cap)
 {
@@ -117,10 +122,7 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     }
     if (holds == DH_HELD_RESTART_NEEDED) {
         dh_setup_wipe(d->work);
-        return refuse(DH_USB_ERROR_STORAGE_FAILED,
-                      "This display couldn't save to its storage earlier, so it can't be set up "
-                      "until it restarts. Unplug it, plug it back in, then try again.",
-                      reply, cap);
+        return refuse(DH_USB_ERROR_STORAGE_FAILED, RESTART_NEEDED, reply, cap);
     }
     if (holds == DH_HELD_SETUP) {
         dh_setup_wipe(d->work);
@@ -168,8 +170,13 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     saved = saved && d->store->save_setup(d->store->ctx, d->work);
     if (!saved) {
         dh_setup_wipe(d->work);
+        /* If the write that failed has left the store needing a restart, sending the bundle
+         * again can't work until then: say so now, not at the next try. */
         return refuse(DH_USB_ERROR_STORAGE_FAILED,
-                      "This display couldn't save its setup. Try again.", reply, cap);
+                      held(d) == DH_HELD_RESTART_NEEDED
+                          ? RESTART_NEEDED
+                          : "This display couldn't save its setup. Try again.",
+                      reply, cap);
     }
 
     dh_writer w = {reply, cap, 0, false};
