@@ -200,7 +200,9 @@ static lv_display_t *start_screen(board_revision_t revision)
 
     const lvgl_port_cfg_t port_cfg = {
         .task_priority = 4,
-        .task_stack = 8192,
+        // Tiny TTF draws each new glyph on this stack: 8 KB left only 336 bytes unused on the
+        // board (D7 log, 20/11/2026), so 12 KB.
+        .task_stack = 12288,
         .task_affinity = -1,
         .task_max_sleep_ms = 500,
         .task_stack_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DEFAULT,

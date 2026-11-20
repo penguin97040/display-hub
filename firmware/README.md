@@ -203,7 +203,7 @@ idf.py -C firmware -B build-rollback -DDH_TEST_VERSION=0.1.0-dev.9 -DDH_TEST_TRI
 ```
 
 - `DH_TEST_VERSION` builds the same code as another version, so one build can be offered as an update to another. It must be a pre-release version (`0.1.0-dev.8`), which the version rules count as older than the plain `0.1.0`.
-- `DH_TEST_TRIAL=no-check-in` makes firmware whose trial boot ignores every answer from the hub, so it must be sent back after five minutes. `DH_TEST_TRIAL=crash` makes firmware that crashes 20 seconds into its trial boot, so the bootloader must send it back. Either needs `DH_TEST_VERSION` as well: test code can't be built with a release version. Installed over USB (not on trial) such a build behaves like any other.
+- `DH_TEST_TRIAL=no-check-in` makes firmware whose trial boot ignores every answer from the hub, so it must be sent back after five minutes. `DH_TEST_TRIAL=crash` makes firmware that also ignores the hub, and crashes 20 seconds into its trial boot, so the bootloader must send it back. Either needs `DH_TEST_VERSION` as well: test code can't be built with a release version. Installed over USB (not on trial) such a build behaves like any other.
 
 The test code is two `#ifdef` blocks in `main/update.c`, and every line it logs starts `dh-test-trial`. To check an image has none of it: `grep -c dh-test-trial display-hub.bin` must print 0.
 

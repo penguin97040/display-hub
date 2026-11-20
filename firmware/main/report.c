@@ -18,6 +18,35 @@ static const char *yes_no(bool value)
     return value ? "yes" : "no";
 }
 
+// What the OTA data says about `running` now. Read again for each log, because the firmware
+// marks itself good (or the trial ends) after start-up.
+static const char *boot_record_of(const esp_partition_t *running)
+{
+    // After a first install the OTA data is blank, so it has no entry for the running slot.
+    esp_ota_img_states_t state;
+    const esp_err_t err = esp_ota_get_state_partition(running, &state);
+    if (err == ESP_ERR_NOT_FOUND) {
+        return "blank (first install)";
+    }
+    if (err != ESP_OK) {
+        return "unreadable";
+    }
+    switch (state) {
+    case ESP_OTA_IMG_NEW:
+        return "new";
+    case ESP_OTA_IMG_PENDING_VERIFY:
+        return "on trial";
+    case ESP_OTA_IMG_VALID:
+        return "marked good";
+    case ESP_OTA_IMG_INVALID:
+        return "marked bad";
+    case ESP_OTA_IMG_ABORTED:
+        return "aborted";
+    default:
+        return "not set";
+    }
+}
+
 void system_report_read(system_report_t *report)
 {
     *report = (system_report_t){0};
@@ -33,35 +62,7 @@ void system_report_read(system_report_t *report)
     report->running_address = running->address;
     report->running_size = running->size;
 
-    // After a first install the OTA data is blank, so it has no entry for the running slot.
-    esp_ota_img_states_t state;
-    const esp_err_t err = esp_ota_get_state_partition(running, &state);
-    if (err == ESP_ERR_NOT_FOUND) {
-        report->boot_record = "blank (first install)";
-    } else if (err != ESP_OK) {
-        report->boot_record = "unreadable";
-    } else {
-        switch (state) {
-        case ESP_OTA_IMG_NEW:
-            report->boot_record = "new";
-            break;
-        case ESP_OTA_IMG_PENDING_VERIFY:
-            report->boot_record = "on trial";
-            break;
-        case ESP_OTA_IMG_VALID:
-            report->boot_record = "marked good";
-            break;
-        case ESP_OTA_IMG_INVALID:
-            report->boot_record = "marked bad";
-            break;
-        case ESP_OTA_IMG_ABORTED:
-            report->boot_record = "aborted";
-            break;
-        default:
-            report->boot_record = "not set";
-            break;
-        }
-    }
+    report->boot_record = boot_record_of(running);
 }
 
 void memory_report_read(memory_report_t *report)
@@ -76,9 +77,10 @@ void report_log(const board_t *board, const system_report_t *system, const efuse
 {
     ESP_LOGI(TAG, "--- Display Hub firmware %s ---", system->version);
     if (system->running_known) {
+        const esp_partition_t *running = esp_ota_get_running_partition();
         ESP_LOGI(TAG, "running from %s at 0x%08" PRIx32 " (%" PRIu32 " bytes); boot record: %s",
                  system->running_label, system->running_address, system->running_size,
-                 system->boot_record);
+                 running != NULL ? boot_record_of(running) : system->boot_record);
     } else {
         ESP_LOGW(TAG, "couldn't tell which partition is running");
     }

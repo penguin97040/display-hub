@@ -188,8 +188,9 @@ bool update_trial_check_in(dh_fw_check_in answer)
     if (s_trial_lock == NULL) {
         return false;
     }
-#ifdef DH_TEST_TRIAL_NO_CHECK_IN
-    // TEST ONLY (firmware/README.md, "Test builds"): never in an official build.
+#if defined(DH_TEST_TRIAL_NO_CHECK_IN) || defined(DH_TEST_TRIAL_CRASH)
+    // TEST ONLY (firmware/README.md, "Test builds"): never in an official build. The crash test
+    // ignores the hub too, or a check-in would end the trial before the crash comes.
     ESP_LOGE(TAG, "dh-test-trial: TEST BUILD, ignoring the hub's answer during the trial boot");
     answer = DH_FW_CHECK_IN_FAILED;
 #endif
