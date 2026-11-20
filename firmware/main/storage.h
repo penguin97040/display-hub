@@ -11,8 +11,9 @@
 //
 // A factory reset erases all of dh_setup and never touches dh_fw.
 //
-// The keys, the record and the session live here, in memory, between writes. Anything that reads
-// or changes them, or calls into dh_update.h or dh_usb.h with them, must hold storage_lock().
+// The keys, the record and the session live in memory between writes (storage_fw.c, which also
+// has every call that changes them for an update). Anything that reads or changes them, or calls
+// into dh_update.h or dh_usb.h with them, must hold storage_lock().
 // Nothing here logs a secret: only counts and yes/no facts.
 //
 // THE SETUP'S GENERATION. The task that talks to the hub (hub.c) works from a copy of the setup,
@@ -32,6 +33,7 @@
 #include "dh_usb.h"
 #include "efuse_report.h"
 #include "esp_err.h"
+#include "storage_fw.h"
 #include "storage_key.h"
 
 #ifdef __cplusplus
@@ -73,8 +75,6 @@ const storage_key_status_t *storage_key_status(void);
 
 // For dh_usb.h: NULL while storage isn't working.
 const dh_setup_store *storage_store(void);
-dh_fw_keys *storage_fw_keys(void);
-dh_fw_record *storage_fw_record(void);
 // The size of the spare app partition, 0 if there is none.
 uint32_t storage_spare_slot_bytes(void);
 
@@ -111,13 +111,7 @@ size_t storage_load_snapshot(uint32_t generation, uint8_t *out, size_t cap);
 // saved snapshot, never part of one.
 bool storage_save_snapshot(uint32_t generation, uint8_t *body, size_t len);
 
-// Counts running time towards the update attempt budget (dh_fw_tick) and saves the record when
-// it changes. Call it every minute or so.
-void storage_fw_tick(void);
-// The attempts left, for a heartbeat.
-uint8_t storage_fw_attempts_left(void);
-// Whether this is new firmware on its trial boot, which sends no heartbeat (dh_update.h).
-bool storage_fw_on_trial(void);
+// What storage keeps for signed updates, and the calls that change it, are in storage_fw.h.
 
 // Prints the facts to the console.
 void storage_log(void);

@@ -420,9 +420,53 @@ static const char *advice(const hub_status_t *hub)
 #define TOKEN_UNSAVED "This display couldn't save its place with the hub. If it restarts now, " \
                       "it will need setting up again."
 
+// What a firmware update is doing, in a few words for the foot of each page. NULL for nothing.
+static const char *update_line(const hub_status_t *hub, const storage_fw_facts_t *fw)
+{
+    if (hub->update == HUB_UPDATE_DOWNLOADING) {
+        return "Updating its firmware";
+    }
+    if (hub->update == HUB_UPDATE_RESTARTING) {
+        return "Restarting to finish the update";
+    }
+    return fw->on_trial ? "Checking the new firmware" : NULL;
+}
+
+// The same in full, for the status screen: an update under way, a trial boot, or how the last
+// update ended. NULL for nothing to say.
+static const char *update_words(const hub_status_t *hub, const storage_fw_facts_t *fw)
+{
+    if (hub->update == HUB_UPDATE_DOWNLOADING) {
+        return "Installing a firmware update. Keep this display plugged in. It restarts by "
+               "itself when the update is ready.";
+    }
+    if (hub->update == HUB_UPDATE_RESTARTING) {
+        return "The firmware update is ready. Restarting now.";
+    }
+    if (fw->on_trial) {
+        return "This is new firmware, on trial. It has 5 minutes from starting to reach the "
+               "hub. If it can't, this display goes back to the version it had before.";
+    }
+    switch (fw->last_result) {
+    case DH_FW_REPORT_INSTALLED:
+        return "The last firmware update was installed.";
+    case DH_FW_REPORT_ROLLED_BACK:
+        return "The last firmware update didn't start properly, so this display went back to "
+               "the version it had before. Nothing was lost.";
+    case DH_FW_REPORT_FAILED:
+        return "The last firmware update didn't finish, so this display kept the version it "
+               "had. Nothing was lost.";
+    case DH_FW_REPORT_REFUSED:
+        return "This display refused the last firmware update it was offered. Nothing was "
+               "changed.";
+    default:
+        return NULL;
+    }
+}
+
 // The short line each page shows about the hub: a problem in its colour, what the display is
 // doing while it isn't yet talking to the hub, or the note about what just happened.
-static void set_line(const hub_status_t *hub, const char *note)
+static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, const char *note)
 {
     const char *line = NULL;
     lv_color_t colour = UI_COLOUR_QUIET;
@@ -454,6 +498,11 @@ static void set_line(const hub_status_t *hub, const char *note)
         colour = UI_COLOUR_WARNING;
         problem = true;
     }
+    // An update is said plainly, but never in place of a problem.
+    if (!problem && update_line(hub, fw) != NULL) {
+        line = update_line(hub, fw);
+        colour = UI_COLOUR_QUIET;
+    }
     if (line == NULL && note != NULL) {
         line = note;
     }
@@ -465,10 +514,11 @@ static void set_line(const hub_status_t *hub, const char *note)
 // A display that is set up: how things stand with the hub. With pages, this is the screen at
 // the end of the swipe row. `drawn` is NULL or the pages in the row; `no_memory` says there
 // was no memory for the screen's copy of them, so none can be shown.
-static void show_hub(const hub_status_t *hub, const hub_pages_t *drawn, bool no_memory,
-                     const char *note)
+static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
+                     const hub_pages_t *drawn, bool no_memory, const char *note)
 {
     static char body[640];
+    static char extra_text[480];
     // What is said about the pages is about the ones on the screen.
     const size_t pages = drawn != NULL ? page_count() : 0;
     const char *extra = NULL;
@@ -478,6 +528,13 @@ static void show_hub(const hub_status_t *hub, const hub_pages_t *drawn, bool no_
     } else if (drawn != NULL && drawn->saved) {
         extra = "The pages shown were saved before the last restart, so their age isn't known "
                 "until the hub answers.";
+    }
+    // Then how things stand with firmware updates, in the same small text.
+    const char *update = update_words(hub, fw);
+    if (update != NULL) {
+        snprintf(extra_text, sizeof(extra_text), "%s%s%s", extra != NULL ? extra : "",
+                 extra != NULL ? "\n\n" : "", update);
+        extra = extra_text;
     }
     // A token that isn't in flash matters more than whatever just happened.
     if (hub->token_unsaved) {
@@ -573,7 +630,8 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
 }
 
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
-                   const hub_status_t *hub, const hub_pages_t *pages, const char *note)
+                   const hub_status_t *hub, const storage_fw_facts_t *fw,
+                   const hub_pages_t *pages, const char *note)
 {
     // Whatever was on the screen is drawn afresh unless only the ages have moved on.
     bool redraw = s_counting || !s_with_pages;
@@ -609,8 +667,8 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     const lv_color_t colour_before = s_line_colour;
     const bool problem_before = s_line_problem;
     if (running) {
-        show_hub(hub, with_pages ? pages : NULL, pages == NULL, note);
-        set_line(hub, note);
+        show_hub(hub, fw, with_pages ? pages : NULL, pages == NULL, note);
+        set_line(hub, fw, note);
     } else {
         s_line[0] = '\0';
         s_line_problem = false;

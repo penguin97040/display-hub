@@ -2,7 +2,7 @@
 
 The official firmware for a Display Hub display, written in C with ESP-IDF. It is also the starter project for anyone making firmware for their own display.
 
-**Status: early.** It takes its setup over USB from the desktop app, keeps it in encrypted storage, joins Wi-Fi, enrols with the hub, polls for its pages, draws them, sends heartbeats, and can be factory-reset with the BOOT button. Installing signed updates follows. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
+**Status: early.** It takes its setup over USB from the desktop app, keeps it in encrypted storage, joins Wi-Fi, enrols with the hub, polls for its pages, draws them, sends heartbeats, installs the signed updates the hub offers (going back by itself if a new version can't reach the hub), and can be factory-reset with the BOOT button. [docs/firmware-handoff.md](../docs/firmware-handoff.md) is the brief it is built to.
 
 ## The board
 
@@ -24,7 +24,8 @@ The board code is in [main/board/](main/board/). It uses the board package's scr
 2. **Waiting for setup.** The screen says to open Display Hub and choose **Add a display**. The firmware reads its USB port for as long as it runs and answers every `hello` and every `provision` ([docs/protocol-v1.md](../docs/protocol-v1.md), "Over USB").
 3. **Set up.** Once a bundle is accepted and stored, the display joins the Wi-Fi network in it and enrols with the hub, once, with the bundle's one-time secret. Nothing from the bundle itself is ever shown or logged. It stays set up across restarts, and refuses another bundle (`already_provisioned`) until it is factory-reset.
 4. **Running.** It asks the hub for its snapshot as often as the hub says, keeps the last good one, and sends a heartbeat after start-up, hourly, and when its update attempts left change. The screen shows the pages, one at a time ([The screen](#the-screen)). When something is wrong it keeps the last pages and says what, in plain words ([Talking to the hub](#talking-to-the-hub)).
-5. **Factory reset:** hold **BOOT** for 10 seconds (below).
+5. **Updates.** When the owner presses **Update** in the desktop app, the display downloads the package through the hub, checks it against the keys it already trusts, and restarts into it on trial ([Signed updates](#signed-updates)).
+6. **Factory reset:** hold **BOOT** for 10 seconds (below).
 
 What to answer over USB is decided by plain C in [components/dh_core](components/dh_core/README.md) (`dh_usb.h`), which the host tests run without a board. A bundle is settled in this order, and the first that applies is the answer:
 
@@ -60,9 +61,9 @@ The console's log lines and the setup exchange share the chip's own USB port (US
 - **no redirect is ever followed**: the firmware never calls `esp_http_client_perform()`, the only place ESP-IDF follows one, so that code isn't even in the image. A redirect reads as an error;
 - no request goes anywhere but the hub. There is no SNTP: ages are worked out on the hub's clock, from the snapshot's own times and how long it has been held.
 
-**Which address.** The hub addresses are tried in the bundle's order. An address that gives no answer is left for the next. At one that answers with a certificate that doesn't match, the second trust anchor is tried, if the bundle had two. The first answer from the real hub ends it, whether it is a success or an error. If none answers, the screen says what the last address did, as the reference display does.
+**Which address.** The address that answered last is tried first, then the others in the bundle's order. An address that gives no answer is left for the next. At one that answers with a certificate that doesn't match, the second trust anchor is tried, if the bundle had two. The first answer from the real hub ends it, whether it is a success or an error. If none answers, the screen says what the last address tried did, as the reference display does. Which address answered last is kept in memory only: every start, and every new setup, begins with the bundle's order.
 
-**`.local` names.** `raspberrypi.local` and the like are looked up by lwIP's own resolver, which sends a one-shot mDNS query for any name ending in `.local` (`CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES`, on by default and set in `sdkconfig.defaults`). `esp_http_client` looks names up through esp-tls with `getaddrinfo()`, which is that resolver. That is from reading ESP-IDF v5.5.6's source, and **hasn't been seen working on a board yet**. The certificate check, not the name, proves it is the hub; a bundle should carry the hub's fixed address as well.
+**`.local` names.** `raspberrypi.local` and the like are looked up by lwIP's own resolver, which sends a one-shot mDNS query for any name ending in `.local` (`CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES`, on by default and set in `sdkconfig.defaults`). `esp_http_client` looks names up through esp-tls with `getaddrinfo()`, which is that resolver. On the one network it has been tried on, the name was never found (the lookup gave up after about 7 seconds, every time) and the fixed address worked. That is why the address that answered last goes first: without it every request waited those 7 seconds. The certificate check, not the name, proves it is the hub; a bundle should carry the hub's fixed address as well.
 
 **Limits.** A snapshot over 32 KiB is refused before it is parsed: if the hub says it is longer, none of it is read. An enrolment response or an error answer is read to 8 KiB at most. A connection, and each wait for more of an answer, times out after 10 seconds.
 
@@ -72,7 +73,33 @@ The console's log lines and the setup exchange share the chip's own USB port (US
 
 **Errors** follow the handoff's table, and the screen uses its words: can't reach the hub; something else is answering as the hub (a certificate that doesn't match); the hub sent data this display can't read; the hub is busy; this display needs setting up again; hub and display versions don't match. After a failure it waits 15 seconds, doubling to 15 minutes (±20%), or an hour for the last two.
 
-**Firmware offers** in a snapshot are read and left alone for now. `dh_fw_tick()` runs every minute, so running time earns update attempts back as the rules say.
+## Signed updates
+
+[docs/firmware-updates.md](../docs/firmware-updates.md) is the design, and "What a display must do" in it is what this firmware does. What is genuine, what fits this display and when to give up are decided by plain C in `dh_core` (`dh_update.h`), which the host tests run against every firmware vector. The firmware's own part is three files:
+
+- [main/hub.c](main/hub.c) reports, and asks the hub for the update, on the task that does everything else on the network;
+- [main/update.c](main/update.c) reads the download, writes the spare app partition and runs the trial boot's clock;
+- [main/storage_fw.c](main/storage_fw.c) holds the trusted keys, the security floor and the update record, and makes every save in the order the update core asks for.
+
+**One update, in order.** After each poll the hub answered, the display sends any final report that is still waiting, then looks at the offer in the snapshot.
+
+1. The update core decides (`dh_fw_on_offer`). An offer it would refuse from the offer alone (no trusted keys, too large) is refused and reported, and costs nothing. With no attempts left, nothing is requested and nothing reported.
+2. Otherwise one attempt is spent, and the reduced budget and the offer id are **saved in one write before anything is requested**. If that write fails, nothing is requested.
+3. `downloading` is reported, once.
+4. `GET /v1/device/firmware/{package_id}`, with the same pinned TLS, token and walk of addresses as every other request. Only a `200` with an exact `Content-Length` equal to the offer's size is read at all; a chunked answer, or one of another length, is refused before a byte of its body is read.
+5. The body is read in pieces of at most 4 KiB and handed to the update core, which checks the header, the key against the display's own stored copy, the signature, and then the manifest. **Nothing is written to flash before all of that has passed**, and no byte past the update form is ever asked for.
+6. Only then is the spare partition opened (`esp_ota_begin`) and the image written as it arrives, with a running SHA-256. A hash that doesn't match abandons the partition (`esp_ota_abort`).
+7. `esp_ota_end` checks the image is a valid app. The record is saved (the release waiting for its trial boot), **then** the spare partition is set to boot (`esp_ota_set_boot_partition`), then the display restarts.
+
+A download that sends nothing for 30 seconds, or takes 15 minutes in all, is given up; both are measured with `esp_timer_get_time()`, which only counts up from the start. A refusal or a failure is saved, then reported, and the final report is sent again after each poll until the hub answers it with anything at all (`not_found` and a `204` for an offer already settled both count).
+
+**The trial boot.** The bootloader starts new firmware once on trial (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). On that start the firmware sends nothing that names its version: no enrolment, no heartbeat, no report, and it acts on no offer. Its check-in is its ordinary poll, `GET /v1/device/snapshot`, tried at least every 15 seconds. As soon as the hub answers with success, or with `token_revoked` or `unknown_device` (which going back wouldn't fix), the image is marked good (`esp_ota_mark_app_valid_cancel_rollback`), then the release's security floor and keys are saved, then the record, and only then is `installed` reported. If 300 seconds of running pass first, a small task of its own (so it depends on nothing else working) calls `esp_ota_mark_app_invalid_rollback_and_reboot()` and saves nothing. A crash or a power cut on the trial boot does the same through the bootloader. The previous firmware, starting again, finds the unfinished record, drops the release's keys, leaves the floor alone and reports `rolled_back`.
+
+**The attempt budget** (five attempts, one earned back for each four hours of running) is counted by `dh_fw_tick()` every minute and whenever an offer is looked at, and a heartbeat goes as soon as the attempts left change.
+
+**Flash and memory during a download.** The spare partition is opened with `OTA_WITH_SEQUENTIAL_WRITES`, so each 4 KiB sector is erased just before it is written: no single call stalls for seconds, and a download that fails early has worn only the sectors it reached. While a sector is erased or written (about 45 ms each) the chip can't run code from flash, so the screen's task and touch pause and run in the gaps: the picture may stutter during the download, and nothing is lost, because the screen's draw buffers are in internal memory and the panel keeps its own picture. The piece being written is in internal memory too, because ESP-IDF writes a buffer in PSRAM 32 bytes at a time. Only one TLS session is ever open: that is why `downloading` is reported before the download is asked for, where the reference display reports it once the manifest has passed. The top of `main/update.c` has what was read in ESP-IDF to decide each of these.
+
+**The screen** says "Updating its firmware" at the foot of each page while it downloads, and keeps showing the pages until the restart. The status screen says the same in full, says when new firmware is on trial, and says how the last update ended (installed, went back, didn't finish, refused). The firmware's version is at the foot of the status screen.
 
 ## The screen
 
@@ -99,7 +126,7 @@ Encrypted NVS, with ESP-IDF's HMAC scheme (the handoff's "[Storage and NVS](../d
 | `dh_fw` | `keys` | The trusted firmware keys and the security floor (201 bytes). |
 | `dh_fw` | `record` | The update record, with the attempt budget (321 bytes). |
 
-Each value is one blob written in one go and read back, so a power cut leaves the old value or the new one. A read that fails is never treated as "nothing there": the display shows a storage problem and refuses setup. [main/storage.c](main/storage.c) is all of it.
+Each value is one blob written in one go and read back, so a power cut leaves the old value or the new one. A read that fails is never treated as "nothing there": the display shows a storage problem and refuses setup. [main/storage.c](main/storage.c) is all of it, except that the keys, the record and the saves an update makes are in [main/storage_fw.c](main/storage_fw.c).
 
 The partition is 64 KiB, and the largest of everything fits in it at once with room to spare. What doesn't fit is two large snapshots: NVS writes a blob's new value before it lets go of the old one, so replacing one 32 KiB snapshot with another in one step fails for want of room (leaving the old one whole). So when the old and new snapshots together are over 40,000 bytes, the old one is erased first; a power cut between the two steps leaves no saved snapshot, which only costs the pages shown before the first poll. Smaller ones, and every other value, are replaced in one step. The top of `storage.c` has the figures, and how this was tried against ESP-IDF's NVS code on a computer.
 
@@ -133,7 +160,7 @@ The button is debounced (it must read the same for 100 ms), a button already dow
 
 ## The console
 
-Open the board's serial port at any speed (opening it may restart the board). At start-up, and again every minute, the firmware prints read-only facts: the version and the slot it runs from, the board's revision and parts, memory, every eFuse key block and security setting, whether it is set up (with the count of hub addresses, whether Wi-Fi is set, whether a device token is held and the size of the saved snapshot, never their values), how many firmware keys it trusts, the security floor, the update attempts left, and how much of the main, USB and hub tasks' stacks has never been used. The hub task logs each thing it does: joining Wi-Fi, enrolling (with the device ID the hub gave it, never the token), each poll with its page count and when the next is due, each heartbeat, and each failure with the status and error code.
+Open the board's serial port at any speed (opening it may restart the board). At start-up, and again every minute, the firmware prints read-only facts: the version and the slot it runs from, the board's revision and parts, memory, every eFuse key block and security setting, whether it is set up (with the count of hub addresses, whether Wi-Fi is set, whether a device token is held and the size of the saved snapshot, never their values), how many firmware keys it trusts, the security floor, the update attempts left, whether it is on trial and how the last update ended, and how much of the main, USB, hub and screen tasks' stacks has never been used. A download logs its progress every 256 KiB with the internal memory left and its lowest so far. The hub task logs each thing it does: joining Wi-Fi, enrolling (with the device ID the hub gave it, never the token), each poll with its page count and when the next is due, each heartbeat, and each failure with the status and error code.
 
 ## Tests without a board
 
@@ -143,7 +170,7 @@ Open the board's serial port at any speed (opening it may restart the board). At
 cmake -S firmware/host-tests -B /tmp/dh-host && cmake --build /tmp/dh-host && ctest --test-dir /tmp/dh-host --output-on-failure
 ```
 
-For the screen it is `ui_tests.c` (ages and countdowns on the hub's clock, saved pages, shares and big numbers with every edge of their range, how each page is drawn, which page is kept when the pages change, and the burn-in shift). For talking to the hub it is `hub_tests.c` (the enrolment request and the heartbeat, the enrolment response and every error group, the stored device ID and token, which address and anchor to try next, when a heartbeat is due and when a snapshot is saved). For setup over USB it is `usb_tests.c` (every bundle rule, every refusal in order, failing writes, the reply lines against `protocol/v1/examples/usb`, the stored form) and the `provision-*` vectors run through the whole handler. [host-tests/usb-e2e/](host-tests/usb-e2e/README.md) goes further on Linux: the desktop app's real sender against the firmware's handler over a pseudo-terminal. [fuzz/](fuzz/README.md) has the fuzz targets.
+For signed updates, beside the vectors, the firmware's own part is tested too: `main/update.c` and `main/storage_fw.c` are built for a computer over a stand-in for the board ([host-tests/glue/](host-tests/glue/README.md)), every firmware vector is run again through them, and `update_glue_tests.c` covers what a vector can't describe (the two time limits, flash calls and saves that fail, a factory reset mid-download, and the trial boot's five minutes against a check-in). For the screen it is `ui_tests.c` (ages and countdowns on the hub's clock, saved pages, shares and big numbers with every edge of their range, how each page is drawn, which page is kept when the pages change, and the burn-in shift). For talking to the hub it is `hub_tests.c` (the enrolment request and the heartbeat, the enrolment response and every error group, the stored device ID and token, which address and anchor to try next, when a heartbeat is due and when a snapshot is saved, the firmware report and the download's path). For setup over USB it is `usb_tests.c` (every bundle rule, every refusal in order, failing writes, the reply lines against `protocol/v1/examples/usb`, the stored form) and the `provision-*` vectors run through the whole handler. [host-tests/usb-e2e/](host-tests/usb-e2e/README.md) goes further on Linux: the desktop app's real sender against the firmware's handler over a pseudo-terminal. [fuzz/](fuzz/README.md) has the fuzz targets.
 
 ## Building
 
@@ -161,6 +188,20 @@ The first build downloads the components listed in [THIRD_PARTY.md](THIRD_PARTY.
 Or build with Espressif's Docker image, as the GitHub checks do: `espressif/idf:v5.5.6`.
 
 The settings are in [sdkconfig.defaults](sdkconfig.defaults), with a note on each. The build makes its full `sdkconfig` in the build folder, so change settings in `sdkconfig.defaults`, not with `menuconfig`. Builds are reproducible: the same source and ESP-IDF give the same image.
+
+### Test builds
+
+Two switches, for trying updates on a board. Both are off unless given on the command line, both are kept in the build folder (so give a test build a folder of its own), and neither is ever used for a release.
+
+```sh
+idf.py -C firmware -B build-update -DDH_TEST_VERSION=0.1.0-dev.8 build
+idf.py -C firmware -B build-rollback -DDH_TEST_VERSION=0.1.0-dev.9 -DDH_TEST_TRIAL=no-check-in build
+```
+
+- `DH_TEST_VERSION` builds the same code as another version, so one build can be offered as an update to another. It must be a pre-release version (`0.1.0-dev.8`), which the version rules count as older than the plain `0.1.0`.
+- `DH_TEST_TRIAL=no-check-in` makes firmware whose trial boot ignores every answer from the hub, so it must be sent back after five minutes. `DH_TEST_TRIAL=crash` makes firmware that crashes 20 seconds into its trial boot, so the bootloader must send it back. Either needs `DH_TEST_VERSION` as well: test code can't be built with a release version. Installed over USB (not on trial) such a build behaves like any other.
+
+The test code is two `#ifdef` blocks in `main/update.c`, and every line it logs starts `dh-test-trial`. To check an image has none of it: `grep -c dh-test-trial display-hub.bin` must print 0.
 
 ## Packing a development build
 

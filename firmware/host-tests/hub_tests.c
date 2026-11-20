@@ -207,6 +207,134 @@ static void test_requests(void)
     CHECK(dh_enrol_request(&PLAIN_INFO, longest, 65, out, sizeof out) == 0);
 }
 
+/* Whether two JSON objects of strings hold the same members with the same values, in any
+ * order. */
+static bool same_string_members(const uint8_t *a, size_t a_len, const uint8_t *b, size_t b_len)
+{
+    dh_json_doc da, db;
+    dh_json_value ra = 0, rb = 0, key = 0, value = 0, other = 0;
+    dh_json_iter it;
+    dh_json_options strict = {0, 0, DH_JSON_NO_DUPLICATES};
+    if (dh_json_parse(&da, a, a_len, &strict, &ra) != DH_JSON_OK ||
+        dh_json_parse(&db, b, b_len, &strict, &rb) != DH_JSON_OK ||
+        dh_json_type_of(&da, ra) != DH_JSON_OBJECT || dh_json_type_of(&db, rb) != DH_JSON_OBJECT ||
+        !dh_json_object_begin(&db, rb, &it)) {
+        return false;
+    }
+    size_t in_a = 0, in_b = 0;
+    while (dh_json_object_next(&db, &it, &key, &value)) {
+        in_b++;
+    }
+    if (!dh_json_object_begin(&da, ra, &it)) {
+        return false;
+    }
+    while (dh_json_object_next(&da, &it, &key, &value)) {
+        in_a++;
+        char name[64], text[128];
+        size_t name_len = 0, text_len = 0;
+        if (!dh_json_string_copy(&da, key, name, sizeof name, &name_len) ||
+            dh_json_type_of(&da, value) != DH_JSON_STRING ||
+            !dh_json_string_copy(&da, value, text, sizeof text, &text_len) ||
+            dh_json_object_find(&db, rb, name, name_len, &other) != 1 ||
+            dh_json_type_of(&db, other) != DH_JSON_STRING ||
+            !dh_json_string_equals(&db, other, text, text_len)) {
+            return false;
+        }
+    }
+    return in_a == in_b;
+}
+
+static void test_firmware_requests(void)
+{
+    char out[DH_HUB_REQUEST_MAX];
+    const char *offer = "5d41402abc4b2a76b9719d911017c592";
+
+    /* The protocol's own examples, member for member. */
+    static const struct {
+        const char *file;
+        dh_fw_report_state state;
+        dh_fw_reason reason;
+        const char *version;
+    } examples[] = {
+        {"firmware-report-downloading.json", DH_FW_REPORT_DOWNLOADING, DH_FW_REASON_NONE, "1.1.0"},
+        {"firmware-report-installed.json", DH_FW_REPORT_INSTALLED, DH_FW_REASON_NONE, "1.2.0"},
+        {"firmware-report-refused.json", DH_FW_REPORT_REFUSED, DH_FW_REASON_DOWNGRADE, "1.1.0"},
+        {"firmware-report-rolled-back.json", DH_FW_REPORT_ROLLED_BACK, DH_FW_REASON_NONE, "1.1.0"},
+    };
+    for (size_t i = 0; i < sizeof examples / sizeof examples[0]; i++) {
+        dh_fw_report report = {.state = examples[i].state, .reason = examples[i].reason};
+        memcpy(report.offer_id, offer, DH_OFFER_ID_HEX_LEN + 1);
+        size_t n = dh_firmware_report_request(&report, examples[i].version, out, sizeof out);
+        size_t want = read_example(examples[i].file);
+        if (n == 0 || out[n] != '\0' ||
+            !same_string_members((const uint8_t *)out, n, file_buf, want)) {
+            FAIL("a firmware report doesn't match the protocol's example");
+        }
+    }
+
+    /* Exactly as written: the reason only when there is one, the version last. */
+    dh_fw_report report = {.state = DH_FW_REPORT_FAILED, .reason = DH_FW_REASON_IMAGE_HASH};
+    memcpy(report.offer_id, offer, DH_OFFER_ID_HEX_LEN + 1);
+    size_t n = dh_firmware_report_request(&report, "0.1.0-dev.7", out, sizeof out);
+    const char *want = "{\"offer_id\":\"5d41402abc4b2a76b9719d911017c592\",\"state\":\"failed\","
+                       "\"reason\":\"image_hash\",\"firmware_version\":\"0.1.0-dev.7\"}";
+    CHECK(n == strlen(want) && strcmp(out, want) == 0);
+    report.state = DH_FW_REPORT_ROLLED_BACK;
+    report.reason = DH_FW_REASON_NONE;
+    n = dh_firmware_report_request(&report, "0.1.0", out, sizeof out);
+    want = "{\"offer_id\":\"5d41402abc4b2a76b9719d911017c592\",\"state\":\"rolled_back\","
+           "\"firmware_version\":\"0.1.0\"}";
+    CHECK(n == strlen(want) && strcmp(out, want) == 0);
+    /* Every state and reason has its wire name in the body. */
+    for (int r = DH_FW_REASON_NO_TRUSTED_KEYS; r <= DH_FW_REASON_FLASH; r++) {
+        report.reason = (dh_fw_reason)r;
+        report.state = dh_fw_reason_state(report.reason);
+        n = dh_firmware_report_request(&report, "0.1.0", out, sizeof out);
+        CHECK(n > 0 && strstr(out, dh_fw_reason_name(report.reason)) != NULL &&
+              strstr(out, dh_fw_report_state_name(report.state)) != NULL);
+    }
+
+    /* Nothing to report, an offer id that isn't one, or too small a buffer: no body. */
+    report.state = DH_FW_REPORT_NONE;
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, sizeof out) == 0);
+    report.state = DH_FW_REPORT_INSTALLED;
+    report.reason = DH_FW_REASON_NONE;
+    report.offer_id[3] = 'G';
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, sizeof out) == 0);
+    report.offer_id[3] = '\"';
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, sizeof out) == 0);
+    memcpy(report.offer_id, offer, DH_OFFER_ID_HEX_LEN + 1);
+    report.offer_id[DH_OFFER_ID_HEX_LEN - 1] = '\0';
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, sizeof out) == 0);
+    memcpy(report.offer_id, offer, DH_OFFER_ID_HEX_LEN + 1);
+    n = dh_firmware_report_request(&report, "0.1.0", out, sizeof out);
+    CHECK(n > 0);
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, n) == 0 && out[0] == '\0');
+    CHECK(dh_firmware_report_request(&report, "0.1.0", out, n + 1) == n);
+
+    /* The download's path. */
+    char path[DH_FIRMWARE_PATH_MAX];
+    char id[DH_PACKAGE_ID_HEX_LEN + 2];
+    memset(id, 'a', DH_PACKAGE_ID_HEX_LEN);
+    id[0] = '0';
+    id[DH_PACKAGE_ID_HEX_LEN - 1] = 'f';
+    id[DH_PACKAGE_ID_HEX_LEN] = '\0';
+    n = dh_firmware_path(id, path, sizeof path);
+    CHECK(n == strlen(DH_PATH_FIRMWARE_PREFIX) + DH_PACKAGE_ID_HEX_LEN && path[n] == '\0');
+    CHECK(strncmp(path, "/v1/device/firmware/", 20) == 0 && strcmp(path + 20, id) == 0);
+    CHECK(dh_firmware_path(id, path, sizeof path - 1) == 0 && path[0] == '\0');
+    /* Only a package id goes into a path: nothing that could name another route. */
+    static const char bad[] = {'/', '.', '%', '?', '#', 'A', 'g', ' ', '\0'};
+    for (size_t i = 0; i < sizeof bad; i++) {
+        id[17] = bad[i];
+        CHECK(dh_firmware_path(id, path, sizeof path) == 0 && path[0] == '\0');
+    }
+    id[17] = 'a';
+    id[DH_PACKAGE_ID_HEX_LEN] = 'a';
+    id[DH_PACKAGE_ID_HEX_LEN + 1] = '\0';
+    CHECK(dh_firmware_path(id, path, sizeof path) == 0);
+}
+
 static void test_enrol_response(void)
 {
     dh_device device;
@@ -457,8 +585,32 @@ static void test_device(void)
     CHECK(memcmp(&device, &wiped, sizeof device) == 0);
 }
 
-/* Runs a walk where try number i (from 0) gives results[i], and writes the tries made as
- * "host.anchor " into out. */
+/* Runs a walk that begins at address `first`, where try number i (from 0) gives results[i], and
+ * writes the tries made as "host.anchor " into out. *next is the address to begin the next walk
+ * at. */
+static dh_problem walk_at(uint8_t hosts, uint8_t anchors, uint8_t first,
+                          const dh_try_result *results, size_t count, char *out, size_t cap,
+                          uint8_t *next)
+{
+    dh_hub_walk w;
+    uint8_t host = 0xFF, anchor = 0xFF;
+    size_t tries = 0, at = 0;
+    out[0] = '\0';
+    dh_hub_walk_begin_at(&w, hosts, anchors, first);
+    while (dh_hub_walk_next(&w, &host, &anchor)) {
+        if (tries >= count || host >= hosts || anchor >= anchors) {
+            snprintf(out, cap, "ran on");
+            return DH_PROBLEM_NONE;
+        }
+        at += (size_t)snprintf(out + at, cap - at, "%u.%u ", (unsigned)host, (unsigned)anchor);
+        dh_hub_walk_tried(&w, results[tries++]);
+    }
+    CHECK(!dh_hub_walk_next(&w, &host, &anchor));
+    *next = dh_hub_walk_answered_host(&w);
+    return dh_hub_walk_problem(&w);
+}
+
+/* The same, in the bundle's order. */
 static dh_problem walk(uint8_t hosts, uint8_t anchors, const dh_try_result *results, size_t count,
                        char *out, size_t cap)
 {
@@ -528,6 +680,80 @@ static void test_walk(void)
     dh_hub_walk_tried(&w, DH_TRY_NO_ANSWER);
     dh_hub_walk_tried(&w, DH_TRY_NO_ANSWER);
     CHECK(dh_hub_walk_next(&w, &host, &anchor) && host == 1 && anchor == 0);
+}
+
+/* The address that answered last time is tried first, then the others in the bundle's order. */
+static void test_walk_from_last_answer(void)
+{
+    char tries[128];
+    uint8_t next = 0xFF;
+    const dh_try_result N = DH_TRY_NO_ANSWER, W = DH_TRY_WRONG_HUB, A = DH_TRY_ANSWERED;
+
+    /* Beginning at 0 is the bundle's order, and an answer there keeps it first. */
+    CHECK(walk_at(3, 1, 0, (dh_try_result[]){A}, 1, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "0.0 ") == 0 && next == 0);
+    /* The first address never answers (a name that can't be looked up): the second does, and
+     * the next walk begins there, so the name is no longer waited for at every request. */
+    CHECK(walk_at(2, 1, 0, (dh_try_result[]){N, A}, 2, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "0.0 1.0 ") == 0 && next == 1);
+    CHECK(walk_at(2, 1, next, (dh_try_result[]){A}, 1, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "1.0 ") == 0 && next == 1);
+    /* When that one stops answering, the others are still walked, in the bundle's order, and
+     * the one that answers becomes the first. */
+    CHECK(walk_at(4, 1, 2, (dh_try_result[]){N, N, N, A}, 4, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "2.0 0.0 1.0 3.0 ") == 0 && next == 3);
+    CHECK(walk_at(4, 1, 2, (dh_try_result[]){N, A}, 2, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "2.0 0.0 ") == 0 && next == 0);
+    CHECK(walk_at(4, 1, 3, (dh_try_result[]){N, N, N, A}, 4, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "3.0 0.0 1.0 2.0 ") == 0 && next == 2);
+    /* Every address is tried exactly once when none answers, and the first stays the first. */
+    CHECK(walk_at(4, 1, 1, (dh_try_result[]){N, N, N, N}, 4, tries, sizeof tries, &next) ==
+          DH_PROBLEM_UNREACHABLE);
+    CHECK(strcmp(tries, "1.0 0.0 2.0 3.0 ") == 0 && next == 1);
+    /* The anchors are walked at each address as before, and the last address tried decides. */
+    CHECK(walk_at(2, 2, 1, (dh_try_result[]){W, W, N}, 3, tries, sizeof tries, &next) ==
+          DH_PROBLEM_UNREACHABLE);
+    CHECK(strcmp(tries, "1.0 1.1 0.0 ") == 0 && next == 1);
+    CHECK(walk_at(2, 2, 1, (dh_try_result[]){N, W, A}, 3, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "1.0 0.0 0.1 ") == 0 && next == 0);
+    /* Something else answering is not the hub answering: it never becomes the first. */
+    CHECK(walk_at(2, 1, 0, (dh_try_result[]){N, W}, 2, tries, sizeof tries, &next) ==
+          DH_PROBLEM_WRONG_HUB);
+    CHECK(next == 0);
+    /* A first address the setup doesn't have (a new setup with fewer) reads as 0. */
+    CHECK(walk_at(2, 1, 2, (dh_try_result[]){N, A}, 2, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "0.0 1.0 ") == 0 && next == 1);
+    CHECK(walk_at(1, 1, 0xFF, (dh_try_result[]){A}, 1, tries, sizeof tries, &next) ==
+          DH_PROBLEM_NONE);
+    CHECK(strcmp(tries, "0.0 ") == 0 && next == 0);
+    /* Nothing to try. */
+    CHECK(walk_at(0, 1, 3, NULL, 0, tries, sizeof tries, &next) == DH_PROBLEM_UNREACHABLE);
+    CHECK(tries[0] == '\0' && next == 0);
+    /* One address of every count, from every first: each address once, the first one first. */
+    for (uint8_t hosts = 1; hosts <= DH_SETUP_MAX_HOSTS; hosts++) {
+        for (uint8_t first = 0; first < hosts; first++) {
+            dh_hub_walk w;
+            uint8_t host = 0xFF, anchor = 0xFF;
+            unsigned seen = 0, count = 0;
+            dh_hub_walk_begin_at(&w, hosts, 1, first);
+            while (dh_hub_walk_next(&w, &host, &anchor)) {
+                CHECK(host < hosts && anchor == 0 && (seen & (1u << host)) == 0);
+                CHECK(count != 0 || host == first);
+                seen |= 1u << host;
+                count++;
+                dh_hub_walk_tried(&w, DH_TRY_NO_ANSWER);
+            }
+            CHECK(count == hosts && seen == (1u << hosts) - 1u);
+        }
+    }
 }
 
 /* The reference display's own cases (tools/display-simulator/src/main.rs, mod tests). */
@@ -660,10 +886,12 @@ static void test_settings_problem(void)
 int main(void)
 {
     test_requests();
+    test_firmware_requests();
     test_enrol_response();
     test_error_response();
     test_device();
     test_walk();
+    test_walk_from_last_answer();
     test_heartbeats();
     test_saving();
     test_settings_problem();

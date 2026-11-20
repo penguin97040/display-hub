@@ -5,10 +5,12 @@ idf_component_register(
         "efuse_report.c"
         "storage_key.c"
         "storage.c"
+        "storage_fw.c"
         "usb_setup.c"
         "wifi.c"
         "hub_http.c"
         "hub.c"
+        "update.c"
         "reset_button.c"
         "ui.c"
         "ui_font.c"
@@ -26,3 +28,13 @@ idf_component_register(
                   esp_driver_usb_serial_jtag esp_driver_gpio esp_timer esp_wifi esp_netif
                   esp_event esp_http_client esp-tls mbedtls dh_core
 )
+
+# TEST ONLY. A build made with -DDH_TEST_TRIAL=no-check-in or -DDH_TEST_TRIAL=crash fails its
+# trial boot on purpose, to try the rollback on a board (README.md, "Test builds"). The top-level
+# CMakeLists.txt refuses it unless the version carries a pre-release tag, so it can never be
+# built as a release.
+if(DH_TEST_TRIAL STREQUAL "no-check-in")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DH_TEST_TRIAL_NO_CHECK_IN=1)
+elseif(DH_TEST_TRIAL STREQUAL "crash")
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DH_TEST_TRIAL_CRASH=1)
+endif()

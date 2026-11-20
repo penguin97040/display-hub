@@ -1,5 +1,5 @@
-// The screens of this build: waiting for setup, the hub's pages, how things stand with the hub,
-// the factory reset countdown and the storage problem.
+// The screens of this build: waiting for setup, the hub's pages, how things stand with the hub
+// and with firmware updates, the factory reset countdown and the storage problem.
 //
 // Once the display is set up and holds pages, it shows one page at a time, in the hub's order;
 // a swipe left or right moves between them, and the status screen comes after the last. Each
@@ -33,9 +33,11 @@ void ui_start(const char *version, const char *board_note);
 // a display that is set up), or the storage problem. `pages` is NULL or the pages to draw: the
 // screen keeps drawing from it (its ages are kept up to date), so it must stay valid, and it may
 // only be changed while holding the LVGL lock, followed by another call to this. `note` is NULL
-// or one line about what just happened ("The setup was erased.").
+// or one line about what just happened ("The setup was erased."). `fw` is how things stand with
+// firmware updates: one being installed, a trial boot, or the last one's result.
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
-                   const hub_status_t *hub, const hub_pages_t *pages, const char *note);
+                   const hub_status_t *hub, const storage_fw_facts_t *fw,
+                   const hub_pages_t *pages, const char *note);
 
 // The countdown while BOOT is held. It covers everything else until ui_show_state() is called.
 void ui_show_reset_countdown(int seconds_left);

@@ -55,6 +55,38 @@ typedef struct {
 
 hub_answer_t hub_http_request(const hub_request_t *request);
 
+// ---- A firmware download (docs/firmware-updates.md, "Checks before installing") ----
+//
+// The same connection as any other request: the same anchor, name check and TLS versions, and
+// no redirect followed. What differs is that a 200 answer's body isn't read here: its length is
+// handed back first, and the caller then reads it a piece at a time, so the update core sees
+// every byte before anything is written.
+
+typedef struct hub_download hub_download_t;
+
+typedef struct {
+    // As for hub_answer_t. With DH_TRY_ANSWERED and a status other than 200, `len` bytes of the
+    // error answer are in the request's buffer (at most error_cap) and there is no download.
+    dh_try_result result;
+    int status;
+    size_t len;
+    bool stopped;
+    // For a 200 answer: whether it came with a Content-Length (and not chunked), and its value.
+    bool has_length;
+    uint64_t length;
+} hub_download_answer_t;
+
+// Sends the request (a GET) and reads the answer's status and headers. Only for a 200 answer is
+// *out set, to a download the caller must close; none of its body has been handed over yet.
+hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_download_t **out);
+
+// Reads up to `cap` bytes of the body, waiting at most a few seconds. Returns how many were
+// read; 0 if none came in that time (ask again: the caller keeps the time limits); or a negative
+// number if the connection broke or the body has ended.
+int hub_http_download_read(hub_download_t *download, uint8_t *out, size_t cap);
+
+void hub_http_download_close(hub_download_t *download);
+
 #ifdef __cplusplus
 }
 #endif

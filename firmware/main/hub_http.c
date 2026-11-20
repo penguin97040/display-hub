@@ -10,9 +10,15 @@
 //   store is asked for, and neither is. When the handshake fails it records Mbed TLS's error and,
 //   if a certificate was presented, the verification flags (lines 320-330, 507-513).
 // - esp-tls/esp_tls.c: a name is looked up with getaddrinfo() (line 242), which is lwIP's.
+// - esp_http_client.c again, for a download: esp_http_client_fetch_headers() answers 0 and marks
+//   the response chunked when there is no Content-Length above zero (line 1608), so "chunked" is
+//   also how a missing length reads; esp_http_client_read() never asks the transport for more
+//   than the caller wants or the receive buffer holds, stops at the Content-Length, and answers
+//   -ESP_ERR_HTTP_EAGAIN when a wait runs out with nothing read (line 1403).
 
 #include "hub_http.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "dh_setup.h"
@@ -32,6 +38,9 @@ static const char *TAG = "hub-http";
 // The hub's response headers are a few hundred bytes; the request's are under 400.
 #define RX_BUFFER_BYTES 2048
 #define TX_BUFFER_BYTES 1024
+// How long one read of a download waits before it hands back to the caller, which keeps the
+// download's own time limits and looks for a factory reset in between.
+#define DOWNLOAD_STEP_TIMEOUT_MS 5000
 
 static bool stopped(const hub_request_t *request)
 {
@@ -58,14 +67,11 @@ static dh_try_result connect_failure(esp_http_client_handle_t client, esp_err_t 
     return mismatch ? DH_TRY_WRONG_HUB : DH_TRY_NO_ANSWER;
 }
 
-hub_answer_t hub_http_request(const hub_request_t *request)
+// Sets a request up and connects: looks the name up, does the TLS handshake and sends the
+// request's headers. NULL, with *result saying why, if no connection was made.
+static esp_http_client_handle_t open_request(const hub_request_t *request, dh_try_result *result)
 {
-    hub_answer_t answer = {.result = DH_TRY_NO_ANSWER};
-    if (stopped(request)) {
-        answer.stopped = true;
-        return answer;
-    }
-
+    *result = DH_TRY_NO_ANSWER;
     const esp_http_client_config_t config = {
         .host = request->host,
         .port = request->port,
@@ -91,7 +97,7 @@ hub_answer_t hub_http_request(const hub_request_t *request)
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (client == NULL) {
         ESP_LOGE(TAG, "couldn't set a request up (out of memory?)");
-        return answer;
+        return NULL;
     }
 
     esp_err_t err = esp_http_client_set_header(client, DH_PROTOCOL_HEADER,
@@ -105,18 +111,77 @@ hub_answer_t hub_http_request(const hub_request_t *request)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "couldn't set a request's headers: %s", esp_err_to_name(err));
         esp_http_client_cleanup(client);
+        return NULL;
+    }
+
+    err = esp_http_client_open(client, request->body != NULL ? (int)request->body_len : 0);
+    if (err != ESP_OK) {
+        *result = connect_failure(client, err);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
+    // From here the other end has proved it is the hub.
+    return client;
+}
+
+// Reads an answer's body into the request's buffer: to its end, or one byte past `cap`. True if
+// the whole of it arrived, or as much as was allowed.
+static bool read_answer(esp_http_client_handle_t client, const hub_request_t *request,
+                        int64_t content_length, size_t cap, int64_t started_ms,
+                        hub_answer_t *answer)
+{
+    if (!esp_http_client_is_chunked_response(client) && content_length > (int64_t)cap) {
+        // Too long by its own account: don't read any of it.
+        answer->len = cap + 1;
+        return true;
+    }
+    // Read until the end, or one byte past what is allowed.
+    while (answer->len <= cap) {
+        if (stopped(request)) {
+            answer->stopped = true;
+            return false;
+        }
+        if (esp_timer_get_time() / 1000 - started_ms > ANSWER_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "the answer took too long");
+            return false;
+        }
+        // A piece at a time, so the checks above are made often.
+        size_t want = cap + 1 - answer->len;
+        if (want > RX_BUFFER_BYTES) {
+            want = RX_BUFFER_BYTES;
+        }
+        const int got =
+            esp_http_client_read(client, (char *)request->answer + answer->len, (int)want);
+        if (got < 0) {
+            ESP_LOGW(TAG, "the answer broke off");
+            return false;
+        }
+        if (got == 0) {
+            // The end, or a wait that ran out with the body unfinished.
+            if (!esp_http_client_is_complete_data_received(client)) {
+                ESP_LOGW(TAG, "the answer stopped part-way");
+                return false;
+            }
+            return true;
+        }
+        answer->len += (size_t)got;
+    }
+    return true;
+}
+
+hub_answer_t hub_http_request(const hub_request_t *request)
+{
+    hub_answer_t answer = {.result = DH_TRY_NO_ANSWER};
+    if (stopped(request)) {
+        answer.stopped = true;
         return answer;
     }
 
     const int64_t started_ms = esp_timer_get_time() / 1000;
-    // Looks the name up, connects, does the TLS handshake and sends the request's headers.
-    err = esp_http_client_open(client, request->body != NULL ? (int)request->body_len : 0);
-    if (err != ESP_OK) {
-        answer.result = connect_failure(client, err);
-        esp_http_client_cleanup(client);
+    esp_http_client_handle_t client = open_request(request, &answer.result);
+    if (client == NULL) {
         return answer;
     }
-    // From here the other end has proved it is the hub.
 
     bool whole = false;
     if (stopped(request)) {
@@ -133,46 +198,7 @@ hub_answer_t hub_http_request(const hub_request_t *request)
         } else {
             answer.status = status;
             const size_t cap = status == 200 ? request->ok_cap : request->error_cap;
-            if (!esp_http_client_is_chunked_response(client) && content_length > (int64_t)cap) {
-                // Too long by its own account: don't read any of it.
-                answer.len = cap + 1;
-                whole = true;
-            } else {
-                // Read until the end, or one byte past what is allowed.
-                while (answer.len <= cap) {
-                    if (stopped(request)) {
-                        answer.stopped = true;
-                        break;
-                    }
-                    if (esp_timer_get_time() / 1000 - started_ms > ANSWER_TIMEOUT_MS) {
-                        ESP_LOGW(TAG, "the answer took too long");
-                        break;
-                    }
-                    // A piece at a time, so the checks above are made often.
-                    size_t want = cap + 1 - answer.len;
-                    if (want > RX_BUFFER_BYTES) {
-                        want = RX_BUFFER_BYTES;
-                    }
-                    const int got = esp_http_client_read(
-                        client, (char *)request->answer + answer.len, (int)want);
-                    if (got < 0) {
-                        ESP_LOGW(TAG, "the answer broke off");
-                        break;
-                    }
-                    if (got == 0) {
-                        // The end, or a wait that ran out with the body unfinished.
-                        whole = esp_http_client_is_complete_data_received(client);
-                        if (!whole) {
-                            ESP_LOGW(TAG, "the answer stopped part-way");
-                        }
-                        break;
-                    }
-                    answer.len += (size_t)got;
-                }
-                if (answer.len > cap) {
-                    whole = true;
-                }
-            }
+            whole = read_answer(client, request, content_length, cap, started_ms, &answer);
         }
     }
     esp_http_client_close(client);
@@ -181,8 +207,108 @@ hub_answer_t hub_http_request(const hub_request_t *request)
     if (whole && !answer.stopped) {
         answer.result = DH_TRY_ANSWERED;
     } else {
+        answer.result = DH_TRY_NO_ANSWER;
         answer.status = 0;
         answer.len = 0;
     }
     return answer;
+}
+
+// ---- A firmware download ----
+
+// A download is its connection and nothing else.
+struct hub_download {
+    esp_http_client_handle_t client;
+};
+
+hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_download_t **out)
+{
+    hub_download_answer_t answer = {.result = DH_TRY_NO_ANSWER};
+    *out = NULL;
+    if (stopped(request)) {
+        answer.stopped = true;
+        return answer;
+    }
+
+    const int64_t started_ms = esp_timer_get_time() / 1000;
+    esp_http_client_handle_t client = open_request(request, &answer.result);
+    if (client == NULL) {
+        return answer;
+    }
+
+    bool keep = false, whole = false;
+    if (stopped(request)) {
+        answer.stopped = true;
+    } else {
+        const int64_t content_length = esp_http_client_fetch_headers(client);
+        const int status = esp_http_client_get_status_code(client);
+        if (content_length < 0 || status < 100) {
+            ESP_LOGW(TAG, "no answer to the request");
+        } else if (status == 200) {
+            // The body is the caller's to read. A response without a length of its own, chunked
+            // or not, is one the update core refuses before any of it is read.
+            answer.status = status;
+            answer.has_length = content_length > 0 && !esp_http_client_is_chunked_response(client);
+            answer.length = answer.has_length ? (uint64_t)content_length : 0;
+            // Shorter waits from here, so the caller's own time limits are looked at often.
+            keep = whole = esp_http_client_set_timeout_ms(client, DOWNLOAD_STEP_TIMEOUT_MS) ==
+                           ESP_OK;
+        } else {
+            // An error answer, read like any other.
+            hub_answer_t error = {.result = DH_TRY_NO_ANSWER};
+            answer.status = status;
+            whole = read_answer(client, request, content_length, request->error_cap, started_ms,
+                                &error);
+            answer.len = error.len;
+            answer.stopped = error.stopped;
+        }
+    }
+
+    if (keep) {
+        hub_download_t *download = calloc(1, sizeof(*download));
+        if (download != NULL) {
+            download->client = client;
+            *out = download;
+            answer.result = DH_TRY_ANSWERED;
+            return answer;
+        }
+        ESP_LOGE(TAG, "out of memory for a download");
+        whole = false;
+    }
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    if (whole && !answer.stopped) {
+        answer.result = DH_TRY_ANSWERED;
+    } else {
+        answer.result = DH_TRY_NO_ANSWER;
+        answer.status = 0;
+        answer.len = 0;
+        answer.has_length = false;
+        answer.length = 0;
+    }
+    return answer;
+}
+
+int hub_http_download_read(hub_download_t *download, uint8_t *out, size_t cap)
+{
+    if (cap == 0) {
+        return 0;
+    }
+    const int got = esp_http_client_read(download->client, (char *)out, (int)cap);
+    if (got > 0) {
+        return got;
+    }
+    // A wait that ran out with nothing read is the only "nothing yet". Anything else, the end
+    // of the body included, is the end of this download.
+    return got == -ESP_ERR_HTTP_EAGAIN ? 0 : -1;
+}
+
+void hub_http_download_close(hub_download_t *download)
+{
+    if (download == NULL) {
+        return;
+    }
+    esp_http_client_close(download->client);
+    esp_http_client_cleanup(download->client);
+    free(download);
 }

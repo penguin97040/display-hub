@@ -71,6 +71,53 @@ size_t dh_heartbeat_request(const dh_device_info *info, char *out, size_t cap)
     return finish(&w);
 }
 
+/* Whether s is exactly n lower-case hex digits and a NUL. */
+static bool lower_hex(const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        if (!((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return s[n] == '\0';
+}
+
+size_t dh_firmware_path(const char *package_id, char *out, size_t cap)
+{
+    dh_writer w = {out, cap, 0, false};
+    if (!lower_hex(package_id, DH_PACKAGE_ID_HEX_LEN)) {
+        w.full = true;
+        return finish(&w);
+    }
+    dh_put(&w, DH_PATH_FIRMWARE_PREFIX);
+    dh_put(&w, package_id);
+    return finish(&w);
+}
+
+size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmware_version,
+                                  char *out, size_t cap)
+{
+    dh_writer w = {out, cap, 0, false};
+    const char *state = dh_fw_report_state_name(report->state);
+    const char *reason = dh_fw_reason_name(report->reason);
+    if (state == NULL || !lower_hex(report->offer_id, DH_OFFER_ID_HEX_LEN)) {
+        w.full = true;
+        return finish(&w);
+    }
+    dh_put(&w, "{\"offer_id\":");
+    dh_put_string(&w, report->offer_id);
+    dh_put(&w, ",\"state\":");
+    dh_put_string(&w, state);
+    if (reason != NULL) {
+        dh_put(&w, ",\"reason\":");
+        dh_put_string(&w, reason);
+    }
+    dh_put(&w, ",\"firmware_version\":");
+    dh_put_string(&w, firmware_version);
+    dh_put_char(&w, '}');
+    return finish(&w);
+}
+
 /* ---- The device ID and token ---- */
 
 /* Printable ASCII with no space: safe in a log line (the ID) and in a header (the token). */
@@ -234,13 +281,21 @@ bool dh_heartbeat_taken(int http_status)
 
 /* ---- Which address to try ---- */
 
-void dh_hub_walk_begin(dh_hub_walk *w, uint8_t host_count, uint8_t anchor_count)
+void dh_hub_walk_begin_at(dh_hub_walk *w, uint8_t host_count, uint8_t anchor_count,
+                          uint8_t first_host)
 {
     memset(w, 0, sizeof *w);
     w->host_count = host_count;
     w->anchor_count = anchor_count;
+    w->first = first_host < host_count ? first_host : 0;
+    w->host = w->first;
     w->done = host_count == 0 || anchor_count == 0;
     w->last = DH_PROBLEM_UNREACHABLE;
+}
+
+void dh_hub_walk_begin(dh_hub_walk *w, uint8_t host_count, uint8_t anchor_count)
+{
+    dh_hub_walk_begin_at(w, host_count, anchor_count, 0);
 }
 
 bool dh_hub_walk_next(dh_hub_walk *w, uint8_t *host, uint8_t *anchor)
@@ -280,14 +335,23 @@ void dh_hub_walk_tried(dh_hub_walk *w, dh_try_result result)
         break;
     }
     w->anchor = 0;
-    if (++w->host >= w->host_count) {
+    if (++w->tried >= w->host_count) {
         w->done = true;
+        return;
     }
+    /* After the first address, the others in the bundle's order, stepping over the first. */
+    uint8_t next = (uint8_t)(w->tried - 1u);
+    w->host = next < w->first ? next : (uint8_t)(next + 1u);
 }
 
 dh_problem dh_hub_walk_problem(const dh_hub_walk *w)
 {
     return w->answered ? DH_PROBLEM_NONE : w->last;
+}
+
+uint8_t dh_hub_walk_answered_host(const dh_hub_walk *w)
+{
+    return w->answered ? w->host : w->first;
 }
 
 /* ---- When a heartbeat is due ---- */

@@ -10,6 +10,11 @@
  * It behaves as firmware must: the keys and the update record are only ever "in flash" as the
  * blobs dh_fw_keys_encode() and dh_fw_record_encode() make, written only when a function says to
  * save, and read back at every restart. So a vector also fails if a save point is missing.
+ *
+ * Built with DH_FW_GLUE (as dh_fw_conform_glue), a `package` vector's offer and download go
+ * through the firmware's own code instead of straight through the update core: main/storage_fw.c
+ * makes the saves, and main/update.c reads the download and writes the spare partition, over a
+ * stand-in for the board (glue/README.md). The expectations are the same.
  */
 #include <inttypes.h>
 #include <stdio.h>
@@ -20,6 +25,12 @@
 #include "dh_snapshot.h"
 #include "dh_update.h"
 #include "dh_usb.h"
+
+#ifdef DH_FW_GLUE
+#include "glue.h"
+#include "storage_fw.h"
+#include "update.h"
+#endif
 
 #define LIT(s) s, (sizeof s - 1u)
 
@@ -277,7 +288,9 @@ static dh_fw_report report_and_answer(void)
 
 /* ---- package ---- */
 
+#ifndef DH_FW_GLUE
 static dh_fw_download download;
+#endif
 
 static void run_package(dh_json_value root, size_t piece)
 {
@@ -320,9 +333,89 @@ static void run_package(dh_json_value root, size_t piece)
     const char *reports[3];
     size_t report_count = 0;
     bool requested = false, begun = false, finished = false;
+#ifndef DH_FW_GLUE
     size_t written_len = 0;
+#endif
     uint64_t bytes_read = 0;
 
+#ifdef DH_FW_GLUE
+    /* The firmware's own code, from the offer to the partition being set to boot. */
+    glue_reset();
+    glue_start(&keys, &record, 0, false);
+    dh_fw_offer_decision decision;
+    if (!storage_fw_on_offer(&device, offer_id, offer_size, &decision)) {
+        die("the record couldn't be saved for the offer");
+    }
+    if (decision.action == DH_FW_OFFER_ATTEMPT) {
+        requested = true;
+        /* The spent attempt must be in flash before anything is requested. */
+        if (glue.record_writes != 1 || glue.keys_writes != 0) {
+            die("the attempt wasn't saved, in one write, before the download");
+        }
+        glue.body = body;
+        glue.body_len = body_len;
+        glue.piece = piece;
+        glue.stalls = strcmp(after_body, "stalls") == 0;
+        glue.may_read = has_length ? content_length : 0;
+        glue.keep_next_free = true;
+        dh_fw_reason reason =
+            update_receive(NULL, &device, offer_size, has_length, content_length, 0, NULL);
+        finished = reason == DH_FW_REASON_NONE;
+        begun = glue.begun;
+        if (begun) {
+            /* The vectors list `downloading` where the reference display sends it, once the
+             * manifest has passed every check. The firmware sends it before it asks for the
+             * download (main/hub.c says why), so here it only marks that moment. */
+            reports[report_count++] = "downloading";
+        }
+        if (glue.download == NULL) {
+            die("update_receive made no download");
+        }
+        bytes_read = dh_fw_download_bytes_read(glue.download);
+        if (glue.read_past_the_form || glue.handed > glue.may_read) {
+            die("a byte past the update form was asked for");
+        }
+        if (begun != dh_fw_download_slot_open(glue.download)) {
+            die("the partition was opened without the update core saying so, or not opened");
+        }
+        if (glue.wrote_while_closed || glue.lock_misused || glue.open ||
+            (!begun && glue.written_len != 0) || (begun && !glue.sequential)) {
+            die("the spare partition or storage's lock was misused");
+        }
+        if (finished) {
+            /* What was written must be the image, whole and in order; and the record must
+             * have been written again, after the image was checked and before the partition
+             * was set to boot. */
+            const dh_fw_manifest *m = dh_fw_download_manifest(glue.download);
+            size_t image_at = (size_t)bytes_read - m->image_size;
+            if (glue.written_len != m->image_size ||
+                memcmp(glue.written, body + image_at, glue.written_len) != 0) {
+                die("what was written isn't the image");
+            }
+            if (!glue.ended || glue.aborted || !glue.set_to_boot || glue.record_writes != 2 ||
+                glue.record_writes_at_set_boot != 2 || strcmp(glue.writes, "rr") != 0) {
+                die("the record wasn't saved before the partition was set to boot");
+            }
+        } else {
+            if (glue.set_to_boot || (begun && !glue.aborted && !glue.ended)) {
+                die("a download that ended left the partition open, or set to boot");
+            }
+            storage_fw_attempt_ended(reason);
+        }
+    } else if (decision.action != DH_FW_OFFER_REFUSE) {
+        die("the offer was neither attempted nor refused");
+    }
+    /* The final report of an offer that wasn't installed, sent and answered as the firmware
+     * does it. Then what the firmware's code left in flash is what the rest starts from. */
+    dh_fw_report glue_final;
+    memset(&glue_final, 0, sizeof glue_final);
+    if (!finished && storage_fw_report_next(&glue_final)) {
+        storage_fw_report_answered(&glue_final);
+    }
+    memcpy(flash.keys, glue.flash_keys, sizeof flash.keys);
+    memcpy(flash.record, glue.flash_record, sizeof flash.record);
+    load();
+#else
     dh_fw_offer_decision decision =
         dh_fw_on_offer(&session, &record, &keys, &device, offer_id, offer_size, 0);
     save(decision.save);
@@ -397,6 +490,7 @@ static void run_package(dh_json_value root, size_t piece)
     } else if (decision.action != DH_FW_OFFER_REFUSE) {
         die("the offer was neither attempted nor refused");
     }
+#endif
 
     char new_version[DH_FW_MAX_VERSION_BYTES + 1] = "";
     if (finished) {
@@ -415,7 +509,11 @@ static void run_package(dh_json_value root, size_t piece)
         save(dh_fw_marked_good(&session, &record, &keys));
         restart(1, false);
     }
+#ifdef DH_FW_GLUE
+    dh_fw_report final = finished ? report_and_answer() : glue_final;
+#else
     dh_fw_report final = report_and_answer();
+#endif
     if (final.state == DH_FW_REPORT_NONE) {
         die("no final report");
     }

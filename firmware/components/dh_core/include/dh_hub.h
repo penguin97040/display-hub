@@ -71,6 +71,24 @@ size_t dh_enrol_request(const dh_device_info *info, const char *secret, size_t s
 /* The body of POST /v1/device/heartbeat: the same `device` object, on its own. */
 size_t dh_heartbeat_request(const dh_device_info *info, char *out, size_t cap);
 
+/* Signed updates (dh_update.h): where a download is asked for and where reports go. */
+#define DH_PATH_FIRMWARE_REPORT "/v1/device/firmware/report"
+#define DH_PATH_FIRMWARE_PREFIX "/v1/device/firmware/"
+/* Room for the download's path, with a NUL. */
+#define DH_FIRMWARE_PATH_MAX (sizeof DH_PATH_FIRMWARE_PREFIX + DH_PACKAGE_ID_HEX_LEN)
+
+/* The path of GET /v1/device/firmware/{package_id}, for an offer's package_id. Returns its
+ * length, or 0 (and an empty string) if package_id isn't 64 lower-case hex digits or the path
+ * doesn't fit in cap bytes (DH_FIRMWARE_PATH_MAX always does). */
+size_t dh_firmware_path(const char *package_id, char *out, size_t cap);
+
+/* The body of POST /v1/device/firmware/report: {"offer_id", "state", "reason" (only when the
+ * report has one), "firmware_version"}. firmware_version is the version running as the report
+ * is sent. Returns its length, with a NUL after it, or 0 if the report has no state, its
+ * offer_id isn't 32 lower-case hex digits, or it doesn't fit. */
+size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmware_version,
+                                  char *out, size_t cap);
+
 /* ---- The device ID and token ---- */
 
 #define DH_DEVICE_MAX_ID_BYTES 64u
@@ -138,20 +156,30 @@ typedef enum {
     DH_TRY_ANSWERED,
 } dh_try_result;
 
-/* One request, tried at each hub address in the bundle's order. At an address, each trust anchor
- * is tried in turn while the certificate doesn't match; an address that doesn't answer isn't
- * tried again with the other anchor. The first answer from the real hub ends it.
+/* One request, tried at each hub address: the one that answered last time first, then the others
+ * in the bundle's order. At an address, each trust anchor is tried in turn while the certificate
+ * doesn't match; an address that doesn't answer isn't tried again with the other anchor. The
+ * first answer from the real hub ends it.
  *
  *   dh_hub_walk walk;
- *   dh_hub_walk_begin(&walk, host_count, anchor_count);
+ *   dh_hub_walk_begin_at(&walk, host_count, anchor_count, first_host);
  *   while (dh_hub_walk_next(&walk, &host, &anchor)) {
  *       dh_hub_walk_tried(&walk, <what happened at hosts[host] with anchors[anchor]>);
  *   }
  *   problem = dh_hub_walk_problem(&walk);
+ *   if (problem == DH_PROBLEM_NONE) {
+ *       first_host = dh_hub_walk_answered_host(&walk);
+ *   }
+ *
+ * Starting where the hub last answered matters when an earlier address never does: a name that
+ * can't be looked up costs several seconds at every request. Keep first_host in memory only (0
+ * at every start, and for every new setup): it is a short cut, never a setting.
  */
 typedef struct {
     uint8_t host_count;
     uint8_t anchor_count;
+    uint8_t first; /* the address tried first */
+    uint8_t tried; /* how many addresses have been finished with */
     uint8_t host;
     uint8_t anchor;
     bool waiting; /* a try was handed out and its result hasn't come back */
@@ -160,7 +188,12 @@ typedef struct {
     dh_problem last;
 } dh_hub_walk;
 
+/* A walk in the bundle's order. */
 void dh_hub_walk_begin(dh_hub_walk *w, uint8_t host_count, uint8_t anchor_count);
+/* A walk that tries hosts[first_host] first, then the others in the bundle's order. A first_host
+ * that isn't one of the addresses is read as 0. */
+void dh_hub_walk_begin_at(dh_hub_walk *w, uint8_t host_count, uint8_t anchor_count,
+                          uint8_t first_host);
 /* The next address and anchor to try. False when there is nothing left to try, or the hub has
  * answered. */
 bool dh_hub_walk_next(dh_hub_walk *w, uint8_t *host, uint8_t *anchor);
@@ -169,6 +202,9 @@ void dh_hub_walk_tried(dh_hub_walk *w, dh_try_result result);
  * reports it: DH_PROBLEM_UNREACHABLE or DH_PROBLEM_WRONG_HUB (and DH_PROBLEM_UNREACHABLE when
  * there was nothing to try). */
 dh_problem dh_hub_walk_problem(const dh_hub_walk *w);
+/* The address the hub answered at: the one to begin the next walk at. If the hub didn't answer,
+ * the address this walk began at, so a round of failures changes nothing. */
+uint8_t dh_hub_walk_answered_host(const dh_hub_walk *w);
 
 /* ---- When a heartbeat is due ---- */
 

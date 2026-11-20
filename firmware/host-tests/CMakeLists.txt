@@ -1,4 +1,5 @@
-# Host tests for dh_core and the screens' words and figures. CI runs:
+# Host tests for dh_core, the screens' words and figures, and the firmware's own part in a signed
+# update. CI runs:
 #   cmake -S firmware/host-tests -B <dir> -DMBEDTLS_DIR=<prefix>
 #   cmake --build <dir>
 #   ctest --test-dir <dir> --output-on-failure
@@ -70,6 +71,30 @@ add_executable(dh_fw_conform fw_conform_cli.c)
 target_link_libraries(dh_fw_conform PRIVATE dh_core)
 target_compile_options(dh_fw_conform PRIVATE ${DH_WARNINGS})
 
+# The firmware's own part in a signed update (main/update.c and main/storage_fw.c), built over a
+# stand-in for the board (glue/README.md): as a second runner for the firmware vectors, and with
+# tests of its own for what the vectors can't describe.
+add_library(dh_glue STATIC
+    glue/glue.c
+    "${DH_FIRMWARE_DIR}/main/update.c"
+    "${DH_FIRMWARE_DIR}/main/storage_fw.c")
+target_include_directories(dh_glue PUBLIC
+    "${CMAKE_CURRENT_LIST_DIR}/glue/include"
+    "${CMAKE_CURRENT_LIST_DIR}/glue"
+    "${DH_FIRMWARE_DIR}/main")
+target_link_libraries(dh_glue PUBLIC dh_core)
+target_compile_options(dh_glue PRIVATE ${DH_WARNINGS})
+
+add_executable(dh_fw_conform_glue fw_conform_cli.c)
+target_link_libraries(dh_fw_conform_glue PRIVATE dh_glue)
+target_compile_options(dh_fw_conform_glue PRIVATE ${DH_WARNINGS})
+target_compile_definitions(dh_fw_conform_glue PRIVATE DH_FW_GLUE=1)
+
+add_executable(dh_update_glue_tests update_glue_tests.c)
+target_link_libraries(dh_update_glue_tests PRIVATE dh_glue)
+target_compile_options(dh_update_glue_tests PRIVATE ${DH_WARNINGS})
+target_compile_definitions(dh_update_glue_tests PRIVATE DH_PROTOCOL_DIR="${DH_PROTOCOL_DIR}")
+
 # The USB handler on a pseudo-terminal, for trying the desktop app's sender against it (see
 # usb-e2e/). Linux only, and not part of the tests run here.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -102,6 +127,10 @@ add_test(NAME ui COMMAND dh_ui_tests)
 add_test(NAME firmware_vectors
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             firmware $<TARGET_FILE:dh_fw_conform> "${DH_PROTOCOL_DIR}/firmware")
+add_test(NAME firmware_vectors_glue
+    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
+            firmware $<TARGET_FILE:dh_fw_conform_glue> "${DH_PROTOCOL_DIR}/firmware")
+add_test(NAME update_glue COMMAND dh_update_glue_tests)
 add_test(NAME examples
     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_LIST_DIR}/run_conformance.py"
             examples $<TARGET_FILE:dh_conform> "${DH_PROTOCOL_DIR}/examples")

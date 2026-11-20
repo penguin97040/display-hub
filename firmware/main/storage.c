@@ -19,7 +19,6 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
-#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
@@ -71,10 +70,13 @@ static SemaphoreHandle_t s_lock;
 static storage_facts_t s_facts = {.state = STORAGE_FAILED};
 static storage_key_status_t s_key_status;
 
-static dh_fw_keys s_keys;
-static dh_fw_record s_record;
-static dh_fw_session s_session;
 static uint32_t s_spare_slot_bytes;
+// The app partition that is running, as the update core numbers them (0 for ota_0), and whether
+// the bootloader started it on trial. Read before NVS is started, so a trial boot whose storage
+// doesn't work is still known to be one, and goes back when its five minutes are up.
+static bool s_running_known;
+static uint8_t s_running_slot;
+static bool s_image_on_trial;
 // See storage.h, "The setup's generation".
 static uint32_t s_generation;
 
@@ -302,65 +304,59 @@ static void erase_check_build_leftovers(void)
              erased ? "erased" : "couldn't be erased");
 }
 
-// Loads the firmware keys and the update record, and settles them with dh_fw_start(). False if
-// they couldn't be read, or the running partition isn't known.
+// Which app partition is running, and whether the bootloader started it on trial. Needs no NVS.
+static void read_running_partition(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    if (running == NULL || running->type != ESP_PARTITION_TYPE_APP ||
+        running->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
+        running->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+        ESP_LOGE(TAG, "can't tell which app partition is running");
+        return;
+    }
+    s_running_known = true;
+    s_running_slot = (uint8_t)(running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
+    esp_ota_img_states_t image_state = ESP_OTA_IMG_UNDEFINED;
+    s_image_on_trial = esp_ota_get_state_partition(running, &image_state) == ESP_OK &&
+                       image_state == ESP_OTA_IMG_PENDING_VERIFY;
+    const esp_partition_t *spare = esp_ota_get_next_update_partition(NULL);
+    s_spare_slot_bytes = spare != NULL ? spare->size : 0;
+}
+
+// Loads the firmware keys and the update record, and settles them with dh_fw_start()
+// (storage_fw.c). False if they couldn't be read, or the running partition isn't known.
 static bool load_firmware_state(void)
 {
     uint8_t blob[DH_FW_RECORD_BLOB_LEN];
     _Static_assert(DH_FW_RECORD_BLOB_LEN >= DH_FW_KEYS_BLOB_LEN, "one buffer for both blobs");
     size_t len = 0;
 
-    dh_fw_keys_init(&s_keys);
+    dh_fw_keys *keys = storage_fw_keys();
+    dh_fw_keys_init(keys);
     blob_result_t found = read_blob(FW_NAMESPACE, FW_KEY_KEYS, blob, sizeof(blob), &len);
     if (found == BLOB_ERROR) {
         return false;
     }
-    if (found != BLOB_MISSING && !dh_fw_keys_decode(&s_keys, blob, len)) {
+    if (found != BLOB_MISSING && !dh_fw_keys_decode(keys, blob, len)) {
         // dh_update.h: carry on with no keys. The display then refuses every update until it is
         // set up again over USB, which is the safe side.
         ESP_LOGE(TAG, "the stored firmware keys can't be read: carrying on with none");
     }
 
-    dh_fw_record_init(&s_record);
+    dh_fw_record *record = storage_fw_record();
+    dh_fw_record_init(record);
     found = read_blob(FW_NAMESPACE, FW_KEY_RECORD, blob, sizeof(blob), &len);
     if (found == BLOB_ERROR) {
         return false;
     }
-    if (found != BLOB_MISSING && !dh_fw_record_decode(&s_record, blob, len)) {
+    if (found != BLOB_MISSING && !dh_fw_record_decode(record, blob, len)) {
         ESP_LOGE(TAG, "the stored update record can't be read: starting a new one");
     }
 
-    // Which app partition is running, as the update core numbers them (0 for ota_0, 1 for
-    // ota_1), and whether the bootloader started it on trial.
-    const esp_partition_t *running = esp_ota_get_running_partition();
-    if (running == NULL || running->type != ESP_PARTITION_TYPE_APP ||
-        running->subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
-        running->subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
-        ESP_LOGE(TAG, "can't tell which app partition is running");
+    if (!s_running_known) {
         return false;
     }
-    const uint8_t slot = (uint8_t)(running->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN);
-    esp_ota_img_states_t image_state = ESP_OTA_IMG_UNDEFINED;
-    const bool on_trial = esp_ota_get_state_partition(running, &image_state) == ESP_OK &&
-                          image_state == ESP_OTA_IMG_PENDING_VERIFY;
-
-    unsigned save = 0;
-    const dh_fw_start_result started =
-        dh_fw_start(&s_session, &s_record, &s_keys, slot, on_trial, &save);
-    // The keys first, then the record. If a write fails, the same is settled at the next start.
-    if ((save & DH_FW_SAVE_KEYS) != 0 && !store_save_keys(NULL, &s_keys)) {
-        ESP_LOGE(TAG, "couldn't save the firmware keys after start-up");
-    }
-    if ((save & DH_FW_SAVE_RECORD) != 0 && !store_save_record(NULL, &s_record)) {
-        ESP_LOGE(TAG, "couldn't save the update record after start-up");
-    }
-    if (started != DH_FW_START_NORMAL) {
-        // Nothing in this build installs updates, so this isn't expected yet.
-        ESP_LOGW(TAG, "the update record had something to settle at start-up (%d)", (int)started);
-    }
-
-    const esp_partition_t *spare = esp_ota_get_next_update_partition(NULL);
-    s_spare_slot_bytes = spare != NULL ? spare->size : 0;
+    storage_fw_settle_start(s_running_slot, s_image_on_trial);
     return true;
 }
 
@@ -456,12 +452,14 @@ void storage_start(efuse_report_t *efuse)
     s_setup_scratch = scratch_alloc(sizeof(*s_setup_scratch));
     s_blob = scratch_alloc(DH_SETUP_BLOB_MAX);
     s_facts = (storage_facts_t){.state = STORAGE_FAILED};
-    dh_fw_keys_init(&s_keys);
-    dh_fw_record_init(&s_record);
+    dh_fw_keys_init(storage_fw_keys());
+    dh_fw_record_init(storage_fw_record());
     if (s_lock == NULL || s_setup_scratch == NULL || s_blob == NULL) {
         ESP_LOGE(TAG, "out of memory at start-up");
         abort();
     }
+
+    read_running_partition();
 
     bool key_made = false;
     const esp_err_t err = storage_key_start_nvs(efuse, &s_key_status, &key_made);
@@ -511,14 +509,25 @@ const dh_setup_store *storage_store(void)
     return s_facts.state == STORAGE_WORKING ? &s_store : NULL;
 }
 
-dh_fw_keys *storage_fw_keys(void)
+// For storage_fw.c: see storage_fw.h, "What storage.c provides".
+bool storage_fw_usable(void)
 {
-    return &s_keys;
+    return s_facts.state == STORAGE_WORKING;
 }
 
-dh_fw_record *storage_fw_record(void)
+bool storage_fw_write_keys(const dh_fw_keys *keys)
 {
-    return &s_record;
+    return store_save_keys(NULL, keys);
+}
+
+bool storage_fw_write_record(const dh_fw_record *record)
+{
+    return store_save_record(NULL, record);
+}
+
+bool storage_image_on_trial(void)
+{
+    return s_image_on_trial;
 }
 
 uint32_t storage_spare_slot_bytes(void)
@@ -703,41 +712,6 @@ bool storage_save_snapshot(uint32_t generation, uint8_t *body, size_t len)
     return ok;
 }
 
-void storage_fw_tick(void)
-{
-    storage_lock();
-    if (s_facts.state == STORAGE_WORKING) {
-        const uint8_t attempts = s_record.attempts_left;
-        const uint64_t uptime_s = (uint64_t)(esp_timer_get_time() / 1000000);
-        if ((dh_fw_tick(&s_session, &s_record, uptime_s) & DH_FW_SAVE_RECORD) != 0) {
-            // If the write fails, the same hour is counted again after the next start.
-            if (!store_save_record(NULL, &s_record)) {
-                ESP_LOGE(TAG, "couldn't save the update record after counting running time");
-            }
-            if (s_record.attempts_left != attempts) {
-                ESP_LOGI(TAG, "update attempts left: %u", (unsigned)s_record.attempts_left);
-            }
-        }
-    }
-    storage_unlock();
-}
-
-uint8_t storage_fw_attempts_left(void)
-{
-    storage_lock();
-    const uint8_t attempts = s_record.attempts_left;
-    storage_unlock();
-    return attempts;
-}
-
-bool storage_fw_on_trial(void)
-{
-    storage_lock();
-    const bool trial = s_session.trial;
-    storage_unlock();
-    return trial;
-}
-
 void storage_log(void)
 {
     storage_lock();
@@ -760,11 +734,8 @@ void storage_log(void)
         } else {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB");
         }
-        ESP_LOGI(TAG,
-                 "firmware keys: %u; security floor: %" PRIu32 "; update attempts left: %u; "
-                 "spare slot: %" PRIu32 " bytes",
-                 (unsigned)s_keys.key_count, s_keys.security_floor,
-                 (unsigned)s_record.attempts_left, s_spare_slot_bytes);
+        ESP_LOGI(TAG, "spare slot: %" PRIu32 " bytes", s_spare_slot_bytes);
+        storage_fw_log();
         break;
     case STORAGE_NO_KEY:
         ESP_LOGE(TAG, "storage isn't working: the storage key can't be used");

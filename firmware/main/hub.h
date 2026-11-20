@@ -2,6 +2,10 @@
 // enrolling", "Every poll", "Heartbeat", "Errors and back-off"): join Wi-Fi, enrol once, keep the
 // device ID and token, poll the snapshot, send heartbeats, and say plainly what is wrong.
 //
+// The same task installs signed updates (docs/firmware-updates.md): it reports, downloads the
+// update the hub offers, checks it as it arrives, writes it to the spare app partition and
+// restarts into it, and on the new firmware's trial boot its poll is the check-in.
+//
 // One task does all of it, and it is the only one that touches Wi-Fi or the network. It never
 // draws: it keeps a small status and a copy of the pages, which the main task reads and shows.
 // What to send, what an answer means and when to try next are decided by dh_core (dh_hub.h,
@@ -54,6 +58,13 @@ typedef enum {
     HUB_DETAIL_REVOKED,         // the hub no longer accepts this display's token
 } hub_detail_t;
 
+// What the hub task is doing about a firmware update, beyond its usual work.
+typedef enum {
+    HUB_UPDATE_NONE,
+    HUB_UPDATE_DOWNLOADING, // an update is being fetched, checked and written to the spare slot
+    HUB_UPDATE_RESTARTING,  // it is written: the display is about to restart into it
+} hub_update_t;
+
 typedef struct {
     hub_state_t state;
     // The setup this is about (storage_setup_generation()). After a setup is erased or replaced,
@@ -69,6 +80,10 @@ typedef struct {
     // They are the ones saved before this start, and no poll has succeeded since: their age
     // isn't known.
     bool saved_pages;
+    hub_update_t update;
+    // Changes whenever what storage_fw_facts() says may have changed (a trial boot marked good,
+    // an update's result), so the screen is drawn again.
+    uint32_t fw_seq;
 } hub_status_t;
 
 // A copy of the pages held, for the screen to draw. It is about 38 KB, so keep it off the stack.

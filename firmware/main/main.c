@@ -1,18 +1,22 @@
 // The official Display Hub firmware. It takes its setup over USB from the desktop app, keeps it in
 // encrypted storage, joins Wi-Fi, enrols with the hub, polls its pages and sends heartbeats, and
 // can be factory-reset with the BOOT button (milestone D5). It draws the pages, one at a time with
-// a swipe between them, and says how things stand (D6). Installing updates comes later.
+// a swipe between them, and says how things stand (D6). It installs the signed updates the hub
+// offers, and goes back to the version before if a new one can't reach the hub (D7).
 //
 // What runs:
 // - the USB task (usb_setup.c) reads the port and answers `hello` and `provision`;
 // - the button task (reset_button.c) watches BOOT;
-// - the hub task (hub.c) does everything on the network;
+// - the hub task (hub.c) does everything on the network, installing an update included;
+// - on a trial boot only, a small task (update.c) counts the five minutes new firmware has to
+//   reach the hub;
 // - LVGL's own task draws, and also turns the pages when the screen is swiped and keeps their
 //   ages up to date (ui.c);
 // - this task, the main one, decides what the screen shows and does the factory reset. The other
 //   tasks only send it events. Everything that touches the screen holds the LVGL lock.
 
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "board/board.h"
@@ -30,6 +34,7 @@
 #include "reset_button.h"
 #include "storage.h"
 #include "ui.h"
+#include "update.h"
 #include "usb_setup.h"
 
 static const char *TAG = "display-hub";
@@ -64,6 +69,9 @@ static hub_status_t s_hub;
 static hub_pages_t *s_pages;
 // The factory reset countdown is on the screen: nothing else may draw over it.
 static bool s_counting;
+// LVGL's own task (esp_lvgl_port names it), for its stack headroom in the log. Tiny TTF draws
+// each new glyph on that stack.
+static TaskHandle_t s_lvgl_task;
 
 static void send_event(event_type_t type, int value)
 {
@@ -122,6 +130,7 @@ static void show_state(const char *note)
         return;
     }
     const storage_facts_t facts = storage_facts();
+    const storage_fw_facts_t fw = storage_fw_facts();
     hub_status(&s_hub);
     // A status about a setup that has since been erased or replaced says nothing about the one
     // there is now. Until the hub task takes the new one up, it is joining, as for any new setup.
@@ -141,7 +150,7 @@ static void show_state(const char *note)
                 forget_pages();
             }
         }
-        ui_show_state(&facts, storage_key_status(), &s_hub, s_pages, note);
+        ui_show_state(&facts, storage_key_status(), &s_hub, &fw, s_pages, note);
         lvgl_port_unlock();
     }
 }
@@ -230,6 +239,8 @@ void app_main(void)
     efuse_report_log(&s_efuse, "at start-up");
     storage_start(&s_efuse);
     storage_log();
+    // New firmware on its trial boot has five minutes from here to reach the hub.
+    update_trial_start();
 
     // The board: its revision is part of what `hello` reports, so it comes before the USB task.
     const esp_err_t board_err = board_start(&s_board);
@@ -245,6 +256,8 @@ void app_main(void)
                  esp_err_to_name(board_err));
     } else if (lvgl_port_lock(0)) {
         const storage_facts_t facts = storage_facts();
+        const storage_fw_facts_t fw = storage_fw_facts();
+        s_lvgl_task = xTaskGetHandle("taskLVGL");
         s_pages = heap_caps_calloc(1, sizeof(*s_pages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (s_pages == NULL) {
             ESP_LOGE(TAG, "out of memory for the screen's copy of the pages; showing the status "
@@ -252,7 +265,7 @@ void app_main(void)
         }
         ui_start(s_system.version, board_note);
         // Nothing from the hub yet: its task starts below.
-        ui_show_state(&facts, storage_key_status(), &s_hub, s_pages, NULL);
+        ui_show_state(&facts, storage_key_status(), &s_hub, &fw, s_pages, NULL);
         // Draw the first screen before turning the brightness up, so nothing left over in the
         // screen's memory is shown brightly.
         lv_refr_now(s_board.display);
@@ -294,15 +307,19 @@ void app_main(void)
         storage_log();
         // How close each task has come to the end of its stack, so the headroom is seen, not
         // guessed.
+        char hub_words[40] = "isn't running";
         if (hub_err == ESP_OK) {
-            ESP_LOGI(TAG,
-                     "stack never used: main task %u bytes, USB task %u bytes, hub task %u bytes",
-                     (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused(),
-                     hub_stack_unused());
-        } else {
-            ESP_LOGI(TAG, "stack never used: main task %u bytes, USB task %u bytes; the hub task "
-                          "isn't running",
-                     (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused());
+            snprintf(hub_words, sizeof(hub_words), "%u bytes", hub_stack_unused());
         }
+        char lvgl_words[40] = "isn't running";
+        if (s_lvgl_task != NULL) {
+            snprintf(lvgl_words, sizeof(lvgl_words), "%u bytes",
+                     (unsigned)uxTaskGetStackHighWaterMark(s_lvgl_task));
+        }
+        ESP_LOGI(TAG,
+                 "stack never used: main task %u bytes, USB task %u bytes, hub task %s, screen "
+                 "task %s",
+                 (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused(), hub_words,
+                 lvgl_words);
     }
 }

@@ -77,7 +77,7 @@ The keys and the floor only ever change in `dh_fw_marked_good()`, in `dh_fw_star
 
 ### What isn't here
 
-Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`). Everything that touches hardware is the firmware's: NVS, `esp_http_client`, the `esp_ota_*` calls, the two time limits on a download (`dh_fw_download_overdue()` says when to give up) and sending the reports.
+Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`). Everything that touches hardware is the firmware's: NVS, `esp_http_client`, the `esp_ota_*` calls, the two time limits on a download (`dh_fw_download_overdue()` says when to give up) and sending the reports. That part is `main/hub.c`, `main/update.c` and `main/storage_fw.c`, and the host tests run the last two as well, over a stand-in for the board (`firmware/host-tests/glue`).
 
 ## Setup over USB
 
@@ -114,16 +114,16 @@ Note that the protocol document says a display answers a `provision` with `provi
 
 `dh_hub.h` is what a display needs once it is set up, beside the snapshot reader and the poll schedule. Like the rest, it follows the reference (`tools/display-simulator/src/paired.rs` and `main.rs`, and `crates/hub-client`).
 
-- **The requests.** `dh_enrol_request()` and `dh_heartbeat_request()` write the JSON bodies, with the `firmware` member (key ids, security floor, spare slot size, attempts left) whenever the keys and the record are known. The same code writes the USB `hello`, so the three can't drift apart. A secret is written as any text may be: quotes, control characters and longer characters all survive.
+- **The requests.** `dh_enrol_request()` and `dh_heartbeat_request()` write the JSON bodies, with the `firmware` member (key ids, security floor, spare slot size, attempts left) whenever the keys and the record are known. The same code writes the USB `hello`, so the three can't drift apart. A secret is written as any text may be: quotes, control characters and longer characters all survive. `dh_firmware_report_request()` writes a firmware report and `dh_firmware_path()` the path a download is asked for at, which takes nothing but a package id of 64 lower-case hex digits.
 - **The answers.** `dh_read_enrol_response()` takes any 2xx status with a readable body as success, and groups anything else as `dh_read_error_response()` does: the four groups of the protocol's error table, for any route. Both stop at 8 KiB.
 - **The device ID and token** are taken as 1 to 64 and 1 to 128 printable ASCII characters with no space, which is wider than the schema (so a hub may change how it makes them) and narrow enough to put a token in a header as it is. `dh_device_encode()` and `dh_device_decode()` are the stored form.
-- **Which address** (`dh_hub_walk`): each hub address in order; at an address, each trust anchor while the certificate doesn't match; an address with no answer isn't tried with the other anchor; the first real answer ends it. With no answer anywhere, the problem is the last address's, as in the reference.
+- **Which address** (`dh_hub_walk`): the hub address that answered last time first (kept in memory for one start, never stored), then the others in the bundle's order; at an address, each trust anchor while the certificate doesn't match; an address with no answer isn't tried with the other anchor; the first real answer ends it. With no answer anywhere, the problem is the last address tried, as in the reference.
 - **Heartbeats** (`dh_heartbeat_due()`): after start-up, hourly, and when the attempts left change; a change the hub didn't take is sent again every five minutes, never at every poll. The reference's own test cases are in `hub_tests.c`.
 - **Saving the last good snapshot** (`dh_snapshot_bodies_match()`, `dh_snapshot_save_due()`): only when something other than `generated_at` differs from the saved copy, and then at most hourly.
 
 `dh_poll.h` has one problem the reference words but the handoff's list doesn't: `DH_PROBLEM_SETTINGS`, "This display's settings are wrong", for a setup with no Wi-Fi details or no certificate that can be read.
 
-**Where it differs from the reference**, on purpose: an ID or token outside the characters above makes the response unreadable (the reference takes any string); an error answer over 8 KiB counts as having no body (the reference fails the read); and at one address, a certificate mismatch from the first anchor isn't forgotten if the second anchor's try gets no answer.
+**Where it differs from the reference**, on purpose: an ID or token outside the characters above makes the response unreadable (the reference takes any string); an error answer over 8 KiB counts as having no body (the reference fails the read); at one address, a certificate mismatch from the first anchor isn't forgotten if the second anchor's try gets no answer; and the address that answered last is tried first (the reference always walks in the bundle's order), because on a board a name that can't be looked up costs several seconds at every request.
 
 ## Memory
 

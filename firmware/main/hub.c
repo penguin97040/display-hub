@@ -11,6 +11,22 @@
 // When the hub refuses the secret (used or expired), the secret is erased and the display says
 // it needs setting up again: there is nothing left to try.
 //
+// UPDATES (docs/firmware-updates.md; dh_core's README, "Signed updates"). After each poll the hub
+// answered, this task sends any final report that is waiting, then looks at the offer in the
+// snapshot. The order for one attempt is the update core's: the spent attempt and the offer id
+// are saved before anything is requested (storage_fw_on_offer); then `downloading` is reported,
+// once; then the update form is asked for with the same pinned TLS, token and walk of addresses
+// as every other request, and checked as it arrives (update.c); then the record is saved, the
+// spare partition set to boot, and the display restarts. Everything that touches the update core
+// runs on this task or under storage's lock. On a trial boot the poll is the check-in: nothing
+// that names the new version is sent (no enrolment, heartbeat or report) and no offer is acted
+// on until the image is marked good.
+//
+// `downloading` is sent before the download is asked for, where the reference display sends it
+// once the manifest has passed its checks. Sending it then would mean a second TLS session
+// while the download's is open, and internal memory is the tight resource on this board; the
+// hub only shows it, and the final report says what really happened.
+//
 // TIME. Every wait is measured with esp_timer_get_time(), which only ever counts up from this
 // start. The display never asks anyone for the date: ages are worked out on the hub's clock
 // (dh_page_freshness) from the snapshot's own times and how long it has been held.
@@ -26,6 +42,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
@@ -34,6 +51,7 @@
 #include "hub_http.h"
 #include "mbedtls/x509_crt.h"
 #include "storage.h"
+#include "update.h"
 #include "usb_setup.h"
 #include "wifi.h"
 
@@ -52,6 +70,11 @@ static const char *TAG = "hub";
 #define WIFI_RETRY_MAX_SECONDS 60u
 // A join that has neither succeeded nor failed by now (no address was given, say) is given up.
 #define WIFI_JOIN_TIMEOUT_MS 30000
+// On a trial boot a failed check-in is tried again at least this often, whatever the usual
+// back-off says: the firmware has five minutes to reach the hub.
+#define TRIAL_RETRY_MS 15000
+// How long "restarting" stays on the screen, and the log has to drain, before the restart.
+#define RESTART_DELAY_MS 1500
 
 static const char *s_firmware_version;
 static const char *s_hardware_revision;
@@ -77,6 +100,8 @@ static dh_text_scratch *s_scratch;
 
 static char s_request[DH_HUB_REQUEST_MAX];
 static char s_authorization[DH_AUTHORIZATION_MAX];
+// Counts every change to what storage_fw_facts() says, so the screen is told (hub_status_t).
+static uint32_t s_fw_seq;
 
 // One session: from finding a setup to that setup being erased.
 typedef struct {
@@ -95,6 +120,14 @@ typedef struct {
     dh_poll_state poll;
     dh_heartbeat_state heartbeat;
     int64_t next_try_ms; // the next enrolment attempt or poll
+    // The hub address that answered last, which the next request tries first (dh_hub_walk). In
+    // memory only: every start, and every new setup, begins with the bundle's order.
+    uint8_t first_host;
+    // The last poll got an answer from the hub (reports may go), and a snapshot (its offer may
+    // be acted on).
+    bool hub_answered;
+    bool fresh_snapshot;
+    hub_update_t update;
 
     bool wifi_started; // the radio is on with this setup's Wi-Fi details
     bool wifi_was_up;
@@ -175,6 +208,8 @@ static void publish(void)
     next.generation = s.generation;
     next.has_snapshot = s.has_snapshot;
     next.saved_pages = s.has_snapshot && s.saved_pages;
+    next.update = s.update;
+    next.fw_seq = s_fw_seq;
 
     xSemaphoreTake(s_status_lock, portMAX_DELAY);
     bool changed = memcmp(&next, &s_status, sizeof(next)) != 0;
@@ -267,10 +302,37 @@ bool hub_pages(hub_pages_t *out)
 
 // ---- One request, at each address in turn ----
 
-// Tries each hub address in the setup's order, and at each one each trust anchor while the
-// certificate doesn't match, and stops at the first answer from the real hub (dh_hub_walk).
-// Returns DH_PROBLEM_NONE with the answer in *answer and its body in s_body, or why there was no
-// answer. `stopped` in the answer means the setup has gone.
+// One try of a walk: which address it was, by its place in the list, never the address itself.
+static void log_try(uint8_t host, uint8_t anchor, dh_try_result result)
+{
+    if (result != DH_TRY_ANSWERED) {
+        ESP_LOGW(TAG, "hub address %u of %u, certificate %u of %u: %s", (unsigned)host + 1,
+                 (unsigned)s_setup->host_count, (unsigned)anchor + 1, (unsigned)s.anchor_count,
+                 result == DH_TRY_WRONG_HUB ? "something else answered" : "no answer");
+    }
+}
+
+// Ends a walk: the address that answered is the one the next request tries first.
+static dh_problem walk_ended(const dh_hub_walk *walk)
+{
+    dh_wipe(s_authorization, sizeof(s_authorization));
+    const dh_problem problem = dh_hub_walk_problem(walk);
+    if (problem == DH_PROBLEM_NONE) {
+        const uint8_t answered = dh_hub_walk_answered_host(walk);
+        if (answered != s.first_host) {
+            ESP_LOGI(TAG, "the hub answered at address %u of %u: trying that one first from now "
+                          "on",
+                     (unsigned)answered + 1, (unsigned)s_setup->host_count);
+            s.first_host = answered;
+        }
+    }
+    return problem;
+}
+
+// Tries the hub address that answered last, then the others in the setup's order, and at each
+// one each trust anchor while the certificate doesn't match, and stops at the first answer from
+// the real hub (dh_hub_walk). Returns DH_PROBLEM_NONE with the answer in *answer and its body in
+// s_body, or why there was no answer. `stopped` in the answer means the setup has gone.
 static dh_problem ask_hub(const char *path, const char *body, size_t body_len, bool with_token,
                           size_t ok_cap, hub_answer_t *answer)
 {
@@ -280,7 +342,7 @@ static dh_problem ask_hub(const char *path, const char *body, size_t body_len, b
     }
     dh_hub_walk walk;
     uint8_t host = 0, anchor = 0;
-    dh_hub_walk_begin(&walk, s_setup->host_count, s.anchor_count);
+    dh_hub_walk_begin_at(&walk, s_setup->host_count, s.anchor_count, s.first_host);
     while (dh_hub_walk_next(&walk, &host, &anchor)) {
         const hub_request_t request = {
             .host = s_setup->hosts[host].text,
@@ -299,18 +361,45 @@ static dh_problem ask_hub(const char *path, const char *body, size_t body_len, b
         if (answer->stopped) {
             break;
         }
-        if (answer->result != DH_TRY_ANSWERED) {
-            // Which address it was, by its place in the list: never the address itself.
-            ESP_LOGW(TAG, "hub address %u of %u, certificate %u of %u: %s", (unsigned)host + 1,
-                     (unsigned)s_setup->host_count, (unsigned)anchor + 1,
-                     (unsigned)s.anchor_count,
-                     answer->result == DH_TRY_WRONG_HUB ? "something else answered"
-                                                        : "no answer");
-        }
+        log_try(host, anchor, answer->result);
         dh_hub_walk_tried(&walk, answer->result);
     }
-    dh_wipe(s_authorization, sizeof(s_authorization));
-    return dh_hub_walk_problem(&walk);
+    return walk_ended(&walk);
+}
+
+// The same walk for a firmware download, always with the token. With DH_PROBLEM_NONE and status
+// 200, *download is open and none of its body has been read; with any other status the error
+// answer is in s_body.
+static dh_problem ask_hub_for_download(const char *path, hub_download_answer_t *answer,
+                                       hub_download_t **download)
+{
+    *answer = (hub_download_answer_t){.result = DH_TRY_NO_ANSWER};
+    *download = NULL;
+    if (dh_authorization(&s.device, s_authorization, sizeof(s_authorization)) == 0) {
+        return DH_PROBLEM_UNREACHABLE;
+    }
+    dh_hub_walk walk;
+    uint8_t host = 0, anchor = 0;
+    dh_hub_walk_begin_at(&walk, s_setup->host_count, s.anchor_count, s.first_host);
+    while (dh_hub_walk_next(&walk, &host, &anchor)) {
+        const hub_request_t request = {
+            .host = s_setup->hosts[host].text,
+            .port = s_setup->port,
+            .anchor_pem = s.anchors[anchor],
+            .path = path,
+            .authorization = s_authorization,
+            .answer = s_body,
+            .error_cap = DH_MAX_HUB_ANSWER_BYTES,
+            .stop = gone,
+        };
+        *answer = hub_http_download_open(&request, download);
+        if (answer->stopped) {
+            break;
+        }
+        log_try(host, anchor, answer->result);
+        dh_hub_walk_tried(&walk, answer->result);
+    }
+    return walk_ended(&walk);
 }
 
 // Writes the body of an enrolment request or a heartbeat into s_request. What the display says
@@ -447,11 +536,19 @@ static void save_snapshot_if_due(size_t len)
     }
 }
 
+// On a trial boot, a check-in that failed is tried again soon, whatever the back-off says.
+static uint32_t trial_wait(uint32_t wait)
+{
+    return storage_fw_on_trial() && wait > TRIAL_RETRY_MS ? TRIAL_RETRY_MS : wait;
+}
+
 static void poll(void)
 {
     // A token that couldn't be stored earlier: try again before anything else.
     save_token();
 
+    s.hub_answered = false;
+    s.fresh_snapshot = false;
     hub_answer_t answer;
     const dh_problem problem =
         ask_hub(DH_PATH_SNAPSHOT, NULL, 0, true, DH_MAX_SNAPSHOT_BYTES, &answer);
@@ -459,13 +556,14 @@ static void poll(void)
         return;
     }
     if (problem != DH_PROBLEM_NONE) {
-        const uint32_t wait = dh_poll_failed(&s.poll, problem, random32, NULL);
+        const uint32_t wait = trial_wait(dh_poll_failed(&s.poll, problem, random32, NULL));
         ESP_LOGW(TAG, "poll: %s; trying again in %" PRIu32 " s", dh_problem_headline(problem),
                  wait / 1000);
         s.next_try_ms = now_ms() + wait;
         set_state(HUB_TROUBLE, HUB_DETAIL_NONE);
         return;
     }
+    s.hub_answered = true;
 
     // A 200 body over 32 KiB arrives here as 32 KiB and one byte, and is refused by its length
     // before anything is parsed. Any other status is an error answer, with its own smaller limit.
@@ -473,6 +571,11 @@ static void poll(void)
         answer.status == 200
             ? dh_read_response(200, s_body, answer.len, NULL, s_spare, s_scratch)
             : dh_read_error_response(answer.status, s_body, answer.len);
+    // On a trial boot this poll is the check-in: a request that doesn't name the new version.
+    // An answer, or one that only setting the display up again would change, marks it good.
+    if (storage_fw_on_trial() && update_trial_check_in(dh_fw_check_in_of(&response))) {
+        s_fw_seq++;
+    }
     uint32_t refresh = 0;
     if (response.outcome == DH_OUTCOME_SHOW) {
         // The same pages as before need no redraw (which would also drop a swipe in progress),
@@ -488,15 +591,12 @@ static void poll(void)
         pages_changed(!same);
         refresh = s_current->refresh_after_seconds;
         save_snapshot_if_due(answer.len);
-        const dh_firmware_offer *offer = &s_current->firmware_update;
-        if (offer->present && offer->usable && strcmp(offer->offer_id, s.offer_seen) != 0) {
-            strlcpy(s.offer_seen, offer->offer_id, sizeof(s.offer_seen));
-            ESP_LOGI(TAG, "the hub offers a firmware update (%" PRIu64 " bytes); this firmware "
-                          "doesn't install updates yet, so the offer is left alone",
-                     offer->size);
-        }
+        s.fresh_snapshot = true;
     }
-    const uint32_t wait = dh_poll_answered(&s.poll, &response, refresh, random32, NULL);
+    uint32_t wait = dh_poll_answered(&s.poll, &response, refresh, random32, NULL);
+    if (response.outcome != DH_OUTCOME_SHOW) {
+        wait = trial_wait(wait);
+    }
     s.next_try_ms = now_ms() + wait;
     if (response.outcome == DH_OUTCOME_SHOW) {
         ESP_LOGI(TAG, "poll: %u %s (%u bytes); next in %" PRIu32 " s",
@@ -548,6 +648,176 @@ static void heartbeat_if_due(void)
         const char *code = dh_error_code_name(response.error_code);
         ESP_LOGW(TAG, "heartbeat not taken (status %d, %s)", answer.status,
                  code != NULL ? code : "no code");
+    }
+}
+
+// ---- Signed updates ----
+
+// Sends one firmware report. True if the hub answered it with anything at all: a final report
+// is only sent again when there was no answer (docs/protocol-v1.md: `not_found` means the hub
+// has no such offer any more, and a report for an offer already settled is answered 204).
+static bool send_report(const dh_fw_report *report)
+{
+    const size_t len =
+        dh_firmware_report_request(report, s_firmware_version, s_request, sizeof(s_request));
+    if (len == 0) {
+        ESP_LOGE(TAG, "a firmware report couldn't be written");
+        return false;
+    }
+    hub_answer_t answer;
+    const dh_problem problem =
+        ask_hub(DH_PATH_FIRMWARE_REPORT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, &answer);
+    if (answer.stopped || gone()) {
+        return false;
+    }
+    const char *state = dh_fw_report_state_name(report->state);
+    const char *reason = dh_fw_reason_name(report->reason);
+    if (problem != DH_PROBLEM_NONE) {
+        ESP_LOGW(TAG, "update report (%s) not sent: %s", state, dh_problem_headline(problem));
+        return false;
+    }
+    if (answer.status >= 200 && answer.status < 300) {
+        ESP_LOGI(TAG, "update report taken: %s%s%s", state, reason != NULL ? ", " : "",
+                 reason != NULL ? reason : "");
+    } else {
+        const dh_response response = dh_read_error_response(answer.status, s_body, answer.len);
+        const char *code = dh_error_code_name(response.error_code);
+        ESP_LOGW(TAG, "update report (%s) answered with status %d (%s): not sent again", state,
+                 answer.status, code != NULL ? code : "no code");
+    }
+    return true;
+}
+
+// Sends the final reports that are waiting: the record's, then a refusal made from an offer
+// alone. One that gets no answer is left for the next poll. Nothing is given out on a trial boot.
+static void send_reports(void)
+{
+    dh_fw_report report;
+    for (int i = 0; i < 2 && !gone() && storage_fw_report_next(&report); i++) {
+        if (!send_report(&report)) {
+            return;
+        }
+        storage_fw_report_answered(&report);
+        s_fw_seq++;
+    }
+}
+
+static void restart_into_update(void)
+{
+    s.update = HUB_UPDATE_RESTARTING;
+    publish();
+    ESP_LOGW(TAG, "restarting into the new firmware");
+    vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
+    esp_restart();
+}
+
+// One attempt, whose spent budget and offer id are already in flash.
+static void install(const dh_firmware_offer *offer, const dh_fw_device *device)
+{
+    ESP_LOGI(TAG, "the hub offers a firmware update (%" PRIu64 " bytes): downloading it. "
+                  "Update attempts left: %u",
+             offer->size, (unsigned)storage_fw_attempts_left());
+    s.update = HUB_UPDATE_DOWNLOADING;
+    s_fw_seq++;
+    publish();
+
+    // Once, and whatever becomes of it: only a final report is sent again.
+    dh_fw_report downloading = {.state = DH_FW_REPORT_DOWNLOADING};
+    strlcpy(downloading.offer_id, offer->offer_id, sizeof(downloading.offer_id));
+    (void)send_report(&downloading);
+
+    dh_fw_reason reason = DH_FW_REASON_DOWNLOAD;
+    char path[DH_FIRMWARE_PATH_MAX];
+    if (!gone() && dh_firmware_path(offer->package_id, path, sizeof(path)) > 0) {
+        // The 15 minutes run from here: finding the hub is part of the download.
+        const int64_t started_ms = now_ms();
+        hub_download_answer_t answer;
+        hub_download_t *download = NULL;
+        const dh_problem problem = ask_hub_for_download(path, &answer, &download);
+        if (answer.stopped || gone()) {
+            ESP_LOGW(TAG, "the setup has gone: the download isn't made");
+        } else if (problem != DH_PROBLEM_NONE) {
+            ESP_LOGW(TAG, "the download wasn't answered: %s", dh_problem_headline(problem));
+        } else if (answer.status != 200 || download == NULL) {
+            const dh_response response =
+                dh_read_error_response(answer.status, s_body, answer.len);
+            const char *code = dh_error_code_name(response.error_code);
+            ESP_LOGW(TAG, "the hub didn't send the download (status %d, %s)", answer.status,
+                     code != NULL ? code : "no code");
+        } else {
+            reason = update_receive(download, device, offer->size, answer.has_length,
+                                    answer.length, started_ms, gone);
+        }
+        hub_http_download_close(download);
+    }
+    ESP_LOGI(TAG, "hub task stack never used: %u bytes", hub_stack_unused());
+    if (reason == DH_FW_REASON_NONE) {
+        restart_into_update();
+    }
+
+    // Refused or failed: the record first, then the report.
+    storage_fw_attempt_ended(reason);
+    s.update = HUB_UPDATE_NONE;
+    s_fw_seq++;
+    publish();
+    send_reports();
+}
+
+// What to do about the offer in the snapshot just taken, if it has one.
+static void act_on_offer(void)
+{
+    const dh_firmware_offer *offer = &s_current->firmware_update;
+    if (!offer->present || !offer->usable) {
+        return;
+    }
+    const dh_fw_device device = {
+        .device_type = USB_SETUP_DEVICE_TYPE,
+        .hardware_revision = s_hardware_revision,
+        .slot_bytes = storage_spare_slot_bytes(),
+    };
+    dh_fw_offer_decision decision;
+    if (!storage_fw_on_offer(&device, offer->offer_id, offer->size, &decision)) {
+        return;
+    }
+    // An offer is in every snapshot until it is settled: say what became of it once.
+    const bool first_sight = strcmp(offer->offer_id, s.offer_seen) != 0;
+    switch (decision.action) {
+    case DH_FW_OFFER_ATTEMPT:
+        strlcpy(s.offer_seen, offer->offer_id, sizeof(s.offer_seen));
+        install(offer, &device);
+        return;
+    case DH_FW_OFFER_REFUSE:
+        strlcpy(s.offer_seen, offer->offer_id, sizeof(s.offer_seen));
+        ESP_LOGW(TAG, "refused the firmware update the hub offers (%s): nothing was requested "
+                      "or written",
+                 dh_fw_reason_name(decision.reason));
+        s_fw_seq++;
+        send_reports();
+        return;
+    case DH_FW_OFFER_WAIT:
+        if (first_sight) {
+            strlcpy(s.offer_seen, offer->offer_id, sizeof(s.offer_seen));
+            ESP_LOGW(TAG, "the hub offers a firmware update, but no update attempts are left: "
+                          "the next is earned after %" PRIu64 " more minutes of running",
+                     (decision.wait_seconds + 59u) / 60u);
+        }
+        return;
+    default:
+        // The offer last acted on, or nothing new is acted on yet (a report is still waiting
+        // for the hub's answer, or this is a trial boot).
+        return;
+    }
+}
+
+// After a poll: any report that is waiting, then the offer in a snapshot just taken.
+static void updates(void)
+{
+    if (!s.hub_answered || storage_fw_on_trial()) {
+        return;
+    }
+    send_reports();
+    if (s.fresh_snapshot && !gone()) {
+        act_on_offer();
     }
 }
 
@@ -882,9 +1152,19 @@ static void run_session(void)
             continue;
         }
         if (!s.enrolled) {
-            enrol();
+            if (storage_fw_on_trial()) {
+                // An enrolment names the running version, which a trial boot must not do. A
+                // display with no token can't check in, so this firmware goes back when its
+                // five minutes are up (update.c).
+                wait_ms(TRIAL_RETRY_MS);
+            } else {
+                enrol();
+            }
         } else {
             poll();
+            if (!gone()) {
+                updates();
+            }
             if (!gone()) {
                 heartbeat_if_due();
             }
