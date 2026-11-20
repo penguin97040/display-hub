@@ -73,7 +73,7 @@ size_t dh_usb_hello(const dh_usb_display *d, char *out, size_t cap)
 
     /* The firmware member, unless the keys and the record aren't known (storage isn't working),
      * or a key's id can't be worked out: better to leave it out than to report a guess. */
-    if (d->store != NULL) {
+    if (d->store != NULL && !d->withhold_firmware) {
         (void)dh_put_firmware_member(&w, d->keys, d->record, d->slot_bytes);
     }
     dh_put_char(&w, '}');
@@ -114,6 +114,13 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
         dh_setup_wipe(d->work);
         return refuse(DH_USB_ERROR_STORAGE_FAILED,
                       "This display's storage isn't working, so it can't be set up.", reply, cap);
+    }
+    if (holds == DH_HELD_RESTART_NEEDED) {
+        dh_setup_wipe(d->work);
+        return refuse(DH_USB_ERROR_STORAGE_FAILED,
+                      "This display couldn't save to its storage earlier, so it can't be set up "
+                      "until it restarts. Unplug it, plug it back in, then try again.",
+                      reply, cap);
     }
     if (holds == DH_HELD_SETUP) {
         dh_setup_wipe(d->work);

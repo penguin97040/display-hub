@@ -79,6 +79,7 @@ typedef struct {
     uint8_t record[DH_FW_RECORD_BLOB_LEN];
     /* Test switches and counters. */
     bool unreadable;
+    bool restart_needed;
     bool fail_keys, fail_record, fail_setup, fail_erase;
     unsigned key_writes, record_writes, setup_writes, erases;
 } fake_store;
@@ -86,7 +87,13 @@ typedef struct {
 static dh_held fake_held(void *ctx)
 {
     fake_store *f = ctx;
-    return f->unreadable ? DH_HELD_UNKNOWN : f->has_setup ? DH_HELD_SETUP : DH_HELD_NOTHING;
+    if (f->unreadable) {
+        return DH_HELD_UNKNOWN;
+    }
+    if (f->has_setup) {
+        return DH_HELD_SETUP;
+    }
+    return f->restart_needed ? DH_HELD_RESTART_NEEDED : DH_HELD_NOTHING;
 }
 
 static bool fake_save_keys(void *ctx, const dh_fw_keys *keys)
@@ -160,7 +167,7 @@ static display *new_display(void)
                                fake_save_record, fake_save_setup, fake_erase_setup};
     d.usb = (dh_usb_display){"display-hub-waveshare-amoled-1.8", "0.1.0",
                              "waveshare-amoled-1.8-v2", 6291456, &d.store, &d.keys, &d.record,
-                             &d.work};
+                             &d.work, false};
     return &d;
 }
 
@@ -936,6 +943,50 @@ static void test_storage(void)
     CHECK(d->flash.key_writes == 0 && d->flash.setup_writes == 0);
     CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
     CHECK(strstr(d->reply, "\"provisioned\":false") != NULL);
+
+    /* A write failed earlier in this run, so what is stored isn't known until a restart: every
+     * bundle is refused before anything is written, with the protocol's only code for it and
+     * words of its own that say what to do. */
+    d = new_display();
+    give_keys(d, MAKER, NULL, 2);
+    d->flash.restart_needed = true;
+    fake_store untouched = d->flash;
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "until it restarts") != NULL && strstr(d->reply, "try again") != NULL);
+    CHECK(strstr(d->reply, "isn't working") == NULL);
+    CHECK(memcmp(&untouched, &d->flash, sizeof untouched) == 0);
+    CHECK(memcmp(&d->work, &zero, sizeof zero) == 0);
+    /* A broken bundle gets the same answer: nothing about it is looked at. */
+    CHECK(refused(d, "{\"type\":\"provision\",\"bundle\":{\"format\":\"x\",\"version\":1,"
+                     "\"hub\":{\"hosts\":[],\"port\":0,\"server_name\":\"x\","
+                     "\"trust_anchors\":[]},\"enrolment\":{\"secret\":\"\","
+                     "\"expires_at\":\"2026-01-01T00:00:00Z\"},\"wifi\":null}}",
+                  DH_USB_ERROR_STORAGE_FAILED) ||
+          ignored(d, "{}"));
+    CHECK(memcmp(&untouched, &d->flash, sizeof untouched) == 0);
+    /* `hello` says it isn't set up. The caller also holds back the firmware member then, since
+     * the keys and the budget in memory may not be what is stored. */
+    CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
+    CHECK(strstr(d->reply, "\"provisioned\":false") != NULL);
+    CHECK(strstr(d->reply, "\"firmware\":{") != NULL);
+    d->usb.withhold_firmware = true;
+    CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
+    CHECK(strstr(d->reply, "\"provisioned\":false") != NULL);
+    CHECK(strstr(d->reply, "firmware\"") == NULL && strstr(d->reply, "key_ids") == NULL);
+    /* Holding the member back changes nothing else: a display that is set up still says so,
+     * and still answers a bundle with "already set up". */
+    d = new_display();
+    CHECK(provisioned(d, line));
+    d->flash.restart_needed = true;
+    d->usb.withhold_firmware = true;
+    CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
+    CHECK(strstr(d->reply, "\"provisioned\":true") != NULL);
+    CHECK(strstr(d->reply, "firmware\"") == NULL);
+    CHECK(refused(d, line, DH_USB_ERROR_ALREADY_PROVISIONED));
+    /* And without it, a display that takes bundles as usual still takes one. */
+    d = new_display();
+    d->usb.withhold_firmware = true;
+    CHECK(provisioned(d, line));
 
     /* No storage at all (the storage key couldn't be used): `hello` says not set up and reports
      * no firmware member, and every bundle is refused, a broken one included. */

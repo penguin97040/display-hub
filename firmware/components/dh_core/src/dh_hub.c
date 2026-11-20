@@ -131,7 +131,7 @@ bool dh_firmware_report_settled(int http_status, const uint8_t *body, size_t len
         return http_status == 404;
     case DH_ERROR_TOKEN_REVOKED:
     case DH_ERROR_UNKNOWN_DEVICE:
-        return true;
+        return http_status >= 400 && http_status < 500;
     default:
         return false;
     }

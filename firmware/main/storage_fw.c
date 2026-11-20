@@ -29,6 +29,10 @@ static bool s_refusal_is_latest;
 // in case the partition can't be set to boot after all.
 static bool s_has_attempt;
 static dh_fw_record s_attempt;
+// The final report the hub last answered without settling it, and how often it has.
+static dh_fw_report s_not_taken;
+static unsigned s_not_taken_count;
+static void (*s_on_stopped)(void);
 
 dh_fw_keys *storage_fw_keys(void)
 {
@@ -40,10 +44,18 @@ dh_fw_record *storage_fw_record(void)
     return &s_record;
 }
 
+void storage_fw_on_stopped(void (*notify)(void))
+{
+    s_on_stopped = notify;
+}
+
 void storage_fw_write_failed(void)
 {
     if (!s_stopped) {
         s_stopped = true;
+        if (s_on_stopped != NULL) {
+            s_on_stopped();
+        }
         ESP_LOGE(TAG, "a write of the firmware keys or the update record failed, so what is in "
                       "flash is no longer known: no updates, saves or update reports until "
                       "this display restarts. Its pages carry on");
@@ -109,6 +121,8 @@ void storage_fw_settle_start(uint8_t running_slot, bool on_trial)
     s_no_way_back = false;
     s_refusal_is_latest = false;
     s_has_attempt = false;
+    s_not_taken_count = 0;
+    memset(&s_not_taken, 0, sizeof(s_not_taken));
     const dh_fw_start_result started =
         dh_fw_start(&s_session, &s_record, &s_keys, running_slot, on_trial, &save);
     // The keys first, then the record. If a write fails, the same is settled at the next start.
@@ -331,9 +345,42 @@ bool storage_fw_report_next(dh_fw_report *out)
     return waiting;
 }
 
+static bool same_report(const dh_fw_report *a, const dh_fw_report *b)
+{
+    return a->state == b->state && a->reason == b->reason &&
+           strncmp(a->offer_id, b->offer_id, sizeof(a->offer_id)) == 0;
+}
+
+bool storage_fw_report_not_taken(const dh_fw_report *sent)
+{
+    bool given_up = false;
+    storage_lock();
+    dh_fw_report waiting;
+    // Only the report that is waiting now is counted.
+    if (working() && dh_fw_report_next(&s_session, &s_record, &waiting) &&
+        same_report(&waiting, sent)) {
+        if (s_not_taken_count == 0 || !same_report(&s_not_taken, sent)) {
+            s_not_taken = *sent;
+            s_not_taken_count = 0;
+        }
+        s_not_taken_count++;
+        if (s_not_taken_count >= DH_FW_REPORT_MAX_REFUSALS) {
+            ESP_LOGE(TAG, "the hub has answered the update report (%s) %u times without taking "
+                          "it: giving it up, so that later updates aren't held back",
+                     dh_fw_report_state_name(sent->state), s_not_taken_count);
+            s_not_taken_count = 0;
+            (void)fw_save(dh_fw_report_answered(&s_session, &s_record, sent));
+            given_up = true;
+        }
+    }
+    storage_unlock();
+    return given_up;
+}
+
 void storage_fw_report_answered(const dh_fw_report *sent)
 {
     storage_lock();
+    s_not_taken_count = 0;
     // If the write fails, the report is sent again after the next start, and the hub answers a
     // final report it has already had with 204.
     (void)fw_save(dh_fw_report_answered(&s_session, &s_record, sent));

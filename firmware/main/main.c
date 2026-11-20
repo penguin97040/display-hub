@@ -51,6 +51,7 @@ typedef enum {
     EVENT_RESET_CANCELLED, // BOOT was let go in time
     EVENT_RESET_HELD,      // BOOT was held to the end: do the factory reset
     EVENT_HUB_CHANGED,     // the hub task has something new to show
+    EVENT_UPDATES_STOPPED, // a write to storage failed: no updates or setup until a restart
 } event_type_t;
 
 typedef struct {
@@ -85,6 +86,13 @@ static void send_event(event_type_t type, int value)
 static void on_setup_stored(void)
 {
     send_event(EVENT_SETUP_STORED, 0);
+}
+
+// Runs in whichever task made the write that failed (the hub task, the USB task or this one),
+// with storage's lock held: it only queues the event.
+static void on_updates_stopped(void)
+{
+    send_event(EVENT_UPDATES_STOPPED, 0);
 }
 
 // Runs in the hub task.
@@ -201,6 +209,12 @@ static void handle_event(const event_t *event)
             show_state(NULL);
         }
         break;
+    case EVENT_UPDATES_STOPPED:
+        // Whatever the display is doing, set up or not: the screen says a restart is needed.
+        if (!s_counting) {
+            show_state(NULL);
+        }
+        break;
     case EVENT_RESET_COUNTING:
         s_counting = true;
         if (s_board.display != NULL && lvgl_port_lock(0)) {
@@ -237,6 +251,7 @@ void app_main(void)
     // key (storage_key.h). Then encrypted NVS, and what it holds.
     efuse_report_read(&s_efuse);
     efuse_report_log(&s_efuse, "at start-up");
+    storage_fw_on_stopped(on_updates_stopped);
     storage_start(&s_efuse);
     storage_log();
     // New firmware on its trial boot has five minutes from here to reach the hub.

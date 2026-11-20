@@ -43,16 +43,25 @@ bool update_trial_check_in(dh_fw_check_in answer);
 // download is given up when it sends nothing for 30 seconds or takes 15 minutes in all, or when
 // `stop` says the setup has gone.
 //
-// Returns DH_FW_REASON_NONE when the display must restart now: the image is written and
-// verified, the record is saved and the spare partition is set to boot (or, if setting it failed
-// in a way that leaves the next start unknown, the record is saved and the restart settles it).
-// Otherwise the reason the attempt ended, with nothing set to boot; the caller ends the attempt
-// (storage_fw_attempt_ended) and reports it. That includes the spare partition failing to be
-// set to boot while the running one is still the one that starts: `flash`, and no restart. The
-// caller closes the download either way.
+// Returns DH_FW_REASON_NONE when the display must restart now, and *restart says which restart
+// it is. Otherwise *restart is UPDATE_NO_RESTART and the return is the reason the attempt ended,
+// with nothing set to boot; the caller ends the attempt (storage_fw_attempt_ended) and reports
+// it. That includes the spare partition failing to be set to boot while the running one is
+// still the one that starts: `flash`, and no restart. The caller closes the download either way.
+typedef enum {
+    UPDATE_NO_RESTART,
+    // The image is written and verified, the record is saved and the spare partition is set to
+    // boot: the new firmware starts next, on trial.
+    UPDATE_RESTART_INTO_NEW,
+    // The record is saved, but the spare partition couldn't be set to boot and the attempt
+    // couldn't be ended here (update.c, boot_not_set). The firmware that is running starts
+    // again, or which one starts can't be told; either way the start settles the record.
+    UPDATE_RESTART_TO_SETTLE,
+} update_restart_t;
+
 dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device,
                             uint64_t offer_size, bool has_length, uint64_t length,
-                            int64_t started_ms, bool (*stop)(void));
+                            int64_t started_ms, bool (*stop)(void), update_restart_t *restart);
 
 #ifdef __cplusplus
 }

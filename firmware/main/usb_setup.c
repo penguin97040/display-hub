@@ -105,6 +105,12 @@ static void handle_line(const uint8_t *line, size_t len)
     // The keys, the record and the stored setup are shared with the rest of the firmware.
     storage_lock();
     const dh_setup_store *store = storage_store();
+    // `hello` says nothing of the keys and the attempt budget once they may not be what flash
+    // holds (storage_fw.h, "When a write fails"). The handler's own copies are left as they
+    // are: a bundle is refused then, before it reads them.
+    const dh_fw_keys *reported_keys = NULL;
+    const dh_fw_record *reported_record = NULL;
+    const bool reportable = storage_fw_reportable(&reported_keys, &reported_record);
     const dh_usb_display display = {
         .device_type = USB_SETUP_DEVICE_TYPE,
         .firmware_version = s_firmware_version,
@@ -114,6 +120,7 @@ static void handle_line(const uint8_t *line, size_t len)
         .keys = store != NULL ? storage_fw_keys() : NULL,
         .record = store != NULL ? storage_fw_record() : NULL,
         .work = s_work,
+        .withhold_firmware = !reportable,
     };
     const dh_usb_answer answer =
         dh_usb_handle_line(&display, line, len, s_reply + 1, DH_USB_REPLY_MAX);

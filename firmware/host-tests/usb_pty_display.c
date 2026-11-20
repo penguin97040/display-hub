@@ -140,7 +140,7 @@ int main(int argc, char **argv)
 
     const dh_usb_display display = {"display-hub-waveshare-amoled-1.8", "0.1.0",
                                     "waveshare-amoled-1.8-v2", 6291456, &store, &keys, &record,
-                                    &work};
+                                    &work, false};
     if (argc == 3) {
         return dh_usb_factory_reset(&display) ? 0 : 1;
     }

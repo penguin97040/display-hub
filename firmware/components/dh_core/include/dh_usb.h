@@ -46,6 +46,11 @@ typedef enum {
     DH_HELD_SETUP,
     /* The store couldn't be read. Never guess: a bundle is refused with storage_failed. */
     DH_HELD_UNKNOWN,
+    /* Nothing is held, but a write failed earlier in this run, so what is stored isn't known
+     * until the display has restarted. A bundle is refused with storage_failed too (the
+     * protocol has no other code for it), with a message that says to restart the display and
+     * try again. */
+    DH_HELD_RESTART_NEEDED,
 } dh_held;
 
 /* Where the firmware keeps things: encrypted NVS on the chip, a fake in the host tests. Each save
@@ -79,6 +84,10 @@ typedef struct {
     /* Scratch for the bundle being read. After DH_USB_PROVISIONED it holds the setup that was
      * stored; after anything else it is wiped. */
     dh_setup *work;
+    /* True: `hello` leaves the `firmware` member out although the keys and the record are
+     * there, because they may not be what is stored (a write failed earlier in this run). It
+     * changes nothing about how a bundle is handled. */
+    bool withhold_firmware;
 } dh_usb_display;
 
 typedef enum {

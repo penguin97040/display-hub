@@ -134,11 +134,18 @@ static bool stop(void)
 /* How long before now the download's request was made. */
 static int64_t asked_ago_us;
 
+/* Which restart the last receive() asked for. */
+static update_restart_t restart;
+
 static dh_fw_reason receive(void)
 {
     glue.keep_next_free = true;
-    return update_receive(NULL, &DEVICE, form_len, true, form_len,
-                          (glue.now_us - asked_ago_us) / 1000, stop);
+    const dh_fw_reason reason = update_receive(NULL, &DEVICE, form_len, true, form_len,
+                                               (glue.now_us - asked_ago_us) / 1000, stop,
+                                               &restart);
+    /* A restart is asked for exactly when no reason is given. */
+    CHECK((reason == DH_FW_REASON_NONE) == (restart != UPDATE_NO_RESTART));
+    return reason;
 }
 
 /* What is in flash, read as a restart would read it. */
@@ -176,7 +183,7 @@ static void test_install(void)
         glue.piece = pieces[i / 2];
         /* Bytes that come in one run, and bytes that come in bursts with pauses between. */
         glue.pauses = i % 2 == 1;
-        CHECK(receive() == DH_FW_REASON_NONE);
+        CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_INTO_NEW);
         check_tidy();
         const dh_fw_manifest *m = dh_fw_download_manifest(glue.download);
         CHECK(m != NULL && strcmp(m->firmware_version, "1.2.0") == 0);
@@ -478,7 +485,7 @@ static void test_not_set_to_boot(void)
     take_offer();
     glue.set_boot_fails = true;
     glue.set_boot_lands = true;
-    CHECK(receive() == DH_FW_REASON_NONE);
+    CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_INTO_NEW);
     CHECK(flash_record().stage == DH_FW_STAGE_PENDING && strcmp(glue.writes, "rr") == 0);
     CHECK(glue_restart(1, true) && storage_fw_on_trial());
 
@@ -488,7 +495,7 @@ static void test_not_set_to_boot(void)
     take_offer();
     glue.set_boot_fails = true;
     glue.boot_unreadable = true;
-    CHECK(receive() == DH_FW_REASON_NONE);
+    CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_TO_SETTLE);
     CHECK(flash_record().stage == DH_FW_STAGE_PENDING && strcmp(glue.writes, "rr") == 0);
     CHECK(glue_restart(0, false));
     CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
@@ -500,7 +507,8 @@ static void test_not_set_to_boot(void)
     take_offer();
     glue.set_boot_fails = true;
     glue.on_set_boot = record_changes_behind_its_back;
-    CHECK(receive() == DH_FW_REASON_NONE);
+    /* Not a restart into the new firmware, and it mustn't be called one. */
+    CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_TO_SETTLE);
     CHECK(!glue.set_to_boot && strcmp(glue.writes, "rr") == 0);
     CHECK(flash_record().stage == DH_FW_STAGE_PENDING);
     CHECK(glue_restart(0, false));
@@ -513,6 +521,145 @@ static void test_not_set_to_boot(void)
     take_offer();
     CHECK(!storage_fw_attempt_not_set_to_boot());
     CHECK(storage_fw_record()->stage == DH_FW_STAGE_ATTEMPT);
+}
+
+/* A final report the hub answers but never takes. */
+static void test_reports_not_taken(void)
+{
+    dh_fw_offer_decision decision;
+    dh_fw_report report, other;
+
+    fresh_display();
+    take_offer();
+    storage_fw_attempt_ended(DH_FW_REASON_IMAGE_HASH);
+    CHECK(strcmp(glue.writes, "rr") == 0);
+    CHECK(storage_fw_report_next(&report));
+    /* Nine answers that don't settle it: it goes on waiting, nothing is written, and no new
+     * offer is acted on meanwhile. Requests that got no answer are never counted (the caller
+     * doesn't call this for them). */
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+        CHECK(storage_fw_report_next(&other) && other.state == DH_FW_REPORT_FAILED);
+    }
+    CHECK(strcmp(glue.writes, "rr") == 0 && !flash_record().result_answered);
+    CHECK(storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_BUSY);
+    /* A report that isn't the one waiting changes nothing. */
+    other = report;
+    other.state = DH_FW_REPORT_ROLLED_BACK;
+    other.reason = DH_FW_REASON_NONE;
+    CHECK(!storage_fw_report_not_taken(&other));
+    CHECK(storage_fw_report_next(&other));
+    /* The tenth: given up, saved as settled, and the next offer is taken. */
+    CHECK(storage_fw_report_not_taken(&report));
+    CHECK(strcmp(glue.writes, "rrr") == 0 && flash_record().result_answered);
+    CHECK(!storage_fw_report_next(&other));
+    CHECK(flash_record().result_state == DH_FW_REPORT_FAILED);
+    CHECK(storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
+
+    /* The count is kept in memory: a restart starts it again, and the report still waits. */
+    fresh_display();
+    take_offer();
+    storage_fw_attempt_ended(DH_FW_REASON_IMAGE_HASH);
+    CHECK(storage_fw_report_next(&report));
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    CHECK(glue_restart(0, false));
+    CHECK(storage_fw_report_next(&report));
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    CHECK(storage_fw_report_not_taken(&report) && !storage_fw_report_next(&other));
+
+    /* An answer that settles it in between ends the count: the next report starts from none. */
+    fresh_display();
+    take_offer();
+    storage_fw_attempt_ended(DH_FW_REASON_IMAGE_HASH);
+    CHECK(storage_fw_report_next(&report));
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    storage_fw_report_answered(&report);
+    CHECK(storage_fw_on_offer(&DEVICE, "000000000000000000000000000003e9", form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
+    storage_fw_attempt_ended(DH_FW_REASON_DOWNLOAD);
+    CHECK(storage_fw_report_next(&report));
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    CHECK(storage_fw_report_next(&other));
+    CHECK(storage_fw_report_not_taken(&report));
+
+    /* A refusal made from the offer alone is given up the same way, with nothing to write. */
+    dh_fw_keys none;
+    dh_fw_record record;
+    dh_fw_keys_init(&none);
+    dh_fw_record_init(&record);
+    glue_reset();
+    glue_start(&none, &record, 0, false);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_REFUSE && storage_fw_report_next(&report));
+    for (unsigned i = 1; i < DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    CHECK(storage_fw_report_not_taken(&report));
+    CHECK(!storage_fw_report_next(&other) && glue.writes[0] == '\0');
+
+    /* Once update work has stopped, nothing is counted or settled. */
+    fresh_display();
+    take_offer();
+    storage_fw_attempt_ended(DH_FW_REASON_IMAGE_HASH);
+    CHECK(storage_fw_report_next(&report));
+    storage_fw_write_failed();
+    for (unsigned i = 0; i < 2 * DH_FW_REPORT_MAX_REFUSALS; i++) {
+        CHECK(!storage_fw_report_not_taken(&report));
+    }
+    CHECK(strcmp(glue.writes, "rr") == 0 && !flash_record().result_answered);
+}
+
+/* Whoever asked is told, once, when update work stops. */
+static unsigned told_stopped;
+static void on_stopped(void)
+{
+    told_stopped++;
+    /* It is called with storage's lock held. */
+    CHECK(glue.lock_depth > 0);
+}
+
+static void test_told_when_stopped(void)
+{
+    dh_fw_offer_decision decision;
+    storage_fw_on_stopped(on_stopped);
+
+    /* A failed write on the update's own path. */
+    fresh_display();
+    told_stopped = 0;
+    glue.record_write_fails = true;
+    CHECK(!storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(told_stopped == 1 && storage_fw_facts().stopped);
+    /* Later calls don't say it again. */
+    storage_lock();
+    storage_fw_write_failed();
+    storage_unlock();
+    storage_fw_attempt_ended(DH_FW_REASON_FLASH);
+    CHECK(told_stopped == 1);
+
+    /* A failed write somewhere else (setup over USB), on a display that isn't set up. */
+    fresh_display();
+    told_stopped = 0;
+    storage_lock();
+    storage_fw_write_failed();
+    storage_unlock();
+    CHECK(told_stopped == 1 && storage_fw_stopped());
+
+    /* A restart starts clean, and a write that works says nothing. */
+    told_stopped = 0;
+    CHECK(glue_restart(0, false) && !storage_fw_stopped());
+    take_offer();
+    CHECK(told_stopped == 0);
+    storage_fw_on_stopped(NULL);
 }
 
 /* What the screen is told. */
@@ -579,6 +726,28 @@ static void test_facts(void)
     storage_unlock();
     CHECK(storage_fw_facts().last_result == DH_FW_REPORT_NONE);
     CHECK(!storage_fw_report_next(&report));
+    /* The same when the refusal's report was still waiting: it is dropped on purpose, because
+     * the offer is looked at again with the new keys and that outcome is what gets reported. */
+    glue_reset();
+    glue_start(&none, &record, 0, false);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_REFUSE && storage_fw_report_next(&report));
+    storage_lock();
+    *storage_fw_keys() = display_keys;
+    storage_fw_changed_by_setup();
+    storage_unlock();
+    CHECK(!storage_fw_report_next(&report));
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
+    glue_reset();
+    glue_start(&none, &record, 0, false);
+    CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
+    CHECK(storage_fw_report_next(&report));
+    storage_fw_report_answered(&report);
+    storage_lock();
+    *storage_fw_keys() = display_keys;
+    storage_fw_changed_by_setup();
+    storage_unlock();
     CHECK(storage_fw_on_offer(&DEVICE, OFFER, form_len, &decision));
     CHECK(decision.action == DH_FW_OFFER_ATTEMPT);
 
@@ -759,6 +928,8 @@ int main(void)
     test_flash_failures();
     test_failed_saves();
     test_not_set_to_boot();
+    test_reports_not_taken();
+    test_told_when_stopped();
     test_facts();
     test_trial();
     glue_reset();

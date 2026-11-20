@@ -657,29 +657,36 @@ static void heartbeat_if_due(void)
 
 // ---- Signed updates ----
 
-// Sends one firmware report. True if the hub's answer settles it (dh_firmware_report_settled):
-// success (a report for an offer already settled is answered 204), `not_found` (the hub has no
-// such offer any more), or a hub that no longer knows this display. False if it is to be sent
-// again after a later poll: no answer, and every other error.
-static bool send_report(const dh_fw_report *report)
+typedef enum {
+    REPORT_NO_ANSWER, // nothing reached the hub, or nothing came back: sent again later
+    REPORT_NOT_TAKEN, // the hub answered, and the answer doesn't settle it: sent again later
+    REPORT_SETTLED,   // not sent again
+} report_result_t;
+
+// Sends one firmware report. What the hub's answer means is dh_firmware_report_settled()'s to
+// say: it is settled by success (a report for an offer already settled is answered 204), by
+// `not_found` (the hub has no such offer any more) and by a hub that no longer knows this
+// display. After no answer, and after every other error, it is sent again following a later
+// poll.
+static report_result_t send_report(const dh_fw_report *report)
 {
     const size_t len =
         dh_firmware_report_request(report, s_firmware_version, s_request, sizeof(s_request));
     if (len == 0) {
         ESP_LOGE(TAG, "a firmware report couldn't be written");
-        return false;
+        return REPORT_NO_ANSWER;
     }
     hub_answer_t answer;
     const dh_problem problem =
         ask_hub(DH_PATH_FIRMWARE_REPORT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, &answer);
     if (answer.stopped || gone()) {
-        return false;
+        return REPORT_NO_ANSWER;
     }
     const char *state = dh_fw_report_state_name(report->state);
     const char *reason = dh_fw_reason_name(report->reason);
     if (problem != DH_PROBLEM_NONE) {
         ESP_LOGW(TAG, "update report (%s) not sent: %s", state, dh_problem_headline(problem));
-        return false;
+        return REPORT_NO_ANSWER;
     }
     const bool settled = dh_firmware_report_settled(answer.status, s_body, answer.len);
     if (answer.status >= 200 && answer.status < 300) {
@@ -692,7 +699,7 @@ static bool send_report(const dh_fw_report *report)
                  answer.status, code != NULL ? code : "no code",
                  settled ? "not sent again" : "sent again after a later poll");
     }
-    return settled;
+    return settled ? REPORT_SETTLED : REPORT_NOT_TAKEN;
 }
 
 // Tells the screen when what storage says about updates has changed without this task doing
@@ -716,20 +723,30 @@ static void send_reports(void)
 {
     dh_fw_report report;
     for (int i = 0; i < 2 && !gone() && storage_fw_report_next(&report); i++) {
-        if (!send_report(&report)) {
+        const report_result_t result = send_report(&report);
+        if (result == REPORT_SETTLED) {
+            storage_fw_report_answered(&report);
+        } else if (result != REPORT_NOT_TAKEN || !storage_fw_report_not_taken(&report)) {
+            // Left for the next poll. (An answer that didn't settle it is counted, and after
+            // DH_FW_REPORT_MAX_REFUSALS of those the report is given up, so that a hub fault
+            // can't hold later updates back for good.)
             return;
         }
-        storage_fw_report_answered(&report);
         s_fw_seq++;
         publish();
     }
 }
 
-static void restart_into_update(void)
+// Restarts: into the new firmware, or (when it couldn't be set to start) so that the start
+// settles the update record from what is in flash.
+static void restart_for_update(update_restart_t restart)
 {
-    s.update = HUB_UPDATE_RESTARTING;
+    const bool into_new = restart == UPDATE_RESTART_INTO_NEW;
+    s.update = into_new ? HUB_UPDATE_RESTARTING : HUB_UPDATE_RESTARTING_TO_SETTLE;
     publish();
-    ESP_LOGW(TAG, "restarting into the new firmware");
+    ESP_LOGW(TAG, "%s", into_new ? "restarting into the new firmware"
+                                 : "restarting to settle an update that couldn't be set to "
+                                   "start: the new firmware is not expected to start");
     vTaskDelay(pdMS_TO_TICKS(RESTART_DELAY_MS));
     esp_restart();
 }
@@ -750,6 +767,7 @@ static void install(const dh_firmware_offer *offer, const dh_fw_device *device)
     (void)send_report(&downloading);
 
     dh_fw_reason reason = DH_FW_REASON_DOWNLOAD;
+    update_restart_t restart = UPDATE_NO_RESTART;
     char path[DH_FIRMWARE_PATH_MAX];
     if (!gone() && dh_firmware_path(offer->package_id, path, sizeof(path)) > 0) {
         // The 15 minutes run from here: finding the hub is part of the download.
@@ -769,13 +787,13 @@ static void install(const dh_firmware_offer *offer, const dh_fw_device *device)
                      code != NULL ? code : "no code");
         } else {
             reason = update_receive(download, device, offer->size, answer.has_length,
-                                    answer.length, started_ms, gone);
+                                    answer.length, started_ms, gone, &restart);
         }
         hub_http_download_close(download);
     }
     ESP_LOGI(TAG, "hub task stack never used: %u bytes", hub_stack_unused());
-    if (reason == DH_FW_REASON_NONE) {
-        restart_into_update();
+    if (reason == DH_FW_REASON_NONE && restart != UPDATE_NO_RESTART) {
+        restart_for_update(restart);
     }
 
     // Refused or failed: the record first, then the report.

@@ -93,14 +93,24 @@ size_t dh_firmware_report_request(const dh_fw_report *report, const char *firmwa
  * (docs/protocol-v1.md, "Signed firmware updates" and the table of error codes):
  *  - any 2xx (a hub answers 204, also for an offer that is already settled);
  *  - 404 with the code `not_found`: the hub has no offer with that id, and never will;
- *  - `token_revoked` or `unknown_device`, with any status: the hub no longer knows this
+ *  - `token_revoked` or `unknown_device` with a 4xx status: the hub no longer knows this
  *    display, and nothing it sends will be taken until it is set up again.
  * Everything else is a hub that didn't take the report this time, and it is sent again after a
  * later poll: a 5xx, `rate_limited`, `unavailable`, the faults the protocol says to retry
  * (`unauthorised`, `forbidden`, `bad_request`, `payload_too_large`, `conflict`, and `not_found`
- * with any status but 404), a code this firmware doesn't know, and an answer with no error body.
+ * with any status but 404), a "set up again" code with a status that isn't 4xx, a code this
+ * firmware doesn't know, and an answer with no error body. The caller bounds how often: see
+ * DH_FW_REPORT_MAX_REFUSALS.
  * body is the answer's body, len bytes (it may be NULL when len is 0). */
 bool dh_firmware_report_settled(int http_status, const uint8_t *body, size_t len);
+
+/* A final report the hub answers but never takes would wait for good, and while one waits no
+ * new offer is acted on: one hub fault could stop a display updating for ever. So once the hub
+ * has answered the same report this many times without settling it (answers only: a request
+ * that got no answer doesn't count), the display stops sending it and treats it as settled. The
+ * count is kept in memory, so it starts again at a restart. The reference display has no such
+ * limit, because it settles a report on any answer at all. */
+#define DH_FW_REPORT_MAX_REFUSALS 10u
 
 /* ---- The device ID and token ---- */
 

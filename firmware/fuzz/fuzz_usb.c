@@ -250,7 +250,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                                working ? &store : NULL,
                                working ? &keys : NULL,
                                working ? &record : NULL,
-                               &work};
+                               &work, false};
     dh_setup_wipe(&work);
 
     if (mode == 1 || mode == 3) {

@@ -204,9 +204,9 @@ static dh_held store_held(void *ctx)
     }
     // After a failed write of the firmware keys or the update record, what flash holds of them
     // isn't known (storage_fw.h, "When a write fails"). A bundle would write them from memory
-    // over it, so none is taken until the display has restarted: it is answered `storage_failed`
-    // before anything is looked at or written.
-    return storage_fw_stopped() ? DH_HELD_UNKNOWN : DH_HELD_NOTHING;
+    // over it, so none is taken until the display has restarted: it is answered `storage_failed`,
+    // with words that say to restart it, before anything is looked at or written.
+    return storage_fw_stopped() ? DH_HELD_RESTART_NEEDED : DH_HELD_NOTHING;
 }
 
 // One write of the firmware keys, for an update (storage_fw.c) or for setup over USB.
@@ -245,26 +245,17 @@ static bool write_fw_record(const dh_fw_record *record)
     return ok;
 }
 
-// For setup over USB (dh_usb.h). A bundle that is accepted takes its keys and refills the
-// attempt budget, so what this start remembered of an offer it refused no longer holds.
+// For setup over USB (dh_usb.h).
 static bool store_save_keys(void *ctx, const dh_fw_keys *keys)
 {
     (void)ctx;
-    const bool ok = write_fw_keys(keys);
-    if (ok) {
-        storage_fw_changed_by_setup();
-    }
-    return ok;
+    return write_fw_keys(keys);
 }
 
 static bool store_save_record(void *ctx, const dh_fw_record *record)
 {
     (void)ctx;
-    const bool ok = write_fw_record(record);
-    if (ok) {
-        storage_fw_changed_by_setup();
-    }
-    return ok;
+    return write_fw_record(record);
 }
 
 static bool store_save_setup(void *ctx, const dh_setup *setup)
@@ -279,6 +270,10 @@ static bool store_save_setup(void *ctx, const dh_setup *setup)
     const bool ok = len > 0 && write_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, len, true);
     dh_wipe(s_blob, DH_SETUP_BLOB_MAX);
     if (ok) {
+        // The setup is the last of a bundle's writes, so the bundle is accepted: the display
+        // may have taken its keys, and its attempt budget is full again. An offer refused
+        // earlier in this run is looked at afresh (storage_fw.h).
+        storage_fw_changed_by_setup();
         s_generation++;
         s_facts.set_up = true;
         s_facts.setup_unreadable = false;

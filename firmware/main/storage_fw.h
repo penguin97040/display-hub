@@ -8,6 +8,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "dh_hub.h"
 #include "dh_update.h"
 
 #ifdef __cplusplus
@@ -44,14 +45,21 @@ void storage_fw_log(void);
 // A write of the keys or the record failed somewhere else (setup over USB writes them through
 // storage.c). See "When a write fails" below.
 void storage_fw_write_failed(void);
+// Names a function to call, once, when update work stops (from whichever task the failed write
+// was on, with the lock held: it should only wake another task). The screen uses it.
+void storage_fw_on_stopped(void (*notify)(void));
 // Whether update work has stopped after a failed write. Setup over USB is refused then too
 // (storage.c): a bundle would write the keys and the record from memory, which may not be what
 // flash holds, over whatever flash does hold. Call it with the lock held.
 bool storage_fw_stopped(void);
-// Setup over USB has just written the keys or the record (a bundle was accepted, which takes
-// its keys and refills the attempt budget). What this start remembered about an offer it
-// refused from the offer alone no longer holds: it is forgotten, so the screen stops saying so
-// and the same offer is looked at afresh. Call it with the lock held.
+// A bundle has just been accepted over USB: its setup is stored, which is the last of its
+// writes (the display may have taken its keys, and its attempt budget is full again). What this
+// start remembered about an offer it refused from the offer alone no longer holds, so it is
+// forgotten: the screen stops saying so, and the same offer is looked at afresh. If that
+// refusal's report hadn't been taken by a hub yet, it is dropped on purpose: the offer is
+// reconsidered with the new keys, and what becomes of it then is what gets reported. Call it
+// with the lock held, and only once the bundle is accepted, never for a bundle that failed
+// part-way.
 void storage_fw_changed_by_setup(void);
 // The keys and the record to report in the `firmware` member of an enrolment or a heartbeat.
 // False, and both NULL, when storage isn't working or update work has stopped: memory may then
@@ -123,6 +131,12 @@ bool storage_fw_marked_good(void);
 bool storage_fw_report_next(dh_fw_report *out);
 // The hub's answer settled a report (dh_fw_report_answered): it isn't sent again.
 void storage_fw_report_answered(const dh_fw_report *sent);
+// The hub answered a final report without settling it (dh_firmware_report_settled said no). Not
+// for a request that got no answer. Counts such answers to this report in this run, and after
+// DH_FW_REPORT_MAX_REFUSALS of them gives it up: the report is settled as if taken, and true is
+// returned, so one hub fault can't keep new offers waiting for good. False: it is sent again
+// after a later poll.
+bool storage_fw_report_not_taken(const dh_fw_report *sent);
 
 // What the screen says about updates.
 typedef struct {

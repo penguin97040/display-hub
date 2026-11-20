@@ -240,8 +240,8 @@ static void log_memory(const char *when, uint64_t read, uint64_t length)
 //    for its trial boot) and the display restarts. Whichever image the bootloader starts then
 //    settles it by the update core's rules: the new one on trial has its record, and the old one
 //    reports that the update didn't start.
-// Returns whether the display must restart. False: the attempt has ended as failed.
-static bool boot_not_set(const esp_partition_t *spare, esp_err_t err)
+// Returns what the caller does next. UPDATE_NO_RESTART: the attempt has ended as failed.
+static update_restart_t boot_not_set(const esp_partition_t *spare, esp_err_t err)
 {
     const esp_partition_t *boots = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -252,7 +252,7 @@ static bool boot_not_set(const esp_partition_t *spare, esp_err_t err)
         ESP_LOGE(TAG, "couldn't set the new firmware to start (%s). The display still starts "
                       "the firmware it is running, so the update ends here as failed",
                  esp_err_to_name(err));
-        return false;
+        return UPDATE_NO_RESTART;
     }
     if (boots_running) {
         // The new image won't be started, but the record in memory isn't the one this attempt
@@ -265,24 +265,25 @@ static bool boot_not_set(const esp_partition_t *spare, esp_err_t err)
                       "the firmware it is running, but the update record in memory isn't this "
                       "attempt's any more: restarting, so it is settled from what is in flash",
                  esp_err_to_name(err));
-        return true;
+        return UPDATE_RESTART_TO_SETTLE;
     }
     if (boots_spare) {
         ESP_LOGW(TAG, "setting the new firmware to start reported a failure (%s), but it is set: "
                       "restarting into it on trial",
                  esp_err_to_name(err));
-    } else {
-        ESP_LOGE(TAG, "couldn't set the new firmware to start (%s), and can't tell which "
-                      "firmware starts next: restarting, so that whichever starts settles it",
-                 esp_err_to_name(err));
+        return UPDATE_RESTART_INTO_NEW;
     }
-    return true;
+    ESP_LOGE(TAG, "couldn't set the new firmware to start (%s), and can't tell which firmware "
+                  "starts next: restarting, so that whichever starts settles it",
+             esp_err_to_name(err));
+    return UPDATE_RESTART_TO_SETTLE;
 }
 
 dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device,
                             uint64_t offer_size, bool has_length, uint64_t length,
-                            int64_t started_ms, bool (*stop)(void))
+                            int64_t started_ms, bool (*stop)(void), update_restart_t *restart)
 {
+    *restart = UPDATE_NO_RESTART;
     // About 12 KB, which only this task reads: PSRAM is fine for it.
     dh_fw_download *d = heap_caps_calloc(1, sizeof(*d), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (d == NULL) {
@@ -425,7 +426,6 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
         }
     }
 
-    bool restart = false;
     if (finished && reason == DH_FW_REASON_NONE) {
         log_memory("downloaded", dh_fw_download_bytes_read(d), length);
         // Step 9. esp_ota_end() checks that what was written is a whole, valid app image.
@@ -448,11 +448,12 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
             err = esp_ota_set_boot_partition(spare);
             if (err == ESP_OK) {
                 ESP_LOGI(TAG, "the new firmware is written, checked and set to start on trial");
-                restart = true;
-            } else if (boot_not_set(spare, err)) {
-                restart = true;
+                *restart = UPDATE_RESTART_INTO_NEW;
             } else {
-                reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
+                *restart = boot_not_set(spare, err);
+                if (*restart == UPDATE_NO_RESTART) {
+                    reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
+                }
             }
         }
     }
@@ -468,5 +469,8 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     }
     heap_caps_free(d);
     // DH_FW_REASON_NONE is only ever returned for "restart now".
-    return restart ? DH_FW_REASON_NONE : reason != DH_FW_REASON_NONE ? reason : DH_FW_REASON_FLASH;
+    if (*restart != UPDATE_NO_RESTART) {
+        return DH_FW_REASON_NONE;
+    }
+    return reason != DH_FW_REASON_NONE ? reason : DH_FW_REASON_FLASH;
 }

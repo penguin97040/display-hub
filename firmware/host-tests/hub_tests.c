@@ -328,6 +328,10 @@ static void test_firmware_requests(void)
         {403, "token_revoked", true},
         {401, "unknown_device", true},
         {404, "unknown_device", true},
+        /* Those two codes on a status that isn't a client error aren't the hub refusing. */
+        {500, "token_revoked", false},
+        {503, "unknown_device", false},
+        {302, "token_revoked", false},
         /* A 404 that isn't the hub's own "no such offer" (a proxy's page, another code). */
         {404, NULL, false},
         {404, "bad_request", false},

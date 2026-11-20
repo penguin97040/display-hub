@@ -63,6 +63,8 @@ typedef enum {
     HUB_UPDATE_NONE,
     HUB_UPDATE_DOWNLOADING, // an update is being fetched, checked and written to the spare slot
     HUB_UPDATE_RESTARTING,  // it is written: the display is about to restart into it
+    // It couldn't be set to start: the display is about to restart, to settle what is stored.
+    HUB_UPDATE_RESTARTING_TO_SETTLE,
 } hub_update_t;
 
 typedef struct {
