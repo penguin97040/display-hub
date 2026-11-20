@@ -245,8 +245,15 @@ void app_main(void)
         storage_log();
         // How close each task has come to the end of its stack, so the headroom is seen, not
         // guessed.
-        ESP_LOGI(TAG, "stack never used: main task %u bytes, USB task %u bytes, hub task %u bytes",
-                 (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused(),
-                 hub_stack_unused());
+        if (hub_err == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "stack never used: main task %u bytes, USB task %u bytes, hub task %u bytes",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused(),
+                     hub_stack_unused());
+        } else {
+            ESP_LOGI(TAG, "stack never used: main task %u bytes, USB task %u bytes; the hub task "
+                          "isn't running",
+                     (unsigned)uxTaskGetStackHighWaterMark(NULL), usb_setup_stack_unused());
+        }
     }
 }

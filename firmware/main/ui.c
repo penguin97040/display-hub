@@ -135,8 +135,13 @@ static const char *advice(const hub_status_t *hub)
         return "The hub and this display's firmware are different versions that can't work "
                "together. Update the one that is older.";
     case DH_PROBLEM_NEEDS_SETUP:
-    case DH_PROBLEM_SETTINGS:
         return "To set it up again, " RESET_HOW;
+    case DH_PROBLEM_SETTINGS:
+        // With no detail, this is only a request to the hub that couldn't be made (storage
+        // trouble, say), not a bad setup: an hourly retry may clear it, so don't send the
+        // owner to erase a setup that is probably fine.
+        return "It couldn't prepare its request to the hub. " RETRYING "\n\n"
+               "If this doesn't clear, unplug the display and plug it back in.";
     default:
         return "";
     }
