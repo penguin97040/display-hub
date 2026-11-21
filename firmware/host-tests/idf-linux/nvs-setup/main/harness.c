@@ -188,6 +188,26 @@ static int run(void)
     got = sizeof back; CHECK(get("nvs", "dh_fw", "keys", back, &got) == ESP_OK && got == sizeof keys && memcmp(back, keys, got) == 0);
     got = sizeof back; CHECK(get("nvs", "dh_fw", "record", back, &got) == ESP_OK && got == sizeof record && memcmp(back, record, got) == 0);
     printf("with the mark: the erase was finished, nothing of the setup is found, keys and record unchanged\n");
+    // A partition full of rubbish (what a wrong key would make of it too): NVS reads every page
+    // as corrupt, erases them itself and starts empty, with no error. So main/storage.c's own
+    // erase at start-up is only for the two answers NVS gives when it will not do that
+    // (ESP_ERR_NVS_NO_FREE_PAGES and ESP_ERR_NVS_NEW_VERSION_FOUND). Neither can be made here
+    // without writing NVS's page format by hand, and that branch of storage.c isn't built for a
+    // computer, so it is not tried by this harness.
+    CHECK(nvs_flash_deinit_partition(SETUP_PART) == ESP_OK);
+    for (size_t at = 0; at < setup_p->size; at += sizeof big) {
+        fill(big, sizeof big, 7000 + (unsigned)at);
+        CHECK(esp_partition_erase_range(setup_p, at, sizeof big) == ESP_OK);
+        CHECK(esp_partition_write_raw(setup_p, at, big, sizeof big) == ESP_OK);
+    }
+    {
+        esp_err_t err = nvs_flash_init_partition(SETUP_PART);
+        got = sizeof back;
+        esp_err_t found = err == ESP_OK ? get(SETUP_PART, "dh_setup", "setup", back, &got) : ESP_FAIL;
+        printf("a partition of rubbish: init %s, setup %s\n", esp_err_to_name(err), err == ESP_OK ? esp_err_to_name(found) : "-");
+        CHECK(err == ESP_OK && found == ESP_ERR_NVS_NOT_FOUND);
+        CHECK(put(SETUP_PART, "dh_setup", "setup", setup, sizeof setup) == ESP_OK);
+    }
     printf("ALL PASSED\n");
     return 0;
 }

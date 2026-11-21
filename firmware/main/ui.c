@@ -637,6 +637,15 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
              NULL, note);
         return true;
     }
+    if (facts->reset_unfinished) {
+        // The erase failed part-way. Nothing is taken as a setup until it has been done.
+        show("Reset not finished", UI_COLOUR_WARNING, NULL,
+             "This display started erasing its setup and couldn't finish.\n\n"
+             "Hold the BOOT button for 10 seconds to try again, or unplug it and plug it back "
+             "in: it finishes the erase when it starts.",
+             NULL, note);
+        return true;
+    }
     if (facts->setup_unreadable) {
         show("Setup can't be read", UI_COLOUR_WARNING, NULL,
              "This display holds a setup that this firmware can't read.\n\n"

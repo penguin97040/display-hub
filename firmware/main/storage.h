@@ -68,28 +68,36 @@ typedef struct {
     bool wifi_set;         // whether it came with Wi-Fi details
     bool enrolled;         // a device ID and token are held
     uint32_t snapshot_bytes; // the size of the saved snapshot, 0 for none
+    // A factory reset began erasing the setup and couldn't finish (or couldn't take its mark
+    // out). No setup is taken until the reset has been done again, or the display restarted:
+    // the next start finishes the erase.
+    bool reset_unfinished;
 } storage_facts_t;
 
 // Starts storage: looks at the storage key and, if there is one, starts encrypted NVS and loads
 // the firmware keys, the update record and the setup. Nothing is burnt here. Call it once,
-// before the USB task starts. `efuse` is the reading taken at start-up; it must outlive the
-// call, because it is brought up to date if a key is made later. It never erases the main NVS
-// partition; the setup partition is erased only to finish a factory reset that was cut short,
-// or if NVS can't start on it.
-void storage_start(efuse_report_t *efuse);
+// before the USB task starts. `efuse` is the reading taken at start-up; storage keeps a copy,
+// and brings it up to date if a key is made later (storage_efuse_report). It never erases the
+// main NVS partition; the setup partition is erased only to finish a factory reset that was cut
+// short, or if NVS says it can't be used as it is (no free pages, or a newer NVS's format).
+void storage_start(const efuse_report_t *efuse);
 
 // Take this around every use of the things below. It is recursive.
 void storage_lock(void);
 void storage_unlock(void);
 
 storage_facts_t storage_facts(void);
-// Why storage isn't working, for the screen and the log.
-const storage_key_status_t *storage_key_status(void);
+// Why storage isn't working, for the screen and the log, and the eFuse reading as it is now.
+// Both are copies taken under the lock: the USB task rewrites them when it makes a new board's
+// storage key.
+storage_key_status_t storage_key_status(void);
+void storage_efuse_report(efuse_report_t *out);
 
 // For dh_usb.h: NULL while storage isn't working.
 const dh_setup_store *storage_store(void);
-// For dh_usb.h's storage_why: words for the app when storage isn't working for a reason worth
-// telling apart (a storage key that was never finished). NULL for the usual words.
+// For dh_usb.h's storage_why: words for the app when a bundle is refused for a reason worth
+// telling apart (a storage key that was never finished, or couldn't be made just now; a
+// factory reset that didn't finish). NULL for the usual words. Call it with the lock held.
 const char *storage_usb_words(void);
 // The size of the spare app partition, 0 if there is none.
 uint32_t storage_spare_slot_bytes(void);

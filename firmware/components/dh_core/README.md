@@ -87,7 +87,7 @@ Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`).
 
 **The order a bundle is settled in.** The first that applies is the answer:
 
-1. Storage isn't working, or can't say what it holds: `storage_failed`. (A display with no store at all may give its own fixed sentence for the reply's message, `storage_why`: the firmware uses it for a storage key that was never finished.) The same code, with words of its own that say to restart the display and try again, when nothing is held but a write failed earlier in the run (`DH_HELD_RESTART_NEEDED`): what is stored isn't known until the display has restarted.
+1. Storage isn't working, or can't say what it holds: `storage_failed`. (The display may give its own fixed sentence for the reply's message, through `storage_why`, a function asked at the moment of the refusal: the firmware uses it for a storage key that was never finished and for a factory reset that didn't finish. It is asked again if the store's `prepare` fails, where the firmware uses it for a key that couldn't be made just now.) The same code, with words of its own that say to restart the display and try again, when nothing is held but a write failed earlier in the run (`DH_HELD_RESTART_NEEDED`): what is stored isn't known until the display has restarted.
 2. A setup or a device token is already held: `already_provisioned`. Nothing changes.
 3. The bundle breaks a rule: `invalid_bundle`.
 4. One of its firmware keys isn't a valid P-256 point: `invalid_bundle`. Nothing is stored.

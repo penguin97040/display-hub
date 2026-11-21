@@ -24,9 +24,10 @@
 // with nothing to say so. So a mark
 // ("dh_reset"/"wiping") is written in "nvs" before the first sector is erased and taken out
 // after NVS has started on the blank partition. A start that finds the mark finishes the erase
-// before it reads anything. A setup partition that won't start at all is erased and
-// started afresh in the same way, so the display comes up waiting for setup; the "nvs"
-// partition is never erased, whatever state it is in.
+// before it reads anything. A setup partition that NVS says can't be used as it is (no free
+// pages, or a newer NVS's format) is erased and started afresh in the same way, so the display
+// comes up waiting for setup; one that fails to start for any other reason is left alone
+// (start_setup_partition). The "nvs" partition is never erased, whatever state it is in.
 
 #include "storage.h"
 
@@ -100,8 +101,12 @@ _Static_assert(DH_SETUP_BLOB_MAX >= SECTOR_BYTES, "the scratch must hold a secto
 static SemaphoreHandle_t s_lock;
 static storage_facts_t s_facts = {.state = STORAGE_FAILED};
 static storage_key_status_t s_key_status;
-// The eFuse reading main.c prints every minute: brought up to date when the key is made.
-static efuse_report_t *s_efuse;
+// The eFuse reading: the one taken at start-up, brought up to date when the key is made. Read
+// by other tasks only as a copy taken under the lock (storage_efuse_report).
+static efuse_report_t s_efuse;
+// A new board's key couldn't be made at the last try, with nothing burnt: the next bundle
+// tries again. Only for the words of the USB reply.
+static bool s_key_not_made;
 // Encrypted NVS is running on the main partition. False for a new board, whose storage key
 // hasn't been made yet: nothing is stored, and nothing is written until store_prepare().
 static bool s_nvs_started;
@@ -257,7 +262,7 @@ static dh_held store_held(void *ctx)
     if (s_facts.state != STORAGE_WORKING) {
         return DH_HELD_UNKNOWN;
     }
-    if (s_nvs_started && !s_setup_started) {
+    if (s_facts.reset_unfinished || (s_nvs_started && !s_setup_started)) {
         // A factory reset's erase failed part-way: what the setup partition holds isn't known.
         return DH_HELD_UNKNOWN;
     }
@@ -488,10 +493,13 @@ static bool store_erase_setup(void *ctx)
     s_facts.enrolled = false;
     s_facts.snapshot_bytes = 0;
     if (!erase_setup_partition()) {
+        // The screen and the USB reply say so until a reset, or a restart, has finished it.
+        s_facts.reset_unfinished = true;
         ESP_LOGE(TAG, "couldn't erase the setup: hold BOOT again, or restart the display, to "
                       "finish the job");
         return false;
     }
+    s_facts.reset_unfinished = false;
     return true;
 }
 
@@ -508,11 +516,24 @@ static bool store_prepare(void *ctx)
         return false;
     }
     if (s_nvs_started) {
-        return s_setup_started;
+        return s_setup_started && !s_facts.reset_unfinished;
+    }
+    s_key_not_made = false;
+    if (s_facts.reset_unfinished) {
+        return false;
     }
     ESP_LOGW(TAG, "a setup has arrived for a board with no storage key: making the key first");
-    const esp_err_t err = storage_key_make(s_efuse, &s_key_status);
+    const esp_err_t err = storage_key_make(&s_efuse, &s_key_status);
     storage_key_log(&s_key_status);
+    if (err != ESP_OK && s_key_status.state == STORAGE_KEY_EMPTY) {
+        // Refused before anything was burnt (the random number generator looked stuck, say):
+        // KEY5 is as empty as it was, so the board is still a new one and the next bundle
+        // tries again.
+        s_key_not_made = true;
+        ESP_LOGE(TAG, "the storage key couldn't be made this time, and nothing was burnt: the "
+                      "next setup tries again");
+        return false;
+    }
     if (err != ESP_OK) {
         s_facts = (storage_facts_t){.state = s_key_status.state == STORAGE_KEY_BLOCKED
                                                  ? STORAGE_NO_KEY
@@ -711,8 +732,15 @@ static void *scratch_alloc(size_t bytes)
 }
 
 // Starts encrypted NVS on the setup partition. If the mark of an unfinished factory reset is
-// there, or NVS won't start on it, the partition is erased first, so it comes up blank and the
-// display waits for setup. The main partition is only read, and its mark taken out.
+// there, the partition is erased first. It is also erased if NVS says the partition itself
+// can't be used as it is, so it comes up blank and the display waits for setup. Those are the
+// two answers ESP-IDF documents as "erase and start again" (nvs_flash.h, nvs_flash_init):
+// ESP_ERR_NVS_NO_FREE_PAGES (PageManager::load, nvs_pagemanager.cpp:132) and
+// ESP_ERR_NVS_NEW_VERSION_FOUND (Page::load, nvs_page.cpp:75). Any other failure may be a
+// passing fault (the HMAC unit couldn't work the keys out, a flash read failed, no memory),
+// and erasing a good setup for it would be worse than the fault: storage is then out of use
+// for this run and the flash is left alone. The main partition is only read, and its mark
+// taken out.
 static bool start_setup_partition(void)
 {
     if (setup_partition() == NULL) {
@@ -734,12 +762,14 @@ static bool start_setup_partition(void)
             s_setup_started = true;
             return true;
         }
-        if (err == ESP_ERR_NO_MEM) {
-            // Nothing wrong with what is stored.
+        if (err != ESP_ERR_NVS_NO_FREE_PAGES && err != ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_LOGE(TAG, "the setup partition didn't start (%s): leaving it as it is",
+                     esp_err_to_name(err));
             return false;
         }
-        ESP_LOGE(TAG, "the setup partition can't be used as it is: erasing it, so this display "
-                      "will wait for setup");
+        ESP_LOGE(TAG, "the setup partition can't be used as it is (%s): erasing it, so this "
+                      "display will wait for setup",
+                 esp_err_to_name(err));
     }
     return erase_setup_partition();
 }
@@ -774,13 +804,13 @@ static bool nothing_stored(void)
     return true;
 }
 
-void storage_start(efuse_report_t *efuse)
+void storage_start(const efuse_report_t *efuse)
 {
     s_lock = xSemaphoreCreateRecursiveMutex();
     s_setup_scratch = scratch_alloc(sizeof(*s_setup_scratch));
     s_blob = scratch_alloc(DH_SETUP_BLOB_MAX);
     s_facts = (storage_facts_t){.state = STORAGE_FAILED};
-    s_efuse = efuse;
+    s_efuse = *efuse;
     dh_fw_keys_init(storage_fw_keys());
     dh_fw_record_init(storage_fw_record());
     if (s_lock == NULL || s_setup_scratch == NULL || s_blob == NULL) {
@@ -790,7 +820,7 @@ void storage_start(efuse_report_t *efuse)
 
     read_running_partition();
 
-    storage_key_assess(efuse, &s_key_status);
+    storage_key_assess(&s_efuse, &s_key_status);
     storage_key_log(&s_key_status);
     if (s_key_status.state == STORAGE_KEY_BLOCKED) {
         s_facts.state = STORAGE_NO_KEY;
@@ -841,18 +871,38 @@ storage_facts_t storage_facts(void)
     return facts;
 }
 
-const storage_key_status_t *storage_key_status(void)
+storage_key_status_t storage_key_status(void)
 {
-    return &s_key_status;
+    storage_lock();
+    // Its words are fixed text, so the copy can be used after the lock is let go.
+    const storage_key_status_t status = s_key_status;
+    storage_unlock();
+    return status;
+}
+
+void storage_efuse_report(efuse_report_t *out)
+{
+    storage_lock();
+    *out = s_efuse;
+    storage_unlock();
 }
 
 const char *storage_usb_words(void)
 {
-    // Fixed words, at most 200 bytes (dh_usb.h, storage_why).
-    return s_facts.state == STORAGE_NO_KEY && s_key_status.unfinished
-               ? "This display's storage key was never finished, so it can't keep a setup "
-                 "safely and can't be set up. Its screen says more."
-               : NULL;
+    // Fixed words, each at most 200 bytes (dh_usb.h, storage_why).
+    if (s_facts.state == STORAGE_NO_KEY && s_key_status.unfinished) {
+        return "This display's storage key was never finished, so it can't keep a setup "
+               "safely and can't be set up. Its screen says more.";
+    }
+    if (s_facts.state == STORAGE_WORKING && s_facts.reset_unfinished) {
+        return "This display's factory reset didn't finish. Hold its BOOT button for 10 "
+               "seconds again, or unplug it and plug it back in, then try again.";
+    }
+    if (s_facts.state == STORAGE_WORKING && !s_nvs_started && s_key_not_made) {
+        return "This display couldn't make its storage key just now, and nothing was changed. "
+               "Try again; if it keeps happening, unplug it and plug it back in first.";
+    }
+    return NULL;
 }
 
 const dh_setup_store *storage_store(void)
@@ -1080,7 +1130,7 @@ void storage_log(void)
         } else if (!s_nvs_started) {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB (a new board: its storage key "
                           "will be made when the setup arrives)");
-        } else if (!s_setup_started) {
+        } else if (s_facts.reset_unfinished || !s_setup_started) {
             ESP_LOGE(TAG, "set up: no, and a factory reset didn't finish: hold BOOT again or "
                           "restart the display");
         } else {

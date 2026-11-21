@@ -95,9 +95,12 @@ typedef struct {
      * there, because they may not be what is stored (a write failed earlier in this run). It
      * changes nothing about how a bundle is handled. */
     bool withhold_firmware;
-    /* NULL, or why storage isn't working, for the storage_failed reply when store is NULL: one
-     * fixed sentence of at most 200 bytes that is safe to log. NULL gives the usual words. */
-    const char *storage_why;
+    /* NULL, or a function that says why storage isn't working, for the reply's message when a
+     * bundle is refused with storage_failed because the store is missing, can't say what it
+     * holds, or couldn't get ready (`prepare`). It is asked at that moment, so it can speak of
+     * what `prepare` has just found. It answers one fixed sentence of at most 200 bytes that is
+     * safe to log, or NULL for the usual words (also used if the sentence is empty or longer). */
+    const char *(*storage_why)(void);
 } dh_usb_display;
 
 typedef enum {

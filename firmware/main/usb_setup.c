@@ -125,7 +125,8 @@ static void handle_line(const uint8_t *line, size_t len)
         .record = store != NULL ? storage_fw_record() : NULL,
         .work = s_work,
         .withhold_firmware = !reportable,
-        .storage_why = store == NULL ? storage_usb_words() : NULL,
+        // Asked, with the lock still held, only when a bundle is refused for want of storage.
+        .storage_why = storage_usb_words,
     };
     const dh_usb_answer answer =
         dh_usb_handle_line(&display, line, len, s_reply + 1, DH_USB_REPLY_MAX);

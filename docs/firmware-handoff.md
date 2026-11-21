@@ -300,7 +300,7 @@ ota_1,     app,  ota_1,   0x620000, 0x600000
 nvs_setup, data, nvs,     0xc20000, 0x20000
 ```
 
-That gives two 6 MiB slots, a 64 KiB NVS for what a factory reset keeps, a 128 KiB NVS of its own for what a factory reset erases ([Factory reset](#factory-reset) says why it is a partition), and about 3.75 MiB left at the end for anything else. (The boards were tried with the first five lines; `nvs_setup` was added after them, at the end so that nothing else moved.) On the ESP32-S3 the bootloader is at 0x0 and the partition table at 0x8000 by default; other chips differ (the original ESP32's bootloader is at 0x1000). Take the offsets from your own build's `build/flasher_args.json`, not from here.
+That gives two 6 MiB slots, a 64 KiB NVS for what a factory reset keeps, a 128 KiB NVS of its own for what a factory reset erases ([Factory reset](#factory-reset) says why it is a partition), and about 3.75 MiB left at the end for anything else. (The boards were tried with the first five lines; `nvs_setup` was added after them, at the end so that nothing else moved. Boards installed before it must be reinstalled over USB once: an over-the-air update can't change the partition table, so firmware that expects `nvs_setup` fails its trial boot on the older layout and is rolled back, using up an update attempt each time. Settle your own layout before your first release for the same reason.) On the ESP32-S3 the bootloader is at 0x0 and the partition table at 0x8000 by default; other chips differ (the original ESP32's bootloader is at 0x1000). Take the offsets from your own build's `build/flasher_args.json`, not from here.
 
 ### Packaging and signing with `hub-firmware`
 

@@ -10,7 +10,7 @@ ESP-IDF's NVS over the firmware's own [partitions.csv](../../partitions.csv), wi
 firmware/host-tests/idf-linux/nvs-setup/run.sh /tmp/dh-nvs-setup
 ```
 
-It checks that the 128 KiB `nvs_setup` partition holds the largest setup, token and snapshot, and takes 1500 snapshot saves in one step each (900 of them 32768 bytes) with nothing else changed; that `nvs_erase_all()` leaves the old bytes in flash; that the factory reset's erase leaves every byte of the partition 0xFF, NVS starts on it empty, and the `nvs` partition is byte for byte what it was; that a start after an erase cut short at any sector can finish the job; and what the reset's mark is for. It ends with `ALL PASSED`.
+It checks that the 128 KiB `nvs_setup` partition holds the largest setup, token and snapshot, and takes 1500 snapshot saves in one step each (900 of them 32768 bytes) with nothing else changed; that `nvs_erase_all()` leaves the old bytes in flash; that the factory reset's erase leaves every byte of the partition 0xFF, NVS starts on it empty, and the `nvs` partition is byte for byte what it was; that a start after an erase cut short at any sector can finish the job; what the reset's mark is for; and that NVS starts empty, by itself, on a partition full of rubbish. It ends with `ALL PASSED`. It does not try `storage.c`'s own choice of when to erase at start-up (only for `ESP_ERR_NVS_NO_FREE_PAGES` and `ESP_ERR_NVS_NEW_VERSION_FOUND`): `storage.c` isn't built for a computer, and those two answers can't be had from NVS without writing its page format by hand.
 
 NVS is started plain there, because ESP-IDF doesn't build NVS encryption for a computer. Encryption changes an entry's bytes, not how many entries a value takes, so the room and the erase are the same.
 

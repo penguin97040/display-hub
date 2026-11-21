@@ -143,7 +143,11 @@ static void show_state(const char *note)
     if (s_board.display == NULL) {
         return;
     }
+    // Copies, each taken under storage's lock and before LVGL's: the USB task changes the key's
+    // status when it makes a new board's storage key. (Storage's lock is never held while
+    // LVGL's is waited for, here or anywhere.)
     const storage_facts_t facts = storage_facts();
+    const storage_key_status_t key = storage_key_status();
     const storage_fw_facts_t fw = storage_fw_facts();
     hub_status(&s_hub);
     // A status about a setup that has since been erased or replaced says nothing about the one
@@ -164,7 +168,7 @@ static void show_state(const char *note)
                 forget_pages();
             }
         }
-        ui_show_state(&facts, storage_key_status(), &s_hub, &fw, s_pages, note);
+        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, note);
         lvgl_port_unlock();
     }
 }
@@ -198,8 +202,10 @@ static void factory_reset(void)
         ESP_LOGE(TAG, "factory reset: nothing to do, storage isn't working");
         show_state(NULL);
     } else {
+        // The screen says so from storage's own facts (reset_unfinished), and goes on saying
+        // so whatever is drawn next, until a reset or a restart has finished the erase.
         ESP_LOGE(TAG, "factory reset: the setup couldn't be erased");
-        show_state("The setup couldn't be erased. Try again.");
+        show_state(NULL);
     }
     storage_log();
 }
@@ -277,6 +283,7 @@ void app_main(void)
                  esp_err_to_name(board_err));
     } else if (lvgl_port_lock(0)) {
         const storage_facts_t facts = storage_facts();
+        const storage_key_status_t key = storage_key_status();
         const storage_fw_facts_t fw = storage_fw_facts();
         s_lvgl_task = xTaskGetHandle("taskLVGL");
         s_pages = heap_caps_calloc(1, sizeof(*s_pages), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -286,7 +293,7 @@ void app_main(void)
         }
         ui_start(s_system.version, board_note);
         // Nothing from the hub yet: its task starts below.
-        ui_show_state(&facts, storage_key_status(), &s_hub, &fw, s_pages, NULL);
+        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, NULL);
         // Draw the first screen before turning the brightness up, so nothing left over in the
         // screen's memory is shown brightly.
         lv_refr_now(s_board.display);
@@ -309,6 +316,7 @@ void app_main(void)
         show_state(NULL);
     }
 
+    storage_efuse_report(&s_efuse);
     report_log(&s_board, &s_system, &s_efuse);
     int64_t logged_ms = esp_timer_get_time() / 1000;
     while (true) {
@@ -332,6 +340,9 @@ void app_main(void)
         logged_ms = esp_timer_get_time() / 1000;
         // Running time earns update attempts back (dh_update.h), set up or not.
         storage_fw_tick();
+        // The eFuses as storage last read them: the USB task reads them again if it makes a
+        // new board's storage key, so this task prints a copy taken under storage's lock.
+        storage_efuse_report(&s_efuse);
         report_log(&s_board, &s_system, &s_efuse);
         storage_log();
         // How close each task has come to the end of its stack, so the headroom is seen, not

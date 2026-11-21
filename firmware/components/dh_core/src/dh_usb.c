@@ -99,6 +99,15 @@ static const char RESTART_NEEDED[] =
     "This display couldn't save to its storage, so it can't be set up until it restarts. "
     "Unplug it, plug it back in, then try again.";
 
+/* Why storage isn't working: the display's own words, if it has any and they fit a message. */
+static const char *storage_words(const dh_usb_display *d)
+{
+    const char *own = d->storage_why != NULL ? d->storage_why() : NULL;
+    return own != NULL && own[0] != '\0' && strlen(own) <= 200
+               ? own
+               : "This display's storage isn't working, so it can't be set up.";
+}
+
 static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
                                dh_json_value bundle, char *reply, size_t cap)
 {
@@ -117,13 +126,7 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     dh_held holds = held(d);
     if (holds == DH_HELD_UNKNOWN || d->keys == NULL || d->record == NULL) {
         dh_setup_wipe(d->work);
-        /* The display's own words for it, if it has any and they fit a message. */
-        const bool own_words = d->store == NULL && d->storage_why != NULL &&
-                               d->storage_why[0] != '\0' && strlen(d->storage_why) <= 200;
-        return refuse(DH_USB_ERROR_STORAGE_FAILED,
-                      own_words ? d->storage_why
-                                : "This display's storage isn't working, so it can't be set up.",
-                      reply, cap);
+        return refuse(DH_USB_ERROR_STORAGE_FAILED, storage_words(d), reply, cap);
     }
     if (holds == DH_HELD_RESTART_NEEDED) {
         dh_setup_wipe(d->work);
@@ -162,9 +165,7 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     if (d->store->prepare != NULL && !d->store->prepare(d->store->ctx)) {
         dh_setup_wipe(d->work);
         return refuse(DH_USB_ERROR_STORAGE_FAILED,
-                      held(d) == DH_HELD_RESTART_NEEDED
-                          ? RESTART_NEEDED
-                          : "This display's storage isn't working, so it can't be set up.",
+                      held(d) == DH_HELD_RESTART_NEEDED ? RESTART_NEEDED : storage_words(d),
                       reply, cap);
     }
 
