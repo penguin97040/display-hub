@@ -7,7 +7,7 @@ This folder holds what makes a build of [the firmware](../README.md) *official*:
 | `keys.txt` | The official public keys, one to a line: the everyday signing key and the recovery key. Public keys only. |
 | `display-hub-waveshare-amoled-1.8-<version>.dhfw` | The signed package for one release. Exactly one at a time. |
 
-Until a checked package is here, no release can be made (the release workflow refuses to go ahead without one), and CI skips the check with a notice.
+A release can't be made without a checked package here: the release workflow refuses to go ahead without one. If the folder has none, CI skips the check with a notice.
 
 ## The official keys
 
@@ -17,7 +17,6 @@ The official firmware is signed by one of these keys. The app shows a package's 
 |---|---|
 | Everyday signing key | `cb2a-6da1-3eb8-8eee-4208-e7f9-e8a6-e141` |
 | Recovery key | `6159-e739-fdfe-af5d-aade-df9d-3a2b-3737` |
-
 
 ## Who signs it, and who checks it
 
