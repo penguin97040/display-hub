@@ -55,8 +55,13 @@ typedef enum {
     STORAGE_WORKING,
     // The storage key can't be used (storage_key.h): NVS isn't started.
     STORAGE_NO_KEY,
-    // Encrypted NVS didn't start, or what it holds couldn't be read.
+    // The stored data itself can't be used (a flash layout without the setup partition, or a
+    // main NVS partition that NVS says must be erased): only Install firmware puts it right.
     STORAGE_FAILED,
+    // Storage didn't start, or couldn't be read, this time, for a reason that may pass (a read
+    // that failed, no memory, a storage key that may just have been burnt). Nothing was erased.
+    // A restart is the first thing to try; Install firmware only if it keeps happening.
+    STORAGE_NOT_STARTED,
 } storage_state_t;
 
 // What is known about the stored setup, without any of its secrets.
@@ -70,7 +75,9 @@ typedef struct {
     uint32_t snapshot_bytes; // the size of the saved snapshot, 0 for none
     // A factory reset began erasing the setup and couldn't finish (or couldn't take its mark
     // out). No setup is taken until the reset has been done again, or the display restarted:
-    // the next start finishes the erase.
+    // the next start finishes the erase, because the reset's mark is in flash. It is only ever
+    // set with that mark in place. (A reset that couldn't even begin leaves the setup as it
+    // was and sets nothing here: the factory reset just answers false.)
     bool reset_unfinished;
 } storage_facts_t;
 

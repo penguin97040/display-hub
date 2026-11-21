@@ -188,8 +188,10 @@ static int run(void)
     got = sizeof back; CHECK(get("nvs", "dh_fw", "keys", back, &got) == ESP_OK && got == sizeof keys && memcmp(back, keys, got) == 0);
     got = sizeof back; CHECK(get("nvs", "dh_fw", "record", back, &got) == ESP_OK && got == sizeof record && memcmp(back, record, got) == 0);
     printf("with the mark: the erase was finished, nothing of the setup is found, keys and record unchanged\n");
-    // A partition full of rubbish (what a wrong key would make of it too): NVS reads every page
-    // as corrupt, erases them itself and starts empty, with no error. So main/storage.c's own
+    // A partition full of rubbish: NVS reads every page as corrupt (its header's own check
+    // fails), erases them itself and starts empty, with no error. (That is not what a wrong
+    // key gives: page headers and entry states aren't encrypted, so the pages still load and
+    // it is the entries that fail their checks.) So main/storage.c's own
     // erase at start-up is only for the two answers NVS gives when it will not do that
     // (ESP_ERR_NVS_NO_FREE_PAGES and ESP_ERR_NVS_NEW_VERSION_FOUND). Neither can be made here
     // without writing NVS's page format by hand, and that branch of storage.c isn't built for a

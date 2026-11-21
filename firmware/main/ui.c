@@ -629,16 +629,27 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
         show("Storage problem", UI_COLOUR_BAD, NULL, body, NULL, note);
         return true;
     }
+    if (facts->state == STORAGE_NOT_STARTED) {
+        // A fault that may pass, with nothing erased: a restart first, never a reinstall.
+        show("Storage problem", UI_COLOUR_WARNING, NULL,
+             "This display's storage didn't start this time, so it can't be used just now. "
+             "Nothing was erased.\n\n"
+             "Unplug it and plug it back in. Only if this keeps happening, use Install "
+             "firmware in Display Hub on your computer, which erases the display's storage.",
+             NULL, note);
+        return true;
+    }
     if (facts->state != STORAGE_WORKING) {
         show("Storage problem", UI_COLOUR_BAD, NULL,
-             "This display's storage didn't start or couldn't be read, so it can't be set up.\n\n"
+             "What this display has stored can't be used as it is, so it can't be set up.\n\n"
              "Open Display Hub on your computer and use Install firmware to install it again. "
              "That erases the display's storage.",
              NULL, note);
         return true;
     }
     if (facts->reset_unfinished) {
-        // The erase failed part-way. Nothing is taken as a setup until it has been done.
+        // The erase failed part-way, with its mark in flash (storage.h), so the next start
+        // does finish it. Nothing is taken as a setup until it has been done.
         show("Reset not finished", UI_COLOUR_WARNING, NULL,
              "This display started erasing its setup and couldn't finish.\n\n"
              "Hold the BOOT button for 10 seconds to try again, or unplug it and plug it back "

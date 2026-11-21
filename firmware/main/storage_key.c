@@ -222,7 +222,8 @@ static bool burn_changed_only_key(const efuse_report_t *before, const efuse_repo
 
 // Makes the storage key and burns it into KEY5. PERMANENT. It reads the eFuses itself and
 // refuses unless the state is STORAGE_KEY_EMPTY. `efuse` is left as the reading taken afterwards.
-static esp_err_t make_key(efuse_report_t *efuse)
+// *burn_tried is set just before the one call that can burn, and never before that.
+static esp_err_t make_key(efuse_report_t *efuse, bool *burn_tried)
 {
     // Not on the stack: this runs on the USB task. Only one task can be here (storage's lock).
     static efuse_report_t before;
@@ -254,6 +255,7 @@ static esp_err_t make_key(efuse_report_t *efuse)
              "KEY%d. This is permanent and happens once.",
              STORAGE_KEY_BLOCK);
     nvs_sec_cfg_t cfg = {0};
+    *burn_tried = true;
     const esp_err_t err = nvs_flash_generate_keys_v2(scheme, &cfg);
     memset(&cfg, 0, sizeof(cfg));
 
@@ -282,13 +284,15 @@ static esp_err_t make_key(efuse_report_t *efuse)
     return ESP_OK;
 }
 
-esp_err_t storage_key_make(efuse_report_t *efuse, storage_key_status_t *status)
+esp_err_t storage_key_make(efuse_report_t *efuse, storage_key_status_t *status,
+                           bool *burn_tried)
 {
+    *burn_tried = false;
     storage_key_assess(efuse, status);
     if (status->state != STORAGE_KEY_EMPTY) {
         return ESP_ERR_INVALID_STATE;
     }
-    const esp_err_t err = make_key(efuse);
+    const esp_err_t err = make_key(efuse, burn_tried);
     storage_key_assess(efuse, status);
     if (err != ESP_OK) {
         return err;

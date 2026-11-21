@@ -185,13 +185,19 @@ static void factory_reset(void)
     const dh_usb_display display = {.store = storage_store()};
     const bool working = display.store != NULL;
     const bool erased = dh_usb_factory_reset(&display);
+    // Whether the erase began and couldn't finish. If it is neither done nor unfinished it
+    // never began, and the setup is as it was and still in use.
+    const bool unfinished = storage_facts().reset_unfinished;
     storage_unlock();
-    hub_wake();
-    // The pages went with the setup (and an erase that failed part-way still ends that setup's
-    // session). show_state() would find them out of date too; this doesn't depend on it.
-    if (s_board.display != NULL && lvgl_port_lock(0)) {
-        forget_pages();
-        lvgl_port_unlock();
+    if (erased || unfinished) {
+        hub_wake();
+        // The pages went with the setup (and an erase that failed part-way still ends that
+        // setup's session). show_state() would find them out of date too; this doesn't depend
+        // on it.
+        if (s_board.display != NULL && lvgl_port_lock(0)) {
+            forget_pages();
+            lvgl_port_unlock();
+        }
     }
 
     if (erased) {
@@ -201,11 +207,15 @@ static void factory_reset(void)
     } else if (!working) {
         ESP_LOGE(TAG, "factory reset: nothing to do, storage isn't working");
         show_state(NULL);
-    } else {
+    } else if (unfinished) {
         // The screen says so from storage's own facts (reset_unfinished), and goes on saying
         // so whatever is drawn next, until a reset or a restart has finished the erase.
         ESP_LOGE(TAG, "factory reset: the setup couldn't be erased");
         show_state(NULL);
+    } else {
+        // Nothing was erased and nothing is waiting to be: the display carries on as it was.
+        ESP_LOGE(TAG, "factory reset: it couldn't start, and the setup is as it was");
+        show_state("The reset couldn't start. Hold BOOT for 10 seconds to try again.");
     }
     storage_log();
 }

@@ -79,9 +79,13 @@ void storage_key_assess(const efuse_report_t *efuse, storage_key_status_t *statu
 // Makes the storage key and burns it into KEY5, PERMANENTLY. Only for a state of
 // STORAGE_KEY_EMPTY: it reads the eFuses again itself, before and after, logs both, and refuses
 // unless they still say so. `efuse` and `status` are brought up to date. ESP_OK only if KEY5
-// then holds a usable key (STORAGE_KEY_PRESENT). Call it only when a setup is about to be
-// written (storage.c, store_prepare).
-esp_err_t storage_key_make(efuse_report_t *efuse, storage_key_status_t *status);
+// then holds a usable key (STORAGE_KEY_PRESENT). *burn_tried says whether ESP-IDF's key
+// generation, the one call that can burn, was reached: false means it declined before that,
+// with certainty that no eFuse was touched; true with an error means an eFuse may have been,
+// whatever the readings say. Call it only when a setup is about to be written (storage.c,
+// store_prepare).
+esp_err_t storage_key_make(efuse_report_t *efuse, storage_key_status_t *status,
+                           bool *burn_tried);
 
 // Starts encrypted NVS on one NVS partition, by its name in the partition table, with the keys
 // the HMAC unit works out from KEY5. Only for a state of STORAGE_KEY_PRESENT. It can't make a

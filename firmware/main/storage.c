@@ -24,7 +24,8 @@
 // with nothing to say so. So a mark
 // ("dh_reset"/"wiping") is written in "nvs" before the first sector is erased and taken out
 // after NVS has started on the blank partition. A start that finds the mark finishes the erase
-// before it reads anything. A setup partition that NVS says can't be used as it is (no free
+// before it reads anything. No mark, no erase: if the mark can't be written, the reset doesn't
+// begin and the setup stays as it was, so "a restart finishes it" is never said untruly. A setup partition that NVS says can't be used as it is (no free
 // pages, or a newer NVS's format) is erased and started afresh in the same way, so the display
 // comes up waiting for setup; one that fails to start for any other reason is left alone
 // (start_setup_partition). The "nvs" partition is never erased, whatever state it is in.
@@ -433,49 +434,57 @@ static bool wipe_setup_partition(const esp_partition_t *partition)
     return true;
 }
 
-// Stops NVS on the setup partition, erases all of it, checks it, and (with a storage key)
-// starts NVS on it again, blank. The mark is written first and taken out last: see the top of
-// this file. True only if every step was seen to work.
-static bool erase_setup_partition(void)
+// How an erase of the setup partition ended.
+typedef enum {
+    ERASE_DONE,        // blank, with NVS running on it again and the mark taken out
+    ERASE_NOT_STARTED, // nothing was erased and no mark is left: the setup is as it was
+    ERASE_UNFINISHED,  // the mark is in flash, so the next start erases (again) before it reads
+} erase_result_t;
+
+// Stops NVS on the setup partition, erases all of it, checks it, and starts NVS on it again,
+// blank. Only with NVS running on the main partition, because the mark comes first: it is
+// written before anything else is touched and taken out last (see the top of this file). If
+// the mark can't be written, or NVS can't be stopped on the partition, nothing is erased.
+static erase_result_t erase_setup_partition(void)
 {
     const esp_partition_t *partition = setup_partition();
-    if (partition == NULL) {
-        ESP_LOGE(TAG, "this flash layout has no \"%s\" partition", SETUP_PARTITION);
-        return false;
+    if (partition == NULL || !s_nvs_started) {
+        ESP_LOGE(TAG, "the setup partition can't be erased: %s",
+                 partition == NULL ? "this flash layout has none" : "NVS isn't running");
+        return ERASE_NOT_STARTED;
     }
-    // If the mark can't be written the erase still goes ahead: it is what was asked for. Only
-    // a power cut in the next second or two could then leave part of the setup behind.
-    const bool marked = s_nvs_started && write_reset_mark(true);
+    // No mark, no erase: without it a power cut, or an erase that fails part-way, would leave
+    // part of the setup in flash with nothing to make the next start finish the job.
+    if (!write_reset_mark(true)) {
+        return ERASE_NOT_STARTED;
+    }
     if (s_setup_started) {
-        // Closes every handle on it. It is given back to NVS only once it is blank.
-        s_setup_started = false;
+        // Closes every handle on it. It is given back to NVS only once it is blank. The flag
+        // goes only once NVS has let go: erasing under an NVS that still holds the partition
+        // would leave it serving pages that are no longer there, and starting it "again"
+        // would be answered with the storage it already has (nvs_partition_manager.cpp:115).
         const esp_err_t err = nvs_flash_deinit_partition(SETUP_PARTITION);
         if (err != ESP_OK && err != ESP_ERR_NVS_NOT_INITIALIZED) {
             ESP_LOGE(TAG, "couldn't stop NVS on the setup partition: %s", esp_err_to_name(err));
-            return false;
+            // Nothing has been erased. With the mark out again the setup is as it was; if
+            // even that fails, the mark stands and the next start does the erase.
+            return write_reset_mark(false) ? ERASE_NOT_STARTED : ERASE_UNFINISHED;
         }
+        s_setup_started = false;
     }
     if (!wipe_setup_partition(partition)) {
-        return false;
+        return ERASE_UNFINISHED;
     }
     ESP_LOGW(TAG, "the setup partition was erased: all %u bytes at 0x%x read back as blank",
              (unsigned)partition->size, (unsigned)partition->address);
-    if (!s_nvs_started) {
-        // A new board with no storage key yet: there is no NVS to start, and no mark.
-        return true;
-    }
     if (storage_key_start_partition(&s_key_status, SETUP_PARTITION) != ESP_OK) {
-        return false;
-    }
-    // While the mark is there the next start erases the partition again, so nothing may be
-    // stored in it: if the mark can't be taken out, the partition stays out of use and the
-    // reset is reported as failed, to be tried again or finished by a restart.
-    if (marked && !write_reset_mark(false)) {
-        (void)nvs_flash_deinit_partition(SETUP_PARTITION);
-        return false;
+        return ERASE_UNFINISHED;
     }
     s_setup_started = true;
-    return true;
+    // While the mark is there the next start erases the partition again, so nothing may be
+    // stored in it: if the mark can't be taken out, the reset is reported as unfinished (no
+    // setup is taken while it is: store_held), to be tried again or finished by a restart.
+    return write_reset_mark(false) ? ERASE_DONE : ERASE_UNFINISHED;
 }
 
 // A factory reset: every sector of the setup partition, and nothing in the main one but the
@@ -483,31 +492,62 @@ static bool erase_setup_partition(void)
 static bool store_erase_setup(void *ctx)
 {
     (void)ctx;
-    // Whatever happens next, nothing more is written for the setup that was held.
+    if (!s_nvs_started) {
+        // A new board with no storage key: nothing has ever been stored on it, and nothing
+        // can be until the key is made, so there is nothing to erase and no flash is touched.
+        ESP_LOGI(TAG, "factory reset: this board has never been set up, so there is nothing "
+                      "to erase");
+        return true;
+    }
+    const erase_result_t result = erase_setup_partition();
+    if (result == ERASE_NOT_STARTED) {
+        // The setup is as it was, and still in use: nothing about it changes.
+        ESP_LOGE(TAG, "the factory reset couldn't start, and nothing was erased: hold BOOT "
+                      "for 10 seconds to try again");
+        return false;
+    }
+    // From here nothing more is written for the setup that was held, and nothing is held:
+    // part of it may be gone already if the erase didn't finish.
     s_generation++;
-    // And nothing is held: part of it may be gone already if the erase fails.
     s_facts.set_up = false;
     s_facts.setup_unreadable = false;
     s_facts.hub_hosts = 0;
     s_facts.wifi_set = false;
     s_facts.enrolled = false;
     s_facts.snapshot_bytes = 0;
-    if (!erase_setup_partition()) {
-        // The screen and the USB reply say so until a reset, or a restart, has finished it.
-        s_facts.reset_unfinished = true;
+    // Unfinished only ever with the mark in flash, so a restart does finish it. The screen and
+    // the USB reply say so until a reset, or a restart, has.
+    s_facts.reset_unfinished = result == ERASE_UNFINISHED;
+    if (result == ERASE_UNFINISHED) {
         ESP_LOGE(TAG, "couldn't erase the setup: hold BOOT again, or restart the display, to "
                       "finish the job");
         return false;
     }
-    s_facts.reset_unfinished = false;
     return true;
 }
 
 // Before a bundle's first write (dh_usb.h): on a new board, makes the storage key, PERMANENTLY
 // (storage_key.h says why it is left until now), and starts encrypted NVS for the first time.
 // On every other board there is nothing to do.
-static bool start_nvs(void);
+typedef enum {
+    START_OK,
+    START_NOT_THIS_TIME, // a fault that may pass: nothing was erased, and a restart may do it
+    START_BROKEN,        // what is in flash can't be used: only Install firmware puts it right
+} start_result_t;
+
+static start_result_t start_nvs(void);
 static bool nothing_stored(void);
+
+// Storage is out of use for the rest of this run, with the words that go with why.
+static void storage_stopped(start_result_t why)
+{
+    s_facts = (storage_facts_t){.state = why == START_BROKEN ? STORAGE_FAILED
+                                                             : STORAGE_NOT_STARTED};
+    ESP_LOGE(TAG, "storage isn't working: %s",
+             why == START_BROKEN
+                 ? "this display can't be set up until its firmware is installed again over USB"
+                 : "restart the display (unplug it and plug it back in)");
+}
 
 static bool store_prepare(void *ctx)
 {
@@ -519,40 +559,43 @@ static bool store_prepare(void *ctx)
         return s_setup_started && !s_facts.reset_unfinished;
     }
     s_key_not_made = false;
-    if (s_facts.reset_unfinished) {
-        return false;
-    }
     ESP_LOGW(TAG, "a setup has arrived for a board with no storage key: making the key first");
-    const esp_err_t err = storage_key_make(&s_efuse, &s_key_status);
+    bool burn_tried = false;
+    const esp_err_t err = storage_key_make(&s_efuse, &s_key_status, &burn_tried);
     storage_key_log(&s_key_status);
-    if (err != ESP_OK && s_key_status.state == STORAGE_KEY_EMPTY) {
-        // Refused before anything was burnt (the random number generator looked stuck, say):
-        // KEY5 is as empty as it was, so the board is still a new one and the next bundle
-        // tries again.
+    if (err != ESP_OK && !burn_tried && s_key_status.state == STORAGE_KEY_EMPTY) {
+        // Declined before the call that burns was reached (the random number generator looked
+        // stuck, say), so no eFuse was touched: the board is still a new one and the next
+        // bundle tries again.
         s_key_not_made = true;
         ESP_LOGE(TAG, "the storage key couldn't be made this time, and nothing was burnt: the "
                       "next setup tries again");
         return false;
     }
-    if (err != ESP_OK) {
-        s_facts = (storage_facts_t){.state = s_key_status.state == STORAGE_KEY_BLOCKED
-                                                 ? STORAGE_NO_KEY
-                                                 : STORAGE_FAILED};
+    if (err != ESP_OK && s_key_status.state == STORAGE_KEY_BLOCKED) {
+        s_facts = (storage_facts_t){.state = STORAGE_NO_KEY};
         ESP_LOGE(TAG, "the storage key couldn't be made: this display can't be set up");
         return false;
     }
-    if (!start_nvs()) {
-        s_facts = (storage_facts_t){.state = STORAGE_FAILED};
-        ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+    if (err != ESP_OK) {
+        // The burn was tried and reported an error, yet KEY5 doesn't read as unusable. An
+        // eFuse may have changed all the same, so the burn is never tried twice in one run:
+        // the next start reads the eFuses afresh and decides from what it finds.
+        ESP_LOGE(TAG, "making the storage key ended with an error (%s)", esp_err_to_name(err));
+        storage_stopped(START_NOT_THIS_TIME);
+        return false;
+    }
+    const start_result_t started = start_nvs();
+    if (started != START_OK) {
+        storage_stopped(started);
         return false;
     }
     ESP_LOGI(TAG, "encrypted NVS started, with a storage key made just now");
     // A new board's flash holds nothing of this firmware's, and what is in memory says so. If
     // something is there after all, memory is wrong: take nothing until a restart has read it.
     if (!nothing_stored()) {
-        s_facts = (storage_facts_t){.state = STORAGE_FAILED};
-        ESP_LOGE(TAG, "this board had no storage key, yet something is stored: restart the "
-                      "display before setting it up");
+        ESP_LOGE(TAG, "this board had no storage key, yet something is stored");
+        storage_stopped(START_NOT_THIS_TIME);
         return false;
     }
     return true;
@@ -741,18 +784,18 @@ static void *scratch_alloc(size_t bytes)
 // and erasing a good setup for it would be worse than the fault: storage is then out of use
 // for this run and the flash is left alone. The main partition is only read, and its mark
 // taken out.
-static bool start_setup_partition(void)
+static start_result_t start_setup_partition(void)
 {
     if (setup_partition() == NULL) {
         ESP_LOGE(TAG, "this flash layout has no \"%s\" partition: it is from an older build. "
                       "Install firmware over USB sets the layout",
                  SETUP_PARTITION);
-        return false;
+        return START_BROKEN;
     }
     bool marked = false;
     if (!read_reset_mark(&marked)) {
         ESP_LOGE(TAG, "couldn't tell whether a factory reset was under way");
-        return false;
+        return START_NOT_THIS_TIME;
     }
     if (marked) {
         ESP_LOGW(TAG, "a factory reset was cut short: finishing its erase now");
@@ -760,25 +803,32 @@ static bool start_setup_partition(void)
         const esp_err_t err = storage_key_start_partition(&s_key_status, SETUP_PARTITION);
         if (err == ESP_OK) {
             s_setup_started = true;
-            return true;
+            return START_OK;
         }
         if (err != ESP_ERR_NVS_NO_FREE_PAGES && err != ESP_ERR_NVS_NEW_VERSION_FOUND) {
             ESP_LOGE(TAG, "the setup partition didn't start (%s): leaving it as it is",
                      esp_err_to_name(err));
-            return false;
+            return START_NOT_THIS_TIME;
         }
         ESP_LOGE(TAG, "the setup partition can't be used as it is (%s): erasing it, so this "
                       "display will wait for setup",
                  esp_err_to_name(err));
     }
-    return erase_setup_partition();
+    // If the erase doesn't finish, the mark is there (or nothing was erased), so the next
+    // start tries again: a restart is the thing to do.
+    return erase_setup_partition() == ERASE_DONE ? START_OK : START_NOT_THIS_TIME;
 }
 
 // Starts encrypted NVS on both partitions. Needs a storage key (STORAGE_KEY_PRESENT).
-static bool start_nvs(void)
+static start_result_t start_nvs(void)
 {
-    if (storage_key_start_partition(&s_key_status, MAIN_PARTITION) != ESP_OK) {
-        return false;
+    const esp_err_t err = storage_key_start_partition(&s_key_status, MAIN_PARTITION);
+    if (err != ESP_OK) {
+        // The main partition is never erased here. If NVS says it must be, that is for
+        // Install firmware; anything else may pass.
+        return err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND
+                   ? START_BROKEN
+                   : START_NOT_THIS_TIME;
     }
     s_nvs_started = true;
     erase_check_build_leftovers();
@@ -832,7 +882,7 @@ void storage_start(const efuse_report_t *efuse)
         // been stored, so the display holds no setup, no firmware keys and a new update record,
         // which is what memory already says. The key is made by store_prepare().
         if (!s_running_known) {
-            ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+            storage_stopped(START_NOT_THIS_TIME);
             return;
         }
         storage_fw_settle_start(s_running_slot, s_image_on_trial);
@@ -840,14 +890,16 @@ void storage_start(const efuse_report_t *efuse)
         return;
     }
 
-    if (!start_nvs()) {
-        ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+    const start_result_t started = start_nvs();
+    if (started != START_OK) {
+        storage_stopped(started);
         return;
     }
     ESP_LOGI(TAG, "encrypted NVS started");
     if (!load_firmware_state() || !load_setup()) {
-        s_facts = (storage_facts_t){.state = STORAGE_FAILED};
-        ESP_LOGE(TAG, "storage couldn't be read: this display can't be set up");
+        // A read that failed: nothing says the stored data is bad, and nothing was erased.
+        ESP_LOGE(TAG, "storage couldn't be read");
+        storage_stopped(START_NOT_THIS_TIME);
         return;
     }
     s_facts.state = STORAGE_WORKING;
@@ -897,6 +949,10 @@ const char *storage_usb_words(void)
     if (s_facts.state == STORAGE_WORKING && s_facts.reset_unfinished) {
         return "This display's factory reset didn't finish. Hold its BOOT button for 10 "
                "seconds again, or unplug it and plug it back in, then try again.";
+    }
+    if (s_facts.state == STORAGE_NOT_STARTED) {
+        return "This display's storage didn't start this time. Unplug it and plug it back in, "
+               "then try again. If it keeps happening, use Install firmware.";
     }
     if (s_facts.state == STORAGE_WORKING && !s_nvs_started && s_key_not_made) {
         return "This display couldn't make its storage key just now, and nothing was changed. "
@@ -1127,12 +1183,12 @@ void storage_log(void)
                      (unsigned)s_facts.hub_hosts, s_facts.hub_hosts == 1 ? "address" : "addresses",
                      s_facts.wifi_set ? "set" : "not set", s_facts.enrolled ? "held" : "not held",
                      s_facts.snapshot_bytes);
+        } else if (s_facts.reset_unfinished || (s_nvs_started && !s_setup_started)) {
+            ESP_LOGE(TAG, "set up: no, and a factory reset didn't finish: hold BOOT again or "
+                          "restart the display");
         } else if (!s_nvs_started) {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB (a new board: its storage key "
                           "will be made when the setup arrives)");
-        } else if (s_facts.reset_unfinished || !s_setup_started) {
-            ESP_LOGE(TAG, "set up: no, and a factory reset didn't finish: hold BOOT again or "
-                          "restart the display");
         } else {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB");
         }
@@ -1143,8 +1199,13 @@ void storage_log(void)
         ESP_LOGE(TAG, "storage isn't working: the storage key can't be used");
         storage_key_log(&s_key_status);
         break;
+    case STORAGE_NOT_STARTED:
+        ESP_LOGE(TAG, "storage isn't working: it didn't start or couldn't be read this time. "
+                      "Nothing was erased: restart the display");
+        break;
     default:
-        ESP_LOGE(TAG, "storage isn't working: encrypted NVS didn't start or couldn't be read");
+        ESP_LOGE(TAG, "storage isn't working: what is stored can't be used. Install firmware "
+                      "over USB erases it");
         break;
     }
     storage_unlock();
