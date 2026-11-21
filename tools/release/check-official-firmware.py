@@ -2,14 +2,14 @@
 
     python3 -I tools/release/check-official-firmware.py --dir firmware/official --build <build folder>
         --hub-firmware <hub-firmware program> [--app-keys <firmware.rs>] [--version <version>]
-        [--none-ok] [--stale-ok]
+        [--stale-ok]
 
 <dir> holds keys.txt (the official public keys) and exactly one package, named
 display-hub-waveshare-amoled-1.8-<version>.dhfw. <build folder> is an ESP-IDF build of firmware/, or
 the same files as CI keeps them: flasher_args.json, display-hub.bin, bootloader/bootloader.bin,
 partition_table/partition-table.bin and ota_data_initial.bin.
 
-The owner signs the package on their own computer, so nothing here trusts it. It passes only if:
+The maintainer signs the package on their own computer, so nothing here trusts it. It passes only if:
 
 - `hub-firmware inspect` accepts it (well formed, every hash and the signature good);
 - its app image and each USB-install part are byte for byte what the build made (SHA-256 and size),
@@ -20,9 +20,9 @@ The owner signs the package on their own computer, so nothing here trusts it. It
 - with --app-keys, the app's OFFICIAL_KEYS (in apps/hub-manager/src/firmware.rs) are those keys'
   ids, so the app that ships with the package names it official.
 
---none-ok passes, saying so, when the folder has no package (CI, before the first one exists).
---stale-ok turns a difference from the build (the second and third points, apart from the file's
-name) into a warning: CI uses it, so the firmware can change between releases. A release uses neither.
+A folder with no package always fails: CI skips this check by itself until the first package is
+committed. --stale-ok turns a difference from the build (the second and third points, apart from the file's
+name) into a warning: CI uses it, so the firmware can change between releases. A release never does.
 
 Prints what it checked, or fails saying why. Standard library only.
 """
@@ -199,10 +199,7 @@ def check(args: argparse.Namespace) -> int:
     folder = pathlib.Path(args.dir)
     package = the_package(folder)
     if package is None:
-        if args.none_ok:
-            print(f"{folder} has no official package yet, so there is nothing to check.")
-            return 0
-        raise Failed(f"{folder} has no official package (a .dhfw file). The owner signs one for each release "
+        raise Failed(f"{folder} has no official package (a .dhfw file). The maintainer signs one for each release "
                      "and commits it there: see firmware/official/README.md")
     keys = official_keys(folder / "keys.txt")
     if not keys:
@@ -300,7 +297,6 @@ def main() -> int:
     ap.add_argument("--hub-firmware", required=True, help="the hub-firmware program")
     ap.add_argument("--app-keys", help="the app's source file with OFFICIAL_KEYS, to check against keys.txt")
     ap.add_argument("--version", help="the version the package must be")
-    ap.add_argument("--none-ok", action="store_true", help="pass when there is no package")
     ap.add_argument("--stale-ok", action="store_true", help="only warn when the package isn't this build")
     args = ap.parse_args()
     try:
