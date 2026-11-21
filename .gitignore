@@ -75,6 +75,11 @@ desktop.ini
 # Local plans for the owner to review (agent working notes, never publish)
 /PLAN.md
 /PLAN-*.md
+NEXT_PROMPT.md
+RUNDOWN.md
+USER_TESTS.md
+# An empty lock file a local tool leaves in the project folder
+/shim-start.lock
 # Test hubs and simulator state from USER_TESTS.md (they hold keys and tokens)
 /hub-test/
 /sim-test/
