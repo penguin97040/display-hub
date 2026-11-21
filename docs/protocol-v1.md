@@ -294,7 +294,7 @@ The desktop manager gives a display everything it needs in one JSON document (`p
 | `hub.server_name` | Always `hub.display-hub.internal`. |
 | `hub.trust_anchors` | One or two `{certificate_pem, spki_sha256}`. |
 | `enrolment.secret`, `enrolment.expires_at` | The one-time secret for `/v1/device/enrol`, valid for 10 minutes. |
-| `wifi` | `{ssid, password}` or `null`. A 2.4 GHz network; the password is empty for an open network. |
+| `wifi` | `{ssid, password}` or `null`. A 2.4 GHz network; the password is empty for an open network. The manager always sends the member; a display reads a bundle that leaves it out as `null`. |
 | `firmware` | Optional: `{"trusted_keys": [1 to 3 public keys], "security_counter": n}`, from the package the app just installed over USB. A display checks each key is a valid P-256 point before storing anything, and refuses the bundle (`invalid_bundle`) otherwise. A display with no keys takes them; one that already has keys accepts the bundle only if it names the same set or leaves the member out. Accepting a bundle refills the display's attempt budget. See [Signed firmware updates](#signed-firmware-updates). |
 
 The bundle is secret while it's valid. Keep the hub details and Wi-Fi settings, use the secret once, then discard it. **Never store provider credentials on a display.** None are ever sent.
@@ -311,6 +311,8 @@ The manager talks to the display over its USB serial port (CDC-ACM or USB-Serial
 Rules:
 
 - Each answer must arrive within 10 seconds.
+- A display answers every line it can read as a `hello` or a `provision`. A line it can't read as either, such as a `provision` whose bundle is missing a member or has one of the wrong type, gets no answer, like a line of boot log, and the manager gives up after those 10 seconds.
+- An error's `message` is plain English for people, at most 200 characters. Act on the `code`. (The reference display's message for `invalid_bundle` lists every problem, and can be longer.)
 - The manager repeats `hello` every 2 seconds until it gets an answer, in case the board restarted when the port opened. Answer every `hello`.
 - The manager opens the port with DTR set and RTS clear. Through a USB serial bridge chip, that doesn't reset an ESP32. On a chip's own USB-Serial-JTAG it may: on an ESP32-S3 board, opening the port with DTR set restarted the chip, and console output flowed only while DTR was set. That restart is why `hello` is repeated.
 - A display that is already provisioned answers `already_provisioned`, and keeps its settings, until the owner factory-resets it on the device itself. Someone who plugs a cable in can't silently point it at another hub.
@@ -360,7 +362,7 @@ The request has its own 15-minute time limit, in place of the usual 10 seconds. 
 | `failed` | `download`, `image_hash` or `flash` |
 | `rolled_back` | none |
 
-Send `downloading` as the download starts and a final report when the offer is settled, repeating a final report until the hub answers. `firmware_version` is the version running when the report is sent, and a final report's version becomes the display's version on the hub. New firmware on its trial boot sends no report, and doesn't act on offers, until it is marked good; its check-in is a request that doesn't name the new version, such as fetching the snapshot. A final report for an offer already settled is answered `204` and changes nothing. `not_found` (404) means the display has no offer with that id. The hub records a state or reason it doesn't know as a failure.
+Send `downloading` once as the download starts (just before the request, or once the manifest has passed its checks: the display's choice) and a final report when the offer is settled, repeating a final report until the hub answers. A display may also send a final report again after an error answer that doesn't settle it; [firmware-handoff.md](firmware-handoff.md#reports) says which answers the official firmware counts. `firmware_version` is the version running when the report is sent, and a final report's version becomes the display's version on the hub. New firmware on its trial boot sends no report, and doesn't act on offers, until it is marked good; its check-in is a request that doesn't name the new version, such as fetching the snapshot. A final report for an offer already settled is answered `204` and changes nothing. `not_found` (404) means the display has no offer with that id. The hub records a state or reason it doesn't know as a failure.
 
 **Provisioning and USB.** The bundle's optional `firmware` member, and the USB error code `firmware_keys_locked` (above). A bundle naming a key that isn't a valid P-256 point is answered `invalid_bundle`.
 
@@ -375,7 +377,7 @@ Send `downloading` as the download starts and a final report when the offer is s
 
 ## Finding the hub
 
-The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.local` then a fixed address. Resolving a `.local` name needs mDNS. ESP-IDF's lwIP resolves `name.local` through `gethostbyname()` when `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` is enabled ([ESP-IDF lwIP guide](https://docs.espressif.com/projects/esp-idf/en/stable/api-guides/lwip.html)). Check on the board that your HTTP client resolves it that way too. Either way, try every host in the list, and recommend that owners add the Pi's fixed address (`advertise_hosts` in `hubd.toml`). The certificate check, not the address, proves it's the hub.
+The bundle lists one to four `hub.hosts` to try in order, such as `raspberrypi.local` then a fixed address. Resolving a `.local` name needs mDNS. ESP-IDF's lwIP resolves `name.local` through `gethostbyname()` when `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` is enabled ([ESP-IDF lwIP guide](https://docs.espressif.com/projects/esp-idf/en/stable/api-guides/lwip.html)). Check on the board that your HTTP client resolves it that way too. Either way, try every host in the list, and recommend that owners add the Pi's fixed address (`advertise_hosts` in `hubd.toml`). A display may try the host that answered last first, then the others in order: the official firmware does, remembering it only until it restarts, because a `.local` name it can't resolve costs several seconds at every request. The certificate check, not the address, proves it's the hub.
 
 ## Conformance
 

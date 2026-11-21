@@ -110,7 +110,7 @@ Fetching the offer from a snapshot is `dh_snapshot.h`'s job (`firmware_update`).
 - The reference writes the bundle first, then the keys and the record, so a failure after the first write leaves it set up although it answered `storage_failed`. Here the setup is written last.
 - A store that can't be read refuses a bundle with `storage_failed` before anything else. The reference has no such state before the keys are read.
 
-Note that the protocol document says a display answers a `provision` with `provisioned` or an error; for a bundle of the wrong shape the reference answers nothing, and so does this.
+A `provision` whose bundle is of the wrong shape gets no answer, from the reference or from this, as the protocol's "Over USB" says.
 
 ## Talking to the hub
 

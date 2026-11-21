@@ -2,7 +2,7 @@
 
 This page gets Display Hub running from the ready-made downloads: the desktop app on your PC, and the hub on a Raspberry Pi. You add displays later, from the app.
 
-**These are previews.** Display Hub works, but it's young: expect rough edges, and read the notes for each release before upgrading. The official firmware for the displays isn't in the downloads yet.
+**These are previews.** Display Hub works, but it's young: expect rough edges, and read the notes for each release before upgrading.
 
 If you'd rather build everything yourself, see [Getting going](../README.md#getting-going) and [Running the hub on a Raspberry Pi](deploy-raspberry-pi.md).
 
@@ -16,7 +16,7 @@ Open the [releases page](https://github.com/penguin97040/display-hub/releases) a
 | A Mac with Apple silicon (M1 or newer), macOS 11 or later | `display-hub-macos-arm64-<version>.zip` |
 | Linux, 64-bit (Intel or AMD), a recent distribution such as Ubuntu 24.04, Debian 13 or Fedora 40 | `display-hub-linux-x64-<version>.tar.gz` |
 
-Each holds the desktop app (`hub-manager`, or **Display Hub** on a Mac) and the command-line tools: `hub-send` for sending your own data to the hub, `usage-helper` for sending Claude Code and Codex usage figures, `hub-firmware` for firmware makers and `display-simulator` for trying things without a display.
+Each holds the desktop app (`hub-manager`, or **Display Hub** on a Mac) and the command-line tools: `hub-send` for sending your own data to the hub, `usage-helper` for sending Claude Code and Codex usage figures, `hub-firmware` for firmware makers and `display-simulator` for trying things without a display. They also hold the official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 (V2) display, which the app offers in **Install firmware** and can put on the hub's shelf for later updates.
 
 You don't need to download the Pi's file (`display-hub-pi-arm64-<version>.tar.gz`) on your PC. The one line in [step 4](#4-set-up-the-hub-on-the-pi) downloads it straight onto the Pi.
 

@@ -2,7 +2,7 @@
 
 This is the brief for building display firmware against protocol v1 as it stands on 18/11/2026. It has two kinds of reader:
 
-- **The official firmware**, which will live in this repository under `firmware/`: ESP-IDF, for the Waveshare ESP32-S3-Touch-AMOLED-1.8. It uses `protocol/v1/` and the tools here in place.
+- **The official firmware**, in this repository under [`firmware/`](../firmware/README.md): C with ESP-IDF 5.5.6, for the Waveshare ESP32-S3-Touch-AMOLED-1.8 V2. It uses `protocol/v1/` and the tools here in place, and is the starter project for a maker's own. Its README, and [`dh_core`'s](../firmware/components/dh_core/README.md), say where it differs from the reference display and why.
 - **Makers** writing firmware for their own displays, in their own repositories, with or without an AI agent. Copy what you need from here at a pinned commit (below), rather than depending on this repository as a submodule.
 
 [`docs/protocol-v1.md`](protocol-v1.md) is the contract and [`docs/firmware-updates.md`](firmware-updates.md) is the design for signed updates. This brief puts them in the order a firmware author meets them, adds what was learnt on a real board, and gives the choices the official firmware has made. Where this brief and those two documents differ, they win. Where any document and the code differ, the code is the truth: tell the project.
@@ -24,6 +24,7 @@ All of these are under `protocol/v1/` unless noted.
 | TLS reference client | `tools/mbedtls-interop/client.c` | An mbedTLS 3.6 client set up as ESP-IDF's HTTP client should be, tested against the real hub. |
 | Reference display | `tools/display-simulator` | Behaves as firmware must, signed updates included. Run it beside a board to compare. |
 | Signing tool | `apps/hub-firmware` | Makes keys, and signs and checks packages. |
+| Official firmware | `firmware/` ([README](../firmware/README.md)) | A whole display firmware in ESP-IDF, with its protocol and signed-update core in plain C (`firmware/components/dh_core`) tested on a computer against every vector. |
 
 **Pin a commit.** A maker records the display-hub commit they copied from, and copies again only on purpose. The official firmware in `firmware/` reads `protocol/v1/` directly, so its tests always run against the current files.
 
@@ -36,8 +37,8 @@ Waveshare **ESP32-S3-Touch-AMOLED-1.8**: [documentation](https://docs.waveshare.
 | V1 | SH8601 | FT3168 | `waveshare-amoled-1.8-v1` |
 | V2 | CO5300 | CST820 | `waveshare-amoled-1.8-v2` |
 
-- Support both in one firmware where you can, choosing the drivers at build time or by probing at start-up. Neither revision's screen or touch has been driven from this project yet. Confirm the controllers against Waveshare's documentation for each revision.
-- The display is 368 × 448 (the simulator draws at that size). Confirm it against Waveshare's documentation.
+- The official firmware supports **V2 only**. It tells the revisions apart at start-up by which touch chip answers: a V1 board reports `waveshare-amoled-1.8-v1` and says on its screen that it isn't supported, and a board whose touch chip doesn't answer reports `waveshare-amoled-1.8-unknown`. Neither is ever reported as a V2. Firmware that supports V1 as well can choose the drivers by the same probe, or at build time. Only V2's screen and touch have been driven from this project, so confirm V1's controllers against Waveshare's documentation.
+- The display is 368 × 448 (the simulator and the official firmware draw at that size).
 - A V2 board reported 16 MB of flash to ESP-IDF. Its chip is an ESP32-S3 with 8 MB of PSRAM, by the product's description.
 - The board runs on USB-C power. It talks to the hub over 2.4 GHz Wi-Fi, and uses USB only for setup and for the first install.
 - It has **PWR** and **BOOT** buttons and **no RESET button**. To start the chip's built-in loader (download mode), hold BOOT while plugging the cable in.
@@ -55,12 +56,15 @@ Waveshare **ESP32-S3-Touch-AMOLED-1.8**: [documentation](https://docs.waveshare.
 With no stored bundle, the display shows that it needs setting up from the desktop app, and listens on its USB serial port (CDC-ACM or USB-Serial-JTAG) at 115200 baud. The exchange is in `docs/protocol-v1.md`, "Over USB": UTF-8 JSON, one object per line ending in `\n`.
 
 1. **Answer every `hello`** with a `hello` of your own: `device_type`, `firmware_version`, `hardware_revision`, `protocol_version: 1`, `provisioned`, and the `firmware` member if you support signed updates (`examples/usb/display-hello-with-firmware.json`). The app repeats `hello` every 2 seconds for up to 10 seconds, because the board may restart when the port opens. Each answer must arrive within 10 seconds.
-2. **On `provision`,** the reference display (`tools/display-simulator/src/usb.rs`) takes these steps, in this order:
-   1. Holding a bundle or a device token already: answer `already_provisioned`, and change nothing.
-   2. The bundle breaks a rule: answer `invalid_bundle`. Check the same rules as `Bundle::problems()` in `crates/hub-protocol/src/provisioning.rs`: format and version, 1 to 4 hosts, a port, the fixed server name, 1 or 2 PEM certificates under 4 KiB with their 64-digit `spki_sha256`, a secret of 1 to 64 characters, an SSID of 1 to 32 bytes and a password that is empty or 8 to 63 characters, the `firmware` member's rules, and 12 KiB at most in all.
-   3. The bundle's `firmware.trusted_keys` holds a key that isn't a valid P-256 point: `invalid_bundle`, storing nothing.
-   4. The display already trusts firmware keys, and the bundle names a different set: `firmware_keys_locked`. The same set in any order, or no `firmware` member, is fine and changes no keys.
-   5. Otherwise store the bundle. A display with no keys takes the bundle's keys, and its `security_counter` as the floor. Accepting any bundle refills the attempt budget to 5. Answer `provisioned`, or `storage_failed` if a write failed.
+2. **On `provision`,** the official firmware takes these steps, in this order. The reference display (`tools/display-simulator/src/usb.rs`) does the same, except where noted:
+   1. Storage that can't be read, or that can't say what it holds: answer `storage_failed`, and change nothing. (The reference has no such state.)
+   2. Holding a bundle or a device token already: answer `already_provisioned`, and change nothing.
+   3. The bundle breaks a rule: answer `invalid_bundle`. Check the same rules as `Bundle::problems()` in `crates/hub-protocol/src/provisioning.rs`: format and version, 1 to 4 hosts, a port, the fixed server name, 1 or 2 PEM certificates under 4 KiB with their 64-digit `spki_sha256`, a secret of 1 to 64 characters, an SSID of 1 to 32 bytes and a password that is empty or 8 to 63 characters, the `firmware` member's rules, and 12 KiB at most in all.
+   4. The bundle's `firmware.trusted_keys` holds a key that isn't a valid P-256 point: `invalid_bundle`, storing nothing.
+   5. The display already trusts firmware keys, and the bundle names a different set: `firmware_keys_locked`. The same set in any order, or no `firmware` member, is fine and changes no keys.
+   6. Otherwise store the bundle. A display with no keys takes the bundle's keys, and its `security_counter` as the floor. Accepting any bundle refills the attempt budget to 5. Answer `provisioned`, or `storage_failed` if a write failed. Write the setup itself **last**, after the keys and the update record, so a failed write never leaves a display that reads as set up. (The reference writes the bundle first, so a later failed write leaves it set up although it answered `storage_failed`.)
+
+   A line that isn't a readable `hello` or `provision` (a member missing, repeated or of the wrong type) gets no answer at all, whatever the display holds. The official firmware also ignores a line that isn't valid UTF-8, where the reference reads on with the bad bytes replaced, and its error `message` is one fixed sentence of at most 200 characters, where the reference's `invalid_bundle` message lists every problem. [dh_core's README](../firmware/components/dh_core/README.md#setup-over-usb) has the details.
 3. **Ignore any line that doesn't start with `{`,** and drop any line over 16 KiB. Boot logs on the same port are harmless.
 4. **Read the port.** Firmware that never reads its serial port can make the app's write time out (on Windows: `os error 121`, "The semaphore timeout period has expired"). Keep a task reading it whenever the display is waiting for setup.
 
@@ -69,7 +73,7 @@ The `firmware` rules come from [firmware-updates.md](firmware-updates.md), "What
 ## Joining and enrolling
 
 1. Join the Wi-Fi network in the bundle. If its `wifi` is `null`, keep the settings you have.
-2. `POST /v1/device/enrol` with the bundle's one-time secret and your `device` fields (with `firmware` if you support updates). Try each `hub.hosts` entry in order; see "Finding the hub" in the protocol. Move on to the next host after a connection failure or a certificate mismatch; stop at the first answer from the real hub.
+2. `POST /v1/device/enrol` with the bundle's one-time secret and your `device` fields (with `firmware` if you support updates). Try each `hub.hosts` entry in order; see "Finding the hub" in the protocol. (The official firmware tries the address that answered last first, for every request, then the rest in order.) Move on to the next host after a connection failure or a certificate mismatch; stop at the first answer from the real hub.
 3. Store the returned `device_id` and `device_token`. **Erase the enrolment secret** once enrolment has succeeded or been refused. On `enrolment_used` or `enrolment_expired`, show that setup must be redone. The secret lasts 10 minutes, so enrol straight after setup.
 
 ## Every poll
@@ -176,6 +180,8 @@ Signed updates are optional in v1, but a display without them can only be update
 
 The trusted keys (0 to 3) and the security floor, in an NVS namespace of their own. An update record: the last offer id acted on, the attempt budget (attempts left 0 to 5, credit hours 0 to 3), the release waiting for its trial boot (version, security counter, any `key_set`), any attempt in progress, and the last result and whether the hub has answered it.
 
+A write of the keys or the record that fails may still have reached flash, so don't guess which record flash holds. The official firmware stops all update work until it restarts: no offers, saves or update reports, and no `firmware` member in heartbeats, enrolment or the USB `hello`. A display that isn't set up refuses a bundle with `storage_failed` and a message saying to restart it. The pages and polls carry on, and the next start reads flash and settles whatever is there.
+
 ### The attempt budget
 
 - [ ] Starts at 5. Saved in NVS with the update record.
@@ -201,7 +207,7 @@ The snapshot's `firmware_update` is `{"offer_id", "package_id", "size"}`. `size`
    - `security_counter` at least your floor (`downgrade`);
    - a `key_set` that leaves out any key you trust now needs a counter strictly above the floor (`downgrade`);
    - `image_size` fits the spare partition (`too_large`), and 137 + `manifest_len` + `image_size` equals `Content-Length` (`bad_format`).
-8. Send the `downloading` report once. Only now `esp_ota_begin` the spare partition. Write exactly `image_size` bytes as they arrive, hashing them, and read no more. A hash that doesn't match `image_sha256`: `esp_ota_abort`, `failed` with `image_hash`.
+8. Send the `downloading` report once, unless you sent it just before the request in step 3, as the official firmware does so that only one TLS session is ever open (the reference sends it here). Only now `esp_ota_begin` the spare partition. Write exactly `image_size` bytes as they arrive, hashing them, and read no more. A hash that doesn't match `image_sha256`: `esp_ota_abort`, `failed` with `image_hash`.
 9. `esp_ota_end` (`failed` with `flash` if it, or any write, fails). Save the update record, `esp_ota_set_boot_partition`, and restart.
 
 Give up on a download that sends nothing for 30 seconds, or takes more than 15 minutes in all, by the monotonic timer (`failed` with `download`). Downloads never resume: the next attempt starts from the beginning. Feed your parser pieces of any size: the vectors' reference feeds 97 bytes at a time.
@@ -230,7 +236,15 @@ Any reset before it is marked good makes the bootloader go back to the previous 
 | `failed` | `download`, `image_hash`, `flash` |
 | `rolled_back` | none |
 
-Repeat a final report until the hub answers it, and send it before acting on anything new. Any answer settles it, even `not_found`.
+Send a waiting final report after a poll the hub answered, before acting on anything new, and never in a loop. While one waits, act on no new offer. It waits across restarts, except a refusal made from the offer alone (`no_trusted_keys`, `too_large`), which is forgotten at a restart like the refusal itself.
+
+Which answers settle it is the display's choice. The reference display counts any answer at all, even `not_found`. The official firmware counts only these, because the protocol's error table makes most other codes faults to retry or transient:
+
+- any `2xx` (the hub answers `204` to a report for an offer already settled);
+- `404` with `not_found`: the hub has no such offer;
+- `token_revoked` or `unknown_device` with a 4xx status: the hub no longer knows the display.
+
+Anything else leaves it waiting: no answer, a `5xx`, `rate_limited`, `unavailable`, a fault such as `bad_request` or `conflict`, a code it doesn't know, or an answer with no error body. So that a hub that always refuses can't hold updates back for good, it gives a report up once the hub has refused it 10 times since the display started. Only a lasting refusal counts: a 4xx answer with a fault code, an unknown code or no error body. A hub that is busy or away never counts (no answer, any 5xx, 408, 429, `rate_limited`, `unavailable`), so an outage of any length costs no report. A report that can't be written at all is given up at once.
 
 ## First install over USB, from the app
 
@@ -274,7 +288,7 @@ The app writes only what the package lists, after erasing everything. An over-th
 
 It erased, wrote all four writes, restarted and booted. That layout has two flaws for real firmware: 1 MB slots are small for an LVGL firmware, and its 16 KiB NVS can't hold a 32 KiB snapshot. A `factory` partition is allowed, but an over-the-air update never writes it, so it holds the first install's image for good.
 
-An example for the 16 MB board, **not yet tried on a board**, with no `factory` partition, so `app_offset` is `0x20000`:
+The official firmware's layout for the 16 MB board (`firmware/partitions.csv`), tried on real V2 boards. It has no `factory` partition, so `app_offset` is `0x20000` and a first install boots from `ota_0`:
 
 ```text
 # Name,   Type, SubType, Offset,   Size
@@ -327,13 +341,15 @@ hub-firmware inspect my-display-1.0.0.dhfw
 These were seen on a V2 board running a throwaway ESP-IDF 5.5 test image, which printed a line every few seconds and spoke no protocol:
 
 - **DTR.** On this board's USB-Serial-JTAG, console output only flows once the host asserts DTR. With DTR off, the host reads nothing.
-- **Opening the port resets the chip.** Opening it with DTR asserted resets the chip: the boot log shows `rst:0x15 (USB_UART_CHIP_RESET)`. So the first `hello` is usually lost while the board boots. That is why the app opens the port with DTR on and RTS off and repeats `hello` every 2 seconds. Firmware must be ready for a `hello` soon after start-up, and answer every one.
+- **Opening the port may reset the chip.** Opening it with DTR asserted can reset the chip: the boot log then shows `rst:0x15 (USB_UART_CHIP_RESET)`. It doesn't happen every time (one test with the official firmware saw no reset, a later one did), so be ready either way. When it does, the first `hello` is lost while the board boots. That is why the app opens the port with DTR on and RTS off and repeats `hello` every 2 seconds. Firmware must be ready for a `hello` soon after start-up, and answer every one.
 - **The factory slot.** Calling `esp_ota_mark_app_valid_cancel_rollback` while running from a `factory` partition logs `E esp_ota_ops: Running firmware is factory`. It is harmless.
 - **Read the port.** Firmware that never reads the port makes the app's setup write time out (Windows `os error 121`).
 - **Download mode.** There is no RESET button. The app tries to reset the board into its loader by itself; if it can't connect, hold BOOT while plugging in.
 - **The flasher resets once.** The app stays in the loader between parts and resets once at the end, after the last write. An earlier version that reset after every part stopped after the bootloader.
 
-Not yet tried on hardware: real firmware answering the USB exchange, enrolment, polling, an over-the-air update, a trial boot or rollback, NVS encryption, and either revision's screen and touch.
+Since then, the official firmware has passed its tests on real V2 boards, covering the screen and touch, the partition layout, setup over USB with its refusals, encrypted NVS, factory reset, Wi-Fi, enrolment, pinned TLS, polling, heartbeats, the saved snapshot, and over-the-air updates with the trial boot, including going back at the 5-minute limit and after a crash. One more lesson came from that:
+
+- **Wi-Fi: 2.4 GHz only, and boards vary.** The ESP32-S3 has no 5 GHz radio, so the network must offer 2.4 GHz. One board found its network in every scan but never joined it: each join failed with reason 2 (`AUTH_EXPIRE`), even with Espressif's plain station example, while other boards joined the same network. A board that scans fine but never joins may have a faulty radio: try another board before changing the firmware or the network.
 
 ## Storage and NVS
 
@@ -369,12 +385,14 @@ The enrolment secret is never stored past enrolment, and no provider credential 
 - Someone with a cable who runs their own firmware on the chip can most likely still use its HMAC unit to decrypt. That is physical access, which this project doesn't defend against.
 - A stolen display's token can be revoked in the app, as before.
 
-**Check on a real board before turning it on.** Espressif's pages don't say either of these:
+**Checked on a real board.** Espressif's pages don't say either of these, so both were tried on a V2 board with the official firmware, and both passed:
 
-1. that the burnt HMAC key doesn't stop normal reflashing and erasing over USB, including the app's **Install firmware**;
-2. whether the generated key is read-protected, so that the key itself can't be read out of the eFuses.
+1. the burnt HMAC key doesn't stop normal reflashing and erasing over USB: after the burn, the app's **Install firmware** erased and reflashed the board, and the firmware started cleanly, as after any erase;
+2. the generated key is read- and write-protected: it reads back as all zeros, so it can't be read out of the eFuses, and it can't be changed.
 
-If either check fails, ship **plain NVS** instead and say so plainly in the firmware's documentation.
+So NVS encryption stays on. Flash encryption and Secure Boot stay off. A maker whose own checks, on another chip or ESP-IDF release, fail should ship **plain NVS** instead and say so plainly in the firmware's documentation.
+
+ESP-IDF's `nvs_flash_init()` burns a key into an empty block whatever state the chip is in. The official firmware never calls it: it checks the eFuses itself, burns a key only on what is plainly a new board's first start, and starts NVS with `nvs_flash_secure_init()` ([firmware/README.md](../firmware/README.md#the-storage-key)).
 
 **Size the NVS partition.** ESP-IDF limits a blob to 97.6% of the partition size minus 4000 bytes, so a 32 KiB snapshot needs a partition of about 37 KiB at the very least, before anything else is stored. ESP-IDF's ready-made two-OTA table has only 16 KiB. The example layout above gives it 64 KiB. Alternatively, keep the snapshot in its own partition or file system.
 
@@ -386,7 +404,7 @@ If either check fails, ship **plain NVS** instead and say so plainly in the firm
 
 ## Factory reset
 
-A deliberate action on the device itself, such as holding a button during start-up: your choice, but document it.
+A deliberate action on the device itself, such as holding a button during start-up: your choice, but document it. The official firmware's is holding **BOOT** for 10 seconds while it runs, with a countdown on screen ([firmware/README.md](../firmware/README.md#factory-reset)).
 
 - **It erases:** the Wi-Fi settings, the hub hosts, port and trust anchors, the device ID and token, any stored bundle, and the saved snapshot. Then the display goes back to waiting for setup.
 - **It keeps:** the trusted firmware keys, the security floor and the update record, with its attempt budget. Those belong to the firmware's maker, not to the hub the display was paired with. So erase the setup namespaces one by one; don't erase the whole NVS partition.
@@ -403,6 +421,7 @@ As in `docs/protocol-v1.md`, "TLS and the hub's identity":
 - `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096` is enough: the hub's records are at most 4 KiB.
 - The certificate is valid from 1970 to 9999, so a display that doesn't know the date still accepts it.
 - The firmware download uses exactly the same settings.
+- Bound how long an answer can take, as well as how big it is. The official firmware gives each answer 30 seconds from the start of its request, and reads the body from a non-blocking socket a little at a time, so a hub that trickles bytes can't hold a read open. The headers are bounded only by a 10-second wait for each read of them: a known limit, which only a hostile hub could use. A download has its own limits ([Acting on an offer](#acting-on-an-offer)).
 
 `tools/mbedtls-interop/client.c` shows these settings in plain mbedTLS. Its checks pass against the real hub with mbedTLS 3.6: TLS 1.2 and 1.3 work, and a different hub key or a wrong name is refused. ESP-IDF 5.5 ships Mbed TLS 3.6. The current stable ESP-IDF (6.x) ships Mbed TLS 4, which this project hasn't tested, so pin an ESP-IDF 5.5 release unless you check 6.x yourself.
 
@@ -437,6 +456,8 @@ into this repository, recording that commit. Don't change the display-hub reposi
   code is the truth.
 - tools/mbedtls-interop/client.c shows the TLS settings. tools/display-simulator is the reference
   display: when unsure what a display does, read it.
+- firmware/ is the official firmware (ESP-IDF, with its protocol core in plain C in
+  firmware/components/dh_core): a worked example of all of this. Copy from it where it fits.
 
 My choices: device_type "<my-device-type>" (it must never change once released), hardware
 revisions <list>, and factory reset by <button action>.
@@ -466,15 +487,15 @@ verification. Never store provider credentials, and never commit a signing key. 
 you tested on real hardware and what you didn't, and list what I must check on the board.
 ````
 
-## What is not decided here
+## What each firmware decides
 
-These are the firmware's to choose and document:
+These are the firmware's to choose and document. The official firmware's choices are in brackets.
 
-- How it lays out pages, beyond the rules above.
-- Which button does a factory reset.
-- Whether to use SNTP.
-- How to tell V1 from V2 at run time, or whether to build one image for each.
-- The official firmware's `device_type`. Packages are matched to it byte for byte, so once released it never changes.
-- The exact partition layout and slot sizes, within the rules above.
-- Which eFuse key block the NVS key uses, and whether NVS encryption stays on after the board checks.
-- Which custom kinds it draws, if any.
+- How it lays out pages, beyond the rules above (one page at a time in the hub's order, then a status screen: [firmware/README.md](../firmware/README.md#the-screen)).
+- Which button does a factory reset (**BOOT**, held for 10 seconds while running).
+- Whether to use SNTP (no: ages are worked out on the hub's clock).
+- How to tell V1 from V2 at run time, or whether to build one image for each (by which touch chip answers; only V2 is supported, and a V1 board says so on its screen).
+- Its `device_type`. Packages are matched to it byte for byte, so once released it never changes (`display-hub-waveshare-amoled-1.8`, with the hardware revision `waveshare-amoled-1.8-v2`).
+- The exact partition layout and slot sizes, within the rules above (two 6 MiB slots and a 64 KiB NVS: [The partition layout](#the-partition-layout)).
+- Which eFuse key block the NVS key uses, and whether NVS encryption is on (KEY5, and on).
+- Which custom kinds it draws, if any (none yet: every custom kind gets the card. `dh_core`'s snapshot reader takes a `custom_kind_supported` function for firmware that draws its own).

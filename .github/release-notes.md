@@ -1,5 +1,5 @@
-{{PREVIEW}}**Display Hub {{VERSION}}**, a preview. It works, but it's young: expect rough edges. The installer backs your hub up before an upgrade. The official firmware for the displays isn't in these downloads yet.
-{{STABLE}}**Display Hub {{VERSION}}**. The installer backs your hub up before an upgrade. The official firmware for the displays isn't in these downloads yet.
+{{PREVIEW}}**Display Hub {{VERSION}}**, a preview. It works, but it's young: expect rough edges. The installer backs your hub up before an upgrade. The downloads include the official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 (V2) display: the app offers it in **Install firmware**.
+{{STABLE}}**Display Hub {{VERSION}}**. The installer backs your hub up before an upgrade. The downloads include the official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 (V2) display: the app offers it in **Install firmware**.
 
 <!-- Write what's new in this release here, then publish. -->
 

@@ -152,7 +152,7 @@ A display follows the display protocol, [docs/protocol-v1.md](docs/protocol-v1.m
 
 **The brief for firmware writers is [docs/firmware-handoff.md](docs/firmware-handoff.md).** It covers the board, the first install and partition layout, storage, TLS settings, the display's side of signed updates and what to copy from here, and is the document to follow.
 
-**The official firmware is not here yet.** Official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 will live in `firmware/` in this repository, and once it exists it will be the starter project for a new display. Until then, build from the protocol and the brief.
+**Start from the official firmware.** The official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 is in [firmware/](firmware/README.md): C with ESP-IDF 5.5.6, tested on real boards. It is the starter project for a new display. Its protocol and signed-update core, [firmware/components/dh_core](firmware/components/dh_core/README.md), is plain C with no hardware, and passes every vector below as host tests. Its README says where it differs from the reference display, and why.
 
 What to test against, all in this repository:
 
@@ -287,6 +287,7 @@ cargo test --workspace --locked
 | [docs/templates.md](docs/templates.md) | The template format |
 | [docs/protocol-v1.md](docs/protocol-v1.md) | The contract between the hub and a display |
 | [docs/firmware-handoff.md](docs/firmware-handoff.md) | The brief for display firmware |
+| [firmware/README.md](firmware/README.md) | The official firmware, and the starter project for your own |
 | [docs/firmware-updates.md](docs/firmware-updates.md) | Signed firmware updates |
 | [docs/security.md](docs/security.md) | How it is kept safe |
 | [docs/deploy-raspberry-pi.md](docs/deploy-raspberry-pi.md) | Running the hub and helpers on a Pi |

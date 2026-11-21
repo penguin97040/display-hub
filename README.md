@@ -23,7 +23,7 @@ The app doesn't need to stay open. When your computer is off, the displays keep 
 ## What you need
 
 - **An always-on computer for the hub.** A Raspberry Pi is recommended: the hub is tested on a Raspberry Pi 5 with Raspberry Pi OS Lite (64-bit).
-- **A display.** The first supported one is the Waveshare ESP32-S3-Touch-AMOLED-1.8, with a USB-C cable to set it up. Its official firmware is still being written (see Status), so for now the display simulator stands in for it.
+- **A display.** The first supported one is the Waveshare ESP32-S3-Touch-AMOLED-1.8, the V2 board (the revision is marked on the back), with a USB-C cable to set it up. The desktop app installs its official firmware, which is in [firmware/](firmware/README.md). Without a board, the display simulator stands in for one.
 - **A computer for the app.** Windows and Linux work today. macOS support is being added.
 - **Wi-Fi** on 2.4 GHz, which ESP32 displays need, with the hub and the displays on the same network.
 
@@ -81,7 +81,8 @@ Then build what fits what I describe:
 - a helper: a small program that collects data and sends it to a page with hub-send
   (start from starters/helper/);
 - a template: a JSON file that describes pages and a short settings form;
-- firmware for a display that Display Hub doesn't support yet, signed with hub-firmware.
+- firmware for a display that Display Hub doesn't support yet, signed with hub-firmware
+  (start from the official firmware in firmware/, and read firmware/README.md).
 
 Before writing code, ask me what I want to see and on which display. Keep it simple and
 explain things in plain words. Never ask me to paste a token, pairing string or password into
@@ -104,12 +105,12 @@ This is under active development, heading for a first preview release. [docs/arc
 | Part | Where it stands |
 |---|---|
 | The hub, `hubd` | Working: HTTPS with a pinned identity, pairing, displays, pages, helpers and firmware packages. Tested on a Raspberry Pi 5, in Raspberry Pi OS containers, and with an mbedTLS client (the TLS library ESP32 firmware uses). |
-| The desktop app, `hub-manager` | Working on Windows and Linux: pairing, pages from templates and for your own helpers, typed-in content, which pages each display shows, adding displays over USB, and installing and updating firmware. Adding a display and updating it have been tried with the simulator; a real display waits for the official firmware. macOS is being added. |
+| The desktop app, `hub-manager` | Working on Windows and Linux: pairing, pages from templates and for your own helpers, typed-in content, which pages each display shows, adding displays over USB, and installing and updating firmware. Adding a display and updating it have been tried with the simulator and with real displays running the official firmware. macOS is being added. |
 | Display protocol v1 (`docs/protocol-v1.md`, `protocol/v1`) | Written, with JSON Schemas, examples and conformance vectors. `display-simulator` is the reference display. |
 | Helpers: `hub-send` and helpers on the Pi | Working, tested against a real hub. Helpers on the Pi each run in a sandbox of their own: [docs/helpers.md](docs/helpers.md). |
 | Templates | The format and the built-in templates work in the app. The app can't yet load a template from a file: [docs/templates.md](docs/templates.md). |
-| Signed firmware updates | The hub, the app, the signing tool (`hub-firmware`) and the simulator are done: [docs/firmware-updates.md](docs/firmware-updates.md). An update has been delivered to the simulator through a real Pi. A real display waits for the official firmware. |
-| Official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 | Not written yet. It will live in `firmware/` in this repository. |
+| Signed firmware updates | The hub, the app, the signing tool (`hub-firmware`) and the simulator are done: [docs/firmware-updates.md](docs/firmware-updates.md). An update has been delivered to the simulator through a real Pi, and to real displays running the official firmware, including going back by itself after a failed trial boot. |
+| Official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 | Working, on the V2 board: [firmware/README.md](firmware/README.md). Tested on real boards: setup over USB, encrypted storage, Wi-Fi, enrolment, pages, factory reset and signed updates with rollback. It comes with the app downloads. |
 | The usage-limits example (`apps/usage-helper`, `crates/usage`) | Forwards subscription usage figures that tools on your computer already report. Tested against stand-ins, not yet with the live tools: [docs/providers.md](docs/providers.md). |
 
 [docs/developer-setup.md](docs/developer-setup.md) covers building, testing and the platform details, and [docs/security.md](docs/security.md) how it is kept safe.

@@ -90,13 +90,13 @@ Then:
 
 ## 5. Over USB, later
 
-Sending setup details over USB needs the display firmware to speak the serial exchange in `docs/protocol-v1.md`. Until it does, a real board won't answer, and the manager says "No display answered on that port" after 10 seconds. Once the firmware supports it:
+Sending setup details over USB needs display firmware that speaks the serial exchange in `docs/protocol-v1.md`, such as the official firmware in `firmware/`. A board running anything else won't answer, and the manager says "No display answered on that port" after 10 seconds. With firmware that does:
 
 - the board's port appears in the list with its USB name;
 - **Send to COMx** sends the details;
 - the board joins Wi-Fi and appears in the list.
 
-The manager opens the port with DTR set and RTS clear, so an ESP32 board shouldn't reset when the port opens. If one does, the manager repeats its hello every 2 seconds until the board answers.
+The manager opens the port with DTR set and RTS clear. Through a USB serial bridge chip that doesn't reset an ESP32, but on a chip's own USB port (as on the Waveshare board) opening it may. If it does, the manager repeats its hello every 2 seconds until the board answers.
 
 ## 6. The helper on the PC (optional)
 
@@ -171,7 +171,7 @@ Stop it with Ctrl+C once the card says "Updated to 1.1.0".
 
 ### Install firmware, with the real board
 
-This erases the board completely. The firmware repository doesn't speak the USB setup exchange or hold firmware keys yet, so for now this checks the flashing half: the last step is expected to say the setup details weren't sent.
+This erases the board completely. It uses a throwaway ESP-IDF image of your own, which speaks no USB setup exchange, so it checks the flashing half: step 6 is expected to say the setup details weren't sent. To try the whole of it, install the official firmware instead (the app offers it, or build and pack it as [firmware/README.md](../firmware/README.md) says).
 
 Build the display firmware with ESP-IDF as usual (`idf.py build`). From its `build` folder you need `bootloader\bootloader.bin`, `partition_table\partition-table.bin` and the app's `.bin`. On the ESP32-S3 the bootloader goes at `0x0`, the partition table at `0x8000` and the app at `0x10000` (check `idf.py build`'s last lines, which print the offsets). Sign them into one package. Use `waveshare-amoled-1.8-v1` or `-v2`, as marked on the back of the board:
 
@@ -186,7 +186,7 @@ Build the display firmware with ESP-IDF as usual (`idf.py build`). From its `bui
 | 3 | Fill in the Wi-Fi details, choose **Erase and install on COMx** | A check screen, "Erase the display on COMx and install this firmware?", repeating the fingerprint, saying everything is erased and listing every key the display will trust afterwards. The package's device type, version and hardware are in a separate box, "What the package says about itself". **Keep it** leaves the board alone. |
 | 4 | Confirm with **Erase and install** | "Connecting", "Erasing the whole flash" (up to a couple of minutes for 16 MB), then "Writing" each part with a percentage that climbs steadily to 100%, then "Restarting". |
 | 5 | Watch the board | It restarts into the firmware you built, as after `idf.py flash`. |
-| 6 | Wait for the app | For now, "The firmware is installed, but the setup details weren't sent", and **Displays** has them ready to send again, with a box saying the display will trust the keys from the firmware just installed on COMx and a **Leave them out** button. Sending to any other port sends the details without those keys. Once the firmware speaks the USB exchange, it says "Installed …" instead and the display checks in. |
+| 6 | Wait for the app | With that image, "The firmware is installed, but the setup details weren't sent", and **Displays** has them ready to send again, with a box saying the display will trust the keys from the firmware just installed on COMx and a **Leave them out** button. Sending to any other port sends the details without those keys. With firmware that speaks the USB exchange, such as the official firmware, it says "Installed …" instead and the display checks in. |
 | 7 | Open a serial monitor on the board's port, then try to install | "COMx is busy", saying to close the other program. Nothing is written. |
 | 8 | If step 4 says "The board didn't start its loader" | Unplug the cable, hold **BOOT** while you plug it back in, let go, and try again. |
 | 9 | Change `--chip` to `esp32` and sign again, then try to install it | "This firmware is for a different chip … the board on COMx is an esp32s3". Nothing is written. |

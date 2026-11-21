@@ -5,7 +5,7 @@
 | Part | Runs on | Job |
 |---|---|---|
 | `hubd` | Raspberry Pi 5, always on | Keeps the pages, what each shows, which pages each display shows, and the displays. Builds each display's snapshot. Serves the device and admin APIs over HTTPS on the local network. |
-| ESP32 displays (official firmware in `firmware/`, being built; or a maker's own) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
+| ESP32 displays (the official firmware in `firmware/`, or a maker's own) | Desk, USB power only | Polls the hub over pinned HTTPS. Keeps the last good snapshot. Draws pages with LVGL. Swipes between them. |
 | `hub-manager` | A PC: Windows and Linux, macOS being added | Pairs with the hub. Adds, removes and reorders pages. Enters manual figures. Adds and revokes displays. Shows diagnostics. Doesn't need to stay open. |
 | `hub-send` | Any computer | The general "send data" tool and library: pairs a helper with the hub, keeps its token, and sends a page body to a feed ([helpers.md](helpers.md)). |
 | `hub-templates` | Inside the manager | Reads, checks and fills in page templates: a settings form and the pages it makes, as declarative JSON ([templates.md](templates.md)). The hub doesn't use it. |
@@ -127,4 +127,4 @@ A helper pairs with `POST /v1/helper/pair` (`{"secret": ...}` from its helper st
 | M6 | Firmware handoff: frozen contract, conformance vectors, provisioning spec | Done, and rewritten for the general backbone: [firmware-handoff.md](firmware-handoff.md) |
 | Backbone 1–4 | Custom pages and ready-made shapes, generic hub storage with per-display ticks, one door for helpers (also on the Pi), templates and the first-run guide | Done |
 | Backbone 5 | Install firmware over USB from the app, signed updates through the hub, rollback, the simulator as the reference display | Done; the flasher and the update path tried on real hardware with a test image |
-| Backbone 6 | Release: macOS, downloads, guides for makers, the official firmware | In progress |
+| Backbone 6 | Release: macOS, downloads, guides for makers, the official firmware | In progress; the official firmware is written and tested on real boards |

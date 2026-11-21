@@ -426,7 +426,7 @@ Authenticated. `200` with `Content-Type: application/octet-stream`, an exact `Co
 
 ### `POST /v1/device/firmware/report`
 
-Authenticated; the answer is `204`. A display sends one when it starts downloading and one when the offer is settled, and repeats a final report until it gets an answer.
+Authenticated; the answer is `204`. A display sends one when it starts downloading and one when the offer is settled, and repeats a final report until it gets an answer. The reference display counts any answer; the official firmware sends it again after most errors, as [firmware-handoff.md](firmware-handoff.md#reports) says.
 
 ```json
 { "offer_id": "<32 hex digits>", "state": "refused", "reason": "downgrade", "firmware_version": "1.1.0" }
@@ -434,7 +434,7 @@ Authenticated; the answer is `204`. A display sends one when it starts downloadi
 
 | `state` | Meaning | `reason` |
 |---|---|---|
-| `downloading` | The manifest passed every check and the image is arriving. | — |
+| `downloading` | The display has started on the download: sent once, just before the request or once the manifest has passed every check, whichever the display chooses. The reference display sends it after the manifest; the official firmware before the request, so that it never has two TLS sessions open at once. | — |
 | `installed` | The new firmware started, reached the hub and was marked good. | — |
 | `refused` | The display would not install it. Nothing was written. | `no_trusted_keys`, `too_large`, `bad_format`, `untrusted_key`, `bad_signature`, `wrong_device_type`, `wrong_hardware`, `downgrade` |
 | `failed` | Something went wrong after the checks. The old firmware is still running. | `download`, `image_hash`, `flash` |
