@@ -47,7 +47,8 @@
 
 static const char *TAG = "hub-http";
 
-// For connecting, sending, and each wait for more of the answer's headers.
+// For connecting, sending, each wait for more of the answer's headers, and the longest silence
+// allowed while its body is read.
 #define STEP_TIMEOUT_MS 10000
 // For the whole answer, however slowly it comes.
 #define ANSWER_TIMEOUT_MS 30000
@@ -58,8 +59,9 @@ static const char *TAG = "hub-http";
 // a download (update.c, "How long one read can take"), one call of esp_http_client_read() can
 // take (bytes asked for) x (wait) against a hub that sends tiny whole TLS records on purpose, so
 // the body can run at most 64 x 50 ms = 3.2 seconds past ANSWER_TIMEOUT_MS. A hub that simply
-// goes quiet is seen within 50 ms, and an honest answer isn't slowed: the bytes of a record
-// already decrypted are handed out without waiting (tcp_transport/transport_ssl.c, line 173).
+// goes quiet is given up on after STEP_TIMEOUT_MS without a byte, and an honest answer isn't
+// slowed: the bytes of a record already decrypted are handed out without waiting
+// (tcp_transport/transport_ssl.c, line 173).
 #define ANSWER_STEP_TIMEOUT_MS 50
 #define ANSWER_READ_BYTES      64
 // How long one read of a download's connection waits for bytes before esp_http_client_read()
@@ -170,6 +172,9 @@ static bool make_non_blocking(esp_http_client_handle_t client)
 static bool read_body(esp_http_client_handle_t client, const hub_request_t *request, size_t cap,
                       int64_t started_ms, hub_answer_t *answer)
 {
+    // When the last bytes came, so a hub that goes quiet is given up on after STEP_TIMEOUT_MS,
+    // as it was with a blocking socket, not only at the end of ANSWER_TIMEOUT_MS.
+    int64_t heard_ms = esp_timer_get_time() / 1000;
     while (answer->len <= cap) {
         if (stopped(request)) {
             answer->stopped = true;
@@ -187,7 +192,11 @@ static bool read_body(esp_http_client_handle_t client, const hub_request_t *requ
         const int got =
             esp_http_client_read(client, (char *)request->answer + answer->len, (int)want);
         if (got == -ESP_ERR_HTTP_EAGAIN) {
-            // Nothing yet: the time limit above says how long to go on waiting.
+            // Nothing yet: wait on, unless the hub has been quiet for too long.
+            if (esp_timer_get_time() / 1000 - heard_ms > STEP_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "the answer went quiet");
+                return false;
+            }
             continue;
         }
         if (got < 0) {
@@ -203,6 +212,7 @@ static bool read_body(esp_http_client_handle_t client, const hub_request_t *requ
             return true;
         }
         answer->len += (size_t)got;
+        heard_ms = esp_timer_get_time() / 1000;
     }
     return true;
 }
