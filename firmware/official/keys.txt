@@ -7,4 +7,7 @@
 # keys, and its key set must be exactly these keys. The app's OFFICIAL_KEYS
 # (apps/hub-manager/src/firmware.rs) must be these keys' ids, in this order; a test checks it.
 #
-# No official keys exist yet, so there are none below.
+# Made 21/11/2026.
+
+04ec67bfa319fcd4bc12e7b6daf0c12881c29078e180b9adc74622e5d3e9550b3085acd8b947c69a6d85b57bece72a2bdda985fe27cd2a0e6c384b96ca92a581b4  # everyday, fingerprint cb2a-6da1-3eb8-8eee-4208-e7f9-e8a6-e141
+049543db9f8bb09796fa687f60f6a7e4fa2f972e3eaf51f3b133c1eadfaaa62a512e17e8187fdca92f874fd7b816b034f77a7c2be4029756b81cc0994d9f3e434f  # recovery, fingerprint 6159-e739-fdfe-af5d-aade-df9d-3a2b-3737

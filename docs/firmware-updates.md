@@ -272,6 +272,11 @@ hub-firmware keygen --out my-displays.dhkey
 
 The official Display Hub firmware is signed with two keys, an everyday key and a recovery key. Their public halves are in `firmware/official/keys.txt`, and the app has the same keys built in. The maintainer signs on their own computer, so no private key reaches GitHub or CI, and the release checks the committed package against a fresh build of the firmware before it goes into the downloads. [firmware/official/README.md](../firmware/official/README.md) has the details.
 
+| Key | Fingerprint |
+|---|---|
+| Everyday signing key | `cb2a-6da1-3eb8-8eee-4208-e7f9-e8a6-e141` |
+| Recovery key | `6159-e739-fdfe-af5d-aade-df9d-3a2b-3737` |
+
 ### If a key is lost or leaked
 
 | What happened | What to do | What it costs |

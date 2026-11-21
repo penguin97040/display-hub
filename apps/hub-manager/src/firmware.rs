@@ -13,10 +13,15 @@ use hub_protocol::firmware::{BundleFirmware, ReportReason};
 use hub_protocol::Timestamp;
 
 /// The key ids (SHA-256 of the public key, 64 lower-case hex digits) of the official Display Hub
-/// firmware keys, which the app names *Official Display Hub firmware*. Empty for now: no official
-/// key exists yet. They are the ids of the public keys in `firmware/official/keys.txt`, which the
-/// release checks the official package against; a test keeps the two lists the same.
-pub const OFFICIAL_KEYS: &[&str] = &[];
+/// firmware keys, which the app names *Official Display Hub firmware*: the everyday signing key,
+/// then the recovery key. They are the ids of the public keys in `firmware/official/keys.txt`,
+/// which the release checks the official package against; a test keeps the two lists the same.
+pub const OFFICIAL_KEYS: &[&str] = &[
+    // everyday, fingerprint cb2a-6da1-3eb8-8eee-4208-e7f9-e8a6-e141
+    "cb2a6da13eb88eee4208e7f9e8a6e1411d51060aa58b8643ad5a3984f01d7bff",
+    // recovery, fingerprint 6159-e739-fdfe-af5d-aade-df9d-3a2b-3737
+    "6159e739fdfeaf5daadedf9d3a2b37370b3ee0f9f586aa0bef572305cbc0d9d8",
+];
 
 /// How long a download normally takes. After this, an offer still reported as downloading is shown
 /// as restarting: the display has the image and is starting the new firmware (a trial boot doesn't

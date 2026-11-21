@@ -28,6 +28,8 @@ secrets/
 *.jks
 *.p12
 *.p8
+# Firmware signing key files from `hub-firmware keygen`
+*.dhkey
 *.mobileprovision
 *.provisionprofile
 *.cer
