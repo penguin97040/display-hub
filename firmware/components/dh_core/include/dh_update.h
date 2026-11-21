@@ -352,9 +352,11 @@ bool dh_fw_signature_valid(const dh_fw_key *stored_key, const uint8_t header[DH_
 typedef enum {
     /* All of the piece was taken. Write `write` if there is any, then read on. */
     DH_FW_STEP_MORE,
-    /* The manifest has passed every check. Report `downloading` (once, without waiting on the
-     * answer) and open the spare partition (esp_ota_begin), then push the rest of the piece. If
-     * it won't open, call dh_fw_download_fail(DH_FW_REASON_FLASH). */
+    /* The manifest has passed every check. Open the spare partition (esp_ota_begin), then push
+     * the rest of the piece. If it won't open, call dh_fw_download_fail(DH_FW_REASON_FLASH).
+     * When `downloading` is reported (once) is the caller's choice: the reference display
+     * reports it here, and this firmware reports it before the download is asked for, because
+     * only one TLS session is ever open (firmware/README.md). */
     DH_FW_STEP_OPEN_SLOT,
     /* Write `write`; that is the whole image and its hash matches. Call esp_ota_end, then
      * dh_fw_attempt_installed(). Read nothing more from the connection. */

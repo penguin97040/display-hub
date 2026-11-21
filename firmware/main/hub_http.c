@@ -23,7 +23,13 @@
 //   non-blocking (esp_http_client_get_socket() hands it out), a record that isn't all there
 //   yet reads as "nothing yet" (net_sockets.c line 354, transport_ssl.c line 277), Mbed TLS
 //   keeps what it has, and the read comes straight back. hub_http_download_open() does that
-//   once the headers are in.
+//   once the headers are in, and read_answer() does it for every other answer's body.
+//   esp_http_client_read() takes the timeout for each of its reads of the connection from the
+//   client as it is then (esp_http_client.c line 1381), so esp_http_client_set_timeout_ms()
+//   after the headers shortens every wait from there on.
+// - The headers themselves are still read on the blocking socket: esp_http_client_fetch_headers()
+//   reads until it has all of them and stops early only when one read waits its whole timeout
+//   (esp_http_client.c line 1593), so no setting of the socket or of the wait bounds it.
 
 #include "hub_http.h"
 
@@ -41,13 +47,21 @@
 
 static const char *TAG = "hub-http";
 
-// For connecting, and for each wait for more of the answer.
+// For connecting, sending, and each wait for more of the answer's headers.
 #define STEP_TIMEOUT_MS 10000
 // For the whole answer, however slowly it comes.
 #define ANSWER_TIMEOUT_MS 30000
 // The hub's response headers are a few hundred bytes; the request's are under 400.
 #define RX_BUFFER_BYTES 2048
 #define TX_BUFFER_BYTES 1024
+// How long one read of an answer's body waits for bytes, and how much one call asks for. As for
+// a download (update.c, "How long one read can take"), one call of esp_http_client_read() can
+// take (bytes asked for) x (wait) against a hub that sends tiny whole TLS records on purpose, so
+// the body can run at most 64 x 50 ms = 3.2 seconds past ANSWER_TIMEOUT_MS. A hub that simply
+// goes quiet is seen within 50 ms, and an honest answer isn't slowed: the bytes of a record
+// already decrypted are handed out without waiting (tcp_transport/transport_ssl.c, line 173).
+#define ANSWER_STEP_TIMEOUT_MS 50
+#define ANSWER_READ_BYTES      64
 // How long one read of a download's connection waits for bytes before esp_http_client_read()
 // hands back to the caller, which keeps the download's own time limits and looks for a factory
 // reset in between. It is short because that call reads the connection again and again until it
@@ -56,8 +70,8 @@ static const char *TAG = "hub-http";
 #define DOWNLOAD_STEP_TIMEOUT_MS 50
 // ESP-IDF's own log tags for the connection. With a non-blocking socket they print an error
 // each time part of a TLS record has arrived and the rest hasn't, which is many times a
-// download and means nothing. They are turned off while a download is read; what goes wrong
-// is logged here and in update.c.
+// download and means nothing. They are turned off while a download, or any other answer's body,
+// is read; what goes wrong is logged here and in update.c.
 #define TRANSPORT_LOG_TAG   "transport_base"
 #define HTTP_CLIENT_LOG_TAG "HTTP_CLIENT"
 
@@ -143,18 +157,19 @@ static esp_http_client_handle_t open_request(const hub_request_t *request, dh_tr
     return client;
 }
 
-// Reads an answer's body into the request's buffer: to its end, or one byte past `cap`. True if
-// the whole of it arrived, or as much as was allowed.
-static bool read_answer(esp_http_client_handle_t client, const hub_request_t *request,
-                        int64_t content_length, size_t cap, int64_t started_ms,
-                        hub_answer_t *answer)
+// Makes the connection's socket non-blocking, so no read of it can be held open by a hub that
+// sends a TLS record a byte at a time (see the top of this file).
+static bool make_non_blocking(esp_http_client_handle_t client)
 {
-    if (!esp_http_client_is_chunked_response(client) && content_length > (int64_t)cap) {
-        // Too long by its own account: don't read any of it.
-        answer->len = cap + 1;
-        return true;
-    }
-    // Read until the end, or one byte past what is allowed.
+    const int fd = esp_http_client_get_socket(client);
+    const int flags = fd >= 0 ? fcntl(fd, F_GETFL, 0) : -1;
+    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+// read_answer() once the connection is ready: reads until the end, or one byte past `cap`.
+static bool read_body(esp_http_client_handle_t client, const hub_request_t *request, size_t cap,
+                      int64_t started_ms, hub_answer_t *answer)
+{
     while (answer->len <= cap) {
         if (stopped(request)) {
             answer->stopped = true;
@@ -164,19 +179,23 @@ static bool read_answer(esp_http_client_handle_t client, const hub_request_t *re
             ESP_LOGW(TAG, "the answer took too long");
             return false;
         }
-        // A piece at a time, so the checks above are made often.
+        // A little at a time, so the checks above are made often (see ANSWER_READ_BYTES).
         size_t want = cap + 1 - answer->len;
-        if (want > RX_BUFFER_BYTES) {
-            want = RX_BUFFER_BYTES;
+        if (want > ANSWER_READ_BYTES) {
+            want = ANSWER_READ_BYTES;
         }
         const int got =
             esp_http_client_read(client, (char *)request->answer + answer->len, (int)want);
+        if (got == -ESP_ERR_HTTP_EAGAIN) {
+            // Nothing yet: the time limit above says how long to go on waiting.
+            continue;
+        }
         if (got < 0) {
             ESP_LOGW(TAG, "the answer broke off");
             return false;
         }
         if (got == 0) {
-            // The end, or a wait that ran out with the body unfinished.
+            // The end, unless the body is unfinished.
             if (!esp_http_client_is_complete_data_received(client)) {
                 ESP_LOGW(TAG, "the answer stopped part-way");
                 return false;
@@ -186,6 +205,36 @@ static bool read_answer(esp_http_client_handle_t client, const hub_request_t *re
         answer->len += (size_t)got;
     }
     return true;
+}
+
+// Reads an answer's body into the request's buffer: to its end, or one byte past `cap`. True if
+// the whole of it arrived, or as much as was allowed, within ANSWER_TIMEOUT_MS of `started_ms`
+// (and at most ANSWER_READ_BYTES x ANSWER_STEP_TIMEOUT_MS past it). The connection is left
+// non-blocking, so it is only fit to be closed afterwards.
+static bool read_answer(esp_http_client_handle_t client, const hub_request_t *request,
+                        int64_t content_length, size_t cap, int64_t started_ms,
+                        hub_answer_t *answer)
+{
+    if (!esp_http_client_is_chunked_response(client) && content_length > (int64_t)cap) {
+        // Too long by its own account: don't read any of it.
+        answer->len = cap + 1;
+        return true;
+    }
+    // Short waits and a non-blocking socket from here, as for a download, so no read can be
+    // held open and the time limit is looked at often.
+    if (!make_non_blocking(client) ||
+        esp_http_client_set_timeout_ms(client, ANSWER_STEP_TIMEOUT_MS) != ESP_OK) {
+        ESP_LOGE(TAG, "couldn't ready the connection for the answer");
+        return false;
+    }
+    const esp_log_level_t transport_level = esp_log_level_get(TRANSPORT_LOG_TAG);
+    const esp_log_level_t http_client_level = esp_log_level_get(HTTP_CLIENT_LOG_TAG);
+    esp_log_level_set(TRANSPORT_LOG_TAG, ESP_LOG_NONE);
+    esp_log_level_set(HTTP_CLIENT_LOG_TAG, ESP_LOG_NONE);
+    const bool whole = read_body(client, request, cap, started_ms, answer);
+    esp_log_level_set(TRANSPORT_LOG_TAG, transport_level);
+    esp_log_level_set(HTTP_CLIENT_LOG_TAG, http_client_level);
+    return whole;
 }
 
 hub_answer_t hub_http_request(const hub_request_t *request)
@@ -241,15 +290,6 @@ struct hub_download {
     esp_log_level_t transport_level;
     esp_log_level_t http_client_level;
 };
-
-// Makes the connection's socket non-blocking, so no read of it can be held open by a hub that
-// sends a TLS record a byte at a time (see the top of this file).
-static bool make_non_blocking(esp_http_client_handle_t client)
-{
-    const int fd = esp_http_client_get_socket(client);
-    const int flags = fd >= 0 ? fcntl(fd, F_GETFL, 0) : -1;
-    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
 
 hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_download_t **out)
 {
