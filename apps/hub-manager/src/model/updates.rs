@@ -378,13 +378,17 @@ impl Model {
         self.fw.bundled.as_ref()
     }
 
-    /// Whether the hub already holds the official firmware that came with the app, as good as new.
+    /// Whether the hub already holds the official firmware that came with the app, or newer official
+    /// firmware for the same kind of display, as good as new.
     pub fn bundled_on_hub(&self) -> bool {
         self.bundled().is_some_and(|b| {
-            let id = b.package_id();
-            self.firmware_packages()
-                .iter()
-                .any(|p| p.package_id == id && !p.damaged)
+            firmware::official_on_hub(
+                &b.package_id(),
+                &b.loaded.checked.manifest.device_type,
+                b.version(),
+                self.firmware_packages(),
+                firmware::OFFICIAL_KEYS,
+            )
         })
     }
 

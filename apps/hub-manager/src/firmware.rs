@@ -168,6 +168,29 @@ fn bundled_in(folder: &Path, official: &[&str]) -> Option<Bundled> {
 
 pub use firmware_package::version::{compare as compare_versions, is_pre_release, order as order_versions};
 
+/// Whether the hub already has all the official firmware the app could add for this package: the
+/// package itself, or one signed by an `official` key for the same device type at the same or a
+/// newer version (say, added from a newer app on another computer). A copy the hub can't read
+/// doesn't count. A version that can't be compared doesn't count either.
+pub fn official_on_hub(
+    package_id: &str,
+    device_type: &str,
+    version: &str,
+    on_hub: &[FirmwarePackageView],
+    official: &[&str],
+) -> bool {
+    on_hub.iter().any(|p| {
+        !p.damaged
+            && (p.package_id == package_id
+                || (p.device_type == device_type
+                    && signer_with(&p.signer_key_id, &[], official).kind == SignerKind::Official
+                    && matches!(
+                        compare_versions(&p.firmware_version, version),
+                        Some(Ordering::Equal | Ordering::Greater)
+                    )))
+    })
+}
+
 // ----- a display's firmware -----
 
 /// What a display trusts, by its own last report.
@@ -765,6 +788,27 @@ pub(crate) mod tests {
             label: label.into(),
             updated_at: ts("2026-11-17T09:00:00Z"),
         }
+    }
+
+    #[test]
+    fn the_bundled_package_is_offered_only_when_the_hub_lacks_an_official_one_as_new() {
+        let official = ["o".repeat(64)];
+        let official: Vec<&str> = official.iter().map(String::as_str).collect();
+        let id = "b".repeat(64);
+        let on_hub = |shelf: &[FirmwarePackageView]| official_on_hub(&id, "desk", "1.2.0", shelf, &official);
+
+        assert!(on_hub(&[package("b", "1.2.0", "k")]), "the same package");
+        assert!(on_hub(&[package("c", "1.2.0", "o")]), "same version, official");
+        assert!(on_hub(&[package("c", "1.3.0", "o")]), "newer official");
+        assert!(!on_hub(&[package("c", "1.1.0", "o")]), "older official");
+        assert!(!on_hub(&[package("c", "1.3.0", "k")]), "newer, not official");
+        let mut other = package("c", "1.3.0", "o");
+        other.device_type = "wall".into();
+        assert!(!on_hub(&[other]), "another device type");
+        assert!(!on_hub(&[]), "empty shelf");
+        let mut damaged = package("c", "1.3.0", "o");
+        damaged.damaged = true;
+        assert!(!on_hub(&[damaged]), "unreadable copy");
     }
 
     #[test]
