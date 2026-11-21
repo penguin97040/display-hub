@@ -826,8 +826,9 @@ impl Manager {
                 out = out
                     .child(ui::p_muted(
                         "This display hasn't said which firmware keys it trusts, so it can't take updates over \
-                         Wi-Fi. Its firmware may be older than signed updates. Install firmware over USB gives it \
-                         new firmware and its maker's keys.",
+                         Wi-Fi. Unplug it and plug it back in to try again. If this message is still here \
+                         afterwards, its firmware may be older than signed updates: Install firmware over USB \
+                         gives it new firmware and its maker's keys.",
                     ))
                     .child(div().flex().child(install_button(self, cx)));
             }

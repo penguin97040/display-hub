@@ -440,7 +440,8 @@ pub fn courtesy(info: Option<&DeviceInfo>, p: &PackageRow) -> Result<(), String>
     let Some(fw) = &info.firmware else {
         return Err(
             "This display hasn't said which firmware keys it trusts, so it can't take updates over Wi-Fi. \
-             Its firmware may be too old, or it was set up without keys: use Install firmware over USB."
+             Unplug it and plug it back in to try again. If this message is still here afterwards, its \
+             firmware may be too old: use Install firmware over USB."
                 .into(),
         );
     };
