@@ -268,6 +268,10 @@ hub-firmware keygen --out my-displays.dhkey
 
 **Judgement call: PBKDF2, not a memory-hard function.** PBKDF2 and AES-GCM are already in `ring`, so the signing tool adds no new cryptography code. Argon2id would slow passphrase guessing more, at the price of another dependency. The passphrase is the second line of defence for a file that should never leave the maker's computer.
 
+### The official keys
+
+The official Display Hub firmware is signed with two keys, an everyday key and a recovery key. Their public halves are in `firmware/official/keys.txt`, and the app has the same keys built in. The maintainer signs on their own computer, so no private key reaches GitHub or CI, and the release checks the committed package against a fresh build of the firmware before it goes into the downloads. [firmware/official/README.md](../firmware/official/README.md) has the details.
+
 ### If a key is lost or leaked
 
 | What happened | What to do | What it costs |
@@ -292,7 +296,7 @@ Nothing else changes them: not the hub, not the app over the network, not a fact
 
 ### Install firmware, in the app
 
-1. The owner plugs the display in and chooses **Install firmware**, then picks a package (a file from the maker, or the official one).
+1. The owner plugs the display in and chooses **Install firmware**. The official package comes with the app and is offered first, as **Use official firmware** with its version; the owner can still choose a file from another maker instead.
 2. The app checks the package as [above](#checking-a-package-hub-app-and-tool). It needs `usb_install`.
 3. **The app shows who signed it, before writing anything:**
    - *Official Display Hub firmware*, when the key is one built into the app itself; or
@@ -368,7 +372,9 @@ The hub records what each display reports about an offer and shows it to admins.
 - **Update available:** shown for a display when the hub holds a package for its device type and hardware revision, signed by a key the display reports trusting, with a higher version. Versions are compared as three numbers; with the numbers equal, a version with a pre-release tag is older than one without. The headline is the newest full release; a pre-release is the headline only when the display already runs one or no newer full release exists. Other choices are listed below it.
 - **Update:** the button names the version, the signer and the summary. Going to an older version, or to a pre-release, asks for a second confirmation and says why.
 - **Progress and results:** *Waiting for the display to check in* (it acts at its next poll, within five minutes by default), *Downloading*, *Restarting*, then *Updated to 1.2.0*; or a plain sentence for each failure. When the display reports `attempts_left` of 0, the app says the update will wait until the display has earned another attempt (up to four hours of running), or until it is set up again over USB. A rollback reads: *The update didn't start properly, so the display went back to 1.1.0. Nothing was lost.*
-- **Install firmware:** the first install over USB, as [above](#install-firmware-in-the-app).
+- **Install firmware:** the first install over USB, as [above](#install-firmware-in-the-app). If the official package came with the app, **Use official firmware** *version* is the first choice, and **Or firmware from another maker** leads to **Choose a file**.
+- **Add official firmware:** in the *Firmware on the hub* panel, until the hub holds the bundled package, the app offers **Add official firmware** *version* ("Included with the app · So displays can update over Wi-Fi"), which puts it on the hub's shelf.
+- **A bundled package is trusted only if it earns it:** the app uses the package that came with it only if it passes the same checks as a chosen file and is signed by a key built into the app. Otherwise (no package, more than one, a damaged or changed one, or one signed by anyone else) the app ignores it, and looks as if none came with it.
 
 The app never holds a signing key. Signing is done with `hub-firmware`, by whoever makes the firmware.
 

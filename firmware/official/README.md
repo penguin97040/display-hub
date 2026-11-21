@@ -11,7 +11,7 @@ Neither is here yet: the official keys haven't been made. Until they are, the ap
 
 ## Who signs it, and who checks it
 
-The owner signs the package on their own computer with `hub-firmware`. The key files and their passphrases never go into this repository, to GitHub or to CI. A package holds only public things (the firmware, a signature and public keys), so it is committed here.
+The maintainer signs the package on their own computer with `hub-firmware`. The key files and their passphrases never go into this repository, to GitHub or to CI. A package holds only public things (the firmware, a signature and public keys), so it is committed here.
 
 A release doesn't take the package on trust. The release workflow builds the firmware again from source, in the same pinned ESP-IDF image CI uses, and [tools/release/check-official-firmware.py](../../tools/release/check-official-firmware.py) refuses the release unless:
 

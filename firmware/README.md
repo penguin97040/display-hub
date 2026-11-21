@@ -191,6 +191,8 @@ The first build downloads the components listed in [THIRD_PARTY.md](THIRD_PARTY.
 
 Or build with Espressif's Docker image, as the GitHub checks do: `espressif/idf:v5.5.6`.
 
+What makes a build the *official* firmware, and how a release's package is signed and checked, is in [official/README.md](official/README.md).
+
 The settings are in [sdkconfig.defaults](sdkconfig.defaults), with a note on each. The build makes its full `sdkconfig` in the build folder, so change settings in `sdkconfig.defaults`, not with `menuconfig`. Builds are reproducible: the same source and ESP-IDF give the same image.
 
 ### Test builds
