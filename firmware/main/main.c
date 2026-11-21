@@ -169,10 +169,12 @@ static void show_state(const char *note)
     }
 }
 
-// The factory reset: erases the setup namespace and nothing else. The firmware keys, the security
-// floor and the update record stay (storage.c, store_erase_setup). No restart is needed: the USB
-// task reads the same facts and goes straight back to accepting a bundle, and the hub task finds
-// its setup gone, stops Wi-Fi and forgets the token (hub.h). This never waits for the network.
+// The factory reset: erases the setup partition, every sector of it, and nothing else. The
+// firmware keys, the security floor and the update record are in the other partition and stay
+// (storage.c, store_erase_setup). No restart is needed: the USB task reads the same facts and
+// goes straight back to accepting a bundle, and the hub task finds its setup gone, stops Wi-Fi
+// and forgets the token (hub.h). This never waits for the network. The erase itself takes a
+// second or two, with storage's lock held.
 static void factory_reset(void)
 {
     storage_lock();
@@ -189,7 +191,8 @@ static void factory_reset(void)
     }
 
     if (erased) {
-        ESP_LOGW(TAG, "factory reset: the setup was erased; firmware keys and update record kept");
+        ESP_LOGW(TAG, "factory reset: the setup partition was erased; firmware keys and update "
+                      "record kept");
         show_state("The setup was erased.");
     } else if (!working) {
         ESP_LOGE(TAG, "factory reset: nothing to do, storage isn't working");
@@ -250,8 +253,8 @@ void app_main(void)
         abort();
     }
 
-    // The eFuses are read, never written, except that a new board's first start makes its storage
-    // key (storage_key.h). Then encrypted NVS, and what it holds.
+    // The eFuses are read, never written, here. (A new board's storage key is made later, when
+    // its first setup arrives over USB: storage_key.h.) Then encrypted NVS, and what it holds.
     efuse_report_read(&s_efuse);
     efuse_report_log(&s_efuse, "at start-up");
     storage_fw_on_stopped(on_updates_stopped);

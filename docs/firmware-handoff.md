@@ -291,15 +291,16 @@ It erased, wrote all four writes, restarted and booted. That layout has two flaw
 The official firmware's layout for the 16 MB board (`firmware/partitions.csv`), tried on real V2 boards. It has no `factory` partition, so `app_offset` is `0x20000` and a first install boots from `ota_0`:
 
 ```text
-# Name,   Type, SubType, Offset,   Size
-nvs,      data, nvs,     0x9000,   0x10000
-otadata,  data, ota,     0x19000,  0x2000
-phy_init, data, phy,     0x1b000,  0x1000
-ota_0,    app,  ota_0,   0x20000,  0x600000
-ota_1,    app,  ota_1,   0x620000, 0x600000
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x10000
+otadata,   data, ota,     0x19000,  0x2000
+phy_init,  data, phy,     0x1b000,  0x1000
+ota_0,     app,  ota_0,   0x20000,  0x600000
+ota_1,     app,  ota_1,   0x620000, 0x600000
+nvs_setup, data, nvs,     0xc20000, 0x20000
 ```
 
-That gives two 6 MiB slots, a 64 KiB NVS, and about 3.9 MB left at the end for anything else. On the ESP32-S3 the bootloader is at 0x0 and the partition table at 0x8000 by default; other chips differ (the original ESP32's bootloader is at 0x1000). Take the offsets from your own build's `build/flasher_args.json`, not from here.
+That gives two 6 MiB slots, a 64 KiB NVS for what a factory reset keeps, a 128 KiB NVS of its own for what a factory reset erases ([Factory reset](#factory-reset) says why it is a partition), and about 3.75 MiB left at the end for anything else. (The boards were tried with the first five lines; `nvs_setup` was added after them, at the end so that nothing else moved.) On the ESP32-S3 the bootloader is at 0x0 and the partition table at 0x8000 by default; other chips differ (the original ESP32's bootloader is at 0x1000). Take the offsets from your own build's `build/flasher_args.json`, not from here.
 
 ### Packaging and signing with `hub-firmware`
 
@@ -360,7 +361,7 @@ Since then, the official firmware has passed its tests on real V2 boards, coveri
 | Wi-Fi SSID and password | Encrypted NVS | Never logged or shown. |
 | Hub hosts, port, trust anchors | Encrypted NVS | Each PEM is under 4 KiB. |
 | Device ID and token | Encrypted NVS | The token is the display's only credential. Never logged or shown. |
-| Trusted firmware keys and security floor | NVS, a namespace of their own | Public, but kept apart so a factory reset can leave them. |
+| Trusted firmware keys and security floor | NVS, apart from the setup | Public, but kept apart so a factory reset can leave them: the official firmware keeps these and the update record in one NVS partition and everything a reset erases in another ([Factory reset](#factory-reset)). |
 | Update record, with the attempt budget | NVS | Small. Written a few times an hour at most, while the budget refills. |
 | Last good snapshot | NVS blob, or a small file system | At most 32 KiB. Save it only when it changes. |
 
@@ -392,22 +393,27 @@ The enrolment secret is never stored past enrolment, and no provider credential 
 
 So NVS encryption stays on. Flash encryption and Secure Boot stay off. A maker whose own checks, on another chip or ESP-IDF release, fail should ship **plain NVS** instead and say so plainly in the firmware's documentation.
 
-ESP-IDF's `nvs_flash_init()` burns a key into an empty block whatever state the chip is in. The official firmware never calls it: it checks the eFuses itself, burns a key only on what is plainly a new board's first start, and starts NVS with `nvs_flash_secure_init()` ([firmware/README.md](../firmware/README.md#the-storage-key)).
+ESP-IDF's `nvs_flash_init()` burns a key into an empty block whatever state the chip is in. The official firmware never calls it: it checks the eFuses itself, and starts NVS with `nvs_flash_secure_init_partition()`, which can't burn anything ([firmware/README.md](../firmware/README.md#the-storage-key)).
 
-**Size the NVS partition.** ESP-IDF limits a blob to 97.6% of the partition size minus 4000 bytes, so a 32 KiB snapshot needs a partition of about 37 KiB at the very least, before anything else is stored. ESP-IDF's ready-made two-OTA table has only 16 KiB. The example layout above gives it 64 KiB. Alternatively, keep the snapshot in its own partition or file system.
+**When to burn the key.** Not at start-up. ESP-IDF burns the key block first and its purpose and protection bits second, and a reset between the two leaves a key block that is neither empty nor usable: the board can then never be set up. The moments after an install are when a reset is most likely (the app opening the USB port can reset the chip). The official firmware leaves a new board's key unburnt, answers `hello` as a display with nothing stored (which is true), and burns the key when the first `provision` has passed every check, just before its first write: the port is open then, and the app is waiting for the answer. A key block found in that half-finished state is reported and never adopted, because it can't be told from a key someone else loaded and kept a copy of.
 
-**Replacing a large blob needs room for two.** NVS writes a blob's new value before it lets go of the old one. In a 64 KiB partition that also holds the setup, replacing one 32 KiB snapshot with another in a single `nvs_set_blob()` fails with `ESP_ERR_NVS_NOT_ENOUGH_SPACE`, leaving the old one whole (tried with ESP-IDF v5.5.6's NVS code). The official firmware keeps the 64 KiB partition and erases the old snapshot first when the two together are over 40,000 bytes; a bigger partition, or one for the snapshot alone, are the other ways.
+**Check the key you find.** Use an existing key only if it is read-protected, write-protected and has its purpose locked, as ESP-IDF's own key generation leaves it. A key with the right purpose that can still be read out protects nothing.
 
-**Don't save every snapshot.** `generated_at` moves with every poll, so "only when it has changed" must leave that field out of the comparison, and a page's `updated_at` still moves whenever the hub collects. At the shortest refresh (30 seconds), a 32 KiB write every poll would use up the rated erase cycles of a 64 KiB partition (about 100,000 for each sector) within months. The official firmware replaces the saved copy at most once an hour.
+**Size the NVS partition.** ESP-IDF limits a blob to 97.6% of the partition size minus 4000 bytes, so a 32 KiB snapshot needs a partition of about 37 KiB at the very least, before anything else is stored. ESP-IDF's ready-made two-OTA table has only 16 KiB. The example layout above keeps it in a 128 KiB partition, with the rest of what a factory reset erases.
 
-**Keep the Wi-Fi driver out of NVS.** ESP-IDF's Wi-Fi driver stores the network's name and password in a namespace of its own by default, which a factory reset that erases only your setup namespace would leave behind. Turn that off (`CONFIG_ESP_WIFI_NVS_ENABLED`, and `esp_wifi_set_storage(WIFI_STORAGE_RAM)`) and hand the driver the details from your own storage at each start.
+**Replacing a large blob needs room for two.** NVS writes a blob's new value before it lets go of the old one. In a 64 KiB partition that also holds the setup, replacing one 32 KiB snapshot with another in a single `nvs_set_blob()` fails with `ESP_ERR_NVS_NOT_ENOUGH_SPACE`, leaving the old one whole (tried with ESP-IDF v5.5.6's NVS code). In the official firmware's 128 KiB setup partition it succeeds every time (tried the same way, 1500 saves beside the largest setup), so the old snapshot is kept until the new one is whole. With less room, erase the old one first and accept that a power cut between the two leaves none.
+
+**Don't save every snapshot.** `generated_at` moves with every poll, so "only when it has changed" must leave that field out of the comparison, and a page's `updated_at` still moves whenever the hub collects. At the shortest refresh (30 seconds), a 32 KiB write every poll would use up the rated erase cycles of a small partition (about 100,000 for each sector) within months. The official firmware replaces the saved copy at most once an hour.
+
+**Keep the Wi-Fi driver out of NVS.** ESP-IDF's Wi-Fi driver stores the network's name and password in a namespace of its own by default, which a factory reset that erases only your own setup would leave behind. Turn that off (`CONFIG_ESP_WIFI_NVS_ENABLED`, and `esp_wifi_set_storage(WIFI_STORAGE_RAM)`) and hand the driver the details from your own storage at each start.
 
 ## Factory reset
 
 A deliberate action on the device itself, such as holding a button during start-up: your choice, but document it. The official firmware's is holding **BOOT** for 10 seconds while it runs, with a countdown on screen ([firmware/README.md](../firmware/README.md#factory-reset)).
 
 - **It erases:** the Wi-Fi settings, the hub hosts, port and trust anchors, the device ID and token, any stored bundle, and the saved snapshot. Then the display goes back to waiting for setup.
-- **It keeps:** the trusted firmware keys, the security floor and the update record, with its attempt budget. Those belong to the firmware's maker, not to the hub the display was paired with. So erase the setup namespaces one by one; don't erase the whole NVS partition.
+- **It keeps:** the trusted firmware keys, the security floor and the update record, with its attempt budget. Those belong to the firmware's maker, not to the hub the display was paired with. So never erase the partition they are in.
+- **Erase the flash, not just the entries.** `nvs_erase_key()` and `nvs_erase_all()` only mark entries as erased: the bytes stay in flash until NVS reclaims the page, which may be never. With NVS encryption but no flash encryption, someone holding the board can run their own program on the chip and have its HMAC unit work the NVS keys out, so the "erased" Wi-Fi password and token could still be read. The official firmware keeps everything a reset must remove in an NVS partition of its own (`nvs_setup`), and a reset stops NVS on it (`nvs_flash_deinit_partition`), erases every sector (`esp_partition_erase_range`), reads each back as 0xFF, and starts NVS on it again. A mark written in the other partition before the erase, and taken out after it, makes a start after a power cut finish the job before reading anything; without it NVS starts on a half-erased partition without complaint, and the rest of the old setup stays in flash.
 - A display must never accept a new bundle without a factory reset, so someone with a cable can't silently point it at another hub. A factory reset followed by a cable can point it at another hub, but can't change whose firmware it accepts (`firmware_keys_locked`).
 - A maker MAY add a physical button action that refills the attempt budget, as a USB bundle does.
 
@@ -421,7 +427,7 @@ As in `docs/protocol-v1.md`, "TLS and the hub's identity":
 - `CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096` is enough: the hub's records are at most 4 KiB.
 - The certificate is valid from 1970 to 9999, so a display that doesn't know the date still accepts it.
 - The firmware download uses exactly the same settings.
-- Bound how long an answer can take, as well as how big it is. The official firmware gives each answer 30 seconds from the start of its request, and reads the body from a non-blocking socket a little at a time, so a hub that trickles bytes can't hold a read open. The headers are bounded only by a 10-second wait for each read of them: a known limit, which only a hostile hub could use. A download has its own limits ([Acting on an offer](#acting-on-an-offer)).
+- Bound how long a request can take, as well as how big its answer is, **the TLS handshake included**: anything that answers at a hub address takes part in the handshake, with or without the hub's key, and a blocking handshake whose only limit is a timeout on each read can be held open for hours a byte at a time. ESP-IDF's `esp_http_client` can't keep such a limit by itself, nor be stopped part-way, on its built-in connection. The official firmware gives each request 30 seconds from its start for everything (the connection, the handshake, the request, and the answer's headers and body) and hands the client a connection of its own, on a socket that never blocks, which looks at that limit and at a factory reset before every read and write ([firmware/README.md](../firmware/README.md#talking-to-the-hub), "Limits"). A download's body has its own limits ([Acting on an offer](#acting-on-an-offer)).
 
 `tools/mbedtls-interop/client.c` shows these settings in plain mbedTLS. Its checks pass against the real hub with mbedTLS 3.6: TLS 1.2 and 1.3 work, and a different hub key or a wrong name is refused. ESP-IDF 5.5 ships Mbed TLS 3.6. The current stable ESP-IDF (6.x) ships Mbed TLS 4, which this project hasn't tested, so pin an ESP-IDF 5.5 release unless you check 6.x yourself.
 

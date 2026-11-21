@@ -473,6 +473,8 @@ static void enrol(void)
         return;
     }
     if (problem != DH_PROBLEM_NONE) {
+        // An answer that broke off part-way may have left part of a token in the buffer.
+        dh_wipe(s_body, DH_MAX_HUB_ANSWER_BYTES + 1);
         const uint32_t wait = dh_poll_failed(&s.poll, problem, random32, NULL);
         ESP_LOGW(TAG, "enrolment: %s; trying again in %" PRIu32 " s",
                  dh_problem_headline(problem), wait / 1000);

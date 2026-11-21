@@ -18,7 +18,8 @@
  *   6. a write fails                                            storage_failed
  *   7. otherwise                                                provisioned
  *
- * Nothing is changed before step 6. There the writes are made in this order: the firmware keys
+ * Nothing is changed before step 6. There the store is first told that a write is coming (its
+ * `prepare`, if it has one), and then the writes are made in this order: the firmware keys
  * (only for a display that had none), the update record (only if the attempt budget wasn't full
  * already) and, last, the setup itself. So a failed write never leaves a setup behind: the
  * display still reads as not set up, and the bundle can be sent again.
@@ -64,6 +65,12 @@ typedef struct {
     /* A factory reset: erases the setup (and the device ID, token and saved snapshot, once there
      * are any). It must leave the firmware keys and the update record alone. */
     bool (*erase_setup)(void *ctx);
+    /* NULL, or what to do just before the first write of a bundle that has passed every check.
+     * It is called once for each such bundle and for no other, so whatever a store must do
+     * before it can keep anything, and should not do for a line that will be refused anyway, goes
+     * here (on the chip: making a new board's storage key, which is permanent). False refuses
+     * the bundle with storage_failed, with nothing written. */
+    bool (*prepare)(void *ctx);
 } dh_setup_store;
 
 /* What the display knows about itself, and what it holds. The strings must be plain text that
@@ -88,6 +95,9 @@ typedef struct {
      * there, because they may not be what is stored (a write failed earlier in this run). It
      * changes nothing about how a bundle is handled. */
     bool withhold_firmware;
+    /* NULL, or why storage isn't working, for the storage_failed reply when store is NULL: one
+     * fixed sentence of at most 200 bytes that is safe to log. NULL gives the usual words. */
+    const char *storage_why;
 } dh_usb_display;
 
 typedef enum {

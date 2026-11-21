@@ -10,8 +10,14 @@
 //   Start-up uses nvs_flash_read_security_cfg_v2() and nvs_flash_secure_init(), which can't burn
 //   anything: with no key, read_security_cfg_hmac() just returns an error
 //   (nvs_sec_provider.c:218-221). A new board's key is made by calling
-//   nvs_flash_generate_keys_v2() directly, from make_key() below and nowhere else, after the
-//   checks in storage_key_assess().
+//   nvs_flash_generate_keys_v2() directly, from storage_key_make() below and nowhere else, after
+//   the checks in storage_key_assess().
+// - More than one partition. The NVS keys come from the HMAC unit and two fixed seeds
+//   (compute_nvs_keys_with_hmac, nvs_sec_provider.c:114), so they are the same whichever
+//   partition they are for, and nvs_flash_secure_init_partition() (nvs_api.cpp:168) takes a
+//   partition's name and copies the keys into that partition's own object. nvs_flash_secure_init()
+//   is the same call with the name "nvs" (nvs_api.cpp:180). So each partition is started with
+//   one read of the keys and one call, and the keys are wiped from this file's copy afterwards.
 // - The start-up hook that these settings add (nvs_sec_provider.c:267) only records which scheme
 //   and key block to use. It reads and writes no eFuse.
 // - How the key is made. generate_keys_hmac() turns the chip's noise source on
@@ -24,7 +30,11 @@
 //   (efuse/src/efuse_controller/keys/with_key_purposes/esp_efuse_api_key.c:270) writes the key,
 //   write-protects it (285), read-protects it because the purpose is HMAC_UP (332-335), sets the
 //   purpose (345) and locks the purpose (346), all in one go. The key block is burnt and checked
-//   first, then block 0 with the protection bits (efuse/esp32s3/esp_efuse_utility.c:102-104).
+//   first, then block 0 with the protection bits (efuse/esp32s3/esp_efuse_utility.c:102-104);
+//   if the key block's burn reports an error, block 0 is left alone (115-119). So a reset, a
+//   power cut or an error between the two leaves a key with no purpose and no protection
+//   (storage_key.h, "A key that was never finished"). Nothing is done between the two steps but
+//   ESP-IDF's own work: the time at risk is one block's programming, a few milliseconds.
 // - On a real V2 board (milestone D2) the burnt key read back as all zeros, encrypted NVS worked
 //   across restarts, and the board could still be erased and reflashed over USB.
 
@@ -43,7 +53,7 @@
 
 static const char *TAG = "storage-key";
 
-// Set if this start burnt the key and the burn changed more of the eFuses than KEY5's own bits.
+// Set if this run burnt the key and the burn changed more of the eFuses than KEY5's own bits.
 // It is permanent by then, so it doesn't stop the display; it is reported every minute instead.
 static bool s_burn_changed_more;
 
@@ -98,14 +108,28 @@ void storage_key_assess(const efuse_report_t *efuse, storage_key_status_t *statu
         if (efuse->damaged_blocks & (1u << STORAGE_KEY_EFUSE_BLOCK)) {
             add_blocker(status, "KEY5 holds the storage key, but reads back as damaged.");
         }
+        // ESP-IDF's key generation leaves the key unreadable, unwritable and with its purpose
+        // fixed, all at once. A key with the purpose but without all three wasn't made that way
+        // (or its burn didn't finish): one that can be read out protects nothing.
+        if (!key->read_protected) {
+            add_blocker(status, "KEY5 holds a storage key that isn't protected from being read.");
+        }
+        if (!key->write_protected || !key->purpose_locked) {
+            add_blocker(status, "KEY5 holds a storage key that isn't locked against changes.");
+        }
         status->state = status->blocker_count == 0 ? STORAGE_KEY_PRESENT : STORAGE_KEY_BLOCKED;
         return;
     }
 
     if (key->purpose != ESP_EFUSE_KEY_PURPOSE_USER) {
         add_blocker(status, "KEY5 already has another purpose.");
-    }
-    if (!key->reads_as_zeros) {
+    } else if (!key->reads_as_zeros && !key->read_protected) {
+        // A key block burnt without its purpose and protection: see storage_key.h.
+        status->unfinished = true;
+        add_blocker(status, "KEY5 holds a key that was never finished: this display lost power "
+                            "or was reset while its storage key was being made, or someone "
+                            "else put a key there. It can't be used, finished or replaced.");
+    } else if (!key->reads_as_zeros) {
         add_blocker(status, "KEY5 isn't empty.");
     }
     if (key->read_protected || key->write_protected || key->purpose_locked) {
@@ -196,12 +220,12 @@ static bool burn_changed_only_key(const efuse_report_t *before, const efuse_repo
     return ok;
 }
 
-// Makes the storage key and burns it into KEY5. PERMANENT. Called only from
-// storage_key_start_nvs(), for a new board. It reads the eFuses itself and refuses unless the
-// state is STORAGE_KEY_EMPTY. `efuse` is left as the reading taken afterwards.
+// Makes the storage key and burns it into KEY5. PERMANENT. It reads the eFuses itself and
+// refuses unless the state is STORAGE_KEY_EMPTY. `efuse` is left as the reading taken afterwards.
 static esp_err_t make_key(efuse_report_t *efuse)
 {
-    efuse_report_t before;
+    // Not on the stack: this runs on the USB task. Only one task can be here (storage's lock).
+    static efuse_report_t before;
     storage_key_status_t status;
 
     efuse_report_read(&before);
@@ -226,7 +250,7 @@ static esp_err_t make_key(efuse_report_t *efuse)
     // also works out the NVS encryption keys, which are read again properly afterwards, so wipe
     // them here.
     ESP_LOGW(TAG,
-             "FIRST START: making this board's storage key and burning it into eFuse key block "
+             "FIRST SETUP: making this board's storage key and burning it into eFuse key block "
              "KEY%d. This is permanent and happens once.",
              STORAGE_KEY_BLOCK);
     nvs_sec_cfg_t cfg = {0};
@@ -258,23 +282,25 @@ static esp_err_t make_key(efuse_report_t *efuse)
     return ESP_OK;
 }
 
-esp_err_t storage_key_start_nvs(efuse_report_t *efuse, storage_key_status_t *status,
-                                bool *key_made)
+esp_err_t storage_key_make(efuse_report_t *efuse, storage_key_status_t *status)
 {
-    *key_made = false;
     storage_key_assess(efuse, status);
-    if (status->state == STORAGE_KEY_EMPTY) {
-        const esp_err_t err = make_key(efuse);
-        storage_key_assess(efuse, status);
-        if (err != ESP_OK) {
-            return err;
-        }
-        *key_made = true;
+    if (status->state != STORAGE_KEY_EMPTY) {
+        return ESP_ERR_INVALID_STATE;
     }
+    const esp_err_t err = make_key(efuse);
+    storage_key_assess(efuse, status);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return status->state == STORAGE_KEY_PRESENT ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
+esp_err_t storage_key_start_partition(const storage_key_status_t *status, const char *partition)
+{
     if (status->state != STORAGE_KEY_PRESENT) {
         return ESP_ERR_INVALID_STATE;
     }
-
     // Read the keys through the HMAC unit and start NVS with them. Neither call can make a key.
     nvs_sec_scheme_t *scheme = hmac_scheme();
     if (scheme == NULL) {
@@ -283,11 +309,11 @@ esp_err_t storage_key_start_nvs(efuse_report_t *efuse, storage_key_status_t *sta
     nvs_sec_cfg_t cfg = {0};
     esp_err_t err = nvs_flash_read_security_cfg_v2(scheme, &cfg);
     if (err == ESP_OK) {
-        err = nvs_flash_secure_init(&cfg);
+        err = nvs_flash_secure_init_partition(partition, &cfg);
     }
     memset(&cfg, 0, sizeof(cfg));
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "encrypted NVS didn't start: 0x%x (%s)", (unsigned)err,
+        ESP_LOGE(TAG, "encrypted NVS didn't start on \"%s\": 0x%x (%s)", partition, (unsigned)err,
                  esp_err_to_name(err));
     }
     return err;
@@ -302,10 +328,12 @@ void storage_key_log(const storage_key_status_t *status)
 {
     switch (status->state) {
     case STORAGE_KEY_PRESENT:
-        ESP_LOGI(TAG, "storage key: KEY%d holds an HMAC_UP key", STORAGE_KEY_BLOCK);
+        ESP_LOGI(TAG, "storage key: KEY%d holds an HMAC_UP key, protected and locked",
+                 STORAGE_KEY_BLOCK);
         break;
     case STORAGE_KEY_EMPTY:
-        ESP_LOGW(TAG, "storage key: none yet; KEY%d is empty and a key can be made",
+        ESP_LOGW(TAG, "storage key: none yet; KEY%d is empty, and the key will be made when the "
+                      "first setup arrives over USB",
                  STORAGE_KEY_BLOCK);
         break;
     default:

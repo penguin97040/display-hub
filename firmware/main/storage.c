@@ -7,6 +7,26 @@
 // A read that fails is never turned into "nothing there": a namespace or key that doesn't exist
 // yet is one thing (a display that hasn't been set up), and any other error is a storage failure,
 // which stops setup and shows on the screen.
+//
+// WHY THE SETUP HAS A PARTITION OF ITS OWN. Erasing a key or a namespace in NVS only marks its
+// entries as erased (nvs_flash/src/nvs_page.cpp, Page::eraseEntryAndSpan: the entry's two state
+// bits are cleared and its bytes are left as they are) until the page is one day reclaimed. So
+// after an nvs_erase_all() the encrypted Wi-Fi password, hub addresses and token would still be
+// in flash, and flash encryption is off: someone holding the board could run their own program
+// on the chip and have its HMAC unit work out the NVS keys. A factory reset therefore erases
+// flash itself: everything it must remove lives in the partition "nvs_setup", and the reset
+// erases every sector of it and reads it back as blank (wipe_setup_partition). Everything it
+// must keep lives in "nvs", which no code here ever erases.
+//
+// A power cut part-way through that erase leaves the first sectors blank and the rest as they
+// were. NVS starts on that without complaint (tried: with the page naming the namespace among
+// those erased, it comes up as not set up), and the rest of the old setup would stay in flash
+// with nothing to say so. So a mark
+// ("dh_reset"/"wiping") is written in "nvs" before the first sector is erased and taken out
+// after NVS has started on the blank partition. A start that finds the mark finishes the erase
+// before it reads anything. A setup partition that won't start at all is erased and
+// started afresh in the same way, so the display comes up waiting for setup; the "nvs"
+// partition is never erased, whatever state it is in.
 
 #include "storage.h"
 
@@ -26,49 +46,69 @@
 
 static const char *TAG = "storage";
 
+// The two NVS partitions, by their names in partitions.csv.
+#define MAIN_PARTITION  "nvs"       // kept by a factory reset
+#define SETUP_PARTITION "nvs_setup" // erased, every sector of it, by a factory reset
+
+// In SETUP_PARTITION.
 #define SETUP_NAMESPACE "dh_setup"
 #define SETUP_KEY       "setup"
 #define DEVICE_KEY      "device"
 #define SNAPSHOT_KEY    "snapshot"
+// In MAIN_PARTITION.
 #define FW_NAMESPACE    "dh_fw"
 #define FW_KEY_KEYS     "keys"
 #define FW_KEY_RECORD   "record"
+// The mark that a factory reset's erase has begun and isn't known to have finished.
+#define RESET_NAMESPACE "dh_reset"
+#define RESET_KEY       "wiping"
 // What the storage key check build (milestone D2) left behind: a boot count and a marker.
 #define D2_NAMESPACE "dh_d2_check"
 
-// ROOM. The partition is 64 KiB (partitions.csv): 16 pages of 4096 bytes, one kept free by NVS,
-// 126 entries of 32 bytes in each of the rest, so 1890 entries. A blob takes one entry for each
-// 32 bytes, one more for each page it touches and one for its index.
+// ROOM in the setup partition. It is 128 KiB (partitions.csv): 32 pages of 4096 bytes, one kept
+// free by NVS, 126 entries of 32 bytes in each of the rest, so 3906 entries. A blob takes one
+// entry for each 32 bytes, one more for each page it touches and one for its index.
 //
 //   the largest setup, 9464 bytes        about 300 entries
-//   the keys, the record, the device     about 30
+//   the device ID and token, 195 bytes   9
 //   the largest snapshot, 32768 bytes    about 1035
-//   ESP-IDF's radio calibration data     about 70 (its own namespace, "phy"; see below)
 //
-// So everything fits at once, with over 400 entries spare. What doesn't fit is two large
-// snapshots: NVS writes a blob's new value before it lets go of the old one
-// (nvs_storage.cpp, Storage::writeItem), so replacing a 32 KiB snapshot with another would need
-// 2070 entries for the two, and fails with ESP_ERR_NVS_NOT_ENOUGH_SPACE (leaving the old one
-// whole: writeMultiPageBlob erases what it had written of the new one). storage_save_snapshot()
-// therefore erases the old snapshot first whenever the two together are over
-// SNAPSHOT_REPLACE_BYTES, and again if NVS still says there is no room. Everything else is small
-// and is always replaced in one step. This was tried against ESP-IDF v5.5.6's own NVS code built
-// for a computer, with a 64 KiB partition holding the largest of everything: one step from 32768
-// bytes to 32768 failed as above with the old snapshot left whole, and 1500 saves this way
-// (300 of them 32768 over 32768) all succeeded with every other value unchanged.
+// NVS writes a blob's new value before it lets go of the old one (nvs_storage.cpp,
+// Storage::writeItem), so replacing a 32 KiB snapshot with another needs 2070 entries for the
+// two, beside the setup and the token: about 2380 in all, which leaves 1500 spare for the pages
+// NVS is part-way through reclaiming. So every value, the largest snapshot included, is replaced
+// in one step, and a power cut leaves the old one or the new one. (In the 64 KiB partition
+// everything once shared, the old snapshot had to be erased first.) This was tried against
+// ESP-IDF v5.5.6's own NVS code built for a computer, with a 128 KiB partition holding the
+// largest setup and token: 1500 snapshot saves in one step each, 900 of them 32768 bytes (and
+// 300 of those straight over another of 32768), with the setup and the token rewritten every
+// 50th, all succeeded and read back, and the setup and the token were unchanged at the end.
+// storage_save_snapshot() still erases the old snapshot and tries once more if NVS ever says
+// there is no room, so a full partition costs the saved pages and nothing else.
 //
-// The radio's calibration data is the one thing here this firmware doesn't write: ESP-IDF's PHY
-// code keeps it in the same partition (so it is encrypted too) and writes it at the first start
-// of Wi-Fi. It holds nothing from a bundle, and a factory reset leaves it.
+// The main partition (64 KiB) holds the firmware keys (201 bytes), the update record (321), the
+// factory reset's mark and the one thing here this firmware doesn't write: ESP-IDF's PHY code
+// keeps the radio's calibration data there, in a namespace of its own ("phy", about 70
+// entries), and writes it at the first start of Wi-Fi. It holds nothing from a bundle, and a
+// factory reset leaves it.
 _Static_assert(DH_SETUP_BLOB_MAX < 3 * 126 * 32, "the largest setup must fit in three NVS pages");
-// Old and new together under this are replaced in one step: about 1300 entries with their
-// overhead, which fits beside everything else above.
-#define SNAPSHOT_REPLACE_BYTES 40000u
 _Static_assert(DH_MAX_SNAPSHOT_BYTES <= 15u * 125u * 32u, "a snapshot must be a size NVS takes");
+// One sector of flash, which is also one NVS page.
+#define SECTOR_BYTES 4096u
+_Static_assert(DH_SETUP_BLOB_MAX >= SECTOR_BYTES, "the scratch must hold a sector for the wipe's check");
 
 static SemaphoreHandle_t s_lock;
 static storage_facts_t s_facts = {.state = STORAGE_FAILED};
 static storage_key_status_t s_key_status;
+// The eFuse reading main.c prints every minute: brought up to date when the key is made.
+static efuse_report_t *s_efuse;
+// Encrypted NVS is running on the main partition. False for a new board, whose storage key
+// hasn't been made yet: nothing is stored, and nothing is written until store_prepare().
+static bool s_nvs_started;
+// And on the setup partition. False with s_nvs_started true only after a factory reset whose
+// erase failed part-way: nothing is read or written there until a reset, or a restart, has
+// finished the job.
+static bool s_setup_started;
 
 static uint32_t s_spare_slot_bytes;
 // The app partition that is running, as the update core numbers them (0 for ota_0), and whether
@@ -93,12 +133,30 @@ typedef enum {
     BLOB_ERROR,   // NVS couldn't read it
 } blob_result_t;
 
+// The partition a namespace is kept in.
+static const char *partition_of(const char *namespace)
+{
+    return strcmp(namespace, SETUP_NAMESPACE) == 0 ? SETUP_PARTITION : MAIN_PARTITION;
+}
+
+// Opens a namespace in its partition. Nothing is opened in a partition that isn't running: the
+// answer is then an error, never "not found".
+static esp_err_t open_namespace(const char *namespace, nvs_open_mode_t mode, nvs_handle_t *nvs)
+{
+    const char *partition = partition_of(namespace);
+    const bool started = strcmp(partition, SETUP_PARTITION) == 0 ? s_setup_started : s_nvs_started;
+    if (!started) {
+        return ESP_ERR_NVS_NOT_INITIALIZED;
+    }
+    return nvs_open_from_partition(partition, namespace, mode, nvs);
+}
+
 static blob_result_t read_blob(const char *namespace, const char *key, uint8_t *out, size_t cap,
                                size_t *len)
 {
     *len = 0;
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(namespace, NVS_READONLY, &nvs);
+    esp_err_t err = open_namespace(namespace, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         return BLOB_MISSING;
     }
@@ -145,7 +203,7 @@ static bool write_blob(const char *namespace, const char *key, uint8_t *data, si
         return false;
     }
     nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open(namespace, NVS_READWRITE, &nvs);
+    esp_err_t err = open_namespace(namespace, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "couldn't open %s for writing: %s", namespace, esp_err_to_name(err));
         dh_wipe(before, sizeof(before));
@@ -199,6 +257,10 @@ static dh_held store_held(void *ctx)
     if (s_facts.state != STORAGE_WORKING) {
         return DH_HELD_UNKNOWN;
     }
+    if (s_nvs_started && !s_setup_started) {
+        // A factory reset's erase failed part-way: what the setup partition holds isn't known.
+        return DH_HELD_UNKNOWN;
+    }
     if (s_facts.set_up) {
         return DH_HELD_SETUP;
     }
@@ -217,6 +279,9 @@ static bool write_fw_keys(const dh_fw_keys *keys)
         ESP_LOGE(TAG, "not writing the firmware keys: updates are off until a restart");
         return false;
     }
+    // (On a new board nothing asks for this before store_prepare() has started NVS: its record
+    // is new and its budget full, so the update core has nothing to save. If something did,
+    // write_blob() fails for want of NVS and update work stops, as for any failed write.)
     uint8_t blob[DH_FW_KEYS_BLOB_LEN];
     dh_fw_keys_encode(keys, blob);
     // Never erased if the write goes wrong: a missing set of keys would read as none.
@@ -285,40 +350,190 @@ static bool store_save_setup(void *ctx, const dh_setup *setup)
     return ok;
 }
 
-// A factory reset: everything in the setup namespace, and nothing in the firmware one.
+// ---- The factory reset's erase ----
+
+// Whether the mark of an unfinished erase is there. False if it couldn't be read.
+static bool read_reset_mark(bool *marked)
+{
+    *marked = false;
+    nvs_handle_t nvs;
+    esp_err_t err = open_namespace(RESET_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+    uint8_t value = 0;
+    err = nvs_get_u8(nvs, RESET_KEY, &value);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return true;
+    }
+    // Any value at all is the mark.
+    *marked = err == ESP_OK;
+    return err == ESP_OK;
+}
+
+static bool write_reset_mark(bool marked)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = open_namespace(RESET_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = marked ? nvs_set_u8(nvs, RESET_KEY, 1) : nvs_erase_key(nvs, RESET_KEY);
+        if (err == ESP_OK || (!marked && err == ESP_ERR_NVS_NOT_FOUND)) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "couldn't %s the mark of a factory reset under way: %s",
+                 marked ? "write" : "take out", esp_err_to_name(err));
+    }
+    return err == ESP_OK;
+}
+
+static const esp_partition_t *setup_partition(void)
+{
+    return esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_NVS,
+                                    SETUP_PARTITION);
+}
+
+// Erases every sector of the setup partition and reads each back as blank (0xFF), straight
+// from flash. NVS must not be running on it. A sector at a time, so no one call holds the chip
+// for long. True only if the whole partition then reads as blank.
+static bool wipe_setup_partition(const esp_partition_t *partition)
+{
+    if (partition->size % SECTOR_BYTES != 0) {
+        ESP_LOGE(TAG, "the setup partition isn't a whole number of sectors");
+        return false;
+    }
+    for (size_t at = 0; at < partition->size; at += SECTOR_BYTES) {
+        esp_err_t err = esp_partition_erase_range(partition, at, SECTOR_BYTES);
+        if (err == ESP_OK) {
+            err = esp_partition_read_raw(partition, at, s_blob, SECTOR_BYTES);
+        }
+        bool blank = err == ESP_OK;
+        for (size_t i = 0; blank && i < SECTOR_BYTES; i++) {
+            blank = s_blob[i] == 0xff;
+        }
+        if (!blank) {
+            ESP_LOGE(TAG, "couldn't erase the setup partition at 0x%x: %s", (unsigned)at,
+                     err == ESP_OK ? "it didn't read back as blank" : esp_err_to_name(err));
+            // What was read may be part of the old setup.
+            dh_wipe(s_blob, DH_SETUP_BLOB_MAX);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Stops NVS on the setup partition, erases all of it, checks it, and (with a storage key)
+// starts NVS on it again, blank. The mark is written first and taken out last: see the top of
+// this file. True only if every step was seen to work.
+static bool erase_setup_partition(void)
+{
+    const esp_partition_t *partition = setup_partition();
+    if (partition == NULL) {
+        ESP_LOGE(TAG, "this flash layout has no \"%s\" partition", SETUP_PARTITION);
+        return false;
+    }
+    // If the mark can't be written the erase still goes ahead: it is what was asked for. Only
+    // a power cut in the next second or two could then leave part of the setup behind.
+    const bool marked = s_nvs_started && write_reset_mark(true);
+    if (s_setup_started) {
+        // Closes every handle on it. It is given back to NVS only once it is blank.
+        s_setup_started = false;
+        const esp_err_t err = nvs_flash_deinit_partition(SETUP_PARTITION);
+        if (err != ESP_OK && err != ESP_ERR_NVS_NOT_INITIALIZED) {
+            ESP_LOGE(TAG, "couldn't stop NVS on the setup partition: %s", esp_err_to_name(err));
+            return false;
+        }
+    }
+    if (!wipe_setup_partition(partition)) {
+        return false;
+    }
+    ESP_LOGW(TAG, "the setup partition was erased: all %u bytes at 0x%x read back as blank",
+             (unsigned)partition->size, (unsigned)partition->address);
+    if (!s_nvs_started) {
+        // A new board with no storage key yet: there is no NVS to start, and no mark.
+        return true;
+    }
+    if (storage_key_start_partition(&s_key_status, SETUP_PARTITION) != ESP_OK) {
+        return false;
+    }
+    // While the mark is there the next start erases the partition again, so nothing may be
+    // stored in it: if the mark can't be taken out, the partition stays out of use and the
+    // reset is reported as failed, to be tried again or finished by a restart.
+    if (marked && !write_reset_mark(false)) {
+        (void)nvs_flash_deinit_partition(SETUP_PARTITION);
+        return false;
+    }
+    s_setup_started = true;
+    return true;
+}
+
+// A factory reset: every sector of the setup partition, and nothing in the main one but the
+// mark while it is under way.
 static bool store_erase_setup(void *ctx)
 {
     (void)ctx;
     // Whatever happens next, nothing more is written for the setup that was held.
     s_generation++;
-    nvs_handle_t nvs = 0;
-    esp_err_t err = nvs_open(SETUP_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = nvs_erase_all(nvs);
-        if (err == ESP_OK) {
-            err = nvs_commit(nvs);
-        }
-        // They must be gone, not merely reported so: the setup, the token and the saved pages.
-        static const char *const keys[] = {SETUP_KEY, DEVICE_KEY, SNAPSHOT_KEY};
-        for (size_t i = 0; err == ESP_OK && i < sizeof(keys) / sizeof(keys[0]); i++) {
-            size_t stored = 0;
-            const esp_err_t left = nvs_get_blob(nvs, keys[i], NULL, &stored);
-            if (left != ESP_ERR_NVS_NOT_FOUND) {
-                err = left == ESP_OK ? ESP_FAIL : left;
-            }
-        }
-        nvs_close(nvs);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "couldn't erase the setup: %s", esp_err_to_name(err));
-        return false;
-    }
+    // And nothing is held: part of it may be gone already if the erase fails.
     s_facts.set_up = false;
     s_facts.setup_unreadable = false;
     s_facts.hub_hosts = 0;
     s_facts.wifi_set = false;
     s_facts.enrolled = false;
     s_facts.snapshot_bytes = 0;
+    if (!erase_setup_partition()) {
+        ESP_LOGE(TAG, "couldn't erase the setup: hold BOOT again, or restart the display, to "
+                      "finish the job");
+        return false;
+    }
+    return true;
+}
+
+// Before a bundle's first write (dh_usb.h): on a new board, makes the storage key, PERMANENTLY
+// (storage_key.h says why it is left until now), and starts encrypted NVS for the first time.
+// On every other board there is nothing to do.
+static bool start_nvs(void);
+static bool nothing_stored(void);
+
+static bool store_prepare(void *ctx)
+{
+    (void)ctx;
+    if (s_facts.state != STORAGE_WORKING) {
+        return false;
+    }
+    if (s_nvs_started) {
+        return s_setup_started;
+    }
+    ESP_LOGW(TAG, "a setup has arrived for a board with no storage key: making the key first");
+    const esp_err_t err = storage_key_make(s_efuse, &s_key_status);
+    storage_key_log(&s_key_status);
+    if (err != ESP_OK) {
+        s_facts = (storage_facts_t){.state = s_key_status.state == STORAGE_KEY_BLOCKED
+                                                 ? STORAGE_NO_KEY
+                                                 : STORAGE_FAILED};
+        ESP_LOGE(TAG, "the storage key couldn't be made: this display can't be set up");
+        return false;
+    }
+    if (!start_nvs()) {
+        s_facts = (storage_facts_t){.state = STORAGE_FAILED};
+        ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+        return false;
+    }
+    ESP_LOGI(TAG, "encrypted NVS started, with a storage key made just now");
+    // A new board's flash holds nothing of this firmware's, and what is in memory says so. If
+    // something is there after all, memory is wrong: take nothing until a restart has read it.
+    if (!nothing_stored()) {
+        s_facts = (storage_facts_t){.state = STORAGE_FAILED};
+        ESP_LOGE(TAG, "this board had no storage key, yet something is stored: restart the "
+                      "display before setting it up");
+        return false;
+    }
     return true;
 }
 
@@ -329,6 +544,7 @@ static const dh_setup_store s_store = {
     .save_record = store_save_record,
     .save_setup = store_save_setup,
     .erase_setup = store_erase_setup,
+    .prepare = store_prepare,
 };
 
 // ---- Start-up ----
@@ -339,11 +555,11 @@ static const dh_setup_store s_store = {
 static void erase_check_build_leftovers(void)
 {
     nvs_handle_t nvs;
-    if (nvs_open(D2_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+    if (open_namespace(D2_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
         return;
     }
     nvs_close(nvs);
-    if (nvs_open(D2_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
+    if (open_namespace(D2_NAMESPACE, NVS_READWRITE, &nvs) != ESP_OK) {
         return;
     }
     const bool erased = nvs_erase_all(nvs) == ESP_OK && nvs_commit(nvs) == ESP_OK;
@@ -413,7 +629,7 @@ static bool stored_length(const char *namespace, const char *key, size_t *len)
 {
     *len = 0;
     nvs_handle_t nvs;
-    esp_err_t err = nvs_open(namespace, NVS_READONLY, &nvs);
+    esp_err_t err = open_namespace(namespace, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
         return true;
     }
@@ -494,12 +710,77 @@ static void *scratch_alloc(size_t bytes)
     return p != NULL ? p : heap_caps_calloc(1, bytes, MALLOC_CAP_DEFAULT);
 }
 
+// Starts encrypted NVS on the setup partition. If the mark of an unfinished factory reset is
+// there, or NVS won't start on it, the partition is erased first, so it comes up blank and the
+// display waits for setup. The main partition is only read, and its mark taken out.
+static bool start_setup_partition(void)
+{
+    if (setup_partition() == NULL) {
+        ESP_LOGE(TAG, "this flash layout has no \"%s\" partition: it is from an older build. "
+                      "Install firmware over USB sets the layout",
+                 SETUP_PARTITION);
+        return false;
+    }
+    bool marked = false;
+    if (!read_reset_mark(&marked)) {
+        ESP_LOGE(TAG, "couldn't tell whether a factory reset was under way");
+        return false;
+    }
+    if (marked) {
+        ESP_LOGW(TAG, "a factory reset was cut short: finishing its erase now");
+    } else {
+        const esp_err_t err = storage_key_start_partition(&s_key_status, SETUP_PARTITION);
+        if (err == ESP_OK) {
+            s_setup_started = true;
+            return true;
+        }
+        if (err == ESP_ERR_NO_MEM) {
+            // Nothing wrong with what is stored.
+            return false;
+        }
+        ESP_LOGE(TAG, "the setup partition can't be used as it is: erasing it, so this display "
+                      "will wait for setup");
+    }
+    return erase_setup_partition();
+}
+
+// Starts encrypted NVS on both partitions. Needs a storage key (STORAGE_KEY_PRESENT).
+static bool start_nvs(void)
+{
+    if (storage_key_start_partition(&s_key_status, MAIN_PARTITION) != ESP_OK) {
+        return false;
+    }
+    s_nvs_started = true;
+    erase_check_build_leftovers();
+    return start_setup_partition();
+}
+
+// Whether neither partition holds anything this firmware keeps. False if any is there, or
+// that couldn't be told.
+static bool nothing_stored(void)
+{
+    static const struct {
+        const char *namespace, *key;
+    } all[] = {
+        {FW_NAMESPACE, FW_KEY_KEYS},  {FW_NAMESPACE, FW_KEY_RECORD},  {SETUP_NAMESPACE, SETUP_KEY},
+        {SETUP_NAMESPACE, DEVICE_KEY}, {SETUP_NAMESPACE, SNAPSHOT_KEY},
+    };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        size_t len = 0;
+        if (!stored_length(all[i].namespace, all[i].key, &len) || len != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void storage_start(efuse_report_t *efuse)
 {
     s_lock = xSemaphoreCreateRecursiveMutex();
     s_setup_scratch = scratch_alloc(sizeof(*s_setup_scratch));
     s_blob = scratch_alloc(DH_SETUP_BLOB_MAX);
     s_facts = (storage_facts_t){.state = STORAGE_FAILED};
+    s_efuse = efuse;
     dh_fw_keys_init(storage_fw_keys());
     dh_fw_record_init(storage_fw_record());
     if (s_lock == NULL || s_setup_scratch == NULL || s_blob == NULL) {
@@ -509,18 +790,31 @@ void storage_start(efuse_report_t *efuse)
 
     read_running_partition();
 
-    bool key_made = false;
-    const esp_err_t err = storage_key_start_nvs(efuse, &s_key_status, &key_made);
+    storage_key_assess(efuse, &s_key_status);
     storage_key_log(&s_key_status);
-    if (err != ESP_OK) {
-        s_facts.state =
-            s_key_status.state == STORAGE_KEY_BLOCKED ? STORAGE_NO_KEY : STORAGE_FAILED;
+    if (s_key_status.state == STORAGE_KEY_BLOCKED) {
+        s_facts.state = STORAGE_NO_KEY;
         ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
         return;
     }
-    ESP_LOGI(TAG, "encrypted NVS started%s", key_made ? " (with a storage key made just now)" : "");
+    if (s_key_status.state == STORAGE_KEY_EMPTY) {
+        // A new board. Nothing is burnt and NVS isn't started: without a key nothing can have
+        // been stored, so the display holds no setup, no firmware keys and a new update record,
+        // which is what memory already says. The key is made by store_prepare().
+        if (!s_running_known) {
+            ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+            return;
+        }
+        storage_fw_settle_start(s_running_slot, s_image_on_trial);
+        s_facts.state = STORAGE_WORKING;
+        return;
+    }
 
-    erase_check_build_leftovers();
+    if (!start_nvs()) {
+        ESP_LOGE(TAG, "storage isn't working: this display can't be set up");
+        return;
+    }
+    ESP_LOGI(TAG, "encrypted NVS started");
     if (!load_firmware_state() || !load_setup()) {
         s_facts = (storage_facts_t){.state = STORAGE_FAILED};
         ESP_LOGE(TAG, "storage couldn't be read: this display can't be set up");
@@ -550,6 +844,15 @@ storage_facts_t storage_facts(void)
 const storage_key_status_t *storage_key_status(void)
 {
     return &s_key_status;
+}
+
+const char *storage_usb_words(void)
+{
+    // Fixed words, at most 200 bytes (dh_usb.h, storage_why).
+    return s_facts.state == STORAGE_NO_KEY && s_key_status.unfinished
+               ? "This display's storage key was never finished, so it can't keep a setup "
+                 "safely and can't be set up. Its screen says more."
+               : NULL;
 }
 
 const dh_setup_store *storage_store(void)
@@ -678,6 +981,10 @@ bool storage_clear_secret(uint32_t generation)
             len = dh_setup_encode(s_setup_scratch, s_blob);
             // Never erased if the write goes wrong: the old setup, secret and all, is better
             // than none, and the secret is of no use to anyone once the hub has seen it.
+            // (Rewriting only marks the old copy's entries as erased, so that copy, with the
+            // used secret, stays in the setup partition's flash until NVS reclaims the page or
+            // a factory reset erases the partition. That is accepted: the secret is spent, and
+            // everything else in the old copy is in the new one too.)
             ok = len > 0 && write_blob(SETUP_NAMESPACE, SETUP_KEY, s_blob, len, false);
         }
         dh_setup_wipe(s_setup_scratch);
@@ -711,22 +1018,13 @@ bool storage_save_snapshot(uint32_t generation, uint8_t *body, size_t len)
     bool ok = false;
     storage_lock();
     nvs_handle_t nvs = 0;
-    if (setup_is(generation) && nvs_open(SETUP_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
-        // See "Room" at the top of this file. Erasing first means a power cut between the two
-        // steps leaves no saved snapshot, which only costs the pages shown before the first poll.
-        bool erased = false;
-        esp_err_t err = ESP_OK;
-        if (s_facts.snapshot_bytes + len > SNAPSHOT_REPLACE_BYTES) {
-            err = nvs_erase_key(nvs, SNAPSHOT_KEY);
-            if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
-                err = nvs_commit(nvs);
-            }
-            erased = true;
-        }
-        if (err == ESP_OK) {
-            err = nvs_set_blob(nvs, SNAPSHOT_KEY, body, len);
-        }
-        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE && !erased) {
+    if (setup_is(generation) && open_namespace(SETUP_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        // One step: the old snapshot stays until the new one is whole (see "Room" at the top of
+        // this file). If NVS ever says there is no room all the same, the old one is erased and
+        // the write tried once more; a power cut between those two leaves no saved snapshot,
+        // which only costs the pages shown before the first poll.
+        esp_err_t err = nvs_set_blob(nvs, SNAPSHOT_KEY, body, len);
+        if (err == ESP_ERR_NVS_NOT_ENOUGH_SPACE) {
             err = nvs_erase_key(nvs, SNAPSHOT_KEY);
             if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) {
                 err = nvs_commit(nvs);
@@ -764,7 +1062,7 @@ void storage_log(void)
 {
     storage_lock();
     if (storage_key_burn_changed_more()) {
-        ESP_LOGE(TAG, "making the storage key at this start changed more of the eFuses than "
+        ESP_LOGE(TAG, "making the storage key in this run changed more of the eFuses than "
                       "KEY%d: compare the eFuse reports printed at start-up",
                  STORAGE_KEY_BLOCK);
     }
@@ -779,6 +1077,12 @@ void storage_log(void)
                      (unsigned)s_facts.hub_hosts, s_facts.hub_hosts == 1 ? "address" : "addresses",
                      s_facts.wifi_set ? "set" : "not set", s_facts.enrolled ? "held" : "not held",
                      s_facts.snapshot_bytes);
+        } else if (!s_nvs_started) {
+            ESP_LOGI(TAG, "set up: no, waiting for setup over USB (a new board: its storage key "
+                          "will be made when the setup arrives)");
+        } else if (!s_setup_started) {
+            ESP_LOGE(TAG, "set up: no, and a factory reset didn't finish: hold BOOT again or "
+                          "restart the display");
         } else {
             ESP_LOGI(TAG, "set up: no, waiting for setup over USB");
         }

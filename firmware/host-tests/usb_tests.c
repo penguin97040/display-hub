@@ -85,6 +85,10 @@ typedef struct {
     bool restart_after_failure;
     bool fail_keys, fail_record, fail_setup, fail_erase;
     unsigned key_writes, record_writes, setup_writes, erases;
+    /* For the store's `prepare` (only the displays that set it): whether it fails, how often it
+     * was called, and how many writes had been made when it last was. */
+    bool fail_prepare;
+    unsigned prepares, writes_before_prepare;
 } fake_store;
 
 static dh_held fake_held(void *ctx)
@@ -152,6 +156,17 @@ static bool fake_erase_setup(void *ctx)
     return true;
 }
 
+static bool fake_prepare(void *ctx)
+{
+    fake_store *f = ctx;
+    f->prepares++;
+    f->writes_before_prepare = f->key_writes + f->record_writes + f->setup_writes;
+    if (f->fail_prepare && f->restart_after_failure) {
+        f->restart_needed = true;
+    }
+    return !f->fail_prepare;
+}
+
 /* A display: the fake flash, what is in memory, and the handler's view of both. */
 typedef struct {
     fake_store flash;
@@ -173,10 +188,11 @@ static display *new_display(void)
     dh_fw_keys_encode(&d.keys, d.flash.keys);
     dh_fw_record_encode(&d.record, d.flash.record);
     d.store = (dh_setup_store){&d.flash,         fake_held,       fake_save_keys,
-                               fake_save_record, fake_save_setup, fake_erase_setup};
+                               fake_save_record, fake_save_setup, fake_erase_setup,
+                               NULL};
     d.usb = (dh_usb_display){"display-hub-waveshare-amoled-1.8", "0.1.0",
                              "waveshare-amoled-1.8-v2", 6291456, &d.store, &d.keys, &d.record,
-                             &d.work, false};
+                             &d.work, false, NULL};
     return &d;
 }
 
@@ -1039,8 +1055,116 @@ static void test_storage(void)
                  "\"firmware_version\":\"0.1.0\",\"hardware_revision\":\"waveshare-amoled-1.8-v2\","
                  "\"protocol_version\":1,\"provisioned\":false}\n") == 0);
     CHECK(!dh_usb_factory_reset(&d->usb));
+    /* The display's own words for why, when it has some: used as they are, for a bundle only.
+     * Words too long for a message, or none, give the usual ones. */
+    d->usb.storage_why = "This display's storage key was damaged while it was being made.";
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strcmp(d->reply, "{\"type\":\"error\",\"code\":\"storage_failed\",\"message\":\"This "
+                           "display's storage key was damaged while it was being made.\"}\n") ==
+          0);
+    CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
+    CHECK(strstr(d->reply, "damaged") == NULL);
+    static char too_long[202];
+    memset(too_long, 'x', sizeof too_long - 1);
+    d->usb.storage_why = too_long;
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "storage isn't working") != NULL);
+    d->usb.storage_why = "";
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "storage isn't working") != NULL);
+    /* They are for a display with no store: one whose store can't be read keeps the usual. */
+    d = new_display();
+    d->flash.unreadable = true;
+    d->usb.storage_why = "This display's storage key was damaged while it was being made.";
+    CHECK(refused(d, line, DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "storage isn't working") != NULL);
+    d = new_display();
+    d->usb.store = NULL;
+    d->usb.keys = NULL;
+    d->usb.record = NULL;
     CHECK(d->flash.key_writes + d->flash.record_writes + d->flash.setup_writes + d->flash.erases ==
           0);
+}
+
+/* A store's `prepare` is called once for a bundle that has passed every check, before its first
+ * write, and never for a line that is refused or ignored. */
+static void test_prepare(void)
+{
+    parts good = base();
+    good.firmware = "{\"trusted_keys\":[\"" MAKER "\",\"" RECOVERY "\"],\"security_counter\":3}";
+    parts invalid = base();
+    invalid.port = "0";
+    parts not_a_point = base();
+    not_a_point.firmware = "{\"trusted_keys\":[\"" NOT_A_POINT "\"],\"security_counter\":0}";
+    parts strangers = base();
+    strangers.firmware = "{\"trusted_keys\":[\"" STRANGER "\"],\"security_counter\":9}";
+
+    /* Nothing that is refused or ignored reaches it, and `hello` never does. */
+    display *d = new_display();
+    d->store.prepare = fake_prepare;
+    CHECK(send(d, "{\"type\":\"hello\",\"protocol_version\":1}").outcome == DH_USB_HELLO);
+    CHECK(refused(d, line_of(&invalid), DH_USB_ERROR_INVALID_BUNDLE));
+    CHECK(refused(d, line_of(&not_a_point), DH_USB_ERROR_INVALID_BUNDLE));
+    CHECK(ignored(d, swapped("\"port\":8443,", "")));
+    CHECK(ignored(d, "{\"type\":\"provision\"}"));
+    CHECK(ignored(d, "not a message"));
+    CHECK(d->flash.prepares == 0);
+    give_keys(d, MAKER, RECOVERY, 3);
+    CHECK(refused(d, line_of(&strangers), DH_USB_ERROR_FIRMWARE_KEYS_LOCKED));
+    CHECK(d->flash.prepares == 0);
+    d->flash.unreadable = true;
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_STORAGE_FAILED));
+    d->flash.unreadable = false;
+    d->flash.restart_needed = true;
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_STORAGE_FAILED));
+    d->flash.restart_needed = false;
+    CHECK(d->flash.prepares == 0);
+
+    /* A good bundle: once, before any write. */
+    d = new_display();
+    d->store.prepare = fake_prepare;
+    d->flash.writes_before_prepare = 99;
+    CHECK(provisioned(d, line_of(&good)));
+    CHECK(d->flash.prepares == 1 && d->flash.writes_before_prepare == 0);
+    CHECK(d->flash.key_writes == 1 && d->flash.setup_writes == 1 && memory_matches_flash(d));
+    /* Set up now: the next bundle is refused before it. */
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_ALREADY_PROVISIONED));
+    CHECK(d->flash.prepares == 1);
+
+    /* It fails: storage_failed, with nothing written and nothing taken into memory. */
+    d = new_display();
+    d->store.prepare = fake_prepare;
+    d->flash.fail_prepare = true;
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strcmp(d->reply, "{\"type\":\"error\",\"code\":\"storage_failed\",\"message\":"
+                           "\"This display's storage isn't working, so it can't be set up.\"}\n") ==
+          0);
+    CHECK(d->flash.prepares == 1 && !d->flash.has_setup && d->keys.key_count == 0);
+    CHECK(d->flash.key_writes + d->flash.record_writes + d->flash.setup_writes == 0);
+    static const dh_setup zero;
+    CHECK(memcmp(&d->work, &zero, sizeof zero) == 0 && memory_matches_flash(d));
+    /* The same bundle again is tried again, and goes in once the store is ready. */
+    d->flash.fail_prepare = false;
+    CHECK(provisioned(d, line_of(&good)));
+    CHECK(d->flash.prepares == 2 && d->flash.writes_before_prepare == 0);
+
+    /* It fails and leaves the store needing a restart: the words say so. */
+    d = new_display();
+    d->store.prepare = fake_prepare;
+    d->flash.fail_prepare = true;
+    d->flash.restart_after_failure = true;
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_STORAGE_FAILED));
+    CHECK(strstr(d->reply, "until it restarts") != NULL);
+    CHECK(d->flash.key_writes + d->flash.record_writes + d->flash.setup_writes == 0);
+
+    /* A failed write after it changes nothing about it: the next try prepares again. */
+    d = new_display();
+    d->store.prepare = fake_prepare;
+    d->flash.fail_setup = true;
+    CHECK(refused(d, line_of(&good), DH_USB_ERROR_STORAGE_FAILED));
+    d->flash.fail_setup = false;
+    CHECK(provisioned(d, line_of(&good)));
+    CHECK(d->flash.prepares == 2);
 }
 
 static void test_factory_reset(void)
@@ -1470,6 +1594,7 @@ int main(void)
     test_the_size_limit();
     test_the_refusal_order();
     test_storage();
+    test_prepare();
     test_factory_reset();
     test_the_examples();
     test_hello_and_other_lines();

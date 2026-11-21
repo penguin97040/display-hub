@@ -1,9 +1,17 @@
 # The layout for a 16 MB board. A first install sets it for good: an over-the-air update writes only
 # the spare app slot, never this table. No factory partition, so the app goes to ota_0 (0x20000).
-# The 64 KiB NVS holds a 32 KiB snapshot with room to spare. About 3.9 MiB is left free at the end.
-# Name,   Type, SubType, Offset,   Size
-nvs,      data, nvs,     0x9000,   0x10000
-otadata,  data, ota,     0x19000,  0x2000
-phy_init, data, phy,     0x1b000,  0x1000
-ota_0,    app,  ota_0,   0x20000,  0x600000
-ota_1,    app,  ota_1,   0x620000, 0x600000
+# Two NVS partitions, both encrypted with the storage key (main/storage.c):
+#   nvs        what a factory reset keeps: the firmware keys, the update record and ESP-IDF's
+#              radio calibration. Never erased by the firmware.
+#   nvs_setup  what a factory reset removes: the setup, the device token and the saved snapshot.
+#              A reset erases every sector of it. 128 KiB, so a 32 KiB snapshot can be replaced
+#              by another in one step, beside the largest setup.
+# nvs_setup sits after the app slots so that nothing before it moves. About 3.75 MiB is left
+# free at the end.
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x10000
+otadata,   data, ota,     0x19000,  0x2000
+phy_init,  data, phy,     0x1b000,  0x1000
+ota_0,     app,  ota_0,   0x20000,  0x600000
+ota_1,     app,  ota_1,   0x620000, 0x600000
+nvs_setup, data, nvs,     0xc20000, 0x20000

@@ -1,0 +1,6 @@
+CONFIG_IDF_TARGET="linux"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+# The firmware's own table, so the sizes tried are the ones shipped.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="../../../partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000

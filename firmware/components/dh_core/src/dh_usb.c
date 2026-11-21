@@ -117,8 +117,13 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     dh_held holds = held(d);
     if (holds == DH_HELD_UNKNOWN || d->keys == NULL || d->record == NULL) {
         dh_setup_wipe(d->work);
+        /* The display's own words for it, if it has any and they fit a message. */
+        const bool own_words = d->store == NULL && d->storage_why != NULL &&
+                               d->storage_why[0] != '\0' && strlen(d->storage_why) <= 200;
         return refuse(DH_USB_ERROR_STORAGE_FAILED,
-                      "This display's storage isn't working, so it can't be set up.", reply, cap);
+                      own_words ? d->storage_why
+                                : "This display's storage isn't working, so it can't be set up.",
+                      reply, cap);
     }
     if (holds == DH_HELD_RESTART_NEEDED) {
         dh_setup_wipe(d->work);
@@ -150,6 +155,17 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
                    : refuse(DH_USB_ERROR_INVALID_BUNDLE,
                             "a key in firmware.trusted_keys isn't a valid P-256 public key", reply,
                             cap);
+    }
+
+    /* Every check has passed, so the store is about to be written: let it get ready. Only now,
+     * so that a line which was always going to be refused never sets this off. */
+    if (d->store->prepare != NULL && !d->store->prepare(d->store->ctx)) {
+        dh_setup_wipe(d->work);
+        return refuse(DH_USB_ERROR_STORAGE_FAILED,
+                      held(d) == DH_HELD_RESTART_NEEDED
+                          ? RESTART_NEEDED
+                          : "This display's storage isn't working, so it can't be set up.",
+                      reply, cap);
     }
 
     /* Keys, record, then the setup last: until that last write succeeds the display isn't set

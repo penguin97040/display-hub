@@ -855,7 +855,8 @@ static bool store_erase_setup(void *ctx)
 }
 
 static const dh_setup_store store = {NULL,           store_held,       store_save_keys,
-                                     store_save_record, store_save_setup, store_erase_setup};
+                                     store_save_record, store_save_setup, store_erase_setup,
+                                     NULL};
 static dh_setup work;
 
 /* Everything in a bundle but its firmware member. */
@@ -898,7 +899,7 @@ static const char *send_bundle(dh_json_value bundle_firmware)
 
     const dh_usb_display display = {"display-hub-waveshare-amoled-1.8", "0.1.0",
                                     "waveshare-amoled-1.8-v2", 6291456, &store, &keys, &record,
-                                    &work, false};
+                                    &work, false, NULL};
     dh_usb_answer a = dh_usb_handle_line(&display, (const uint8_t *)line, n, reply, sizeof reply);
     /* The reply line must say the same as the answer. */
     char want[DH_USB_REPLY_MAX];
@@ -944,7 +945,7 @@ static void run_provision(dh_json_value root)
         }
         const dh_usb_display display = {"display-hub-waveshare-amoled-1.8", "0.1.0",
                                         "waveshare-amoled-1.8-v2", 6291456, &store, &keys,
-                                        &record, &work, false};
+                                        &record, &work, false, NULL};
         if (!dh_usb_factory_reset(&display) || flash_setup.held) {
             die("the factory reset left the setup behind");
         }

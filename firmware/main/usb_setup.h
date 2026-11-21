@@ -19,7 +19,8 @@ extern "C" {
 // changes.
 #define USB_SETUP_DEVICE_TYPE "display-hub-waveshare-amoled-1.8"
 
-// Called from the USB task once a bundle has been stored. It should only wake another task.
+// Called from the USB task once a bundle has been stored, and also if handling one left storage
+// out of use (a new board whose storage key couldn't be made). It should only wake another task.
 typedef void (*usb_setup_stored_t)(void);
 
 // Installs the USB-Serial-JTAG driver and moves the console onto it. Call it first thing in

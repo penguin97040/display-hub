@@ -57,8 +57,11 @@ _Static_assert(TX_BUFFER_BYTES >= 2 * (DH_USB_REPLY_MAX + 1), "a reply must fit 
 // How long a reply waits for room in the transmit buffer. The app waits 10 seconds for an answer.
 #define REPLY_WAIT_MS 1000
 
-// JSON reading, a P-256 point check and encrypted NVS writes all run on this task.
-#define TASK_STACK_BYTES 8192
+// JSON reading, a P-256 point check and encrypted NVS writes all run on this task. So does the
+// making of a new board's storage key, with its eFuse reports and the first start of NVS
+// (storage.c, store_prepare), which happens once in a board's life and can't be tried again:
+// the stack has 4 KB more than the rest was seen to need.
+#define TASK_STACK_BYTES 12288
 #define TASK_PRIORITY    5
 
 static const char *s_firmware_version;
@@ -105,6 +108,7 @@ static void handle_line(const uint8_t *line, size_t len)
     // The keys, the record and the stored setup are shared with the rest of the firmware.
     storage_lock();
     const dh_setup_store *store = storage_store();
+    const storage_state_t state_before = storage_facts().state;
     // `hello` says nothing of the keys and the attempt budget once they may not be what flash
     // holds (storage_fw.h, "When a write fails"). The handler's own copies are left as they
     // are: a bundle is refused then, before it reads them.
@@ -121,6 +125,7 @@ static void handle_line(const uint8_t *line, size_t len)
         .record = store != NULL ? storage_fw_record() : NULL,
         .work = s_work,
         .withhold_firmware = !reportable,
+        .storage_why = store == NULL ? storage_usb_words() : NULL,
     };
     const dh_usb_answer answer =
         dh_usb_handle_line(&display, line, len, s_reply + 1, DH_USB_REPLY_MAX);
@@ -152,6 +157,11 @@ static void handle_line(const uint8_t *line, size_t len)
         break;
     case DH_USB_REFUSED:
         ESP_LOGW(TAG, "bundle refused: %s (%s)", dh_usb_error_name(answer.error), answer.why);
+        // Getting storage ready for a new board's first setup can end with storage out of use
+        // (storage.c, store_prepare). The screen is told, as it is of a stored setup.
+        if (facts.state != state_before && s_on_stored != NULL) {
+            s_on_stored();
+        }
         break;
     default:
         ESP_LOGW(TAG, "ignored a line of %u bytes that isn't a message for a display",

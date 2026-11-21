@@ -37,7 +37,8 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # different block means a different key, and NVS written with the old one can't be read.
 # With these on, ESP-IDF's nvs_flash_init() burns a new key into an empty KEY5 without asking,
 # whatever state the chip is in. The firmware never calls it: main/storage_key.c looks at the
-# eFuses first, and makes the key itself only on a new board whose KEY5 is empty.
+# eFuses first, and makes the key itself only on a new board whose KEY5 is empty, when that
+# board's first setup arrives over USB. Both NVS partitions (partitions.csv) use this one key.
 CONFIG_NVS_ENCRYPTION=y
 CONFIG_NVS_SEC_KEY_PROTECT_USING_HMAC=y
 CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID=5
@@ -53,7 +54,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 
 # --- Wi-Fi ---
 # The Wi-Fi driver must never keep the network's name and password in its own NVS namespace: a
-# factory reset erases only this firmware's setup namespace, so they would outlive it. The
+# factory reset erases only this firmware's setup partition, so they would outlive it. The
 # firmware hands them to the driver from its own encrypted setup at each start (main/wifi.c).
 # CONFIG_ESP_WIFI_NVS_ENABLED is not set
 # A display only ever joins a network. It is never an access point.
@@ -64,6 +65,10 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y
 
 # --- TLS (see docs/firmware-handoff.md, "TLS, exactly") ---
+# Lets main/hub_http.c hand ESP-IDF's HTTP client a connection of its own making, which keeps a
+# time limit on the TLS handshake and the answer's headers and can be stopped by a factory reset.
+# The client's built-in connection can do neither (the top of hub_http.c says why).
+CONFIG_ESP_HTTP_CLIENT_ENABLE_CUSTOM_TRANSPORT=y
 # The hub's records are at most 4 KiB, so a 4 KiB receive buffer is enough (the default is 16 KiB).
 CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
 CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096

@@ -118,7 +118,7 @@ esp_err_t wifi_prepare(TaskHandle_t wake)
     err = esp_wifi_init(&init);
     if (err == ESP_OK) {
         // The driver must never write the network's details to flash: a factory reset erases
-        // only this firmware's own setup namespace. (CONFIG_ESP_WIFI_NVS_ENABLED is off too.)
+        // only this firmware's own setup partition. (CONFIG_ESP_WIFI_NVS_ENABLED is off too.)
         err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     }
     if (err == ESP_OK) {

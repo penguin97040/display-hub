@@ -101,7 +101,8 @@ static bool store_erase_setup(void *ctx)
 }
 
 static const dh_setup_store store = {NULL,           store_held,       store_save_keys,
-                                     store_save_record, store_save_setup, store_erase_setup};
+                                     store_save_record, store_save_setup, store_erase_setup,
+                                     NULL};
 
 static dh_fw_keys keys;
 static dh_fw_record record;
@@ -250,7 +251,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
                                working ? &store : NULL,
                                working ? &keys : NULL,
                                working ? &record : NULL,
-                               &work, false};
+                               &work, false, NULL};
     dh_setup_wipe(&work);
 
     if (mode == 1 || mode == 3) {

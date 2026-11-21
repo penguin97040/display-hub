@@ -23,11 +23,10 @@
 //
 // HOW LONG ONE READ CAN TAKE. Two things in ESP-IDF stand between a download and its time limits,
 // and neither can be interrupted from outside once it has been called:
-// - Mbed TLS reads the socket until it has a whole TLS record, and on the blocking socket
-//   esp-tls sets up each of those reads may wait 10 seconds for one byte. hub_http.c makes the
-//   download's socket non-blocking, so a record that isn't all there yet reads as "nothing yet"
-//   and the call comes straight back (what was read in ESP-IDF for that is at the top of
-//   hub_http.c);
+// - Mbed TLS reads the socket until it has a whole TLS record, and on a blocking socket each
+//   of those reads may wait 10 seconds for one byte. hub_http.c's connection is on a socket
+//   that never blocks, so a record that isn't all there yet reads as "nothing yet" and the
+//   call comes straight back (what was read in ESP-IDF for that is at the top of hub_http.c);
 // - esp_http_client_read() (esp_http_client.c, line 1346) reads the connection again until it
 //   has every byte it was asked for, and stops early only when one of those reads waits its
 //   whole timeout for nothing. So a hub that sends tiny whole records, each just inside the

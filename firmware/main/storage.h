@@ -1,15 +1,26 @@
 // What the display keeps in flash, in encrypted NVS (docs/firmware-handoff.md, "Storage and NVS").
 //
-// Two namespaces, so a factory reset can erase one and leave the other:
+// Two NVS partitions, so a factory reset can erase one, every sector of it, and leave the other:
 //
-//   dh_setup  "setup"     the setup from the USB bundle (hub hosts, port, trust anchors, the
-//                         enrolment secret until it is used, Wi-Fi), as dh_setup_encode() writes it
-//             "device"    the device ID and token the hub gave it (dh_device_encode)
-//             "snapshot"  the last good snapshot, as the hub sent it (at most 32 KiB)
-//   dh_fw     "keys"    the trusted firmware keys and the security floor (dh_fw_keys_encode)
-//             "record"  the update record, with the attempt budget (dh_fw_record_encode)
+//   nvs_setup  dh_setup  "setup"     the setup from the USB bundle (hub hosts, port, trust
+//                                    anchors, the enrolment secret until it is used, Wi-Fi), as
+//                                    dh_setup_encode() writes it
+//                        "device"    the device ID and token the hub gave it (dh_device_encode)
+//                        "snapshot"  the last good snapshot, as the hub sent it (at most 32 KiB)
+//   nvs        dh_fw     "keys"      the trusted firmware keys and the security floor
+//                                    (dh_fw_keys_encode)
+//                        "record"    the update record, with the attempt budget
+//                                    (dh_fw_record_encode)
+//              dh_reset  "wiping"    there only while a factory reset's erase is under way
 //
-// A factory reset erases all of dh_setup and never touches dh_fw.
+// A factory reset erases the whole of nvs_setup, in flash itself, and never erases anything in
+// nvs (storage.c says why a partition and not a namespace). Both are encrypted with the same
+// storage key.
+//
+// A NEW BOARD has no storage key, so nothing can be stored on it and encrypted NVS isn't
+// started. It reads as working and not set up, with no firmware keys and a new update record.
+// Its key is made, permanently, when its first setup arrives and has passed every check
+// (the store's `prepare`; storage_key.h says why not sooner).
 //
 // The keys, the record and the session live in memory between writes (storage_fw.c, which also
 // has every call that changes them for an update). Anything that reads or changes them, or calls
@@ -42,7 +53,7 @@ extern "C" {
 
 typedef enum {
     STORAGE_WORKING,
-    // The storage key can't be used (storage_key.h): NVS was never started.
+    // The storage key can't be used (storage_key.h): NVS isn't started.
     STORAGE_NO_KEY,
     // Encrypted NVS didn't start, or what it holds couldn't be read.
     STORAGE_FAILED,
@@ -59,10 +70,12 @@ typedef struct {
     uint32_t snapshot_bytes; // the size of the saved snapshot, 0 for none
 } storage_facts_t;
 
-// Starts storage: looks at the storage key, starts encrypted NVS (making the key on a new
-// board's first start), and loads the firmware keys, the update record and the setup. Call it
-// once, before the USB task starts. `efuse` is the reading taken at start-up, and is brought up to
-// date if a key was made. It never erases the NVS partition.
+// Starts storage: looks at the storage key and, if there is one, starts encrypted NVS and loads
+// the firmware keys, the update record and the setup. Nothing is burnt here. Call it once,
+// before the USB task starts. `efuse` is the reading taken at start-up; it must outlive the
+// call, because it is brought up to date if a key is made later. It never erases the main NVS
+// partition; the setup partition is erased only to finish a factory reset that was cut short,
+// or if NVS can't start on it.
 void storage_start(efuse_report_t *efuse);
 
 // Take this around every use of the things below. It is recursive.
@@ -75,6 +88,9 @@ const storage_key_status_t *storage_key_status(void);
 
 // For dh_usb.h: NULL while storage isn't working.
 const dh_setup_store *storage_store(void);
+// For dh_usb.h's storage_why: words for the app when storage isn't working for a reason worth
+// telling apart (a storage key that was never finished). NULL for the usual words.
+const char *storage_usb_words(void);
 // The size of the spare app partition, 0 if there is none.
 uint32_t storage_spare_slot_bytes(void);
 
