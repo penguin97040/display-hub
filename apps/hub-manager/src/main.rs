@@ -98,7 +98,10 @@ fn main() {
         }),
         dir,
     );
-    let mut model = Model::new(saved, &pc_name()).with_guide_dismissed(guide_dismissed);
+    // The official firmware that came with the app is read and checked here too.
+    let mut model = Model::new(saved, &pc_name())
+        .with_guide_dismissed(guide_dismissed)
+        .with_bundled(firmware::bundled());
     let mut start = None;
     if let Some(hub) = model.hub.clone() {
         match ctx.resume(&hub) {

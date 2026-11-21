@@ -161,6 +161,10 @@ pub enum Op {
     UploadFirmware {
         path: PathBuf,
     },
+    /// Uploads a package this app has already read and checked: the one that came with it.
+    UploadLoaded {
+        loaded: Box<crate::firmware::Loaded>,
+    },
     RemoveFirmware {
         id: String,
     },
@@ -1008,6 +1012,12 @@ impl Model {
     /// Starts with the setup checklist already closed or not, as `manager.json` says.
     pub fn with_guide_dismissed(mut self, dismissed: bool) -> Self {
         self.guide_dismissed = dismissed;
+        self
+    }
+
+    /// Starts with the official firmware package that came with the app, if one did.
+    pub fn with_bundled(mut self, bundled: Option<crate::firmware::Bundled>) -> Self {
+        self.fw.bundled = bundled;
         self
     }
 

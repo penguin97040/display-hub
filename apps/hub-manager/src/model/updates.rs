@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 use super::{minutes, wifi_of, Busy, Confirm, EnrolStage, Model, Op, PackageSays, Refresh};
 use crate::field::Field;
 use crate::firmware::{
-    self, bundle_firmware, display_firmware, package_title, DisplayFirmware, Loaded, Plan, Progress,
+    self, bundle_firmware, display_firmware, package_title, Bundled, DisplayFirmware, Loaded, Plan, Progress,
     ProgressCell, Signer, SignerKind,
 };
 use crate::guidance::{signer_phrase, Guidance, Next, Tone};
@@ -174,6 +174,8 @@ pub struct LabelEdit {
 
 /// The firmware screen's own state.
 pub struct FirmwareUi {
+    /// The official firmware package that came with the app, if one did and it checked out.
+    pub bundled: Option<Bundled>,
     pub install: InstallFlow,
     pub label_edit: Option<LabelEdit>,
     pub publisher_label: Field,
@@ -185,6 +187,7 @@ pub struct FirmwareUi {
 impl Default for FirmwareUi {
     fn default() -> Self {
         Self {
+            bundled: None,
             install: InstallFlow::default(),
             label_edit: None,
             publisher_label: Field::new(48),
@@ -368,6 +371,29 @@ impl Model {
     pub fn upload_firmware(&mut self, path: PathBuf) -> Option<Op> {
         self.notice = None;
         self.start(Busy::Uploading, Op::UploadFirmware { path })
+    }
+
+    /// The official firmware that came with the app.
+    pub fn bundled(&self) -> Option<&Bundled> {
+        self.fw.bundled.as_ref()
+    }
+
+    /// Whether the hub already holds the official firmware that came with the app, as good as new.
+    pub fn bundled_on_hub(&self) -> bool {
+        self.bundled().is_some_and(|b| {
+            let id = b.package_id();
+            self.firmware_packages()
+                .iter()
+                .any(|p| p.package_id == id && !p.damaged)
+        })
+    }
+
+    /// Add the official firmware that came with the app to the hub. It was checked when the app
+    /// started.
+    pub fn upload_bundled(&mut self) -> Option<Op> {
+        let loaded = Box::new(self.bundled()?.loaded.clone());
+        self.notice = None;
+        self.start(Busy::Uploading, Op::UploadLoaded { loaded })
     }
 
     pub fn ask_remove_package(&mut self, id: &str) {
@@ -643,6 +669,18 @@ impl Model {
     pub fn load_package(&mut self, from: PackageSource) -> Option<Op> {
         self.notice = None;
         self.start(Busy::Loading, Op::LoadPackage { from })
+    }
+
+    /// Install firmware with the official package that came with the app. It is already read and
+    /// checked, so the next thing is to look for the display's port.
+    pub fn use_bundled(&mut self) -> Option<Op> {
+        if self.busy.is_some() || self.fw.install.stage != InstallStage::Choose {
+            return None;
+        }
+        let loaded = self.bundled()?.loaded.clone();
+        self.notice = None;
+        self.take_loaded(loaded);
+        self.first_install_scan()
     }
 
     pub(super) fn take_loaded(&mut self, loaded: Loaded) {
@@ -1744,6 +1782,63 @@ mod tests {
         let (loaded, _) = usb_package("esp32s3", key_set);
         m.finish(Ok(Outcome::PackageLoaded(Box::new(loaded))), Instant::now());
         assert_eq!(m.fw.install.stage, InstallStage::Ready);
+    }
+
+    #[test]
+    fn the_official_firmware_that_came_with_the_app_needs_no_file() {
+        // Without one, there is nothing to use or add.
+        let (mut m, _) = connected(vec![]);
+        assert!(m.bundled().is_none());
+        assert!(!m.bundled_on_hub());
+        assert!(m.upload_bundled().is_none());
+        assert!(m.use_bundled().is_none());
+        assert_eq!(m.fw.install.stage, InstallStage::Choose);
+        assert!(!m.fw.install.open);
+
+        let (loaded, _) = usb_package("esp32s3", true);
+        let (m0, now) = with_firmware();
+        let mut m = m0.with_bundled(Some(firmware::Bundled {
+            loaded: loaded.clone(),
+        }));
+        assert_eq!(m.bundled().map(|b| b.version()), Some("1.0.0"));
+
+        // Install firmware: straight to the details, with the very package that was checked, and
+        // looking for the display's port as after choosing a file.
+        assert!(matches!(m.use_bundled(), Some(Op::ListPorts)));
+        assert_eq!(m.fw.install.stage, InstallStage::Ready);
+        assert!(m.fw.install.open);
+        m.finish(Ok(Outcome::Ports(vec![])), now);
+        assert!(m.use_bundled().is_none(), "one is already chosen");
+        assert_eq!(
+            m.fw.install.loaded.as_ref().map(|l| l.checked.package_id),
+            Some(loaded.checked.package_id)
+        );
+        // Closing the install keeps the package for next time.
+        m.close_install();
+        assert!(m.bundled().is_some());
+
+        // Adding it to the hub sends the checked package, and then there is nothing left to add.
+        assert!(!m.bundled_on_hub());
+        match m.upload_bundled() {
+            Some(Op::UploadLoaded { loaded: sent }) => assert_eq!(sent.bytes, loaded.bytes),
+            other => panic!("{other:?}"),
+        }
+        let mut on_hub = package("a", "1.0.0", "k");
+        on_hub.package_id = loaded.checked.package_id.to_hex();
+        let mut r = m.last.clone().unwrap();
+        r.firmware.as_mut().unwrap().packages.push(on_hub.clone());
+        m.finish(
+            Ok(Outcome::Uploaded {
+                package: Box::new(on_hub),
+                new: true,
+                refresh: Some(r),
+            }),
+            now,
+        );
+        assert!(m.bundled_on_hub(), "{:?}", m.notice);
+        // A copy the hub can't read doesn't count: adding it again repairs it.
+        m.last.as_mut().unwrap().firmware.as_mut().unwrap().packages[3].damaged = true;
+        assert!(!m.bundled_on_hub());
     }
 
     #[test]

@@ -1,14 +1,19 @@
 """Checks the layout of a download that tools/release/package-app.sh or pi-tarball.sh packed.
 
-    python3 -I tools/release/check-package.py <windows|macos|linux|pi> <version> <folder>
+    python3 -I tools/release/check-package.py <windows|macos|linux|pi> <version> <folder> [<firmware>]
 
 <folder> holds the file, named as the release names it. It must hold one folder of the same name
 (display-hub-pi for the Pi) with exactly the files that download ships: programs 0755, everything
 else 0644 and folders 0755, every entry with the same time, owned by root in a tarball and in name
 order in a zip. CI runs this on every push, the release workflow on what it publishes. Use relative
 paths on Windows, where Python doesn't read Git Bash's /d/... paths.
+
+<firmware> is the official firmware package an app download must hold: under its own name in
+firmware/ beside the app (Display Hub.app/Contents/Resources/firmware/ on macOS), where the app
+looks for it, and the same bytes. Without it, the download must hold no firmware at all.
 """
 
+import hashlib
 import os
 import pathlib
 import sys
@@ -21,7 +26,13 @@ PI_PROGRAMS = ["hubd", "hub-send", "install.sh", "display-hub-helper", "helpers/
 APP = "Display Hub.app/Contents"
 
 
-def expected(platform: str, version: str) -> tuple[str, str, dict[str, int], set[str]]:
+def firmware_path(platform: str, firmware: str) -> str:
+    """Where a download keeps the official firmware package, inside its folder."""
+    folder = f"{APP}/Resources/firmware" if platform == "macos" else "firmware"
+    return f"{folder}/{pathlib.Path(firmware).name}"
+
+
+def expected(platform: str, version: str, firmware: str | None) -> tuple[str, str, dict[str, int], set[str]]:
     """The file's name, its folder, each file in the folder with its mode, and the folders."""
     if platform == "pi":
         deploy = pathlib.Path(__file__).resolve().parents[2] / "deploy" / "raspberry-pi"
@@ -43,6 +54,11 @@ def expected(platform: str, version: str) -> tuple[str, str, dict[str, int], set
         dirs |= {"Display Hub.app", APP, f"{APP}/MacOS", f"{APP}/_CodeSignature"}
     else:
         files["hub-manager" + exe] = 0o755
+    if firmware is not None:
+        inside = firmware_path(platform, firmware)
+        files[inside] = 0o644
+        parent = pathlib.PurePosixPath(inside).parent
+        dirs |= {parent.as_posix()} | ({f"{APP}/Resources"} if platform == "macos" else set())
     ext = ".zip" if platform in ("windows", "macos") else ".tar.gz"
     return top + ext, top, files, dirs
 
@@ -67,12 +83,30 @@ def entries(path: pathlib.Path) -> list[tuple[str, bool, int, object]]:
     return out
 
 
+def content(path: pathlib.Path, entry: str) -> bytes:
+    """One file's bytes, from the archive."""
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path) as z:
+            return z.read(entry)
+    with tarfile.open(path, "r:gz") as t:
+        f = t.extractfile(entry)
+        return f.read() if f else b""
+
+
 def main() -> int:
-    if len(sys.argv) != 4 or sys.argv[1] not in ("windows", "macos", "linux", "pi"):
-        print("usage: check-package.py <windows|macos|linux|pi> <version> <folder>", file=sys.stderr)
+    if len(sys.argv) not in (4, 5) or sys.argv[1] not in ("windows", "macos", "linux", "pi"):
+        print("usage: check-package.py <windows|macos|linux|pi> <version> <folder> [<firmware package>]",
+              file=sys.stderr)
         return 2
-    platform, version, folder = sys.argv[1:]
-    name, top, files, dirs = expected(platform, version)
+    platform, version, folder = sys.argv[1:4]
+    firmware = sys.argv[4] if len(sys.argv) == 5 else None
+    if firmware is not None and platform == "pi":
+        print("the Pi download holds no firmware package", file=sys.stderr)
+        return 2
+    if firmware is not None and not pathlib.Path(firmware).is_file():
+        print(f"no firmware package at {firmware}", file=sys.stderr)
+        return 1
+    name, top, files, dirs = expected(platform, version, firmware)
     path = pathlib.Path(folder) / name
     if not path.is_file():
         print(f"no {path}", file=sys.stderr)
@@ -111,10 +145,17 @@ def main() -> int:
         names = [e[0] + ("/" if e[1] else "") for e in found]
         if names != sorted(names):
             problems.append("the zip's entries aren't in name order")
+    said = ""
+    if firmware is not None and not problems:
+        inside = firmware_path(platform, firmware)
+        want = pathlib.Path(firmware).read_bytes()
+        if content(path, f"{top}/{inside}") != want:
+            problems.append(f"{top}/{inside} isn't the same as {firmware}")
+        said = f", with the firmware package {inside} (sha256 {hashlib.sha256(want).hexdigest()})"
     if problems:
         print(f"{path}:", *problems, sep="\n  ", file=sys.stderr)
         return 1
-    print(f"{path}: {len(got_files)} files as expected")
+    print(f"{path}: {len(got_files)} files as expected{said}")
     return 0
 
 

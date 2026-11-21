@@ -265,6 +265,43 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  firmware-official:
+    # The official package the owner signed and committed (firmware/official/), checked as a release
+    # checks it against the build above, except that a package older than the source is only a
+    # warning: the firmware changes between releases. Skipped until there is a package.
+    needs: firmware
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Look for the official package
+        id: present
+        run: |
+          if compgen -G "firmware/official/*.dhfw" > /dev/null; then
+            echo "package=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::firmware/official/ has no package yet, so there is no official firmware to check."
+            echo "package=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install Rust
+        if: steps.present.outputs.package == 'true'
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build hub-firmware
+        if: steps.present.outputs.package == 'true'
+        run: cargo build --locked -p hub-firmware
+      # The partner of upload-artifact, from the same publisher: what the firmware job built.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: steps.present.outputs.package == 'true'
+        with:
+          name: display-hub-firmware-unsigned
+          path: fw-out
+      - name: Check the official package against the build
+        if: steps.present.outputs.package == 'true'
+        run: |
+          python3 -I tools/release/check-official-firmware.py --dir firmware/official --build fw-out \
+            --hub-firmware target/debug/hub-firmware --app-keys apps/hub-manager/src/firmware.rs --stale-ok
+
   firmware-host:
     # The firmware's protocol and update cores, built for this computer and tested with every
     # vector, against mbedTLS 3.6 (the line ESP-IDF 5.5 ships), built as in the linux job. Skipped

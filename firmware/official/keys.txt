@@ -1,0 +1,10 @@
+# The official Display Hub firmware keys: public keys only, never a key file.
+#
+# One key to a line, as the 130 hex digits `hub-firmware keygen` prints after "Public key:".
+# Anything after a # is a comment; say there which key it is (everyday or recovery).
+#
+# The release checks the official package against this file: it must be signed by one of these
+# keys, and its key set must be exactly these keys. The app's OFFICIAL_KEYS
+# (apps/hub-manager/src/firmware.rs) must be these keys' ids, in this order; a test checks it.
+#
+# No official keys exist yet, so there are none below.

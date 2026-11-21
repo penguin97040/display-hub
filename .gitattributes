@@ -9,3 +9,5 @@ firmware/fuzz/corpus/fw_download/** binary
 firmware/fuzz/corpus/fw_manifest/** binary
 firmware/fuzz/corpus/usb/** binary
 firmware/fuzz/corpus/hub/** binary
+# Signed firmware packages are raw bytes, checked byte for byte by the release.
+*.dhfw binary

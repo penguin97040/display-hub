@@ -4,6 +4,7 @@
 //! tested without hardware. The view's wording for these is in `guidance.rs`.
 
 use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use firmware_package::{CheckedPackage, PackageError};
@@ -13,8 +14,8 @@ use hub_protocol::Timestamp;
 
 /// The key ids (SHA-256 of the public key, 64 lower-case hex digits) of the official Display Hub
 /// firmware keys, which the app names *Official Display Hub firmware*. Empty for now: no official
-/// key exists yet. The official keys will be added in a later step, once they have been made and
-/// their fingerprints published.
+/// key exists yet. They are the ids of the public keys in `firmware/official/keys.txt`, which the
+/// release checks the official package against; a test keeps the two lists the same.
 pub const OFFICIAL_KEYS: &[&str] = &[];
 
 /// How long a download normally takes. After this, an offer still reported as downloading is shown
@@ -92,6 +93,75 @@ fn signer_with(key_id: &str, labels: &[SignerView], official: &[&str]) -> Signer
         fingerprint: fingerprint(key_id),
         kind,
     }
+}
+
+// ----- the official firmware that comes with the app -----
+
+/// The folder a download keeps the official package in: beside the app's program on Windows and
+/// Linux, and in `Display Hub.app/Contents/Resources` on macOS. `tools/release/package-app.sh` puts
+/// it there.
+pub const BUNDLED_FOLDER: &str = "firmware";
+
+/// Where the official package would be, for an app whose program is the file `exe`.
+pub fn bundled_folder(exe: &Path, macos: bool) -> Option<PathBuf> {
+    let beside = exe.parent()?;
+    if macos {
+        // Display Hub.app/Contents/MacOS/hub-manager
+        Some(beside.parent()?.join("Resources").join(BUNDLED_FOLDER))
+    } else {
+        Some(beside.join(BUNDLED_FOLDER))
+    }
+}
+
+/// The official firmware package that came with the app, read and checked.
+#[derive(Clone, Debug)]
+pub struct Bundled {
+    pub loaded: Loaded,
+}
+
+impl Bundled {
+    pub fn version(&self) -> &str {
+        &self.loaded.checked.manifest.firmware_version
+    }
+
+    pub fn package_id(&self) -> String {
+        self.loaded.checked.package_id.to_hex()
+    }
+}
+
+/// The official package that came with this app, if there is one. Anything else in the folder is
+/// ignored, without a word: the app then looks as it does with no package at all.
+pub fn bundled() -> Option<Bundled> {
+    let exe = std::env::current_exe().ok()?;
+    bundled_in(&bundled_folder(&exe, cfg!(target_os = "macos"))?, OFFICIAL_KEYS)
+}
+
+/// The one package in `folder`, if it passes the checks a chosen file gets, is signed by one of the
+/// `official` keys and can do a first install over USB. A folder with no package, or more than one,
+/// has none: the app never guesses which is meant.
+fn bundled_in(folder: &Path, official: &[&str]) -> Option<Bundled> {
+    if official.is_empty() {
+        return None;
+    }
+    let mut found = None;
+    for entry in std::fs::read_dir(folder).ok()? {
+        let path = entry.ok()?.path();
+        if path.extension().is_some_and(|e| e == "dhfw") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(path);
+        }
+    }
+    let path = found?;
+    // A plain file of a package's size, never a link to somewhere else.
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > hub_protocol::limits::MAX_FIRMWARE_PACKAGE_BYTES {
+        return None;
+    }
+    let loaded = Loaded::check(std::fs::read(&path).ok()?).ok()?;
+    let official = official.contains(&loaded.checked.signer_key_id().to_hex().as_str());
+    (official && Plan::of(&loaded.checked).is_ok()).then_some(Bundled { loaded })
 }
 
 // ----- versions -----
@@ -707,7 +777,120 @@ pub(crate) mod tests {
         let official = signer_with(&id, &[label(&id, "Kea Displays")], &[id.as_str()]);
         assert_eq!(official.kind, SignerKind::Official);
         assert_eq!(official.name(), "Official Display Hub firmware");
-        assert!(OFFICIAL_KEYS.is_empty(), "no official key exists yet");
+    }
+
+    /// The public keys in a keys file: 130 hex digits each, one to a line, with `#` starting a
+    /// comment. `tools/release/check-official-firmware.py` reads the file the same way.
+    fn keys_in(text: &str) -> Vec<firmware_package::PublicKey> {
+        text.lines()
+            .map(|l| l.split('#').next().unwrap_or_default().trim())
+            .filter(|l| !l.is_empty())
+            .map(|l| {
+                firmware_package::PublicKey::from_hex(l)
+                    .filter(firmware_package::PublicKey::is_valid_point)
+                    .unwrap_or_else(|| panic!("{l:?} in the keys file isn't a public key"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_official_keys_are_the_ones_the_release_checks_against() {
+        let keys = keys_in(include_str!("../../../firmware/official/keys.txt"));
+        let ids: Vec<String> = keys.iter().map(|k| k.key_id().to_hex()).collect();
+        assert_eq!(
+            OFFICIAL_KEYS,
+            ids.iter().map(String::as_str).collect::<Vec<_>>(),
+            "OFFICIAL_KEYS must be the key ids of firmware/official/keys.txt, in its order"
+        );
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "a key is listed twice");
+
+        // The reader itself: comments and blank lines aside, each line is one key.
+        let key = SigningKey::generate().unwrap().0.public_key();
+        let text = format!("# Everyday\n\n{}  # the everyday key\n", key.to_hex());
+        assert_eq!(keys_in(&text), [key]);
+    }
+
+    #[test]
+    fn the_app_and_a_macos_bundle_keep_the_official_package_in_their_own_places() {
+        assert_eq!(
+            bundled_folder(Path::new("/opt/display-hub/hub-manager"), false),
+            Some(PathBuf::from("/opt/display-hub/firmware"))
+        );
+        assert_eq!(
+            bundled_folder(
+                Path::new("/Applications/Display Hub.app/Contents/MacOS/hub-manager"),
+                true
+            ),
+            Some(PathBuf::from(
+                "/Applications/Display Hub.app/Contents/Resources/firmware"
+            ))
+        );
+        assert_eq!(bundled_folder(Path::new("/"), false), None);
+    }
+
+    #[test]
+    fn a_bundled_package_is_official_only_when_an_official_key_signed_it() {
+        let (loaded, key) = usb_package("esp32s3", true);
+        let id = key.public_key().key_id().to_hex();
+        let other = SigningKey::generate().unwrap().0.public_key().key_id().to_hex();
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join(BUNDLED_FOLDER);
+
+        // No folder, and an empty one.
+        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        std::fs::create_dir(&folder).unwrap();
+        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+
+        let file = folder.join("display-hub-waveshare-amoled-1.8-1.0.0.dhfw");
+        std::fs::write(&file, loaded.bytes.as_slice()).unwrap();
+        std::fs::write(folder.join("README.txt"), "not a package").unwrap();
+        let found = bundled_in(&folder, &[other.as_str(), id.as_str()]).expect("signed by an official key");
+        assert_eq!(found.version(), "1.0.0");
+        assert_eq!(found.package_id(), loaded.checked.package_id.to_hex());
+        assert_eq!(found.loaded.bytes, loaded.bytes);
+
+        // Well formed, but signed by someone else: never official. Nor is anything for an app
+        // with no official keys, nor a test's throwaway key for the app as it is built.
+        assert!(bundled_in(&folder, &[other.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[]).is_none());
+        assert!(bundled_in(&folder, OFFICIAL_KEYS).is_none());
+
+        // A file that doesn't check out.
+        let mut damaged = loaded.bytes.to_vec();
+        let last = damaged.len() - 1;
+        damaged[last] ^= 1;
+        std::fs::write(&file, &damaged).unwrap();
+        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        std::fs::write(&file, b"not a package").unwrap();
+        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+
+        // Two packages: the app doesn't guess.
+        std::fs::write(&file, loaded.bytes.as_slice()).unwrap();
+        assert!(bundled_in(&folder, &[id.as_str()]).is_some());
+        std::fs::write(folder.join("another.dhfw"), loaded.bytes.as_slice()).unwrap();
+        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+    }
+
+    #[test]
+    fn a_bundled_package_that_cant_do_a_first_install_is_left_alone() {
+        let key = SigningKey::generate().unwrap().0;
+        let release = Release {
+            device_type: "desk".into(),
+            hardware_revisions: vec!["simulated".into()],
+            firmware_version: "1.0.0".into(),
+            security_counter: 0,
+            summary: None,
+            key_set: None,
+            usb_install: None,
+        };
+        let built = build_and_sign(&key, &release, &[9; 5000]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("updates-only.dhfw"), &built.bytes).unwrap();
+        let id = key.public_key().key_id().to_hex();
+        assert!(bundled_in(dir.path(), &[id.as_str()]).is_none());
     }
 
     fn package(id: &str, version: &str, signer: &str) -> FirmwarePackageView {

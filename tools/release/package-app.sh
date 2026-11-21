@@ -3,12 +3,17 @@
 # `cargo build --release --locked` of hub-manager, hub-send, hub-firmware, display-simulator and
 # usage-helper. The release workflow runs it on each runner; it prints the file's path.
 #
-#   bash tools/release/package-app.sh windows <version> <bin-dir> <out-dir>   display-hub-windows-x64-<version>.zip
-#   bash tools/release/package-app.sh macos   <version> <bin-dir> <out-dir>   display-hub-macos-arm64-<version>.zip
-#   bash tools/release/package-app.sh linux   <version> <bin-dir> <out-dir>   display-hub-linux-x64-<version>.tar.gz
+#   bash tools/release/package-app.sh windows <version> <bin-dir> <out-dir> [<firmware>]   display-hub-windows-x64-<version>.zip
+#   bash tools/release/package-app.sh macos   <version> <bin-dir> <out-dir> [<firmware>]   display-hub-macos-arm64-<version>.zip
+#   bash tools/release/package-app.sh linux   <version> <bin-dir> <out-dir> [<firmware>]   display-hub-linux-x64-<version>.tar.gz
 #
 # Each holds one folder of the same name with the programs and LICENSE. On macOS the app is
 # "Display Hub.app", signed ad hoc (no paid certificate, but Apple silicon runs nothing unsigned).
+#
+# <firmware> is the official firmware package (.dhfw), already checked by
+# check-official-firmware.py. It goes in under its own name where the app looks for it: firmware/
+# beside the app, or Display Hub.app/Contents/Resources/firmware/ on macOS. A release always gives
+# one; without it the download has no firmware in it.
 # The zips need Python 3 (on the Windows and macOS runners); macOS also uses codesign and plutil,
 # which come with it.
 #
@@ -17,11 +22,15 @@
 # commit's.
 set -euo pipefail
 
-[ $# -eq 4 ] || { echo "usage: $0 <windows|macos|linux> <version> <bin-dir> <out-dir>" >&2; exit 2; }
+[ $# -eq 4 ] || [ $# -eq 5 ] || {
+  echo "usage: $0 <windows|macos|linux> <version> <bin-dir> <out-dir> [<firmware package>]" >&2
+  exit 2
+}
 platform=$1
 version=$2
 bins=$3
 out=$4
+firmware=${5:-}
 root=$(cd "$(dirname "$0")/../.." && pwd)
 [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] || { echo "not a version: $version" >&2; exit 2; }
 tools=(hub-send hub-firmware display-simulator usage-helper usage-helper-sync)
@@ -35,6 +44,10 @@ esac
 for b in hub-manager "${tools[@]}"; do
   [ -f "$bins/$b$exe" ] || { echo "no $bins/$b$exe" >&2; exit 2; }
 done
+if [ $# -eq 5 ]; then
+  [ -f "$firmware" ] || { echo "no firmware package at ${firmware:-(nothing given)}" >&2; exit 2; }
+  [[ ${firmware##*/} =~ ^[a-z0-9][a-z0-9.-]*\.dhfw$ ]] || { echo "not a package's name: ${firmware##*/}" >&2; exit 2; }
+fi
 
 stamp=${SOURCE_DATE_EPOCH:-$(git -C "$root" log -1 --format=%ct 2>/dev/null || date +%s)}
 [[ $stamp =~ ^[0-9]+$ ]] || { echo "not a time in seconds: $stamp" >&2; exit 2; }
@@ -94,9 +107,18 @@ done
 mkdir -p "$out"
 out=$(cd "$out" && pwd)
 
+# Puts the official firmware package in the folder $1, where the app looks for it.
+add_firmware() {
+  [ -n "$firmware" ] || return 0
+  mkdir -m 0755 "$1/firmware"
+  cp "$firmware" "$1/firmware/${firmware##*/}"
+  chmod 0644 "$1/firmware/${firmware##*/}"
+}
+
 case $platform in
   windows)
     cp "$bins/hub-manager.exe" "$dir/hub-manager.exe"
+    add_firmware "$dir"
     programs=("$name/hub-manager.exe")
     for b in "${tools[@]}"; do programs+=("$name/$b.exe"); done
     pack_zip "$out/$name.zip" "${programs[@]}"
@@ -107,6 +129,11 @@ case $platform in
     mkdir -p "$app/Contents/MacOS"
     cp "$bins/hub-manager" "$app/Contents/MacOS/hub-manager"
     chmod 0755 "$app/Contents/MacOS/hub-manager"
+    # Before signing, so the app's signature covers it.
+    if [ -n "$firmware" ]; then
+      mkdir -m 0755 "$app/Contents/Resources"
+      add_firmware "$app/Contents/Resources"
+    fi
     # Apple's version fields take numbers only, so a release candidate's suffix is left off.
     short=${version%%-*}
     cat > "$app/Contents/Info.plist" <<PLIST
@@ -163,6 +190,7 @@ PLIST
     cp "$bins/hub-manager" "$dir/hub-manager"
     chmod 0755 "$dir/hub-manager"
     chmod 0644 "$dir/LICENSE"
+    add_firmware "$dir"
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$stamp" --format=gnu \
       -C "$stage" -cf - "$name" | gzip -9 -n > "$out/$name.tar.gz"
     echo "$out/$name.tar.gz"

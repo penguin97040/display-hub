@@ -194,6 +194,21 @@ fn check_package(bytes: Vec<u8>) -> Result<Loaded, Failure> {
     Loaded::check(bytes).map_err(|e| Failure::Package(e.to_string()))
 }
 
+/// Sends a checked package to the hub, then refreshes.
+async fn upload(s: &Session, bytes: Arc<Vec<u8>>) -> Result<Outcome, Failure> {
+    let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|b| (*b).clone());
+    let (package, new) = s
+        .client
+        .upload_firmware(&s.token, bytes)
+        .await
+        .map_err(Failure::Client)?;
+    Ok(Outcome::Uploaded {
+        package: Box::new(package),
+        new,
+        refresh: refresh_after(s).await,
+    })
+}
+
 /// After a first install the board restarts, and a board with the chip's own USB disappears from the
 /// PC and comes back. Opens the port again until the display answers, for up to 40 seconds.
 pub fn send_after_install(
@@ -413,14 +428,10 @@ pub async fn execute(ctx: Arc<Ctx>, op: Op) -> Result<Outcome, Failure> {
             let bytes = blocking(move || read_package(&path)).await?;
             // Checked here first, so a damaged file is explained without a round trip.
             let bytes = blocking(move || check_package(bytes).map(|l| l.bytes)).await?;
-            let bytes = Arc::try_unwrap(bytes).unwrap_or_else(|b| (*b).clone());
-            let (package, new) = s.client.upload_firmware(&s.token, bytes).await.map_err(c)?;
-            Ok(Outcome::Uploaded {
-                package: Box::new(package),
-                new,
-                refresh: refresh_after(&s).await,
-            })
+            upload(&s, bytes).await
         }
+        // Checked when the app started; the very bytes that passed are what goes to the hub.
+        Op::UploadLoaded { loaded } => upload(&ctx.session()?, loaded.bytes).await,
         Op::RemoveFirmware { id } => {
             let s = ctx.session()?;
             s.client.delete_firmware(&s.token, &id).await.map_err(c)?;
@@ -1258,6 +1269,22 @@ mod install_tests {
         run(&mut m, &ctx, op).await;
         assert!(m.connected(), "{:?}", m.notice);
         assert!(m.shelf().is_some(), "this hub lists firmware");
+
+        // The official firmware that came with the app goes to the hub as it was checked, with no
+        // file to choose.
+        m.fw.bundled = Some(crate::firmware::Bundled {
+            loaded: first.clone(),
+        });
+        assert!(!m.bundled_on_hub());
+        let op = m.upload_bundled();
+        assert!(matches!(op, Some(Op::UploadLoaded { .. })));
+        run(&mut m, &ctx, op).await;
+        assert!(m.bundled_on_hub(), "{:?}", m.notice);
+        assert_eq!(m.firmware_packages().len(), 1);
+        assert_eq!(
+            m.firmware_packages()[0].package_id,
+            first.checked.package_id.to_hex()
+        );
 
         // A display with no keys takes the package's key set and its security counter.
         let stop = Arc::new(AtomicBool::new(false));

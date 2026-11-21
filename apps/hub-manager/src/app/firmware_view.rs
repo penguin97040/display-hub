@@ -192,6 +192,34 @@ impl Manager {
             cx,
             |this, _, cx| this.prompt_open(cx, Model::upload_firmware),
         );
+        // The official firmware that came with the app, until the hub has it.
+        let official = self
+            .model
+            .bundled()
+            .filter(|_| !self.model.bundled_on_hub())
+            .map(|b| b.version().to_string())
+            .map(|version| {
+                let add = self.button(
+                    "fw-add-official",
+                    &format!("Add official firmware {}", keep_case(&version)),
+                    Kind::Secondary,
+                    !busy,
+                    cx,
+                    |this, _, cx| {
+                        let op = this.model.upload_bundled();
+                        this.run(op, cx);
+                    },
+                );
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(add)
+                    .child(ui::label(
+                        "Included with the app · So displays can update over Wi-Fi",
+                    ))
+            });
         let rows = self.model.package_rows();
         let mut list = div().flex().flex_col();
         if rows.is_empty() {
@@ -281,6 +309,7 @@ impl Manager {
                          own keys before installing. Nothing installs until you press Update on a display.",
                     ))
                     .child(div().flex().child(add))
+                    .children(official)
                     .child(list),
             ),
         )
@@ -510,10 +539,39 @@ impl Manager {
         );
         let body = match stage {
             InstallStage::Choose => {
+                // The official firmware that came with the app goes first: no file to find.
+                let official = self.model.bundled().map(|b| b.version().to_string());
+                let official = official.map(|version| {
+                    let use_it = self.button(
+                        "install-official",
+                        &format!("Use official firmware {}", keep_case(&version)),
+                        Kind::Primary,
+                        !busy,
+                        cx,
+                        |this, _, cx| {
+                            let op = this.model.use_bundled();
+                            this.run(op, cx);
+                        },
+                    );
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(ui::p(format!(
+                            "Official firmware {version}, included with the app. It is for the Waveshare \
+                             ESP32-S3-Touch-AMOLED-1.8 board."
+                        )))
+                        .child(div().flex().child(use_it))
+                        .child(ui::label("Or firmware from another maker"))
+                });
                 let file = self.button(
                     "install-file",
                     "Choose a file",
-                    Kind::Primary,
+                    if official.is_some() {
+                        Kind::Secondary
+                    } else {
+                        Kind::Primary
+                    },
                     !busy,
                     cx,
                     |this, _, cx| {
@@ -563,6 +621,7 @@ impl Manager {
                          Use it for a new display, or for one that trusts no keys. Afterwards the display trusts that \
                          maker's keys, so it can take updates through the hub.",
                     ))
+                    .children(official)
                     .child(div().flex().flex_wrap().gap(px(8.0)).child(file).when(
                         self.model.fw.install.open,
                         |d| d.child(cancel),

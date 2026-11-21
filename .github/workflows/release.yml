@@ -78,10 +78,93 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  firmware:
+    # The official firmware, built from this tag's source as CI builds it: in Espressif's own
+    # ESP-IDF v5.5.6 image, pinned by digest. Nothing here is signed, and no key is ever here: the
+    # build is only what the owner's signed package is checked against, in the next job.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: espressif/idf:v5.5.6@sha256:bf72fe7a15c22849a9a94147301165a545fb8905d97c176cf748e3e4614cac84
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # The lock file must already say exactly what the build downloads.
+      - name: Build
+        run: |
+          set -o pipefail
+          . "$IDF_PATH/export.sh"
+          cp firmware/dependencies.lock "$RUNNER_TEMP/dependencies.lock"
+          idf.py -C firmware -B "$RUNNER_TEMP/fw-build" build
+          cmp firmware/dependencies.lock "$RUNNER_TEMP/dependencies.lock"
+          mkdir -p fw-out/bootloader fw-out/partition_table
+          cd "$RUNNER_TEMP/fw-build"
+          cp flasher_args.json display-hub.bin display-hub.elf ota_data_initial.bin "$GITHUB_WORKSPACE/fw-out/"
+          cp bootloader/bootloader.bin "$GITHUB_WORKSPACE/fw-out/bootloader/"
+          cp partition_table/partition-table.bin "$GITHUB_WORKSPACE/fw-out/partition_table/"
+          sha256sum display-hub.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin
+      # Not named release-*: it isn't a download.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: firmware-build
+          path: fw-out
+          if-no-files-found: error
+          retention-days: 7
+
+  official-firmware:
+    # The package the owner signed on their own computer and committed (firmware/official/), held
+    # against the build above: the same bytes, this release's version, the official board, signed
+    # by an official key, with the official keys as its key set, and those keys built into the app.
+    # No package, or one that differs in any of that, and there is no release. The checked file is
+    # what the app downloads carry.
+    needs: [pi, firmware]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.pi.outputs.version }}
+    outputs:
+      name: ${{ steps.check.outputs.name }}
+      sha256: ${{ steps.check.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Build hub-firmware
+        run: cargo build --release --locked -p hub-firmware
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: firmware-build
+          path: fw-out
+      # The firmware's version is the programs': a tag's -rc.N or -test.N isn't part of it.
+      - name: Check the official package against the build
+        id: check
+        run: |
+          python3 -I tools/release/check-official-firmware.py --dir firmware/official --build fw-out \
+            --hub-firmware target/release/hub-firmware --app-keys apps/hub-manager/src/firmware.rs \
+            --version "${VERSION%%-*}"
+          mkdir official-firmware
+          cp firmware/official/*.dhfw official-firmware/
+          file=$(ls official-firmware)
+          {
+            echo "name=$file"
+            echo "sha256=$(sha256sum "official-firmware/$file" | cut -d' ' -f1)"
+          } | tee -a "$GITHUB_OUTPUT"
+      # Not named release-*: it travels inside the app downloads, not beside them.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: official-firmware
+          path: official-firmware/*.dhfw
+          if-no-files-found: error
+          retention-days: 7
+
   apps:
     # The desktop app and the command-line tools, with the Pi download's name, address and checksum
-    # built in, so the app's first-run guide shows the one line that installs the hub.
-    needs: pi
+    # built in, so the app's first-run guide shows the one line that installs the hub, and with the
+    # checked official firmware package beside the app, where it looks for it.
+    needs: [pi, official-firmware]
     strategy:
       matrix:
         include:
@@ -107,6 +190,8 @@ jobs:
       DISPLAY_HUB_PI_TARBALL: ${{ needs.pi.outputs.tarball }}
       DISPLAY_HUB_PI_URL: ${{ needs.pi.outputs.url }}
       DISPLAY_HUB_PI_SHA256: ${{ needs.pi.outputs.sha256 }}
+      FIRMWARE: ${{ needs.official-firmware.outputs.name }}
+      FIRMWARE_SHA256: ${{ needs.official-firmware.outputs.sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -135,11 +220,19 @@ jobs:
           timeout 180 target/release/hub-manager.exe --smoke-test | tee smoke.log
           grep -qx launched smoke.log
           grep -qx rendered smoke.log
-      # Relative paths for the check: Python on Windows doesn't read Git Bash's /d/... paths.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: official-firmware
+          path: official-firmware
+      # Relative paths for the check: Python on Windows doesn't read Git Bash's /d/... paths. The
+      # firmware package must be the very file the check passed, and must be in the download.
       - name: Pack
         run: |
-          bash tools/release/package-app.sh "$PLATFORM" "$VERSION" target/release release-out
-          "$PYTHON" -I tools/release/check-package.py "$PLATFORM" "$VERSION" release-out
+          fw="official-firmware/$FIRMWARE"
+          "$PYTHON" -I -c 'import hashlib, sys; sys.exit(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest() != sys.argv[2])' \
+            "$fw" "$FIRMWARE_SHA256" || { echo "$fw isn't the package that was checked"; exit 1; }
+          bash tools/release/package-app.sh "$PLATFORM" "$VERSION" target/release release-out "$fw"
+          "$PYTHON" -I tools/release/check-package.py "$PLATFORM" "$VERSION" release-out "$fw"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.platform }}
