@@ -226,21 +226,24 @@ static void usb_task(void *arg)
     // The count of resets when the line now being read began.
     unsigned line_resets = atomic_load(&s_resets);
     while (true) {
+        // The count of resets is noted before the read, so a reset that finishes during the
+        // read or straight after it always makes this piece's lines stale (see below).
+        const unsigned piece_resets = atomic_load(&s_resets);
         // Keep reading whatever the display is doing, so the app's writes never stall.
         const int got = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(1000));
         if (got <= 0) {
             forget_if_reset(line_resets);
             continue;
         }
-        // A factory reset can come at any moment from here on: while this piece is being fed,
-        // or while one of its lines waits for storage's lock. So the count of resets is noted
-        // now, once for the whole piece, and every line that begins in this piece is given
-        // that count, also one that begins after an earlier line of the piece has waited out
-        // a reset: its bytes were in hand before the reset finished. The count is looked at
-        // again with storage's lock held, for each line (handle_line), so nothing that was in
-        // hand when a reset finished is acted on. A piece read after the reset has the new
-        // count, so the `hello` and the bundle that follow a reset are answered at once.
-        const unsigned piece_resets = atomic_load(&s_resets);
+        // A factory reset can come at any moment: while this piece is being read or fed, or
+        // while one of its lines waits for storage's lock. So the count of resets is noted
+        // before the read, once for the whole piece, and every line that begins in this piece
+        // is given that count, also one that begins after an earlier line of the piece has
+        // waited out a reset. The count is looked at again with storage's lock held, for each
+        // line (handle_line), so nothing read before a reset finished is acted on. A piece
+        // whose read began after the reset has the new count, so the `hello` and the bundle
+        // that follow a reset are answered at once. (A line that arrives while the reset is
+        // under way may be dropped: the app sends `hello` again.)
         // A line part-read before the reset is dropped before any more of it is fed.
         forget_if_reset(line_resets);
         const uint8_t *piece = chunk;
