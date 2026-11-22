@@ -81,11 +81,12 @@ static const char *s_firmware_version;
 static const char *s_hardware_revision;
 static usb_setup_stored_t s_on_stored;
 static TaskHandle_t s_task;
-// A factory reset has happened, and this task hasn't yet dropped what it was reading. Set by
-// usb_setup_forget() from another task, which holds storage's lock as it does (see there);
-// read by this task with that lock held before a line is acted on, and taken (read and cleared
-// in one step) by this task alone, once the piece it was working through is finished.
-static atomic_bool s_forget;
+// How many factory resets there have been. Added to by usb_setup_forget() from another task,
+// which holds storage's lock as it does (see there). This task notes the count as each piece
+// is read from the port, and so for each line as it begins (usb_task), and reads it again
+// with that lock held before the line is acted on: a line that began before a reset finished
+// is dropped, and one that began after it is answered as usual.
+static atomic_uint s_resets;
 
 // Too big for a stack, and holding a bundle while one is read: taken from the heap once.
 static dh_usb_line_reader *s_reader;
@@ -122,15 +123,17 @@ static bool send_reply(size_t reply_len)
 }
 
 // False if the line was dropped unread, because a factory reset came while it was arriving.
-static bool handle_line(const uint8_t *line, size_t len)
+// `began` is the count of resets noted when the line began (usb_task).
+static bool handle_line(const uint8_t *line, size_t len, unsigned began)
 {
     // The keys, the record and the stored setup are shared with the rest of the firmware.
     storage_lock();
-    // A factory reset sets s_forget before it lets go of this lock (usb_setup_forget), and a
-    // line waits here while the erase runs. So with the lock in hand and s_forget set, this
-    // line was read, in whole or in part, before the reset finished: it is dropped, never
-    // stored on the display that was just erased. s_forget is left set for usb_task().
-    if (atomic_load(&s_forget)) {
+    // A factory reset adds to s_resets before it lets go of this lock (usb_setup_forget), and
+    // a line waits here while the erase runs. So with the lock in hand and a count that has
+    // moved on, this line was read, in whole or in part, before the reset finished: it is
+    // dropped, never stored on the display that was just erased. A line that began after the
+    // reset has the new count, and is answered.
+    if (began != atomic_load(&s_resets)) {
         storage_unlock();
         dh_usb_line_wipe(s_reader);
         return false;
@@ -203,13 +206,15 @@ static bool handle_line(const uint8_t *line, size_t len)
     return true;
 }
 
-// After a factory reset, once the piece in hand has been worked through: a line that is still
-// part-read is dropped, and the rest of it is ignored as it comes. Every line that was
-// completed from that piece has been dropped already (handle_line). From here on, a line is
-// one that began in a piece read after the reset.
-static void forget_if_reset(void)
+// After a factory reset: a line that is part-read, and began before the reset (`began` is the
+// count noted when it did), is dropped, its bytes are wiped, and the rest of it is ignored as
+// it comes. Looked at before and after each piece and whenever a read comes back empty, so
+// within a second of the reset. Nothing else needs forgetting: the buffers are wiped after
+// every line and every piece, and a whole line that began before the reset is dropped where
+// it would be acted on (handle_line).
+static void forget_if_reset(unsigned began)
 {
-    if (atomic_exchange(&s_forget, false)) {
+    if (s_reader->len != 0 && began != atomic_load(&s_resets)) {
         dh_usb_line_forget(s_reader);
     }
 }
@@ -218,22 +223,35 @@ static void usb_task(void *arg)
 {
     (void)arg;
     static uint8_t chunk[256];
+    // The count of resets when the line now being read began.
+    unsigned line_resets = atomic_load(&s_resets);
     while (true) {
         // Keep reading whatever the display is doing, so the app's writes never stall.
         const int got = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(1000));
         if (got <= 0) {
-            forget_if_reset();
+            forget_if_reset(line_resets);
             continue;
         }
         // A factory reset can come at any moment from here on: while this piece is being fed,
-        // or while one of its lines waits for storage's lock. s_forget is looked at again
-        // with that lock held, for each line (handle_line), and only taken once the whole
-        // piece has been fed, so nothing that was in hand when the reset finished is acted on.
-        // That can also drop a line sent in the second after a reset: the app sends `hello`
-        // again by itself, and no bundle is sent that soon.
+        // or while one of its lines waits for storage's lock. So the count of resets is noted
+        // now, once for the whole piece, and every line that begins in this piece is given
+        // that count, also one that begins after an earlier line of the piece has waited out
+        // a reset: its bytes were in hand before the reset finished. The count is looked at
+        // again with storage's lock held, for each line (handle_line), so nothing that was in
+        // hand when a reset finished is acted on. A piece read after the reset has the new
+        // count, so the `hello` and the bundle that follow a reset are answered at once.
+        const unsigned piece_resets = atomic_load(&s_resets);
+        // A line part-read before the reset is dropped before any more of it is fed.
+        forget_if_reset(line_resets);
         const uint8_t *piece = chunk;
         size_t left = (size_t)got;
         while (left > 0) {
+            if (s_reader->len == 0) {
+                // No line is part-read, so a line that comes out of this call began in this
+                // piece. (With one part-read, a line that begins after it in the same call
+                // is given the older count: dropped at worst, never the other way round.)
+                line_resets = piece_resets;
+            }
             size_t used = 0, len = 0;
             const uint8_t *line = NULL;
             const dh_line_event event =
@@ -241,7 +259,7 @@ static void usb_task(void *arg)
             piece += used;
             left -= used;
             if (event == DH_LINE_JSON) {
-                if (!handle_line(line, len)) {
+                if (!handle_line(line, len, line_resets)) {
                     ESP_LOGW(TAG, "dropped a line of %u bytes unread: a factory reset came "
                                   "while it was arriving",
                              (unsigned)len);
@@ -251,7 +269,7 @@ static void usb_task(void *arg)
             }
         }
         dh_wipe(chunk, sizeof(chunk));
-        forget_if_reset();
+        forget_if_reset(line_resets);
         // A dropped line (too long, or not starting with '{') never reaches handle_line(), but
         // it may have been a bundle. This wipes the buffer only when no line is part-read.
         dh_usb_line_wipe(s_reader);
@@ -288,7 +306,7 @@ esp_err_t usb_setup_start(const char *firmware_version, const char *hardware_rev
 
 void usb_setup_forget(void)
 {
-    atomic_store(&s_forget, true);
+    atomic_fetch_add(&s_resets, 1);
 }
 
 unsigned usb_setup_stack_unused(void)

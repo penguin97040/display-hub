@@ -625,6 +625,9 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
         case STORAGE_STOP_ERASE_UNFINISHED:
             why = UI_STORAGE_ERASE_UNFINISHED;
             break;
+        case STORAGE_STOP_ERASE_UNSURE:
+            why = UI_STORAGE_ERASE_UNSURE;
+            break;
         case STORAGE_STOP_ERASED:
             why = UI_STORAGE_ERASED;
             break;
@@ -646,9 +649,22 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
              NULL, note);
         return true;
     }
+    if (facts->reset_unfinished && facts->reset_unsure) {
+        // Nothing was erased, and whether the reset's mark is in flash can't be told
+        // (storage.h): the next start may erase the setup, or may go back to using it. So
+        // this doesn't say that a restart finishes the job. It says to restart and then reset
+        // again, which erases the setup whichever it was.
+        show("Reset may have failed", UI_COLOUR_WARNING, NULL,
+             "This display may not have erased its setup.\n\n"
+             "Unplug it and plug it back in, then hold the BOOT button for 10 seconds again.\n\n"
+             "If this keeps happening, use Install firmware in Display Hub on your computer, "
+             "which erases the display's storage.",
+             NULL, note);
+        return true;
+    }
     if (facts->reset_unfinished) {
-        // The erase failed part-way, with its mark in flash (storage.h), so the next start
-        // does finish it. Nothing is taken as a setup until it has been done.
+        // The erase failed part-way, with its mark known to be in flash (storage.h), so the
+        // next start does finish it. Nothing is taken as a setup until it has been done.
         show("Reset not finished", UI_COLOUR_WARNING, NULL,
              "This display started erasing its setup and couldn't finish.\n\n"
              "Hold the BOOT button for 10 seconds to try again, or unplug it and plug it back "

@@ -430,6 +430,22 @@ static void test_abandoned_image(void)
     CHECK(glue.write_tried && glue.spare_spoilt == 1 && glue.written_when_spoilt == 0);
     check_ended(DH_FW_REASON_FLASH, true);
 
+    /* The first write is refused because the image's first byte isn't an app's. With writes in
+     * order ESP-IDF has erased the first sector by then (esp_ota_ops.c:336, before the check
+     * at 347), so what the partition held has gone already: spoilt all the same, never left
+     * as if it could still be gone back to. */
+    fresh_display();
+    take_offer();
+    memcpy(bad, form, form_len);
+    bad[image_at] = bad[image_at] == 0xe9u ? 0x00u : bad[image_at];
+    glue.body = bad;
+    glue.checks_magic = true;
+    CHECK(receive() == DH_FW_REASON_FLASH);
+    CHECK(glue.begun && glue.sequential && glue.aborted && glue.written_len == 0);
+    CHECK(glue.write_tried && glue.erased_by_write && glue.spare_spoilt == 1);
+    check_ended(DH_FW_REASON_FLASH, true);
+    bad[form_len - 1] ^= 0x01u;
+
     /* The erase fails: the update still ends as it would have, and nothing else is touched. */
     fresh_display();
     take_offer();

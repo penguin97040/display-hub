@@ -432,7 +432,8 @@ static void test_shift(void)
 static void test_storage_stopped(void)
 {
     static const ui_storage_stop all[] = {UI_STORAGE_NOT_STARTED, UI_STORAGE_ERASE_UNFINISHED,
-                                          UI_STORAGE_ERASED, UI_STORAGE_WRITE_FAILED};
+                                          UI_STORAGE_ERASE_UNSURE, UI_STORAGE_ERASED,
+                                          UI_STORAGE_WRITE_FAILED};
     for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
         const char *text = ui_storage_stopped_text(all[i]);
         /* "Nothing was erased" only when nothing was. */
@@ -453,6 +454,17 @@ static void test_storage_stopped(void)
     CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASE_UNFINISHED), "couldn't finish") != NULL);
     CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASE_UNFINISHED),
                  "finishes the erase when it starts") != NULL);
+    /* Only that one promises that a restart finishes the erase. A reset whose mark can't be
+     * told to be in flash says the setup may still be there, and to reset again after the
+     * restart. */
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+        CHECK((strstr(ui_storage_stopped_text(all[i]), "finishes the erase") != NULL) ==
+              (all[i] == UI_STORAGE_ERASE_UNFINISHED));
+    }
+    const char *unsure = ui_storage_stopped_text(UI_STORAGE_ERASE_UNSURE);
+    const char *again = strstr(unsure, "hold the BOOT button for 10 seconds");
+    CHECK(strstr(unsure, "may not have been erased") != NULL);
+    CHECK(again != NULL && strstr(unsure, "Unplug it and plug it back in") < again);
     /* A write that failed isn't "didn't start", and promises nothing about what was erased. */
     CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_WRITE_FAILED), "couldn't save") != NULL);
     CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_WRITE_FAILED), "didn't start") == NULL);

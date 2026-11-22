@@ -73,10 +73,13 @@ typedef enum {
     STORAGE_STOP_NOT_STARTED,
     // An erase of the setup partition began and couldn't finish (to finish a factory reset,
     // because NVS said the partition couldn't be used as it was, or for a reset asked for
-    // while storage was out of use). Its mark is in flash, so the next start finishes it. (Or
-    // the mark couldn't be read after a write to it failed, so it may be: storage.c,
-    // erase_setup_partition.)
+    // while storage was out of use). Its mark is in flash, so the next start finishes it.
     STORAGE_STOP_ERASE_UNFINISHED,
+    // A factory reset was asked for while storage was out of use, its mark couldn't be written
+    // and read back, and whether the mark is in flash can't be told. If it is, the next start
+    // erases the setup; if it isn't, the next start finds the setup as it was. So the screen
+    // doesn't say a restart finishes the erase: it says the setup may still be there.
+    STORAGE_STOP_ERASE_UNSURE,
     // The setup partition was erased, for one of the same reasons, and storage is out of use
     // all the same.
     STORAGE_STOP_ERASED,
@@ -103,6 +106,10 @@ typedef struct {
     // couldn't even begin, with the mark known not to be in flash, leaves the setup as it was
     // and sets nothing here.)
     bool reset_unfinished;
+    // With `reset_unfinished`: nothing was erased, and whether the mark is in flash can't be
+    // told. The next start may erase the setup, or may find it as it was and go back to using
+    // it, so nothing may promise that a restart finishes the reset.
+    bool reset_unsure;
 } storage_facts_t;
 
 // Starts storage: looks at the storage key and, if there is one, starts encrypted NVS and loads
@@ -129,8 +136,9 @@ typedef enum {
     // The setup partition is blank (or this is a new board, which has never stored anything).
     STORAGE_RESET_DONE,
     // The erase began and couldn't finish, or its mark may be in flash and can't be taken out
-    // or read. Another reset, or a restart with the mark in flash, finishes it.
-    // (`reset_unfinished` in the facts, while storage is working.)
+    // or read. The setup is out of use either way. Another reset, or a restart with the mark
+    // in flash, finishes it; where the mark can't be told, a restart may bring the setup back.
+    // (`reset_unfinished` in the facts, while storage is working, with `reset_unsure`.)
     STORAGE_RESET_UNFINISHED,
     // Nothing was erased, the mark isn't in flash, and the setup is in use as it was.
     STORAGE_RESET_NOT_STARTED,

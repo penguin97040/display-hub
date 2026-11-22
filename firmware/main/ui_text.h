@@ -111,12 +111,14 @@ size_t ui_keep_view(const ui_page_ids *before, size_t view, const dh_snapshot *a
 typedef enum {
     UI_STORAGE_NOT_STARTED,      // it didn't start or couldn't be read; nothing was erased
     UI_STORAGE_ERASE_UNFINISHED, // an erase of the setup began and couldn't finish
+    UI_STORAGE_ERASE_UNSURE,     // a reset erased nothing, and a restart may not either
     UI_STORAGE_ERASED,           // the setup was erased
     UI_STORAGE_WRITE_FAILED,     // a write failed and couldn't be undone
 } ui_storage_stop;
 
 // What that screen says: what happened, then what to do. It says "Nothing was erased" only
-// when nothing was, always says to unplug the display and plug it back in first, and names
+// when nothing was, says that a restart finishes an erase only when the reset's mark is known
+// to be in flash, always says to unplug the display and plug it back in first, and names
 // Install firmware only as what to do if that keeps failing.
 const char *ui_storage_stopped_text(ui_storage_stop why);
 

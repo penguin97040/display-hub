@@ -239,6 +239,11 @@ esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
     if (glue.written_len + size > glue.write_fails_after) {
         return ESP_FAIL;
     }
+    if (glue.checks_magic && glue.written_len == 0 && size > 0 &&
+        ((const uint8_t *)data)[0] != 0xe9u) {
+        glue.erased_by_write = glue.sequential;
+        return ESP_ERR_OTA_VALIDATE_FAILED;
+    }
     if (glue.written_len + size > glue.written_cap) {
         size_t cap = (glue.written_len + size) * 2u;
         uint8_t *bigger = realloc(glue.written, cap);

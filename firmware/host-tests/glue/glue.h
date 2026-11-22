@@ -60,6 +60,12 @@ typedef struct {
     bool aborted;
     bool set_to_boot;
     bool wrote_while_closed;
+    /* esp_ota_write() refuses a first byte that isn't an app image's (0xE9), as ESP-IDF's does
+     * for an app partition, and only after it has erased the sector the write starts in, as
+     * ESP-IDF's does for writes in order (esp_ota_ops.c:336, then 347). Off unless a test asks:
+     * the vectors' images aren't real apps. `erased_by_write` says that erase happened. */
+    bool checks_magic;
+    bool erased_by_write;
     /* esp_ota_write() was called at all, whether or not it then failed: only from then on may
      * anything of the partition have changed. */
     bool write_tried;

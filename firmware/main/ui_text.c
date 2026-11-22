@@ -243,12 +243,18 @@ const char *ui_storage_stopped_text(ui_storage_stop why)
     "erases the display's storage."
     switch (why) {
     case UI_STORAGE_ERASE_UNFINISHED:
-        // With the reset's mark in flash, so the next start does finish (or, after a second
-        // fault, with a mark that couldn't be read: storage.h).
+        // With the reset's mark in flash, so the next start does finish (storage.h).
         return "This display's storage isn't working just now. It started erasing its setup "
                "and couldn't finish.\n\n"
                "Unplug it and plug it back in: it finishes the erase when it starts. "
                IF_IT_KEEPS_HAPPENING;
+    case UI_STORAGE_ERASE_UNSURE:
+        // Whether the mark is in flash can't be told, so the next start may find the setup as
+        // it was: no promise that a restart erases it, and BOOT again once it has restarted.
+        return "This display's storage isn't working just now, and its setup may not have "
+               "been erased.\n\n"
+               "Unplug it and plug it back in, then hold the BOOT button for 10 seconds to "
+               "erase it. " IF_IT_KEEPS_HAPPENING;
     case UI_STORAGE_ERASED:
         return "This display's storage isn't working just now. Its setup was erased.\n\n"
                "Unplug it and plug it back in, then choose Add a display in Display Hub on "

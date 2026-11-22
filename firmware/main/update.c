@@ -358,8 +358,17 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     bool ota_open = false;
     // A write to the spare partition was tried. Opening it changes nothing in flash
     // (OTA_WITH_SEQUENTIAL_WRITES: see the top), so until then the partition still holds
-    // whatever it held, which may be the last good firmware. A write that fails counts: it may
-    // have erased the first sector, or written part of it, before it failed.
+    // whatever it held, which may be the last good firmware. A write that fails counts,
+    // whatever error it gives: it may have erased the first sector, or written part of it,
+    // before it failed. That goes for a first byte that isn't an image's, too. With writes in
+    // order, esp_ota_write() erases before it looks at that byte (app_update/esp_ota_ops.c:
+    // "ret = esp_partition_erase_range(it->partition.staging, it->wrote_size, ...)" at 336,
+    // then "if (data_bytes[0] != ESP_IMAGE_HEADER_MAGIC)" at 347), so by the time it answers
+    // ESP_ERR_OTA_VALIDATE_FAILED the first sector of what was there has gone. The only
+    // answers given before any flash call are ESP_ERR_INVALID_ARG for no data (316-318) and
+    // for a handle it doesn't know (403-405); the erase and the write give the same error for
+    // a range they refuse, the write after the erase, so that one can't be told apart and
+    // counts as well.
     bool spare_written = false;
     bool finished = false;
     const uint64_t started_s = (uint64_t)(started_ms / 1000);
