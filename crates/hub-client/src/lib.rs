@@ -1203,7 +1203,14 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let c = dev_client(port);
+        // As in the app, the connect wait is well under the wait for the whole call, so a
+        // connect that runs out of time is always reported as one. With the two waits equal,
+        // either could end first.
+        let waits = Waits {
+            total: Duration::from_secs(5),
+            connect: Duration::from_millis(300),
+        };
+        let c = HubClient::loopback_dev_waiting(&format!("http://127.0.0.1:{port}/"), waits).unwrap();
         let e = c.http.get(c.url("v1/health")).send().await.unwrap_err();
         // Linux refuses at once. Windows tries a closed port again for about 2 s before it
         // refuses, so with this test's short connect wait the same thing ends as a connect
