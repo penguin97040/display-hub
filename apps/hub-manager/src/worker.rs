@@ -1274,6 +1274,7 @@ mod install_tests {
         // file to choose.
         m.fw.bundled = Some(crate::firmware::Bundled {
             loaded: first.clone(),
+            board: crate::firmware::OFFICIAL_BOARD,
         });
         assert!(!m.bundled_on_hub());
         let op = m.upload_bundled();

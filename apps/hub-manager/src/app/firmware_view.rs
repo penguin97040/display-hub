@@ -540,8 +540,11 @@ impl Manager {
         let body = match stage {
             InstallStage::Choose => {
                 // The official firmware that came with the app goes first: no file to find.
-                let official = self.model.bundled().map(|b| b.version().to_string());
-                let official = official.map(|version| {
+                let official = self
+                    .model
+                    .bundled()
+                    .map(|b| (b.version().to_string(), b.board.described()));
+                let official = official.map(|(version, board)| {
                     let use_it = self.button(
                         "install-official",
                         &format!("Use official firmware {}", keep_case(&version)),
@@ -558,8 +561,7 @@ impl Manager {
                         .flex_col()
                         .gap(px(8.0))
                         .child(ui::p(format!(
-                            "Official firmware {version}, included with the app. It is for the Waveshare \
-                             ESP32-S3-Touch-AMOLED-1.8 board."
+                            "Official firmware {version}, included with the app. It is for {board}."
                         )))
                         .child(div().flex().child(use_it))
                         .child(ui::label("Or firmware from another maker"))

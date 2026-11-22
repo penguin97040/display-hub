@@ -118,10 +118,50 @@ pub fn bundled_folder(exe: &Path, macos: bool) -> Option<PathBuf> {
     }
 }
 
+/// A board the app has firmware for, by the names a package's manifest gives it, and the words people
+/// know it by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KnownBoard {
+    pub device_type: &'static str,
+    pub hardware_revision: &'static str,
+    /// The board's model, as its maker sells it.
+    pub model: &'static str,
+    /// The board's revision, as it is marked on the back.
+    pub revision: &'static str,
+}
+
+impl KnownBoard {
+    /// Whether a package is for this board: its device type, and this revision among its hardware.
+    pub fn fits(&self, manifest: &firmware_package::Manifest) -> bool {
+        manifest.device_type == self.device_type
+            && manifest
+                .hardware_revisions
+                .iter()
+                .any(|h| h == self.hardware_revision)
+    }
+
+    /// The board in a sentence: "the <model>, the <revision> board".
+    pub fn described(&self) -> String {
+        format!("the {}, the {} board", self.model, self.revision)
+    }
+}
+
+/// The board the official firmware is for. `tools/release/check-official-firmware.py` and the
+/// firmware (`USB_SETUP_DEVICE_TYPE` in `firmware/main/usb_setup.h`) name it the same way; a test
+/// keeps them together.
+pub const OFFICIAL_BOARD: KnownBoard = KnownBoard {
+    device_type: "display-hub-waveshare-amoled-1.8",
+    hardware_revision: "waveshare-amoled-1.8-v2",
+    model: "Waveshare ESP32-S3-Touch-AMOLED-1.8",
+    revision: "V2",
+};
+
 /// The official firmware package that came with the app, read and checked.
 #[derive(Clone, Debug)]
 pub struct Bundled {
     pub loaded: Loaded,
+    /// The board its manifest says it is for.
+    pub board: KnownBoard,
 }
 
 impl Bundled {
@@ -138,13 +178,17 @@ impl Bundled {
 /// ignored, without a word: the app then looks as it does with no package at all.
 pub fn bundled() -> Option<Bundled> {
     let exe = std::env::current_exe().ok()?;
-    bundled_in(&bundled_folder(&exe, cfg!(target_os = "macos"))?, OFFICIAL_KEYS)
+    bundled_in(
+        &bundled_folder(&exe, cfg!(target_os = "macos"))?,
+        OFFICIAL_KEYS,
+        &OFFICIAL_BOARD,
+    )
 }
 
 /// The one package in `folder`, if it passes the checks a chosen file gets, is signed by one of the
-/// `official` keys and can do a first install over USB. A folder with no package, or more than one,
-/// has none: the app never guesses which is meant.
-fn bundled_in(folder: &Path, official: &[&str]) -> Option<Bundled> {
+/// `official` keys, is for `board` and can do a first install over USB. A folder with no package, or
+/// more than one, has none: the app never guesses which is meant.
+fn bundled_in(folder: &Path, official: &[&str], board: &KnownBoard) -> Option<Bundled> {
     if official.is_empty() {
         return None;
     }
@@ -166,7 +210,11 @@ fn bundled_in(folder: &Path, official: &[&str]) -> Option<Bundled> {
     }
     let loaded = Loaded::check(std::fs::read(&path).ok()?).ok()?;
     let official = official.contains(&loaded.checked.signer_key_id().to_hex().as_str());
-    (official && Plan::of(&loaded.checked).is_ok()).then_some(Bundled { loaded })
+    let usable = official && board.fits(&loaded.checked.manifest) && Plan::of(&loaded.checked).is_ok();
+    usable.then_some(Bundled {
+        loaded,
+        board: *board,
+    })
 }
 
 // ----- versions -----
@@ -889,38 +937,39 @@ pub(crate) mod tests {
         let folder = dir.path().join(BUNDLED_FOLDER);
 
         // No folder, and an empty one.
-        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_none());
         std::fs::create_dir(&folder).unwrap();
-        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_none());
 
         let file = folder.join("display-hub-waveshare-amoled-1.8-1.0.0.dhfw");
         std::fs::write(&file, loaded.bytes.as_slice()).unwrap();
         std::fs::write(folder.join("README.txt"), "not a package").unwrap();
-        let found = bundled_in(&folder, &[other.as_str(), id.as_str()]).expect("signed by an official key");
+        let found =
+            bundled_in(&folder, &[other.as_str(), id.as_str()], &DESK).expect("signed by an official key");
         assert_eq!(found.version(), "1.0.0");
         assert_eq!(found.package_id(), loaded.checked.package_id.to_hex());
         assert_eq!(found.loaded.bytes, loaded.bytes);
 
         // Well formed, but signed by someone else: never official. Nor is anything for an app
         // with no official keys, nor a test's throwaway key for the app as it is built.
-        assert!(bundled_in(&folder, &[other.as_str()]).is_none());
-        assert!(bundled_in(&folder, &[]).is_none());
-        assert!(bundled_in(&folder, OFFICIAL_KEYS).is_none());
+        assert!(bundled_in(&folder, &[other.as_str()], &DESK).is_none());
+        assert!(bundled_in(&folder, &[], &DESK).is_none());
+        assert!(bundled_in(&folder, OFFICIAL_KEYS, &DESK).is_none());
 
         // A file that doesn't check out.
         let mut damaged = loaded.bytes.to_vec();
         let last = damaged.len() - 1;
         damaged[last] ^= 1;
         std::fs::write(&file, &damaged).unwrap();
-        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_none());
         std::fs::write(&file, b"not a package").unwrap();
-        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_none());
 
         // Two packages: the app doesn't guess.
         std::fs::write(&file, loaded.bytes.as_slice()).unwrap();
-        assert!(bundled_in(&folder, &[id.as_str()]).is_some());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_some());
         std::fs::write(folder.join("another.dhfw"), loaded.bytes.as_slice()).unwrap();
-        assert!(bundled_in(&folder, &[id.as_str()]).is_none());
+        assert!(bundled_in(&folder, &[id.as_str()], &DESK).is_none());
     }
 
     #[test]
@@ -939,7 +988,124 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("updates-only.dhfw"), &built.bytes).unwrap();
         let id = key.public_key().key_id().to_hex();
-        assert!(bundled_in(dir.path(), &[id.as_str()]).is_none());
+        assert!(bundled_in(dir.path(), &[id.as_str()], &DESK).is_none());
+    }
+
+    /// The board `usb_package` makes packages for.
+    const DESK: KnownBoard = KnownBoard {
+        device_type: "desk",
+        hardware_revision: "simulated",
+        model: "Desk display",
+        revision: "A",
+    };
+
+    #[test]
+    fn a_bundled_package_for_another_board_is_left_alone() {
+        let (loaded, key) = usb_package("esp32s3", true);
+        let id = key.public_key().key_id().to_hex();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("desk.dhfw"), loaded.bytes.as_slice()).unwrap();
+        let found = bundled_in(dir.path(), &[id.as_str()], &DESK).expect("for this board");
+        assert_eq!(found.board, DESK);
+        let other_type = KnownBoard {
+            device_type: "wall",
+            ..DESK
+        };
+        assert!(bundled_in(dir.path(), &[id.as_str()], &other_type).is_none());
+        let other_revision = KnownBoard {
+            hardware_revision: "simulated-v2",
+            ..DESK
+        };
+        assert!(bundled_in(dir.path(), &[id.as_str()], &other_revision).is_none());
+        assert!(bundled_in(dir.path(), &[id.as_str()], &OFFICIAL_BOARD).is_none());
+    }
+
+    #[test]
+    fn the_bundled_board_is_described_by_its_model_and_revision() {
+        assert_eq!(
+            OFFICIAL_BOARD.described(),
+            "the Waveshare ESP32-S3-Touch-AMOLED-1.8, the V2 board"
+        );
+    }
+
+    #[test]
+    fn the_official_board_is_the_one_the_release_and_the_firmware_name() {
+        let script = include_str!("../../../tools/release/check-official-firmware.py");
+        assert!(
+            script.contains(&format!("DEVICE_TYPE = \"{}\"\n", OFFICIAL_BOARD.device_type)),
+            "check-official-firmware.py's DEVICE_TYPE"
+        );
+        assert!(
+            script.contains(&format!(
+                "HARDWARE = [\"{}\"]\n",
+                OFFICIAL_BOARD.hardware_revision
+            )),
+            "check-official-firmware.py's HARDWARE"
+        );
+        let usb = include_str!("../../../firmware/main/usb_setup.h");
+        assert!(
+            usb.contains(&format!(
+                "#define USB_SETUP_DEVICE_TYPE \"{}\"",
+                OFFICIAL_BOARD.device_type
+            )),
+            "usb_setup.h's USB_SETUP_DEVICE_TYPE"
+        );
+    }
+
+    #[test]
+    fn the_committed_official_package_is_found_as_a_download_would_find_it() {
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../firmware/official");
+        let packages = std::fs::read_dir(&folder)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "dhfw")
+            })
+            .count();
+        if packages == 0 {
+            return;
+        }
+        let found = bundled_in(&folder, OFFICIAL_KEYS, &OFFICIAL_BOARD).expect("the official package");
+        assert_eq!(found.board, OFFICIAL_BOARD);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bundled_package_that_is_a_link_is_left_alone() {
+        let (loaded, key) = usb_package("esp32s3", true);
+        let id = key.public_key().key_id().to_hex();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let real = elsewhere.path().join("real.dhfw.bin");
+        std::fs::write(&real, loaded.bytes.as_slice()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("linked.dhfw")).unwrap();
+        assert!(
+            bundled_in(dir.path(), &[id.as_str()], &DESK).is_none(),
+            "a good package, but only by a link"
+        );
+        std::fs::copy(&real, dir.path().join("copy.bin")).unwrap();
+        std::fs::remove_file(dir.path().join("linked.dhfw")).unwrap();
+        std::fs::rename(dir.path().join("copy.bin"), dir.path().join("real.dhfw")).unwrap();
+        assert!(
+            bundled_in(dir.path(), &[id.as_str()], &DESK).is_some(),
+            "the same bytes as a file"
+        );
+    }
+
+    #[test]
+    fn a_bundled_file_larger_than_any_package_is_not_read() {
+        let (_, key) = usb_package("esp32s3", true);
+        let id = key.public_key().key_id().to_hex();
+        let dir = tempfile::tempdir().unwrap();
+        // Empty space on most file systems, so the test doesn't write 16 MB.
+        let big = std::fs::File::create(dir.path().join("big.dhfw")).unwrap();
+        big.set_len(hub_protocol::limits::MAX_FIRMWARE_PACKAGE_BYTES + 1)
+            .unwrap();
+        drop(big);
+        assert!(bundled_in(dir.path(), &[id.as_str()], &DESK).is_none());
     }
 
     fn package(id: &str, version: &str, signer: &str) -> FirmwarePackageView {

@@ -713,9 +713,12 @@ impl Store {
             // version moved meanwhile, the next pass decides afresh.
             if current > 0 && copied_from != Some(current) {
                 drop(tx);
-                let copy = self.copy_before_upgrade(&conn, current)?;
-                tracing::info!(path = %copy.display(), from = current, "saved a copy of the database before upgrading it");
-                copied_from = Some(current);
+                // No copy means another process upgraded it while this one was copying: the next
+                // pass finds the work done.
+                if let Some(copy) = self.copy_before_upgrade(&conn, current)? {
+                    tracing::info!(path = %copy.display(), from = current, "saved a copy of the database before upgrading it");
+                    copied_from = Some(current);
+                }
                 continue;
             }
             // Every step in one transaction: a failure part-way leaves the database as it was.
@@ -748,7 +751,9 @@ impl Store {
 
     /// Saves an online copy of the database beside it, owner-only, named after its schema version
     /// and the time: `hub-before-upgrade-schema-2-2026-11-16T05-39-17Z.db`. Never replaces a file.
-    fn copy_before_upgrade(&self, conn: &Connection, version: i64) -> Result<PathBuf, StoreError> {
+    /// `None`, with nothing saved, if the database was already past `version` when copied: another
+    /// process upgraded it meanwhile.
+    fn copy_before_upgrade(&self, conn: &Connection, version: i64) -> Result<Option<PathBuf>, StoreError> {
         let fail = |path: &Path, detail: String| StoreError::UpgradeCopy {
             path: path.into(),
             detail,
@@ -785,7 +790,11 @@ impl Store {
             Connection::open(&dest)?.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
         });
         match copied {
-            Ok(v) if v == version => Ok(dest),
+            Ok(v) if v == version => Ok(Some(dest)),
+            Ok(v) if v > version => {
+                let _ = std::fs::remove_file(&dest);
+                Ok(None)
+            }
             outcome => {
                 // Only the incomplete copy, which this call just created, is removed.
                 let _ = std::fs::remove_file(&dest);
@@ -1729,6 +1738,59 @@ mod tests {
                 .count();
             assert_eq!(copies, 0, "a new database is never copied");
         }
+    }
+
+    /// The same for an existing database that needs upgrading: an opener that copied it while
+    /// another finished the upgrade finds the work done, rather than failing over a copy at the new
+    /// schema.
+    #[test]
+    fn many_processes_upgrading_a_database_at_once_all_succeed() {
+        for round in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hub.db");
+            schema_2_database(&path);
+            let gate = Arc::new(std::sync::Barrier::new(8));
+            let openers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (path, gate) = (path.clone(), gate.clone());
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        Store::open(&path).map(|s| s.schema_version().unwrap())
+                    })
+                })
+                .collect();
+            for opener in openers {
+                let version = opener
+                    .join()
+                    .unwrap()
+                    .unwrap_or_else(|e| panic!("round {round}: {e}"));
+                assert_eq!(version, SCHEMA_VERSION);
+            }
+            let saved = copies(dir.path());
+            assert!(!saved.is_empty(), "round {round}: no copy");
+            for copy in saved {
+                let (version, pages, displays) = Store::inspect(&copy).unwrap();
+                assert_eq!((version, pages, displays), (2, 9, 3), "round {round}: {copy:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_copy_that_finds_the_upgrade_done_is_not_kept_and_is_no_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.db");
+        schema_2_database(&path);
+        let store = Store::open(&path).unwrap();
+        let before = copies(dir.path());
+        // As if this opener read schema 2, let go, and another process upgraded the database
+        // before the copy was made.
+        let found = store.copy_before_upgrade(&store.conn(), 2).unwrap();
+        assert_eq!(found, None);
+        assert_eq!(
+            copies(dir.path()),
+            before,
+            "the copy at the new schema was removed"
+        );
     }
 
     #[test]

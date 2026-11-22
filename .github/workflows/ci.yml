@@ -43,8 +43,12 @@ jobs:
       - name: Pack as a release would
         run: |
           cargo build --locked -p hub-manager -p hub-send -p hub-firmware -p display-simulator -p usage-helper
-          bash tools/release/package-app.sh linux 0.0.0-ci target/debug ci-out
-          python3 -I tools/release/check-package.py linux 0.0.0-ci ci-out
+          # The committed official package goes in as a release's does, so packing an app that
+          # holds one is tried on every push, not first at a tag. Without one, the download has none.
+          set -- firmware/official/*.dhfw
+          [ -f "$1" ] || set --
+          bash tools/release/package-app.sh linux 0.0.0-ci target/debug ci-out "$@"
+          python3 -I tools/release/check-package.py linux 0.0.0-ci ci-out "$@"
       # The release workflow's first and last steps, on stand-in tags: what it reads from a tag, and
       # the notes it writes (a preview's say so, a stable release's don't).
       - name: Check a stand-in tag and the release notes
@@ -133,8 +137,12 @@ jobs:
       # As the release packs it. Relative paths: Python here is a Windows program.
       - name: Pack as a release would
         run: |
-          bash tools/release/package-app.sh windows 0.0.0-ci target/release ci-out
-          python -I tools/release/check-package.py windows 0.0.0-ci ci-out
+          # The committed official package goes in as a release's does, so packing an app that
+          # holds one is tried on every push, not first at a tag. Without one, the download has none.
+          set -- firmware/official/*.dhfw
+          [ -f "$1" ] || set --
+          bash tools/release/package-app.sh windows 0.0.0-ci target/release ci-out "$@"
+          python -I tools/release/check-package.py windows 0.0.0-ci ci-out "$@"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: hub-manager-windows-x64
@@ -163,8 +171,12 @@ jobs:
       - name: Pack as a release would
         run: |
           cargo build --locked -p hub-manager -p hub-send -p hub-firmware -p display-simulator -p usage-helper
-          bash tools/release/package-app.sh macos 0.0.0-ci target/debug ci-out
-          python3 -I tools/release/check-package.py macos 0.0.0-ci ci-out
+          # The committed official package goes in as a release's does, so packing and signing an
+          # app that holds one is tried on every push, not first at a tag. Without one, none.
+          set -- firmware/official/*.dhfw
+          [ -f "$1" ] || set --
+          bash tools/release/package-app.sh macos 0.0.0-ci target/debug ci-out "$@"
+          python3 -I tools/release/check-package.py macos 0.0.0-ci ci-out "$@"
 
   pi:
     # The Raspberry Pi release build (aarch64 against glibc 2.36, so it runs on Raspberry Pi OS

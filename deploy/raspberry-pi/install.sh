@@ -150,13 +150,18 @@ if ! systemctl is-active --quiet display-hub; then
 fi
 
 # "Active" only means the process started. The database is set up before the hub listens, so wait
-# (up to 30 seconds) until its port answers. Commands run before then would race the hub for the
+# (up to about a minute) until its port answers. Commands run before then would race the hub for the
 # new database. If the port is changed in hubd.toml this just runs out of time, and the commands
 # below try again anyway.
-for _ in $(seq 1 30); do
-  timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/8443' 2>/dev/null && break
-  sleep 1
-done
+answers() { timeout 1 bash -c 'exec 3<>/dev/tcp/127.0.0.1/8443' 2>/dev/null; }
+if ! answers; then
+  say "Waiting for the hub to answer on this Pi (port 8443). This can take up to a minute."
+  for _ in $(seq 1 30); do
+    sleep 1
+    answers && break
+  done
+  answers || say "(It hasn't answered yet. Carrying on: the steps below try again.)"
+fi
 
 say ""
 say "Display Hub is running: $new_version"
@@ -173,8 +178,9 @@ if [ "$fresh_install" = 1 ]; then
     if as_hub "$bin" pair-admin 2>"$pair_err"; then paired=1; break; fi
     sleep 2
   done
+  # Shown either way: on success it holds only warnings, which are worth seeing too.
+  cat "$pair_err" >&2 || true
   if [ "$paired" = 0 ]; then
-    cat "$pair_err" >&2 || true
     say "(Couldn't make one. Try again with: sudo -u $user hubd pair-admin)"
   fi
   rm -f "$pair_err"

@@ -32,6 +32,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// the other end (a VPN can lose the close), and is better replaced than tried.
 const POOL_IDLE: Duration = Duration::from_secs(4);
 
+/// The usual time allowed for a call, and for opening its connection. Tests use shorter ones.
+#[derive(Clone, Copy, Debug)]
+struct Waits {
+    total: Duration,
+    connect: Duration,
+}
+
+const WAITS: Waits = Waits {
+    total: TIMEOUT,
+    connect: CONNECT_TIMEOUT,
+};
+
 /// Why a call to the hub failed, in terms a person can act on.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -95,6 +107,10 @@ impl HubClient {
     /// Plain HTTP to a hub in development mode on this computer. Any other host is refused, so
     /// this can never send data across a network unencrypted.
     pub fn loopback_dev(base: &str) -> Result<Self, ClientError> {
+        Self::loopback_dev_waiting(base, WAITS)
+    }
+
+    fn loopback_dev_waiting(base: &str, waits: Waits) -> Result<Self, ClientError> {
         let base = Url::parse(base).map_err(|e| ClientError::AddressRefused(e.to_string()))?;
         let loopback = match base.host() {
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -110,8 +126,8 @@ impl HubClient {
         let http = reqwest::Client::builder()
             // Plain HTTP only. TLS is configured to trust no key at all, so it can never succeed.
             .use_preconfigured_tls(pin::client_config(Vec::new()))
-            .timeout(TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(waits.total)
+            .connect_timeout(waits.connect)
             .pool_idle_timeout(POOL_IDLE)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -123,6 +139,10 @@ impl HubClient {
     /// HTTPS to a hub identified by the SHA-256 of its public key (one, or two during a key change).
     /// Any other server at `host` is refused before anything is sent.
     pub fn pinned(host: &str, port: u16, pins: Vec<[u8; 32]>) -> Result<Self, ClientError> {
+        Self::pinned_waiting(host, port, pins, WAITS)
+    }
+
+    fn pinned_waiting(host: &str, port: u16, pins: Vec<[u8; 32]>, waits: Waits) -> Result<Self, ClientError> {
         let authority = if host.contains(':') && !host.starts_with('[') {
             format!("[{host}]")
         } else {
@@ -138,8 +158,8 @@ impl HubClient {
         let http = reqwest::Client::builder()
             .use_preconfigured_tls(pin::client_config(pins))
             .https_only(true)
-            .timeout(TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(waits.total)
+            .connect_timeout(waits.connect)
             .pool_idle_timeout(POOL_IDLE)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -837,25 +857,24 @@ impl HubClient {
         .map(|_| ())
     }
 
-    /// Sends a request, and a plain read (a GET with no body) is sent once more if the hub couldn't be
-    /// reached. A connection that failed is dropped, never reused, so the second try opens a new one.
-    /// A read that timed out is sent again only with the usual short timeout: a long download that
-    /// stalled isn't made to wait twice. Anything else, a changed hub key and a refusal from the hub
-    /// included, is reported as it was.
+    /// Sends a request, and a plain read (a GET with no body) is sent once more if its connection was
+    /// lost on the way, as a VPN or Wi-Fi hiccup can do. A connection that failed is dropped, never
+    /// reused, so the second try opens a new one. A read that got no answer in time is sent again
+    /// only with the usual short timeout: a long download that stalled isn't made to wait twice.
+    /// Nothing is sent again when nothing answers at the address (the connection ran out of time, was
+    /// refused or found no way there), so a hub that is turned off costs one wait, not two. Anything
+    /// else, a changed hub key and a refusal from the hub included, is reported as it was.
     async fn execute(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response, ClientError> {
         let req = req.build().map_err(classify)?;
         let short = req.timeout().is_none();
         let again = (req.method() == Method::GET && req.body().is_none())
             .then(|| req.try_clone())
             .flatten();
-        match self.http.execute(req).await.map_err(classify) {
-            Err(ClientError::Unreachable(_)) if again.is_some() => {
-                self.http.execute(again.expect("checked")).await.map_err(classify)
+        match (self.http.execute(req).await, again) {
+            (Err(e), Some(again)) if worth_retrying(&e, short) => {
+                self.http.execute(again).await.map_err(classify)
             }
-            Err(ClientError::Timeout) if short && again.is_some() => {
-                self.http.execute(again.expect("checked")).await.map_err(classify)
-            }
-            r => r,
+            (r, _) => r.map_err(classify),
         }
     }
 
@@ -914,14 +933,50 @@ async fn read_capped(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>,
     Ok(out)
 }
 
+/// Whether a plain read that failed is worth sending once more, on a new connection.
+fn worth_retrying(e: &reqwest::Error, short: bool) -> bool {
+    match class_of(e) {
+        // Out of time while connecting means nothing answered: another try would only wait again.
+        ClientError::Timeout => short && !e.is_connect(),
+        ClientError::Unreachable(_) => !(e.is_connect() && nothing_there(e)),
+        _ => false,
+    }
+}
+
+/// Whether a connection failed because nothing at the address takes it: refused, or no way there.
+/// A connection dropped part way through opening, as a VPN can do, isn't one of these.
+fn nothing_there(e: &(dyn std::error::Error + 'static)) -> bool {
+    use std::io::ErrorKind;
+    let mut src = e.source();
+    while let Some(s) = src {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            if matches!(
+                io.kind(),
+                ErrorKind::ConnectionRefused
+                    | ErrorKind::HostUnreachable
+                    | ErrorKind::NetworkUnreachable
+                    | ErrorKind::AddrNotAvailable
+            ) {
+                return true;
+            }
+        }
+        src = s.source();
+    }
+    false
+}
+
 fn classify(e: reqwest::Error) -> ClientError {
+    class_of(&e)
+}
+
+fn class_of(e: &reqwest::Error) -> ClientError {
     if e.is_timeout() {
         ClientError::Timeout
     } else {
         // reqwest's messages name the URL, which holds no credentials here (they go in headers).
         let mut msg = e.to_string();
-        let dns = is_dns_failure(&e);
-        let mut src = std::error::Error::source(&e);
+        let dns = is_dns_failure(e);
+        let mut src = std::error::Error::source(e);
         while let Some(s) = src {
             msg = format!("{msg}: {s}");
             src = s.source();
@@ -1034,5 +1089,123 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    // ---- sending a read again ----------------------------------------------------------------------
+
+    const QUICK: Waits = Waits {
+        total: Duration::from_millis(400),
+        connect: Duration::from_millis(400),
+    };
+
+    /// A server on this computer that answers `v1/health` in plain HTTP, but takes the first `hold`
+    /// connections and never answers them. Returns its port and its count of connections.
+    async fn server_that_holds(hold: usize) -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((mut conn, _)) = listener.accept().await else {
+                    return;
+                };
+                if count.fetch_add(1, Ordering::SeqCst) < hold {
+                    held.push(conn);
+                    continue;
+                }
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => got.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let body = br#"{"status":"ok","protocol_versions":[1]}"#;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = conn.write_all(head.as_bytes()).await;
+                    let _ = conn.write_all(body).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    fn dev_client(port: u16) -> HubClient {
+        HubClient::loopback_dev_waiting(&format!("http://127.0.0.1:{port}/"), QUICK).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_read_that_got_no_answer_in_time_is_sent_once_more() {
+        let (port, seen) = server_that_holds(1).await;
+        let health = dev_client(port)
+            .health()
+            .await
+            .expect("the second connection answers");
+        assert_eq!(health.status, "ok");
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_that_gets_no_answer_twice_is_not_sent_a_third_time() {
+        let (port, seen) = server_that_holds(usize::MAX).await;
+        assert!(matches!(
+            dev_client(port).health().await,
+            Err(ClientError::Timeout)
+        ));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_read_with_its_own_long_timeout_is_not_sent_again_when_it_runs_out() {
+        let (port, seen) = server_that_holds(usize::MAX).await;
+        let c = dev_client(port);
+        let req = c.http.get(c.url("v1/health")).timeout(Duration::from_millis(300));
+        assert!(matches!(c.execute(req).await, Err(ClientError::Timeout)));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_that_runs_out_of_time_opening_is_not_tried_again() {
+        // The server takes the connection but never answers the TLS greeting, so opening it runs
+        // out of time, as it does for a hub that is turned off.
+        let (port, seen) = server_that_holds(usize::MAX).await;
+        let c = HubClient::pinned_waiting(
+            "127.0.0.1",
+            port,
+            vec![[0; 32]],
+            Waits {
+                total: Duration::from_secs(5),
+                connect: Duration::from_millis(300),
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(c.health().await, Err(ClientError::Timeout)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "one wait, not the full timeout"
+        );
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_not_tried_again() {
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let c = dev_client(port);
+        let e = c.http.get(c.url("v1/health")).send().await.unwrap_err();
+        assert!(matches!(class_of(&e), ClientError::Unreachable(_)), "{e:?}");
+        assert!(!worth_retrying(&e, true));
     }
 }

@@ -913,7 +913,10 @@ pub struct Model {
     pub needs_pairing: bool,
     pub section: Section,
     pub last: Option<Refresh>,
+    /// When the next background refresh is counted from: the last answer, or a try that failed.
     pub refreshed_at: Option<Instant>,
+    /// When `last` arrived, for the hub's clock. A failed try moves `refreshed_at` but not this.
+    answered_at: Option<Instant>,
     /// Whether the last call reached the hub. `None` before the first.
     pub online: Option<bool>,
     /// The running refresh was started by the timer, not by the person.
@@ -976,6 +979,7 @@ impl Model {
             section: Section::Overview,
             last: None,
             refreshed_at: None,
+            answered_at: None,
             online: None,
             background_refresh: false,
             missed_refreshes: 0,
@@ -1124,7 +1128,7 @@ impl Model {
     /// The hub's clock now, from its last answer plus the time since.
     pub fn hub_now(&self, now: Instant) -> Option<Timestamp> {
         let r = self.last.as_ref()?;
-        let since = now.saturating_duration_since(self.refreshed_at?).as_secs() as i64;
+        let since = now.saturating_duration_since(self.answered_at?).as_secs() as i64;
         Some(r.status.now.plus_seconds(since))
     }
 
@@ -2183,6 +2187,7 @@ impl Model {
         }
         self.last = Some(r);
         self.refreshed_at = Some(now);
+        self.answered_at = Some(now);
         self.online = Some(true);
         self.missed_refreshes = 0;
         self.prune_tick_changes();
@@ -2517,8 +2522,11 @@ impl Model {
                 guidance::from_install(e, &port)
             }
         };
-        // Only the quiet miss above waits for a quick second try; after anything else, the usual wait.
-        self.missed_refreshes = 0;
+        // Only the quiet miss above waits for a quick second try; after a refresh that failed any
+        // other way, the usual wait. Another operation's failure leaves a quick try that is due.
+        if busy == Some(Busy::Refreshing) {
+            self.missed_refreshes = 0;
+        }
         if matches!(busy, Some(Busy::Installing { .. })) {
             self.install_failed();
         }
@@ -3615,6 +3623,41 @@ mod tests {
         m.refresh_due(now).unwrap();
         m.finish(Err(Failure::Client(ClientError::IdentityMismatch)), now);
         assert!(m.notice.is_some());
+    }
+
+    #[test]
+    fn another_operation_failing_keeps_the_quick_try_after_a_missed_refresh() {
+        let (mut m, now) = connected(vec![]);
+        m.refreshed_at = None;
+        m.refresh_due(now).unwrap();
+        m.finish(Err(Failure::Client(ClientError::Timeout)), now);
+        m.upload_firmware(PathBuf::from("board.dhfw")).unwrap();
+        m.finish(
+            Err(Failure::ReadFile("gone".into())),
+            now + Duration::from_secs(1),
+        );
+        assert!(
+            m.refresh_due(now + RETRY_SOON).is_some(),
+            "the second try is still soon, not a full wait away"
+        );
+    }
+
+    #[test]
+    fn the_hub_clock_keeps_going_when_a_try_fails() {
+        let (mut m, now) = connected(vec![]);
+        let t = now + REFRESH_EVERY;
+        let before = m.hub_now(t).unwrap();
+        m.refresh_due(t).unwrap();
+        m.finish(Err(Failure::Client(ClientError::Timeout)), t);
+        assert_eq!(m.hub_now(t), Some(before), "a quiet miss");
+        let later = t + RETRY_SOON;
+        m.refresh_due(later).unwrap();
+        m.finish(Err(Failure::Client(ClientError::Timeout)), later);
+        assert_eq!(
+            m.hub_now(later),
+            Some(before.plus_seconds(RETRY_SOON.as_secs() as i64)),
+            "a miss that was shown"
+        );
     }
 
     #[test]

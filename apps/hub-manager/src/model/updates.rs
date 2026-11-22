@@ -369,8 +369,9 @@ impl Model {
 
     /// Add a firmware file: checked here, then sent to the hub.
     pub fn upload_firmware(&mut self, path: PathBuf) -> Option<Op> {
-        self.notice = None;
-        self.start(Busy::Uploading, Op::UploadFirmware { path })
+        let op = self.start(Busy::Uploading, Op::UploadFirmware { path });
+        self.clear_notice_if(op.is_some());
+        op
     }
 
     /// The official firmware that came with the app.
@@ -396,8 +397,17 @@ impl Model {
     /// started.
     pub fn upload_bundled(&mut self) -> Option<Op> {
         let loaded = Box::new(self.bundled()?.loaded.clone());
-        self.notice = None;
-        self.start(Busy::Uploading, Op::UploadLoaded { loaded })
+        let op = self.start(Busy::Uploading, Op::UploadLoaded { loaded });
+        self.clear_notice_if(op.is_some());
+        op
+    }
+
+    /// An upload clears what was said before only once it starts: one refused while something else
+    /// runs leaves the notice up.
+    fn clear_notice_if(&mut self, started: bool) {
+        if started {
+            self.notice = None;
+        }
     }
 
     pub fn ask_remove_package(&mut self, id: &str) {
@@ -1803,6 +1813,7 @@ mod tests {
         let (m0, now) = with_firmware();
         let mut m = m0.with_bundled(Some(firmware::Bundled {
             loaded: loaded.clone(),
+            board: firmware::OFFICIAL_BOARD,
         }));
         assert_eq!(m.bundled().map(|b| b.version()), Some("1.0.0"));
 
@@ -1821,12 +1832,20 @@ mod tests {
         m.close_install();
         assert!(m.bundled().is_some());
 
+        // While something else runs, adding it is refused and what was said stays up.
+        m.notice = Some(Guidance::done("Saved", ""));
+        m.busy = Some(Busy::Refreshing);
+        assert!(m.upload_bundled().is_none());
+        assert!(m.notice.is_some());
+        m.busy = None;
+
         // Adding it to the hub sends the checked package, and then there is nothing left to add.
         assert!(!m.bundled_on_hub());
         match m.upload_bundled() {
             Some(Op::UploadLoaded { loaded: sent }) => assert_eq!(sent.bytes, loaded.bytes),
             other => panic!("{other:?}"),
         }
+        assert!(m.notice.is_none(), "cleared once the upload starts");
         let mut on_hub = package("a", "1.0.0", "k");
         on_hub.package_id = loaded.checked.package_id.to_hex();
         let mut r = m.last.clone().unwrap();
