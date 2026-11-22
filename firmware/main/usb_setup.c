@@ -17,6 +17,18 @@
 // port without the console (a crash report, or ESP_EARLY_LOG from an interrupt). `hello` is
 // repeated by the app, so a spoilt one costs two seconds.
 //
+// WHAT STAYS IN MEMORY. A `provision` line holds the Wi-Fi password and the enrolment secret.
+// This task wipes its own copies as soon as a line has been dealt with: the piece just read,
+// the line reader's buffer and the handler's scratch. A factory reset also drops a line that
+// was only part-read (usb_setup_forget). What can't be wiped is the driver's own receive
+// buffer, RX_BUFFER_BYTES of ring buffer that ESP-IDF gives no call to reach: the bytes of the
+// last lines to pass through it stay there until later traffic overwrites them (every `hello`
+// does, a little at a time), or the display loses power. So a factory reset clears the setup
+// from flash, every sector of it, and from this firmware's own buffers; it doesn't promise
+// that no trace is left in RAM. Reading that takes code running on the chip, and RAM doesn't
+// outlive a power cycle. (The buffer isn't emptied at a reset either: what is waiting in it
+// unread was sent after the reset began, and is a line to answer.)
+//
 // What was read in ESP-IDF v5.5.6 to write this (paths are under components/):
 // - esp_driver_usb_serial_jtag/src/usb_serial_jtag.c: the receive interrupt copies what arrives
 //   into the driver's receive buffer and silently drops what doesn't fit (line 150), so that
@@ -68,6 +80,8 @@ static const char *s_firmware_version;
 static const char *s_hardware_revision;
 static usb_setup_stored_t s_on_stored;
 static TaskHandle_t s_task;
+// Set by usb_setup_forget() from another task; acted on, and cleared, by the USB task alone.
+static volatile bool s_forget;
 
 // Too big for a stack, and holding a bundle while one is read: taken from the heap once.
 static dh_usb_line_reader *s_reader;
@@ -181,6 +195,13 @@ static void usb_task(void *arg)
     while (true) {
         // Keep reading whatever the display is doing, so the app's writes never stall.
         const int got = usb_serial_jtag_read_bytes(chunk, sizeof(chunk), pdMS_TO_TICKS(1000));
+        if (s_forget) {
+            // A factory reset: a line that was part-read is dropped, and the rest of it is
+            // ignored as it comes. Whatever was read just now is fed below as usual: it is
+            // the rest of that line, or a new line to answer.
+            s_forget = false;
+            dh_usb_line_forget(s_reader);
+        }
         if (got <= 0) {
             continue;
         }
@@ -232,6 +253,11 @@ esp_err_t usb_setup_start(const char *firmware_version, const char *hardware_rev
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+void usb_setup_forget(void)
+{
+    s_forget = true;
 }
 
 unsigned usb_setup_stack_unused(void)

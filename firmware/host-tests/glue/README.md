@@ -1,6 +1,6 @@
 # A stand-in for the board, for `main/update.c`
 
-`main/update.c` is the part of the firmware that reads an update from the hub, writes it to the spare app partition and runs the trial boot's clock. It can't run without ESP-IDF, so these files stand in for the few ESP-IDF calls it makes: a connection that hands out a body in pieces, a spare partition that is an array, a clock the test moves, and storage that is the update core itself.
+`main/update.c` is the part of the firmware that reads an update from the hub, writes it to the spare app partition and runs the trial boot's clock. It can't run without ESP-IDF, so these files stand in for the few ESP-IDF calls it makes: a connection that hands out a body in pieces, a spare partition that is an array (with the one erase the firmware may make of it, of its first sector), a clock the test moves, and storage that is the update core itself.
 
 - `include/` has headers with the names `update.c` includes (`esp_ota_ops.h`, `freertos/task.h` and so on), holding only what it uses.
 - `glue.h` and `glue.c` are the stand-in, and the switches a test sets.

@@ -5,7 +5,8 @@
  * through the same code as dh_fw_conform_glue; these are the cases a vector can't describe: the
  * two time limits (also against a hub that trickles bytes), flash calls and saves that fail, a
  * partition that can't be set to boot, a setup that goes mid-download, a refusal made from the
- * offer alone, and the trial boot's five minutes against a check-in.
+ * offer alone, an image that was given up (which must be left unable to start), the trial
+ * boot's five minutes against a check-in, and a start whose image state can't be read.
  *
  * The package is the one in protocol/v1/firmware/package-01-valid.json: version 1.2.0, security
  * counter 4, for a display that trusts `maker` and `recovery` with a floor of 3.
@@ -19,6 +20,7 @@
 #include "dh_json.h"
 #include "dh_update.h"
 #include "esp_err.h"
+#include "esp_ota_ops.h"
 #include "glue.h"
 #include "storage_fw.h"
 #include "update.h"
@@ -168,6 +170,8 @@ static void check_tidy(void)
 {
     CHECK(!glue.wrote_while_closed && !glue.lock_misused && !glue.mutex_misused);
     CHECK(glue.lock_depth == 0 && !glue.open);
+    /* Nothing is ever erased but the first sector of the spare partition, once it is closed. */
+    CHECK(!glue.erased_elsewhere);
     /* One read never asks for more than 256 bytes (update.c, "How long one read can take"). */
     CHECK(!glue.read_past_the_form && glue.most_asked <= 256);
 }
@@ -190,6 +194,7 @@ static void test_install(void)
         /* Opened for writes in order, written with exactly the image, checked, and set to
          * boot only once the record was in flash. */
         CHECK(glue.begun && glue.sequential && glue.ended && !glue.aborted && glue.set_to_boot);
+        CHECK(glue.spare_spoilt == 0);
         CHECK(m != NULL && glue.written_len == m->image_size &&
               memcmp(glue.written, form + form_len - glue.written_len, glue.written_len) == 0);
         CHECK(glue.handed == form_len);
@@ -213,6 +218,9 @@ static void check_ended(dh_fw_reason reason, bool opened)
     check_tidy();
     CHECK(!glue.set_to_boot && glue.begun == opened);
     CHECK(!opened || glue.aborted || glue.ended);
+    /* An image that was given up can't be started: its first sector is erased, once. A
+     * partition that was never opened is left as it was. */
+    CHECK(glue.spare_spoilt == (opened ? 1u : 0u));
     storage_fw_attempt_ended(reason);
     dh_fw_record r = flash_record();
     CHECK(r.stage == DH_FW_STAGE_IDLE && r.result_state == dh_fw_reason_state(reason) &&
@@ -342,6 +350,95 @@ static void test_flash_failures(void)
     CHECK(receive() == DH_FW_REASON_FLASH);
     CHECK(glue.written_len == 0 && glue.aborted);
     check_ended(DH_FW_REASON_FLASH, true);
+}
+
+/* An image that was given up is left unable to start (update.c, spoil_spare). */
+static void test_abandoned_image(void)
+{
+    static uint8_t bad[sizeof form];
+    uint8_t start[16];
+
+    /* The whole image arrives and doesn't match the manifest's hash: what was written could be
+     * a complete app that nobody signed. Its first sector is erased, after the partition is
+     * closed, and reads back as blank. */
+    fresh_display();
+    take_offer();
+    memcpy(bad, form, form_len);
+    bad[form_len - 1] ^= 0x01u;
+    glue.body = bad;
+    /* In bursts, so that most of the image is written before its last piece is refused. */
+    glue.piece = 64;
+    glue.pauses = true;
+    CHECK(receive() == DH_FW_REASON_IMAGE_HASH);
+    CHECK(glue.aborted && glue.spare_spoilt == 1 && glue.written_when_spoilt > 0);
+    CHECK(esp_partition_read(esp_ota_get_next_update_partition(NULL), 0, start, sizeof start) ==
+          ESP_OK);
+    for (size_t i = 0; i < sizeof start; i++) {
+        CHECK(start[i] == 0xff);
+    }
+    check_ended(DH_FW_REASON_IMAGE_HASH, true);
+
+    /* The erase fails: the update still ends as it would have, and nothing else is touched. */
+    fresh_display();
+    take_offer();
+    glue.body = bad;
+    glue.erase_fails = true;
+    CHECK(receive() == DH_FW_REASON_IMAGE_HASH);
+    CHECK(glue.aborted && glue.spare_spoilt == 0 && !glue.set_to_boot);
+    check_tidy();
+
+    /* The record of the release can't be saved: the image is whole and genuine, but it must
+     * never start without its record, so it is spoilt too. */
+    fresh_display();
+    take_offer();
+    glue.record_write_fails = true;
+    CHECK(receive() == DH_FW_REASON_FLASH);
+    CHECK(glue.ended && !glue.set_to_boot && glue.spare_spoilt == 1);
+    check_tidy();
+
+    /* It can't be set to boot, and the display still starts the firmware it is running. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    CHECK(receive() == DH_FW_REASON_FLASH && restart == UPDATE_NO_RESTART);
+    CHECK(glue.spare_spoilt == 1);
+    check_tidy();
+
+    /* Whenever a restart is asked for, the image may be the one that starts: never spoilt. */
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    glue.set_boot_lands = true;
+    CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_INTO_NEW);
+    CHECK(glue.spare_spoilt == 0);
+    fresh_display();
+    take_offer();
+    glue.set_boot_fails = true;
+    glue.boot_unreadable = true;
+    CHECK(receive() == DH_FW_REASON_NONE && restart == UPDATE_RESTART_TO_SETTLE);
+    CHECK(glue.spare_spoilt == 0);
+    check_tidy();
+
+    /* The OTA data names the spare partition as the one to start next (it can't be read as
+     * the running one): left alone. */
+    fresh_display();
+    take_offer();
+    glue.body = bad;
+    glue.set_boot_fails = true; /* only so that set_boot_lands is looked at */
+    glue.set_boot_lands = true;
+    CHECK(receive() == DH_FW_REASON_IMAGE_HASH);
+    CHECK(glue.aborted && glue.spare_spoilt == 0);
+    check_tidy();
+
+    /* ESP-IDF gone wrong, naming the running partition as the spare one and letting it be
+     * opened: nothing of the running partition is ever erased. */
+    fresh_display();
+    take_offer();
+    glue.body = bad;
+    glue.spare_is_running = true;
+    CHECK(receive() == DH_FW_REASON_IMAGE_HASH);
+    CHECK(glue.begun && glue.aborted && glue.spare_spoilt == 0);
+    check_tidy();
 }
 
 /* After a write failed, nothing about updates is done until the display restarts. */
@@ -920,18 +1017,86 @@ static void test_trial(void)
     CHECK(!glue.mutex_misused);
 }
 
+/* Installs the package and restarts into it with the bootloader's record of the image
+ * unreadable (or saying anything but "on trial" or "marked good"). */
+static void start_unknown(uint8_t running_slot)
+{
+    fresh_display();
+    take_offer();
+    CHECK(receive() == DH_FW_REASON_NONE);
+    forget_writes();
+    glue.image_unknown = true;
+    CHECK(glue_restart(running_slot, false));
+}
+
+/* "On trial" fails closed (storage_fw.h): with a release waiting in the running partition, only
+ * an image that reads back as marked good is taken as marked good. */
+static void test_image_state_unknown(void)
+{
+    dh_fw_report report;
+
+    /* Unknown, with the release waiting in the partition that is running: a trial boot. Nothing
+     * of the release is applied, nothing is written and nothing is reported. */
+    start_unknown(1);
+    CHECK(storage_fw_on_trial() && storage_image_on_trial() && storage_fw_facts().on_trial);
+    CHECK(glue.writes[0] == '\0' && flash_keys().security_floor == 3);
+    CHECK(flash_record().stage == DH_FW_STAGE_PENDING && !storage_fw_report_next(&report));
+    /* Its clock runs, and a check-in marks it good: only then the floor, the keys, the record. */
+    update_trial_start();
+    CHECK(glue.task_made);
+    CHECK(update_trial_check_in(DH_FW_CHECK_IN_ANSWERED));
+    CHECK(glue.marked_valid == 1 && glue.writes_at_marked_valid == 0);
+    CHECK(strcmp(glue.writes, "kr") == 0 && flash_keys().security_floor == 4);
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_INSTALLED);
+    check_tidy();
+
+    /* The same start with no check-in: back to the version before at 300 seconds, with nothing
+     * of the release ever applied. */
+    start_unknown(1);
+    update_trial_start();
+    CHECK(glue_run_task());
+    CHECK(glue.rolled_back == 1 && glue.rolled_back_at_us == 300 * 1000000LL);
+    CHECK(glue.writes[0] == '\0' && flash_keys().security_floor == 3);
+
+    /* Read back as marked good: the last start ended between marking and saving, and this one
+     * finishes the job (as before). */
+    fresh_display();
+    take_offer();
+    CHECK(receive() == DH_FW_REASON_NONE);
+    forget_writes();
+    CHECK(glue_restart(1, false));
+    CHECK(!storage_fw_on_trial() && !storage_image_on_trial());
+    CHECK(strcmp(glue.writes, "kr") == 0 && flash_keys().security_floor == 4);
+
+    /* Unknown, in the other partition: the version before, which settles it as rolled back. */
+    start_unknown(0);
+    CHECK(!storage_fw_on_trial() && !storage_image_on_trial());
+    CHECK(flash_keys().security_floor == 3);
+    CHECK(storage_fw_report_next(&report) && report.state == DH_FW_REPORT_ROLLED_BACK);
+
+    /* Unknown, with no release waiting (a first install reads this way): an ordinary start. */
+    fresh_display();
+    glue.image_unknown = true;
+    CHECK(glue_restart(0, false));
+    CHECK(!storage_fw_on_trial() && !storage_image_on_trial() && glue.writes[0] == '\0');
+    update_trial_start();
+    CHECK(!glue.task_made);
+}
+
 int main(void)
 {
     load_package();
     test_install();
     test_time_limits();
     test_flash_failures();
+    test_abandoned_image();
     test_failed_saves();
     test_not_set_to_boot();
     test_reports_not_taken();
     test_told_when_stopped();
     test_facts();
     test_trial();
+    test_image_state_unknown();
     glue_reset();
     printf("update glue tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? 0 : 1;

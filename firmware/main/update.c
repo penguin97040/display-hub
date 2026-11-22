@@ -20,6 +20,13 @@
 //   valid (set_actual_ota_seq, line 488). So after a first install there is always a valid image
 //   to go back to, and esp_ota_mark_app_invalid_rollback_and_reboot() finds it. A reset of any
 //   kind on a trial boot makes the bootloader mark the image aborted and start the other.
+//   The bootloader also falls back by itself: if the image the OTA data names doesn't pass its
+//   check, it tries the other slots and starts any image that does
+//   (bootloader_utility_load_boot_image, line 590 on), signed by this project or not, since
+//   Secure Boot is off. And esp_ota_abort() only frees the handle (esp_ota_ops.c, line 456):
+//   what was written stays. So an image that was
+//   given up is spoilt here, by erasing its first sector (spoil_spare), and can never be the
+//   one the bootloader falls back to.
 //
 // HOW LONG ONE READ CAN TAKE. Two things in ESP-IDF stand between a download and its time limits,
 // and neither can be interrupted from outside once it has been called:
@@ -82,6 +89,9 @@ static uint8_t s_piece[PIECE_BYTES];
 // top. Reads go on filling s_piece until it is full, so the flash is still written a sector's
 // worth at a time.
 #define READ_BYTES 256
+
+// What is erased of an image that was given up: one flash sector, which holds its header.
+#define SPOIL_BYTES 4096
 
 // How often a download's progress, and the internal memory left, are logged.
 #define PROGRESS_EVERY_BYTES (256u * 1024u)
@@ -279,6 +289,43 @@ static update_restart_t boot_not_set(const esp_partition_t *spare, esp_err_t err
     return UPDATE_RESTART_TO_SETTLE;
 }
 
+// An image that was given up must never be started. It isn't set to boot, but the bootloader
+// would fall back to it if the running image were ever damaged, and a download that failed its
+// hash can be a complete, valid app that nobody signed. So the first sector of the spare
+// partition, which holds the image's header, is erased: the bootloader then finds no image
+// there at all. Only ever the spare partition, never the one that is running or the one set to
+// boot next; and only once it has been opened for this download, so an offer that was refused
+// before anything was written leaves the version before where it is.
+static void spoil_spare(const esp_partition_t *spare)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    const esp_partition_t *boots = esp_ota_get_boot_partition();
+    if (spare == NULL || running == NULL || spare->address == running->address ||
+        (boots != NULL && boots->address == spare->address)) {
+        ESP_LOGE(TAG, "not erasing the start of the abandoned image: its partition can't be "
+                      "told from the one in use");
+        return;
+    }
+    uint8_t start[16];
+    esp_err_t err = esp_partition_erase_range(spare, 0, SPOIL_BYTES);
+    if (err == ESP_OK) {
+        err = esp_partition_read(spare, 0, start, sizeof(start));
+    }
+    bool blank = err == ESP_OK;
+    for (size_t i = 0; blank && i < sizeof(start); i++) {
+        blank = start[i] == 0xff;
+    }
+    if (blank) {
+        ESP_LOGI(TAG, "the abandoned image in %s can't be started: its first sector is erased",
+                 spare->label);
+    } else {
+        // Nothing more can be done here. It still isn't set to boot, and the next download
+        // that opens the partition erases the same sector before it writes.
+        ESP_LOGE(TAG, "couldn't erase the start of the abandoned image in %s: %s", spare->label,
+                 err == ESP_OK ? "it didn't read back as blank" : esp_err_to_name(err));
+    }
+}
+
 dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device,
                             uint64_t offer_size, bool has_length, uint64_t length,
                             int64_t started_ms, bool (*stop)(void), update_restart_t *restart)
@@ -307,6 +354,7 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     const esp_partition_t *spare = esp_ota_get_next_update_partition(NULL);
     esp_ota_handle_t ota = 0;
     bool ota_open = false;
+    bool ota_begun = false; // the spare partition was opened, so something of it may be written
     bool finished = false;
     const uint64_t started_s = (uint64_t)(started_ms / 1000);
     uint64_t last_byte_s = uptime_seconds();
@@ -388,6 +436,7 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
                         reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
                     } else {
                         ota_open = true;
+                        ota_begun = true;
                     }
                     break;
                 }
@@ -460,6 +509,11 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     if (ota_open) {
         // Nothing of an abandoned image is ever started: the partition isn't set to boot.
         esp_ota_abort(ota);
+    }
+    if (ota_begun && reason != DH_FW_REASON_NONE && *restart == UPDATE_NO_RESTART) {
+        // And it can't be fallen back to either. (Not when a restart is asked for: then the
+        // image was written, checked and recorded, and may be the one that starts next.)
+        spoil_spare(spare);
     }
     if (reason != DH_FW_REASON_NONE) {
         ESP_LOGW(TAG, "the update ended: %s (%s), after %" PRIu64 " bytes. Nothing was installed",

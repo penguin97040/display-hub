@@ -54,3 +54,13 @@ void dh_usb_line_wipe(dh_usb_line_reader *r)
         b[i] = 0;
     }
 }
+
+void dh_usb_line_forget(dh_usb_line_reader *r)
+{
+    if (r->len != 0) {
+        /* What is still to come of that line isn't the start of a line. */
+        r->discarding = true;
+        r->len = 0;
+    }
+    dh_usb_line_wipe(r);
+}

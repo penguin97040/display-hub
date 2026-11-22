@@ -114,9 +114,20 @@ static bool fw_save(unsigned what)
     return true;
 }
 
-void storage_fw_settle_start(uint8_t running_slot, bool on_trial)
+bool storage_fw_settle_start(uint8_t running_slot, storage_image_t image)
 {
     unsigned save = 0;
+    bool on_trial = image == STORAGE_IMAGE_ON_TRIAL;
+    // See storage_fw.h, "On trial fails closed". Without this, a state that couldn't be read
+    // would count as "already marked good", and the release's security counter and keys would
+    // be applied with no check-in at all.
+    if (image == STORAGE_IMAGE_UNKNOWN && s_record.stage == DH_FW_STAGE_PENDING &&
+        s_record.has_last_offer && s_record.pending_slot == running_slot) {
+        ESP_LOGW(TAG, "an update is waiting for its trial boot in the partition that is running, "
+                      "and the bootloader's record doesn't say it was marked good: treating this "
+                      "start as its trial boot");
+        on_trial = true;
+    }
     s_stopped = false;
     s_no_way_back = false;
     s_refusal_is_latest = false;
@@ -149,6 +160,7 @@ void storage_fw_settle_start(uint8_t running_slot, bool on_trial)
     default:
         break;
     }
+    return on_trial;
 }
 
 void storage_fw_log(void)

@@ -428,6 +428,39 @@ static void test_shift(void)
     CHECK(dx >= -UI_SHIFT_MAX && dx <= UI_SHIFT_MAX);
 }
 
+/* The amber "Storage problem" screen: what it says for each reason storage is out of use. */
+static void test_storage_stopped(void)
+{
+    static const ui_storage_stop all[] = {UI_STORAGE_NOT_STARTED, UI_STORAGE_ERASE_UNFINISHED,
+                                          UI_STORAGE_ERASED, UI_STORAGE_WRITE_FAILED};
+    for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
+        const char *text = ui_storage_stopped_text(all[i]);
+        /* "Nothing was erased" only when nothing was. */
+        CHECK((strstr(text, "Nothing was erased") != NULL) == (all[i] == UI_STORAGE_NOT_STARTED));
+        /* Always a restart first, and Install firmware only as the last resort, after it. */
+        const char *restart = strstr(text, "Unplug it and plug it back in");
+        const char *reinstall = strstr(text, "Only if this keeps happening, use Install firmware");
+        CHECK(restart != NULL && reinstall != NULL && restart < reinstall);
+        /* Plain text, of a length the status screen shows without much scrolling. */
+        CHECK(strlen(text) < 400);
+        for (const char *c = text; *c != '\0'; c++) {
+            CHECK(*c == '\n' || (*c >= 0x20 && *c < 0x7f));
+        }
+    }
+    /* What was erased is said, and what the next start does about an erase cut short. */
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASED), "Its setup was erased") != NULL);
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASED), "Add a display") != NULL);
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASE_UNFINISHED), "couldn't finish") != NULL);
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_ERASE_UNFINISHED),
+                 "finishes the erase when it starts") != NULL);
+    /* A write that failed isn't "didn't start", and promises nothing about what was erased. */
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_WRITE_FAILED), "couldn't save") != NULL);
+    CHECK(strstr(ui_storage_stopped_text(UI_STORAGE_WRITE_FAILED), "didn't start") == NULL);
+    /* Anything else reads as the first. */
+    CHECK(strcmp(ui_storage_stopped_text((ui_storage_stop)99),
+                 ui_storage_stopped_text(UI_STORAGE_NOT_STARTED)) == 0);
+}
+
 static void test_unicode_example(void)
 {
     /* The example with macrons in its titles reads, and keeps them as they are. */
@@ -458,6 +491,7 @@ int main(void)
     test_forms();
     test_keep_view();
     test_shift();
+    test_storage_stopped();
     test_unicode_example();
     printf("ui tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;

@@ -33,14 +33,21 @@ void ui_start(const char *version, const char *board_note);
 // a display that is set up), or the storage problem. `pages` is NULL or the pages to draw: the
 // screen keeps drawing from it (its ages are kept up to date), so it must stay valid, and it may
 // only be changed while holding the LVGL lock, followed by another call to this. `note` is NULL
-// or one line about what just happened ("The setup was erased."). `fw` is how things stand with
-// firmware updates: one being installed, a trial boot, or the last one's result.
+// or a line or two about what just happened ("The setup was erased."), shown on the status
+// screen. `note_line` is NULL, or the same note in a few words (at most 80 bytes) for one that
+// the caller keeps passing until it no longer matters, such as a factory reset that didn't
+// happen: it takes the short line on every page, ahead of whatever else that line would say,
+// so the note can't be missed while a page is showing. `fw` is how things stand with firmware
+// updates: one being installed, a trial boot, or the last one's result.
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
                    const hub_status_t *hub, const storage_fw_facts_t *fw,
-                   const hub_pages_t *pages, const char *note);
+                   const hub_pages_t *pages, const char *note, const char *note_line);
 
 // The countdown while BOOT is held. It covers everything else until ui_show_state() is called.
 void ui_show_reset_countdown(int seconds_left);
+// BOOT was held to the end: the erase is about to begin. It too covers everything else until
+// ui_show_state() is called.
+void ui_show_reset_erasing(void);
 
 #ifdef __cplusplus
 }

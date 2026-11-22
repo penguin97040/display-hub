@@ -106,6 +106,20 @@ void ui_page_ids_of(const dh_snapshot *s, ui_page_ids *out);
 // status screen.
 size_t ui_keep_view(const ui_page_ids *before, size_t view, const dh_snapshot *after);
 
+// Why storage is out of use until a restart, for the amber "Storage problem" screen (storage.h
+// has the same list, as storage_stop_t).
+typedef enum {
+    UI_STORAGE_NOT_STARTED,      // it didn't start or couldn't be read; nothing was erased
+    UI_STORAGE_ERASE_UNFINISHED, // an erase of the setup began and couldn't finish
+    UI_STORAGE_ERASED,           // the setup was erased
+    UI_STORAGE_WRITE_FAILED,     // a write failed and couldn't be undone
+} ui_storage_stop;
+
+// What that screen says: what happened, then what to do. It says "Nothing was erased" only
+// when nothing was, always says to unplug the display and plug it back in first, and names
+// Install firmware only as what to do if that keeps failing.
+const char *ui_storage_stopped_text(ui_storage_stop why);
+
 // Burn-in care: the content's offset, in pixels, at step `step` of a slow cycle. Each offset is
 // within +-UI_SHIFT_MAX in both directions, so content laid out UI_SHIFT_MAX in from the edges
 // is never cut off.

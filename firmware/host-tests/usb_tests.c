@@ -1305,6 +1305,27 @@ static void test_the_examples(void)
     }
     CHECK(clean);
 
+    /* A factory reset with a line part-read (a `provision` that never finished): what was
+     * read is wiped, the rest of that line is ignored when it comes, even if it looks like a
+     * line of its own, and the line after it is read as usual. */
+    size_t half = strlen(stream) / 2;
+    CHECK(dh_usb_line_feed(&reader, (const uint8_t *)stream, half, &used, &line, &len) ==
+          DH_LINE_NONE && used == half && reader.len == half);
+    dh_usb_line_forget(&reader);
+    clean = reader.len == 0;
+    for (size_t i = 0; i < sizeof reader.buf; i++) {
+        clean = clean && reader.buf[i] == 0;
+    }
+    CHECK(clean);
+    static const char rest[] = "{\"type\":\"hello\",\"protocol_version\":1}\n{\"x\":1}\n";
+    CHECK(dh_usb_line_feed(&reader, (const uint8_t *)rest, sizeof rest - 1, &used, &line, &len) ==
+          DH_LINE_JSON && len == 7 && memcmp(line, "{\"x\":1}", 7) == 0);
+    /* With nothing part-read it only wipes: the next line is taken. */
+    dh_usb_line_forget(&reader);
+    CHECK(dh_usb_line_feed(&reader, (const uint8_t *)rest, sizeof rest - 1, &used, &line, &len) ==
+          DH_LINE_JSON && len == 37);
+    dh_usb_line_wipe(&reader);
+
     /* Sent again: the example's refusal, byte for byte. */
     CHECK(refused(d, stream, DH_USB_ERROR_ALREADY_PROVISIONED));
     stream[strlen(stream) - 1] = '\0';

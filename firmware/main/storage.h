@@ -58,15 +58,35 @@ typedef enum {
     // The stored data itself can't be used (a flash layout without the setup partition, or a
     // main NVS partition that NVS says must be erased): only Install firmware puts it right.
     STORAGE_FAILED,
-    // Storage didn't start, or couldn't be read, this time, for a reason that may pass (a read
-    // that failed, no memory, a storage key that may just have been burnt). Nothing was erased.
-    // A restart is the first thing to try; Install firmware only if it keeps happening.
+    // Storage is out of use for this run, for a reason that may pass: it didn't start or
+    // couldn't be read (a read that failed, no memory, a storage key that may just have been
+    // burnt), or it was working until a write failed and couldn't be undone. A restart is the
+    // first thing to try; Install firmware only if it keeps happening. `stop` in the facts
+    // says which, and whether anything of the setup was erased.
     STORAGE_NOT_STARTED,
 } storage_state_t;
+
+// With STORAGE_NOT_STARTED: why, and what became of the setup partition in this run. The
+// screen says "nothing was erased" only for the first.
+typedef enum {
+    // It didn't start, or couldn't be read. Nothing was erased.
+    STORAGE_STOP_NOT_STARTED,
+    // An erase of the setup partition began and couldn't finish (to finish a factory reset,
+    // because NVS said the partition couldn't be used as it was, or for a reset asked for
+    // while storage was out of use). Its mark is in flash, so the next start finishes it.
+    STORAGE_STOP_ERASE_UNFINISHED,
+    // The setup partition was erased, for one of the same reasons, and storage is out of use
+    // all the same.
+    STORAGE_STOP_ERASED,
+    // Storage was working until a write failed and what it left couldn't be erased. Nothing
+    // more is read or written until a restart has read what is really there.
+    STORAGE_STOP_WRITE,
+} storage_stop_t;
 
 // What is known about the stored setup, without any of its secrets.
 typedef struct {
     storage_state_t state;
+    storage_stop_t stop;   // with STORAGE_NOT_STARTED: why
     bool set_up;           // a setup is held: the display refuses another until it is reset
     bool setup_unreadable; // one is held, but it isn't in a form this firmware reads
     uint8_t hub_hosts;     // how many addresses it has for the hub
@@ -99,6 +119,29 @@ storage_facts_t storage_facts(void);
 // storage key.
 storage_key_status_t storage_key_status(void);
 void storage_efuse_report(efuse_report_t *out);
+
+// How a factory reset ended.
+typedef enum {
+    // The setup partition is blank (or this is a new board, which has never stored anything).
+    STORAGE_RESET_DONE,
+    // The erase began and couldn't finish. Its mark is in flash: another reset, or a restart,
+    // finishes it. (`reset_unfinished` in the facts, while storage is working.)
+    STORAGE_RESET_UNFINISHED,
+    // Nothing was erased, and the setup is in use as it was.
+    STORAGE_RESET_NOT_STARTED,
+    // Storage isn't working and NVS never started in this run, so nothing can be erased
+    // safely. Only Install firmware erases the display then.
+    STORAGE_RESET_NO_STORAGE,
+} storage_reset_t;
+
+// The factory reset (the BOOT button): erases the setup partition, every sector of it, and
+// nothing else. It works whenever NVS is running on the main partition, where the reset's mark
+// is kept: also when storage is out of use for this run after a read or a write that failed
+// (the setup is erased, and storage stays out of use until a restart). Takes the lock itself.
+storage_reset_t storage_factory_reset(void);
+// Whether storage_factory_reset() could erase anything: false only where it would answer
+// STORAGE_RESET_NO_STORAGE. Takes the lock itself.
+bool storage_reset_possible(void);
 
 // For dh_usb.h: NULL while storage isn't working.
 const dh_setup_store *storage_store(void);

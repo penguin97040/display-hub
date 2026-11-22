@@ -555,7 +555,9 @@ bool dh_setup_decode(dh_setup *out, const uint8_t *blob, size_t len)
         lo = take_u8(&r);
         a->pem_len = (uint16_t)(lo | ((unsigned)take_u8(&r) << 8));
         take_bytes(&r, a->pem, a->pem_len, sizeof a->pem);
-        uint8_t hash[DH_SHA256_LEN + 1u];
+        /* Zeroed: take_bytes() writes nothing once the blob has been found bad, and the copy
+         * below is made all the same (*out is wiped before a bad blob is refused). */
+        uint8_t hash[DH_SHA256_LEN + 1u] = {0};
         take_bytes(&r, hash, DH_SHA256_LEN, sizeof hash);
         memcpy(a->spki_sha256, hash, DH_SHA256_LEN);
     }

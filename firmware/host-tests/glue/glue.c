@@ -196,7 +196,7 @@ static const esp_partition_t SPARE = {ESP_PARTITION_SUBTYPE_APP_OTA_1, 0x620000,
 const esp_partition_t *esp_ota_get_next_update_partition(const esp_partition_t *start_from)
 {
     (void)start_from;
-    return &SPARE;
+    return glue.spare_is_running ? &RUNNING : &SPARE;
 }
 
 const esp_partition_t *esp_ota_get_running_partition(void)
@@ -218,7 +218,8 @@ const esp_partition_t *esp_ota_get_boot_partition(void)
 esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size,
                         esp_ota_handle_t *out_handle)
 {
-    if (partition != &SPARE || glue.begin_fails || glue.begun) {
+    if ((partition != &SPARE && !(glue.spare_is_running && partition == &RUNNING)) ||
+        glue.begin_fails || glue.begun) {
         return ESP_FAIL;
     }
     glue.begun = true;
@@ -272,6 +273,41 @@ esp_err_t esp_ota_abort(esp_ota_handle_t handle)
     }
     glue.open = false;
     glue.aborted = true;
+    return ESP_OK;
+}
+
+/* ---- esp_partition.h: only the spare partition's first sector may ever be erased ---- */
+
+esp_err_t esp_partition_erase_range(const esp_partition_t *partition, size_t offset, size_t size)
+{
+    if (partition == NULL || partition->address != SPARE.address || offset != 0 ||
+        size != 4096 || glue.open) {
+        glue.erased_elsewhere = true;
+        return ESP_FAIL;
+    }
+    if (glue.erase_fails) {
+        return ESP_FAIL;
+    }
+    glue.spare_spoilt++;
+    glue.written_when_spoilt = glue.written_len;
+    if (glue.written_len > 0) {
+        memset(glue.written, 0xff, glue.written_len < size ? glue.written_len : size);
+    }
+    return ESP_OK;
+}
+
+esp_err_t esp_partition_read(const esp_partition_t *partition, size_t offset, void *out,
+                             size_t size)
+{
+    if (partition == NULL || partition->address != SPARE.address) {
+        return ESP_FAIL;
+    }
+    /* Flash that was never written reads as blank. */
+    memset(out, 0xff, size);
+    if (offset < glue.written_len) {
+        size_t n = glue.written_len - offset;
+        memcpy(out, glue.written + offset, n < size ? n : size);
+    }
     return ESP_OK;
 }
 
@@ -419,10 +455,12 @@ bool glue_restart(uint8_t running_slot, bool on_trial)
         !dh_fw_record_decode(storage_fw_record(), glue.flash_record, sizeof glue.flash_record)) {
         return false;
     }
-    glue.image_on_trial = on_trial;
     glue.now_us = 0;
     storage_lock();
-    storage_fw_settle_start(running_slot, on_trial);
+    glue.image_on_trial = storage_fw_settle_start(
+        running_slot, on_trial               ? STORAGE_IMAGE_ON_TRIAL
+                      : glue.image_unknown   ? STORAGE_IMAGE_UNKNOWN
+                                             : STORAGE_IMAGE_GOOD);
     storage_unlock();
     return true;
 }

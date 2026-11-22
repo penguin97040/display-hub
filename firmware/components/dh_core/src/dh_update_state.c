@@ -355,6 +355,15 @@ static bool decode_record(dh_fw_record *out, const uint8_t *blob)
     return true;
 }
 
+/* A RULE FOR EVERY LATER FORMAT. A record this function can't decode reads as a new one, with a
+ * full attempt budget and no release waiting. So a later firmware must never leave behind a
+ * record that this one can't read: after going back to this version (a failed trial boot), an
+ * undecodable record would hand back every attempt already spent, and lose the release that
+ * was waiting, so the going back would never be reported. A later format must therefore keep
+ * this length and layout and format number for as long as a display may go back to firmware
+ * that reads only this one, and add to it in a way this decoder still accepts (or keep writing
+ * this form until the trial boot is over). The same holds for the keys blob above, where an
+ * undecodable one reads as no keys. */
 bool dh_fw_record_decode(dh_fw_record *out, const uint8_t *blob, size_t len)
 {
     dh_fw_record_init(out);

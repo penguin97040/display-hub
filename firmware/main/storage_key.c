@@ -44,6 +44,7 @@
 #include <string.h>
 
 #include "bootloader_random.h"
+#include "dh_setup.h"
 #include "esp_efuse.h"
 #include "esp_log.h"
 #include "esp_random.h"
@@ -189,8 +190,9 @@ static bool random_looks_alive(void)
         }
     }
     const bool repeated = memcmp(a, b, sizeof(a)) == 0;
-    memset(a, 0, sizeof(a));
-    memset(b, 0, sizeof(b));
+    // Not memset(): a compiler may drop a write to memory that is never read again.
+    dh_wipe(a, sizeof(a));
+    dh_wipe(b, sizeof(b));
     return !all_same && !repeated;
 }
 
@@ -257,7 +259,7 @@ static esp_err_t make_key(efuse_report_t *efuse, bool *burn_tried)
     nvs_sec_cfg_t cfg = {0};
     *burn_tried = true;
     const esp_err_t err = nvs_flash_generate_keys_v2(scheme, &cfg);
-    memset(&cfg, 0, sizeof(cfg));
+    dh_wipe(&cfg, sizeof(cfg));
 
     efuse_report_read(efuse);
     efuse_report_log(efuse, "after the storage key was made");
@@ -315,7 +317,7 @@ esp_err_t storage_key_start_partition(const storage_key_status_t *status, const 
     if (err == ESP_OK) {
         err = nvs_flash_secure_init_partition(partition, &cfg);
     }
-    memset(&cfg, 0, sizeof(cfg));
+    dh_wipe(&cfg, sizeof(cfg));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "encrypted NVS didn't start on \"%s\": 0x%x (%s)", partition, (unsigned)err,
                  esp_err_to_name(err));

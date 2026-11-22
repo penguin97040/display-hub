@@ -181,7 +181,9 @@ void dh_fw_record_init(dh_fw_record *rec);  /* a full budget, nothing else */
  * field and answers false for a blob of the wrong length, another format or with a value out of
  * range, leaving *out as init leaves it. Treat a blob that is missing as init does. For one that
  * won't decode, carry on with init's values too: with no keys a display refuses every update
- * until it is set up again over USB, which is the safe side. */
+ * until it is set up again over USB, which is the safe side. A record that won't decode reads
+ * as a new one, with a full budget, so a later format must stay readable by this firmware
+ * (dh_update_state.c, dh_fw_record_decode, has the rule). */
 #define DH_FW_KEYS_BLOB_LEN 201u
 #define DH_FW_RECORD_BLOB_LEN 321u
 void dh_fw_keys_encode(const dh_fw_keys *keys, uint8_t out[DH_FW_KEYS_BLOB_LEN]);

@@ -490,8 +490,11 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
 }
 
 // The short line each page shows about the hub: a problem in its colour, what the display is
-// doing while it isn't yet talking to the hub, or the note about what just happened.
-static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, const char *note)
+// doing while it isn't yet talking to the hub, or the note about what just happened. A note
+// that has a line of its own (`note_line`) takes the line ahead of all of those, as a problem:
+// it is something the owner did that didn't happen, and no other line may hide it.
+static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, const char *note,
+                     const char *note_line)
 {
     const char *line = NULL;
     lv_color_t colour = UI_COLOUR_QUIET;
@@ -531,6 +534,11 @@ static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, cons
     if (line == NULL && note != NULL) {
         line = note;
     }
+    if (note_line != NULL) {
+        line = note_line;
+        colour = UI_COLOUR_WARNING;
+        problem = true;
+    }
     snprintf(s_line, sizeof(s_line), "%s", line != NULL ? line : "");
     s_line_colour = colour;
     s_line_problem = problem;
@@ -540,7 +548,7 @@ static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, cons
 // the end of the swipe row. `drawn` is NULL or the pages in the row; `no_memory` says there
 // was no memory for the screen's copy of them, so none can be shown.
 static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
-                     const hub_pages_t *drawn, bool no_memory, const char *note)
+                     const hub_pages_t *drawn, bool no_memory, const char *note, bool note_lasts)
 {
     static char body[640];
     static char extra_text[480];
@@ -561,8 +569,9 @@ static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
                  extra != NULL ? "\n\n" : "", update);
         extra = extra_text;
     }
-    // A token that isn't in flash matters more than whatever just happened.
-    if (hub->token_unsaved) {
+    // A token that isn't in flash matters more than whatever just happened, but not more than
+    // a note that is kept up until it is dealt with (the line on each page says the token).
+    if (hub->token_unsaved && !note_lasts) {
         note = TOKEN_UNSAVED;
     }
     switch (hub->state) {
@@ -630,13 +639,24 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
         return true;
     }
     if (facts->state == STORAGE_NOT_STARTED) {
-        // A fault that may pass, with nothing erased: a restart first, never a reinstall.
-        show("Storage problem", UI_COLOUR_WARNING, NULL,
-             "This display's storage didn't start this time, so it can't be used just now. "
-             "Nothing was erased.\n\n"
-             "Unplug it and plug it back in. Only if this keeps happening, use Install "
-             "firmware in Display Hub on your computer, which erases the display's storage.",
-             NULL, note);
+        // A fault that may pass: a restart first, never a reinstall. The words say what was
+        // erased, if anything (ui_text.h).
+        ui_storage_stop why = UI_STORAGE_NOT_STARTED;
+        switch (facts->stop) {
+        case STORAGE_STOP_ERASE_UNFINISHED:
+            why = UI_STORAGE_ERASE_UNFINISHED;
+            break;
+        case STORAGE_STOP_ERASED:
+            why = UI_STORAGE_ERASED;
+            break;
+        case STORAGE_STOP_WRITE:
+            why = UI_STORAGE_WRITE_FAILED;
+            break;
+        default:
+            break;
+        }
+        show("Storage problem", UI_COLOUR_WARNING, NULL, ui_storage_stopped_text(why), NULL,
+             note);
         return true;
     }
     if (facts->state != STORAGE_WORKING) {
@@ -685,7 +705,7 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
 
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
                    const hub_status_t *hub, const storage_fw_facts_t *fw,
-                   const hub_pages_t *pages, const char *note)
+                   const hub_pages_t *pages, const char *note, const char *note_line)
 {
     // Whatever was on the screen is drawn afresh unless only the ages have moved on.
     bool redraw = s_counting || !s_with_pages;
@@ -721,8 +741,8 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     const lv_color_t colour_before = s_line_colour;
     const bool problem_before = s_line_problem;
     if (running) {
-        show_hub(hub, fw, with_pages ? pages : NULL, pages == NULL, note);
-        set_line(hub, fw, note);
+        show_hub(hub, fw, with_pages ? pages : NULL, pages == NULL, note, note_line != NULL);
+        set_line(hub, fw, note, note_line);
     } else {
         s_line[0] = '\0';
         s_line_problem = false;
@@ -747,6 +767,16 @@ void ui_show_reset_countdown(int seconds_left)
     snprintf(number, sizeof(number), "%d", seconds_left);
     show("Factory reset", UI_COLOUR_WARNING, number,
          "Keep holding BOOT to erase this display's setup.\n\nLet go now to cancel.", NULL, NULL);
+    s_counting = true;
+    render();
+}
+
+void ui_show_reset_erasing(void)
+{
+    show("Factory reset", UI_COLOUR_WARNING, NULL,
+         "Erasing this display's setup. This takes a few seconds.\n\n"
+         "You can let go of BOOT. Keep the display plugged in.",
+         NULL, NULL);
     s_counting = true;
     render();
 }

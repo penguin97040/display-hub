@@ -235,6 +235,35 @@ size_t ui_keep_view(const ui_page_ids *before, size_t view, const dh_snapshot *a
     return view < after_count ? view : after_count - 1;
 }
 
+const char *ui_storage_stopped_text(ui_storage_stop why)
+{
+// The last resort, the same every time.
+#define IF_IT_KEEPS_HAPPENING \
+    "Only if this keeps happening, use Install firmware in Display Hub on your computer, which " \
+    "erases the display's storage."
+    switch (why) {
+    case UI_STORAGE_ERASE_UNFINISHED:
+        // Only ever with the reset's mark in flash (storage.h), so the next start does finish.
+        return "This display's storage isn't working just now. It started erasing its setup "
+               "and couldn't finish.\n\n"
+               "Unplug it and plug it back in: it finishes the erase when it starts. "
+               IF_IT_KEEPS_HAPPENING;
+    case UI_STORAGE_ERASED:
+        return "This display's storage isn't working just now. Its setup was erased.\n\n"
+               "Unplug it and plug it back in, then choose Add a display in Display Hub on "
+               "your computer. " IF_IT_KEEPS_HAPPENING;
+    case UI_STORAGE_WRITE_FAILED:
+        return "This display couldn't save to its storage, so it can't be used just now.\n\n"
+               "Unplug it and plug it back in. " IF_IT_KEEPS_HAPPENING;
+    default:
+        // A fault that may pass, with nothing erased: a restart first, never a reinstall.
+        return "This display's storage didn't start this time, so it can't be used just now. "
+               "Nothing was erased.\n\n"
+               "Unplug it and plug it back in. " IF_IT_KEEPS_HAPPENING;
+    }
+#undef IF_IT_KEEPS_HAPPENING
+}
+
 void ui_shift(unsigned step, int32_t *dx, int32_t *dy)
 {
     // The centre, then round a small square, one step at a time.

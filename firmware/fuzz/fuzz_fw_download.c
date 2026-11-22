@@ -9,6 +9,9 @@
  *    display trusts (made when the target starts). That is what a hostile or careless maker
  *    could send, and it reaches the manifest reader, step 7 and the image.
  *
+ * The first byte also chooses the answer's Content-Length: the body's length, a little more, a
+ * little less, or none at all (a chunked answer), which must be refused before a byte is read.
+ *
  * It checks what must hold whatever arrives: nothing is taken past the Content-Length, nothing
  * is written before the manifest has passed, a download only finishes if what was written is the
  * image the manifest names, for this display, and the same body gives the same answer however
@@ -102,8 +105,9 @@ typedef struct {
     uint32_t written;
 } outcome;
 
-/* One download of body[0..len), in pieces whose sizes come from `seed` (0: all at once). */
-static outcome run(size_t len, uint64_t content_length, uint8_t seed)
+/* One download of body[0..len), in pieces whose sizes come from `seed` (0: all at once). The
+ * offer's size is content_length; without has_length the answer came with no Content-Length. */
+static outcome run(size_t len, bool has_length, uint64_t content_length, uint8_t seed)
 {
     outcome o = {DH_FW_REASON_NONE, false, 0, 0};
     dh_sha256 written_hash;
@@ -111,9 +115,11 @@ static outcome run(size_t len, uint64_t content_length, uint8_t seed)
     uint32_t x = seed;
     size_t at = 0;
     dh_sha256_begin(&written_hash);
-    o.reason = dh_fw_download_begin(&download, &trusted, &device, content_length, true,
+    o.reason = dh_fw_download_begin(&download, &trusted, &device, content_length, has_length,
                                     content_length);
     over = o.reason != DH_FW_REASON_NONE;
+    /* An answer with no Content-Length is refused here, whatever its body would have been. */
+    CHECK(has_length || over);
     while (!over) {
         if (at == len) {
             o.reason = dh_fw_download_fail(&download, DH_FW_REASON_DOWNLOAD);
@@ -158,6 +164,7 @@ static outcome run(size_t len, uint64_t content_length, uint8_t seed)
     }
     o.read = dh_fw_download_bytes_read(&download);
     CHECK(o.read == at && o.read <= content_length && o.read <= len);
+    CHECK(has_length || (o.read == 0 && !dh_fw_download_slot_open(&download)));
     CHECK(o.opened == dh_fw_download_slot_open(&download));
     CHECK(finished == (o.reason == DH_FW_REASON_NONE));
     /* The spare partition is only ever opened for a manifest that is signed by the trusted key,
@@ -235,8 +242,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             memcpy(body + 8, trusted.keys[(mode >> 2) & 1u].bytes, DH_FW_KEY_LEN);
         }
     }
-    /* The Content-Length: what is there, a little more, or a little less. */
+    /* The Content-Length: what is there, a little more, a little less, or none at all. */
     uint64_t content_length = len;
+    bool has_length = true;
     switch ((mode >> 4) & 3u) {
     case 1:
         content_length = len + 1u + (mode >> 6);
@@ -244,11 +252,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     case 2:
         content_length = len > (mode >> 6) ? len - (mode >> 6) - 1u : 0;
         break;
+    case 3:
+        has_length = false;
+        break;
     default:
         break;
     }
-    outcome whole = run(len, content_length, 0);
-    outcome pieces = run(len, content_length, seed ? seed : 1);
+    outcome whole = run(len, has_length, content_length, 0);
+    outcome pieces = run(len, has_length, content_length, seed ? seed : 1);
     CHECK(whole.reason == pieces.reason && whole.read == pieces.read &&
           whole.opened == pieces.opened);
     /* When the hash doesn't match, the last piece isn't handed over to be written. */

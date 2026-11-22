@@ -20,7 +20,9 @@ typedef enum {
     RESET_BUTTON_HELD,      // held to the end: do the reset. Sent once per hold.
 } reset_button_event_t;
 
-// Called from the button's task. It should only pass the event on to another task.
+// Called from the button's task. It should only pass the event on to another task. It may wait
+// to do so: the button isn't watched meanwhile, which is the right way round for the two events
+// that end a countdown (a lost one would leave the countdown on the screen).
 typedef void (*reset_button_handler_t)(reset_button_event_t event, int seconds_left);
 
 esp_err_t reset_button_start(reset_button_handler_t handler);

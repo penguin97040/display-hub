@@ -60,6 +60,17 @@ typedef struct {
     bool aborted;
     bool set_to_boot;
     bool wrote_while_closed;
+    /* esp_partition_erase_range(): how often the spare partition's first sector was erased, and
+     * how much had been written to the partition when it last was; whether anything else was
+     * ever asked for (the running partition, another range, or a partition still open); and a
+     * switch that makes the erase fail. */
+    unsigned spare_spoilt;
+    size_t written_when_spoilt;
+    bool erased_elsewhere;
+    bool erase_fails;
+    /* ESP-IDF gone wrong: the "spare" partition it names, and lets be opened, is the one that
+     * is running. Nothing of it may ever be erased. */
+    bool spare_is_running;
     uint8_t *written;
     size_t written_len;
     size_t written_cap;
@@ -93,7 +104,11 @@ typedef struct {
     dh_fw_download *download;
 
     /* ---- The bootloader's record, and restarts ---- */
+    /* Whether the start was a trial boot, as storage_fw_settle_start() answered. */
     bool image_on_trial;
+    /* For a restart that isn't on trial: the bootloader's record of the running image can't be
+     * read (or says something other than "marked good"), instead of saying it is good. */
+    bool image_unknown;
     int mark_valid_error;  /* an esp_err_t; 0 to succeed */
     int roll_back_error;   /* an esp_err_t; 0 to succeed, which restarts */
     unsigned marked_valid;

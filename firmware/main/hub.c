@@ -486,15 +486,17 @@ static void enrol(void)
 
     const dh_enrol_answer read =
         dh_read_enrol_response(answer.status, s_body, answer.len, &s.device);
-    // The body held the token. This wipes the copy this task owns, and the TLS session wipes
-    // its own buffers when it is freed. Two copies in memory are NOT wiped, because ESP-IDF's
-    // HTTP client keeps them and frees them as they are, with no call to reach them: the
-    // answer as it passed through the client's receive buffer (and, when the body came in the
-    // same TLS record as the headers, the client's cache of it), and in every later request
-    // the Authorization header in its header list and send buffer. They sit in freed heap
-    // until something else is given that memory. That is accepted: the token is in memory for
-    // as long as the display is enrolled anyway (s.device), and reading the heap takes code
-    // running on the chip.
+    // The body held the token, and has been read: it is wiped here, before the answer is
+    // looked at, so no path below can leave it in the buffer. (Nothing in `read` points into
+    // it.) That is the copy this task owns, and the TLS session wipes its own buffers when it
+    // is freed. Two copies in memory are NOT wiped, because ESP-IDF's HTTP client keeps them
+    // and frees them as they are, with no call to reach them: the answer as it passed through
+    // the client's receive buffer (and, when the body came in the same TLS record as the
+    // headers, the client's cache of it), and in every later request the Authorization header
+    // in its header list and send buffer. They sit in freed heap until something else is given
+    // that memory. That is accepted: the token is in memory for as long as the display is
+    // enrolled anyway (s.device), and reading the heap takes code running on the chip.
+    dh_wipe(s_body, DH_MAX_HUB_ANSWER_BYTES + 1);
     if (read.enrolled) {
         ESP_LOGI(TAG, "enrolled with the hub as %s", s.device.id);
         s.enrolled = true;

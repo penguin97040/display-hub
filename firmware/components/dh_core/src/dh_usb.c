@@ -170,7 +170,14 @@ static dh_usb_answer provision(const dh_usb_display *d, const dh_json_doc *doc,
     }
 
     /* Keys, record, then the setup last: until that last write succeeds the display isn't set
-     * up. What was saved is taken into memory straight away, so memory and flash always agree. */
+     * up. What was saved is taken into memory straight away, so memory and flash always agree.
+     *
+     * THE ORDER IS DELIBERATE, and so is what it costs. If the keys are saved and a later write
+     * fails, the display isn't set up but already trusts this bundle's keys, as if it had been
+     * set up and factory-reset: the same bundle sent again is taken (its keys match), and a
+     * bundle naming other keys is refused with firmware_keys_locked until Install firmware has
+     * erased the display. The other order would leave a display that is set up and polling
+     * with no trusted keys, or with a record that doesn't go with them. */
     bool saved = true;
     if (saved && (save & DH_FW_SAVE_KEYS) != 0) {
         saved = d->store->save_keys(d->store->ctx, &keys);

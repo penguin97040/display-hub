@@ -10,7 +10,8 @@ corpus/fw_manifest holds each distinct manifest, each distinct header, a few bun
 the stored forms of an empty key store and a fresh update record.
 corpus/fw_download holds, for each package vector, its body as a hub would send it (two bytes
 choosing that, then the body), and for each distinct manifest the same manifest and image for
-the target to sign itself (see fuzz_fw_download.c for the layout).
+the target to sign itself (see fuzz_fw_download.c for the layout). The first of each is also
+written as an answer with no Content-Length.
 """
 
 import hashlib
@@ -41,6 +42,7 @@ def main():
         folder.mkdir(parents=True, exist_ok=True)
         seen[folder] = {hashlib.sha256(f.read_bytes()).hexdigest() for f in folder.iterdir()}
     signed = set()
+    no_length_body = no_length_signed = False
     for path in sorted(vectors.glob("*.json")):
         vector = json.loads(path.read_text(encoding="utf-8"))
         if vector["kind"] == "provision":
@@ -57,6 +59,9 @@ def main():
             continue
         body = bytes.fromhex(vector["response"]["body_hex"])
         write(downloads, "body", b"\x00\x61" + body, seen[downloads])
+        if not no_length_body:
+            no_length_body = True
+            write(downloads, "nolength", b"\x30\x61" + body, seen[downloads])
         if len(body) < HEADER:
             continue
         write(manifests, "header", body[:HEADER], seen[manifests])
@@ -73,6 +78,14 @@ def main():
             b"\x01\x61" + struct.pack("<H", length) + manifest + image,
             seen[downloads],
         )
+        if not no_length_signed:
+            no_length_signed = True
+            write(
+                downloads,
+                "nolength",
+                b"\x31\x61" + struct.pack("<H", length) + manifest + image,
+                seen[downloads],
+            )
     # The stored forms of an empty key store and a fresh update record (dh_update_state.c).
     write(manifests, "stored", b"\x01" + bytes(200), seen[manifests])
     record = bytearray(321)

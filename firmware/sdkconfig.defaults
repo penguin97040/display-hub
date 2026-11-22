@@ -15,7 +15,8 @@ CONFIG_SPIRAM_SPEED_80M=y
 
 # --- Tasks ---
 # app_main draws the first screen itself (lv_refr_now), and LVGL's software drawing needs far more
-# than the default 3.5 KB of stack: the first board test overflowed it. 8 KB, as the LVGL task has.
+# than the default 3.5 KB of stack: the first board test overflowed it. 8 KB. (LVGL's own task,
+# which draws everything after that first screen, has 12 KB: main/board/board.c.)
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # --- Partitions and updates ---

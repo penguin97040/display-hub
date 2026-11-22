@@ -33,11 +33,25 @@ bool storage_fw_write_record(const dh_fw_record *record);
 dh_fw_keys *storage_fw_keys(void);
 dh_fw_record *storage_fw_record(void);
 
+// What the bootloader's own record (the OTA data) says of the image that is running.
+typedef enum {
+    STORAGE_IMAGE_UNKNOWN,  // it couldn't be read, or says anything but the two below
+    STORAGE_IMAGE_ON_TRIAL, // ESP_OTA_IMG_PENDING_VERIFY: started on trial, not yet marked good
+    STORAGE_IMAGE_GOOD,     // ESP_OTA_IMG_VALID, read back: marked good
+} storage_image_t;
+
 // Call once at start-up, with the lock held or before any other task runs, once the keys and
 // the record have been loaded into the two above: settles whatever the last run left
 // (dh_fw_start) and saves what that changes. running_slot is the update core's number for the
-// app partition that is running (0 for ota_0), and on_trial the bootloader's word for it.
-void storage_fw_settle_start(uint8_t running_slot, bool on_trial);
+// app partition that is running (0 for ota_0), and `image` the bootloader's word for it.
+//
+// Returns whether this start is a trial boot. "ON TRIAL" FAILS CLOSED: when the update record
+// says a release is waiting for its trial boot in the partition that is running, only an image
+// that reads back as marked good is taken as marked good. Anything else, a state that couldn't
+// be read included, is a trial boot: nothing of the release (its security counter, its keys)
+// is applied until this firmware has reached the hub and been marked good, and it goes back
+// if it can't.
+bool storage_fw_settle_start(uint8_t running_slot, storage_image_t image);
 
 // Prints how things stand to the console. Call it with the lock held.
 void storage_fw_log(void);
@@ -82,8 +96,9 @@ bool storage_fw_reportable(const dh_fw_keys **keys, const dh_fw_record **record)
 // power-cut case already covers. The record is never erased to "clean up": a missing record
 // reads as a new one, with a full attempt budget.
 
-// Whether the bootloader started this image on trial (ESP_OTA_IMG_PENDING_VERIFY), whatever
-// became of storage.
+// Whether this start is a trial boot: the bootloader started this image on trial
+// (ESP_OTA_IMG_PENDING_VERIFY), whatever became of storage, or storage_fw_settle_start() said
+// so from the update record.
 bool storage_image_on_trial(void);
 
 // Counts running time towards the update attempt budget (dh_fw_tick) and saves the record when

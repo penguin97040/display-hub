@@ -42,6 +42,11 @@ dh_line_event dh_usb_line_feed(dh_usb_line_reader *r, const uint8_t *data, size_
  * and before the next feed; it does nothing while a line is part-read. */
 void dh_usb_line_wipe(dh_usb_line_reader *r);
 
+/* For a factory reset: drops a line that is part-read, overwrites the whole buffer with zeros,
+ * and ignores the rest of that line when it comes, up to its newline. A part-read line may be
+ * the start of a `provision` that never finished. Lines that begin after it are read as usual. */
+void dh_usb_line_forget(dh_usb_line_reader *r);
+
 #ifdef __cplusplus
 }
 #endif
