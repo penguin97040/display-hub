@@ -26,7 +26,8 @@
 //   Secure Boot is off. And esp_ota_abort() only frees the handle (esp_ota_ops.c, line 456):
 //   what was written stays. So an image that was
 //   given up is spoilt here, by erasing its first sector (spoil_spare), and can never be the
-//   one the bootloader falls back to.
+//   one the bootloader falls back to. A partition that was opened and never written to is
+//   left alone: it still holds the version before.
 //
 // HOW LONG ONE READ CAN TAKE. Two things in ESP-IDF stand between a download and its time limits,
 // and neither can be interrupted from outside once it has been called:
@@ -294,8 +295,9 @@ static update_restart_t boot_not_set(const esp_partition_t *spare, esp_err_t err
 // hash can be a complete, valid app that nobody signed. So the first sector of the spare
 // partition, which holds the image's header, is erased: the bootloader then finds no image
 // there at all. Only ever the spare partition, never the one that is running or the one set to
-// boot next; and only once it has been opened for this download, so an offer that was refused
-// before anything was written leaves the version before where it is.
+// boot next; and only once a write to it has been tried for this download (update_receive,
+// spare_written). An offer that was refused, or a download that broke off, before the first
+// write leaves the version before where it is: opening the partition erases nothing.
 static void spoil_spare(const esp_partition_t *spare)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -354,7 +356,11 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
     const esp_partition_t *spare = esp_ota_get_next_update_partition(NULL);
     esp_ota_handle_t ota = 0;
     bool ota_open = false;
-    bool ota_begun = false; // the spare partition was opened, so something of it may be written
+    // A write to the spare partition was tried. Opening it changes nothing in flash
+    // (OTA_WITH_SEQUENTIAL_WRITES: see the top), so until then the partition still holds
+    // whatever it held, which may be the last good firmware. A write that fails counts: it may
+    // have erased the first sector, or written part of it, before it failed.
+    bool spare_written = false;
     bool finished = false;
     const uint64_t started_s = (uint64_t)(started_ms / 1000);
     uint64_t last_byte_s = uptime_seconds();
@@ -407,7 +413,9 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
                 // The update core only ever names bytes to write after it has said to open the
                 // partition, which it says only once the manifest has passed every check.
                 if (push.write_len > 0) {
-                    const esp_err_t err = ota_open && esp_ptr_internal(push.write)
+                    const bool can_write = ota_open && esp_ptr_internal(push.write);
+                    spare_written = spare_written || can_write;
+                    const esp_err_t err = can_write
                                               ? esp_ota_write(ota, push.write, push.write_len)
                                               : ESP_ERR_INVALID_STATE;
                     if (err != ESP_OK) {
@@ -436,7 +444,6 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
                         reason = dh_fw_download_fail(d, DH_FW_REASON_FLASH);
                     } else {
                         ota_open = true;
-                        ota_begun = true;
                     }
                     break;
                 }
@@ -510,9 +517,11 @@ dh_fw_reason update_receive(hub_download_t *download, const dh_fw_device *device
         // Nothing of an abandoned image is ever started: the partition isn't set to boot.
         esp_ota_abort(ota);
     }
-    if (ota_begun && reason != DH_FW_REASON_NONE && *restart == UPDATE_NO_RESTART) {
+    if (spare_written && reason != DH_FW_REASON_NONE && *restart == UPDATE_NO_RESTART) {
         // And it can't be fallen back to either. (Not when a restart is asked for: then the
-        // image was written, checked and recorded, and may be the one that starts next.)
+        // image was written, checked and recorded, and may be the one that starts next. And
+        // not when the partition was opened and no write was tried: nothing of it has
+        // changed, and what it holds may be the last good firmware, to go back to.)
         spoil_spare(spare);
     }
     if (reason != DH_FW_REASON_NONE) {

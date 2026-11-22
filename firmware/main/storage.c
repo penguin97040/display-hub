@@ -25,9 +25,12 @@
 // sector is erased and taken out after NVS has started on the blank partition. A start that
 // finds the mark finishes the erase before it reads anything. No mark, no erase: the mark is
 // read back after it is written, and unless it reads as written the reset doesn't begin and
-// the setup stays in use as it was, so "a restart finishes it" is never said untruly. (A write
-// that failed may have reached flash all the same, so the mark is then taken out again; if
-// even that can't be checked, the log says a restart may do the erase after all.)
+// the setup stays in use as it was. (A write that failed may have reached flash all the same.
+// If the mark wasn't there before, it is then taken out again, and "nothing was erased" is said
+// only once it reads as not there. A mark that was there already, from an erase that didn't
+// finish, is never taken out before the erase has finished. Whenever the mark is in flash, or
+// that can't be told, the reset counts as unfinished: the setup goes out of use and no new one
+// is taken, so the display never carries on with a setup that the next start may erase.)
 //
 // A setup partition that NVS says can't be used as it is (no free pages, or a newer NVS's
 // format) is erased and started afresh in the same way, so the display comes up waiting for
@@ -467,12 +470,21 @@ typedef enum {
     ERASE_DONE,        // blank, with NVS running on it again and the mark taken out
     ERASE_NOT_STARTED, // nothing was erased, and the setup is in use as it was
     ERASE_UNFINISHED,  // the mark is in flash, so the next start erases (again) before it reads
+                       // (or the mark can't be read, and the next start may)
 } erase_result_t;
 
 // Stops NVS on the setup partition, erases all of it, checks it, and starts NVS on it again,
 // blank. Only with NVS running on the main partition, because the mark comes first: it is
 // written and read back before anything else is touched, and taken out last (see the top of
 // this file). Unless the mark reads as written, nothing is erased.
+//
+// The mark may be there already: at a start that is finishing an erase that was cut short, or
+// when BOOT is held again after a reset that didn't finish. Part of the partition may then be
+// blank already, so that mark is never taken out here before the whole partition is: without
+// it the next start would run NVS on what is left, with the rest of the old setup still in
+// flash. So the mark is read first, and ERASE_NOT_STARTED is answered only when the mark is
+// known not to be in flash: it wasn't there before, and it reads as not there now. Whenever
+// it is there, or can't be told, the answer is ERASE_UNFINISHED.
 static erase_result_t erase_setup_partition(void)
 {
     const esp_partition_t *partition = setup_partition();
@@ -481,17 +493,37 @@ static erase_result_t erase_setup_partition(void)
                  partition == NULL ? "this flash layout has none" : "NVS isn't running");
         return ERASE_NOT_STARTED;
     }
+    bool was_marked = false;
+    const bool was_read = read_reset_mark(&was_marked);
     // No mark, no erase: without it a power cut, or an erase that fails part-way, would leave
     // part of the setup in flash with nothing to make the next start finish the job.
-    if (!write_reset_mark(true)) {
-        // The failed write may have left the mark all the same, and a mark would make the
-        // next start erase a setup that is still in use: take it out, and say so if that
-        // can't be checked either. (The owner did ask for the setup to go.)
-        if (!write_reset_mark(false)) {
-            ESP_LOGE(TAG, "whether the mark was left can't be told: if it was, the next start "
-                          "erases the setup");
+    if (!(was_read && was_marked) && !write_reset_mark(true)) {
+        if (!was_read) {
+            // Whether an earlier erase left its mark can't be told, so it isn't touched (see
+            // above), and nothing is erased without a mark that reads as written. If the mark
+            // is there, the next start erases; if it isn't, the next start finds the setup as
+            // it was, and that start's screen says so. Until then this one is treated as
+            // unfinished: the setup is out of use and no new one is taken, so nothing is
+            // stored that the next start might erase.
+            ESP_LOGE(TAG, "whether the mark is in flash can't be told: if it is, the next "
+                          "start erases the setup");
+            s_erase_seen = STORAGE_STOP_ERASE_UNFINISHED;
+            return ERASE_UNFINISHED;
         }
-        return ERASE_NOT_STARTED;
+        // The mark wasn't there before, so nothing of the setup has been erased. The failed
+        // write may have left it all the same, and a mark would make the next start erase a
+        // setup that is still in use: take it out. Only if it then reads as not there is the
+        // setup still in use as it was.
+        if (write_reset_mark(false)) {
+            return ERASE_NOT_STARTED;
+        }
+        // It is there, or can't be read: the next start erases the setup, or may. Saying
+        // "nothing was erased" and carrying on with a setup that a restart then erases would
+        // be untrue, so the reset counts as begun.
+        ESP_LOGE(TAG, "the mark couldn't be taken out again, or can't be read: the next start "
+                      "erases the setup if it is there");
+        s_erase_seen = STORAGE_STOP_ERASE_UNFINISHED;
+        return ERASE_UNFINISHED;
     }
     // From here the mark is in flash: whatever goes wrong below, the next start does the erase.
     s_erase_seen = STORAGE_STOP_ERASE_UNFINISHED;
@@ -549,8 +581,9 @@ static erase_result_t erase_setup(void)
     s_facts.wifi_set = false;
     s_facts.enrolled = false;
     s_facts.snapshot_bytes = 0;
-    // Unfinished only ever with the mark in flash, so a restart does finish it. The screen and
-    // the USB reply say so until a reset, or a restart, has.
+    // Unfinished with the mark in flash, so a restart does finish it (or, if the mark couldn't
+    // be read, where a restart may: erase_setup_partition). The screen and the USB reply say
+    // so until a reset, or a restart, has.
     s_facts.reset_unfinished = result == ERASE_UNFINISHED;
     if (s_facts.state == STORAGE_NOT_STARTED) {
         // Storage was out of use before the reset, and still is: the screen's words follow
@@ -662,7 +695,11 @@ static bool store_prepare(void *ctx)
 bool storage_reset_possible(void)
 {
     storage_lock();
-    const bool possible = s_facts.state == STORAGE_WORKING || s_nvs_started;
+    // A new board (working, no NVS yet) has nothing to erase, which counts as done. Otherwise
+    // the erase needs NVS running, for the mark, and a setup partition to erase: a flash
+    // layout without one can't be reset, however often BOOT is held.
+    const bool possible = (s_facts.state == STORAGE_WORKING && !s_nvs_started) ||
+                          (s_nvs_started && setup_partition() != NULL);
     storage_unlock();
     return possible;
 }
@@ -675,12 +712,14 @@ storage_reset_t storage_factory_reset(void)
         // A new board: nothing to erase, and no flash is touched (store_erase_setup says so).
         (void)store_erase_setup(NULL);
         result = STORAGE_RESET_DONE;
-    } else if (!s_nvs_started) {
+    } else if (!s_nvs_started || setup_partition() == NULL) {
         // Without NVS on the main partition the reset's mark can't be written, and an erase
         // with no mark could be cut short and leave part of a setup with nothing to say so.
-        ESP_LOGE(TAG, "factory reset: not done. Storage isn't working, and never started in "
-                      "this run, so nothing can be erased safely: Install firmware over USB "
-                      "erases everything");
+        // And a flash layout from an older build has no setup partition to erase at all.
+        ESP_LOGE(TAG, "factory reset: not done. Storage isn't working, and %s, so nothing can "
+                      "be erased safely: Install firmware over USB erases everything",
+                 !s_nvs_started ? "never started in this run"
+                                : "this flash layout has no setup partition");
     } else {
         // Working, or out of use for this run with NVS running all the same (a read or a
         // write that failed): the mark can be written, so the setup can be erased properly.
@@ -917,8 +956,8 @@ static start_result_t start_setup_partition(void)
                       "display will wait for setup",
                  esp_err_to_name(err));
     }
-    // If the erase doesn't finish, the mark is there (or nothing was erased), so the next
-    // start tries again: a restart is the thing to do. s_erase_seen says which, for the words
+    // If the erase doesn't finish, the mark is there (or may be, or nothing was erased), so the
+    // next start tries again: a restart is the thing to do. s_erase_seen says which, for the words
     // on the screen: "nothing was erased" is only said when nothing was.
     return erase_setup_partition() == ERASE_DONE ? START_OK : START_NOT_THIS_TIME;
 }

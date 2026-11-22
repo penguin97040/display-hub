@@ -417,9 +417,6 @@ static const char *advice(const hub_status_t *hub)
     }
 }
 
-#define TOKEN_UNSAVED "This display couldn't save its place with the hub. If it restarts now, " \
-                      "it will need setting up again."
-
 // What a firmware update is doing, in a few words for the foot of each page. NULL for nothing.
 static const char *update_line(const hub_status_t *hub, const storage_fw_facts_t *fw)
 {
@@ -490,65 +487,52 @@ static const char *update_words(const hub_status_t *hub, const storage_fw_facts_
 }
 
 // The short line each page shows about the hub: a problem in its colour, what the display is
-// doing while it isn't yet talking to the hub, or the note about what just happened. A note
-// that has a line of its own (`note_line`) takes the line ahead of all of those, as a problem:
-// it is something the owner did that didn't happen, and no other line may hide it.
+// doing while it isn't yet talking to the hub, or the note about what just happened. Which
+// one is ui_line_pick()'s choice (ui_text.h): a problem with the hub, or a token that couldn't
+// be saved, comes ahead of a kept note's line (`kept_line`), and that ahead of the rest. The
+// status screen says every one of them (ui_show_state).
 static void set_line(const hub_status_t *hub, const storage_fw_facts_t *fw, const char *note,
-                     const char *note_line)
+                     const char *kept_line)
 {
-    const char *line = NULL;
-    lv_color_t colour = UI_COLOUR_QUIET;
-    bool problem = false;
+    ui_line_facts facts = {
+        .token_unsaved = hub->token_unsaved,
+        .kept = kept_line,
+        .update = update_line(hub, fw),
+        .note = note,
+    };
     switch (hub->state) {
     case HUB_TROUBLE:
     case HUB_NEEDS_SETUP:
-        line = headline(hub);
-        colour = hub->problem == DH_PROBLEM_WRONG_HUB ? UI_COLOUR_BAD : UI_COLOUR_WARNING;
-        problem = true;
+        facts.problem = headline(hub);
+        facts.problem_is_bad = hub->problem == DH_PROBLEM_WRONG_HUB;
         break;
     case HUB_FAILED:
-        line = "Can't connect";
-        colour = UI_COLOUR_BAD;
-        problem = true;
+        facts.problem = "Can't connect";
+        facts.problem_is_bad = true;
         break;
     case HUB_JOINING_WIFI:
-        line = "Joining Wi-Fi";
+        facts.doing = "Joining Wi-Fi";
         break;
     case HUB_ENROLLING:
     case HUB_WAITING:
-        line = "Joining the hub";
+        facts.doing = "Joining the hub";
         break;
     default:
         break;
     }
-    if (!problem && hub->token_unsaved) {
-        line = "Couldn't save its place with the hub";
-        colour = UI_COLOUR_WARNING;
-        problem = true;
-    }
-    // An update is said plainly, but never in place of a problem.
-    if (!problem && update_line(hub, fw) != NULL) {
-        line = update_line(hub, fw);
-        colour = UI_COLOUR_QUIET;
-    }
-    if (line == NULL && note != NULL) {
-        line = note;
-    }
-    if (note_line != NULL) {
-        line = note_line;
-        colour = UI_COLOUR_WARNING;
-        problem = true;
-    }
-    snprintf(s_line, sizeof(s_line), "%s", line != NULL ? line : "");
-    s_line_colour = colour;
-    s_line_problem = problem;
+    const ui_line line = ui_line_pick(&facts);
+    snprintf(s_line, sizeof(s_line), "%s", line.text != NULL ? line.text : "");
+    s_line_colour = line.tone == UI_LINE_BAD       ? UI_COLOUR_BAD
+                    : line.tone == UI_LINE_WARNING ? UI_COLOUR_WARNING
+                                                   : UI_COLOUR_QUIET;
+    s_line_problem = line.problem;
 }
 
 // A display that is set up: how things stand with the hub. With pages, this is the screen at
 // the end of the swipe row. `drawn` is NULL or the pages in the row; `no_memory` says there
 // was no memory for the screen's copy of them, so none can be shown.
 static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
-                     const hub_pages_t *drawn, bool no_memory, const char *note, bool note_lasts)
+                     const hub_pages_t *drawn, bool no_memory, const char *note)
 {
     static char body[640];
     static char extra_text[480];
@@ -568,11 +552,6 @@ static void show_hub(const hub_status_t *hub, const storage_fw_facts_t *fw,
         snprintf(extra_text, sizeof(extra_text), "%s%s%s", extra != NULL ? extra : "",
                  extra != NULL ? "\n\n" : "", update);
         extra = extra_text;
-    }
-    // A token that isn't in flash matters more than whatever just happened, but not more than
-    // a note that is kept up until it is dealt with (the line on each page says the token).
-    if (hub->token_unsaved && !note_lasts) {
-        note = TOKEN_UNSAVED;
     }
     switch (hub->state) {
     case HUB_ONLINE:
@@ -705,14 +684,18 @@ static bool show_not_running(const storage_facts_t *facts, const storage_key_sta
 
 void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key,
                    const hub_status_t *hub, const storage_fw_facts_t *fw,
-                   const hub_pages_t *pages, const char *note, const char *note_line)
+                   const hub_pages_t *pages, const char *note, const char *kept_note,
+                   const char *kept_line)
 {
+    static char notes[UI_NOTES_ROOM];
     // Whatever was on the screen is drawn afresh unless only the ages have moved on.
     bool redraw = s_counting || !s_with_pages;
     s_counting = false;
     s_pages = pages;
 
-    const bool running = !show_not_running(facts, key, fw, note);
+    // The status screen says the kept note and the note, both, whatever else it is saying.
+    const bool running = !show_not_running(
+        facts, key, fw, ui_notes_text(kept_note, false, note, notes, sizeof(notes)));
     const bool with_pages = running && pages != NULL && pages->has_snapshot;
     if (with_pages) {
         const bool fresh = !s_with_pages || pages->content_seq != s_drawn_content ||
@@ -741,8 +724,11 @@ void ui_show_state(const storage_facts_t *facts, const storage_key_status_t *key
     const lv_color_t colour_before = s_line_colour;
     const bool problem_before = s_line_problem;
     if (running) {
-        show_hub(hub, fw, with_pages ? pages : NULL, pages == NULL, note, note_line != NULL);
-        set_line(hub, fw, note, note_line);
+        // And, for a display that is set up, a token that isn't in flash as well: on a page
+        // only one of them has the line, so this is where each can be read.
+        show_hub(hub, fw, with_pages ? pages : NULL, pages == NULL,
+                 ui_notes_text(kept_note, hub->token_unsaved, note, notes, sizeof(notes)));
+        set_line(hub, fw, note, kept_line);
     } else {
         s_line[0] = '\0';
         s_line_problem = false;

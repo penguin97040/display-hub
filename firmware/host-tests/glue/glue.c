@@ -231,6 +231,7 @@ esp_err_t esp_ota_begin(const esp_partition_t *partition, size_t image_size,
 
 esp_err_t esp_ota_write(esp_ota_handle_t handle, const void *data, size_t size)
 {
+    glue.write_tried = true;
     if (handle != OTA_HANDLE || !glue.open) {
         glue.wrote_while_closed = true;
         return ESP_FAIL;

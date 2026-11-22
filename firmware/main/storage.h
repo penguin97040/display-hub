@@ -73,7 +73,9 @@ typedef enum {
     STORAGE_STOP_NOT_STARTED,
     // An erase of the setup partition began and couldn't finish (to finish a factory reset,
     // because NVS said the partition couldn't be used as it was, or for a reset asked for
-    // while storage was out of use). Its mark is in flash, so the next start finishes it.
+    // while storage was out of use). Its mark is in flash, so the next start finishes it. (Or
+    // the mark couldn't be read after a write to it failed, so it may be: storage.c,
+    // erase_setup_partition.)
     STORAGE_STOP_ERASE_UNFINISHED,
     // The setup partition was erased, for one of the same reasons, and storage is out of use
     // all the same.
@@ -95,9 +97,11 @@ typedef struct {
     uint32_t snapshot_bytes; // the size of the saved snapshot, 0 for none
     // A factory reset began erasing the setup and couldn't finish (or couldn't take its mark
     // out). No setup is taken until the reset has been done again, or the display restarted:
-    // the next start finishes the erase, because the reset's mark is in flash. It is only ever
-    // set with that mark in place. (A reset that couldn't even begin leaves the setup as it
-    // was and sets nothing here: the factory reset just answers false.)
+    // the next start finishes the erase, because the reset's mark is in flash. It is set with
+    // that mark in place, or where the mark may be there and can't be read: the setup is out
+    // of use either way, so nothing is in use that the next start may erase. (A reset that
+    // couldn't even begin, with the mark known not to be in flash, leaves the setup as it was
+    // and sets nothing here.)
     bool reset_unfinished;
 } storage_facts_t;
 
@@ -124,13 +128,15 @@ void storage_efuse_report(efuse_report_t *out);
 typedef enum {
     // The setup partition is blank (or this is a new board, which has never stored anything).
     STORAGE_RESET_DONE,
-    // The erase began and couldn't finish. Its mark is in flash: another reset, or a restart,
-    // finishes it. (`reset_unfinished` in the facts, while storage is working.)
+    // The erase began and couldn't finish, or its mark may be in flash and can't be taken out
+    // or read. Another reset, or a restart with the mark in flash, finishes it.
+    // (`reset_unfinished` in the facts, while storage is working.)
     STORAGE_RESET_UNFINISHED,
-    // Nothing was erased, and the setup is in use as it was.
+    // Nothing was erased, the mark isn't in flash, and the setup is in use as it was.
     STORAGE_RESET_NOT_STARTED,
-    // Storage isn't working and NVS never started in this run, so nothing can be erased
-    // safely. Only Install firmware erases the display then.
+    // Storage isn't working and NVS never started in this run, or the flash layout has no
+    // setup partition, so nothing can be erased safely. Only Install firmware erases the
+    // display then.
     STORAGE_RESET_NO_STORAGE,
 } storage_reset_t;
 

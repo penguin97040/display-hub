@@ -33,8 +33,12 @@ esp_err_t usb_setup_start(const char *firmware_version, const char *hardware_rev
                           usb_setup_stored_t on_stored);
 
 // For a factory reset: the USB task forgets whatever line it has part-read (it may be the start
-// of a bundle that never finished) and wipes its buffers, within a second. Call it from any
-// task. What a reset does NOT clear is at the top of usb_setup.c, "What stays in memory".
+// of a bundle that never finished) and wipes its buffers, within a second, and drops unread any
+// line it had in hand when this was called. Call it from any task, and with storage's lock
+// still held from the erase (storage_lock): the USB task looks for it with that lock held
+// before it acts on a line, so a line that was waiting for the erase to finish is never stored
+// on the erased display. What a reset does NOT clear is at the top of usb_setup.c, "What stays
+// in memory".
 void usb_setup_forget(void);
 
 // How many bytes of the USB task's stack have never been used, so the headroom is seen, not

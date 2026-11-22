@@ -74,16 +74,18 @@ static hub_status_t s_hub;
 static hub_pages_t *s_pages;
 // The factory reset countdown is on the screen: nothing else may draw over it.
 static bool s_counting;
-// A note that is kept on the screen, whatever else is drawn, until it no longer matters: a
-// factory reset that was asked for and didn't happen. `s_lasting_line` is the same in a few
-// words for the foot of each page (ui.h), and `s_lasting_generation` the setup it was said
-// about: once that setup has gone or been replaced, so has the note.
+// A note that is kept on the status screen, whatever else is drawn, until it no longer
+// matters: a factory reset that was asked for and didn't happen. `s_lasting_line` is the same
+// in a few words for the foot of each page, where a problem with the hub comes ahead of it
+// (ui.h), and `s_lasting_generation` the setup it was said about: once that setup has gone or
+// been replaced, so has the note.
 static const char *s_lasting_note;
 static const char *s_lasting_line;
 static uint32_t s_lasting_generation;
 // Whether the last hold of BOOT was turned away at once, with nothing a reset could erase.
 static bool s_reset_refused;
-// What didn't start at start-up, if anything, said under whatever else the status screen says.
+// What didn't start at start-up, if anything, said under whatever else the status screen says
+// (a kept note included) whenever there is no news to say in its place.
 static char s_start_note[200];
 // Update work has stopped after a failed write (storage_fw.h), and the screen hasn't said so
 // yet. Set from whichever task the write was on; read and cleared by the main task only.
@@ -171,7 +173,8 @@ static void drop_note(void)
 }
 
 // `note` is NULL, or a line about what just happened, shown until the screen is next drawn.
-// Without one, a note that is being kept is shown, and failing that whatever didn't start.
+// Without one, whatever didn't start at start-up is said in its place. A note that is being
+// kept is shown as well as either.
 static void show_state(const char *note)
 {
     if (s_board.display == NULL) {
@@ -197,11 +200,7 @@ static void show_state(const char *note)
     if (s_lasting_note != NULL && s_lasting_generation != generation) {
         drop_note();
     }
-    const char *line = NULL;
-    if (note == NULL && s_lasting_note != NULL) {
-        note = s_lasting_note;
-        line = s_lasting_line;
-    } else if (note == NULL && s_start_note[0] != '\0') {
+    if (note == NULL && s_start_note[0] != '\0') {
         note = s_start_note;
     }
     if (lvgl_port_lock(0)) {
@@ -215,7 +214,8 @@ static void show_state(const char *note)
                 forget_pages();
             }
         }
-        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, note, line);
+        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, note, s_lasting_note,
+                      s_lasting_line);
         lvgl_port_unlock();
     }
 }
@@ -249,9 +249,13 @@ static void show_state(const char *note)
 static void factory_reset(void)
 {
     // It works whenever NVS started, also with storage out of use for this run (storage.h).
+    // Storage's lock is kept until the USB task has been told, so a bundle that was arriving
+    // during the erase can't be stored between the two (usb_setup.h).
+    storage_lock();
     const storage_reset_t result = storage_factory_reset();
     // A bundle that never finished arriving is forgotten too, whatever became of the erase.
     usb_setup_forget();
+    storage_unlock();
     if (result == STORAGE_RESET_DONE || result == STORAGE_RESET_UNFINISHED) {
         hub_wake();
         // The pages went with the setup (and an erase that failed part-way still ends that
@@ -410,7 +414,7 @@ void app_main(void)
         }
         ui_start(s_system.version, board_note);
         // Nothing from the hub yet: its task starts below.
-        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, NULL, NULL);
+        ui_show_state(&facts, &key, &s_hub, &fw, s_pages, NULL, NULL, NULL);
         // Draw the first screen before turning the brightness up, so nothing left over in the
         // screen's memory is shown brightly.
         lv_refr_now(s_board.display);

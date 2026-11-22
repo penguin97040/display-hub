@@ -120,6 +120,47 @@ typedef enum {
 // Install firmware only as what to do if that keeps failing.
 const char *ui_storage_stopped_text(ui_storage_stop why);
 
+// The short line at the foot of each page, chosen from everything that could be said there.
+typedef enum {
+    UI_LINE_QUIET,   // what the display is doing, or what just happened
+    UI_LINE_WARNING, // amber: something to put right
+    UI_LINE_BAD,     // red
+} ui_line_tone;
+
+typedef struct {
+    const char *problem;  // what is wrong with the hub or the connection, in a few words
+    bool problem_is_bad;  // that problem is drawn red, not amber
+    bool token_unsaved;   // the display's place with the hub isn't in flash
+    const char *kept;     // a kept note in a few words (a factory reset that didn't happen)
+    const char *update;   // what a firmware update is doing
+    const char *doing;    // what the display is doing while it isn't yet talking to the hub
+    const char *note;     // what just happened, or what didn't start at start-up
+} ui_line_facts;          // each string is NULL for nothing to say
+
+typedef struct {
+    const char *text; // NULL for no line
+    ui_line_tone tone;
+    bool problem; // it is a problem: the status screen's dot takes its colour
+} ui_line;
+
+// One line, by what matters most. A problem with the hub comes first, then a token that
+// couldn't be saved: those are about the display working at all, and nothing may hide them.
+// Then the kept note, as a problem too: something the owner did that didn't happen. Then an
+// update, then what the display is doing, then the note.
+#define UI_TOKEN_UNSAVED_LINE "Couldn't save its place with the hub"
+ui_line ui_line_pick(const ui_line_facts *facts);
+
+// The notes under the status screen's words, each a paragraph of its own: the kept note, then
+// the token that couldn't be saved, then `note` (what just happened, or what didn't start).
+// All that apply are shown, since none stands in for another. Returns `out`, or NULL when
+// there is nothing to say. A note that doesn't fit whole is left out, never cut short.
+#define UI_TOKEN_UNSAVED_NOTE \
+    "This display couldn't save its place with the hub. If it restarts now, it will need " \
+    "setting up again."
+#define UI_NOTES_ROOM 640
+const char *ui_notes_text(const char *kept, bool token_unsaved, const char *note, char *out,
+                          size_t size);
+
 // Burn-in care: the content's offset, in pixels, at step `step` of a slow cycle. Each offset is
 // within +-UI_SHIFT_MAX in both directions, so content laid out UI_SHIFT_MAX in from the edges
 // is never cut off.

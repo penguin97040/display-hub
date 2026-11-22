@@ -243,7 +243,8 @@ const char *ui_storage_stopped_text(ui_storage_stop why)
     "erases the display's storage."
     switch (why) {
     case UI_STORAGE_ERASE_UNFINISHED:
-        // Only ever with the reset's mark in flash (storage.h), so the next start does finish.
+        // With the reset's mark in flash, so the next start does finish (or, after a second
+        // fault, with a mark that couldn't be read: storage.h).
         return "This display's storage isn't working just now. It started erasing its setup "
                "and couldn't finish.\n\n"
                "Unplug it and plug it back in: it finishes the erase when it starts. "
@@ -262,6 +263,58 @@ const char *ui_storage_stopped_text(ui_storage_stop why)
                "Unplug it and plug it back in. " IF_IT_KEEPS_HAPPENING;
     }
 #undef IF_IT_KEEPS_HAPPENING
+}
+
+ui_line ui_line_pick(const ui_line_facts *facts)
+{
+    ui_line line = {.text = NULL, .tone = UI_LINE_QUIET, .problem = false};
+    if (facts->problem != NULL) {
+        line.text = facts->problem;
+        line.tone = facts->problem_is_bad ? UI_LINE_BAD : UI_LINE_WARNING;
+        line.problem = true;
+    } else if (facts->token_unsaved) {
+        line.text = UI_TOKEN_UNSAVED_LINE;
+        line.tone = UI_LINE_WARNING;
+        line.problem = true;
+    } else if (facts->kept != NULL) {
+        line.text = facts->kept;
+        line.tone = UI_LINE_WARNING;
+        line.problem = true;
+    } else if (facts->update != NULL) {
+        // An update is said plainly, but never in place of a problem.
+        line.text = facts->update;
+    } else if (facts->doing != NULL) {
+        line.text = facts->doing;
+    } else {
+        line.text = facts->note;
+    }
+    return line;
+}
+
+const char *ui_notes_text(const char *kept, bool token_unsaved, const char *note, char *out,
+                          size_t size)
+{
+    const char *const notes[] = {kept, token_unsaved ? UI_TOKEN_UNSAVED_NOTE : NULL,
+                                 note != kept ? note : NULL};
+    size_t at = 0;
+    if (size == 0) {
+        return NULL;
+    }
+    out[0] = '\0';
+    for (size_t i = 0; i < sizeof(notes) / sizeof(notes[0]); i++) {
+        if (notes[i] == NULL || notes[i][0] == '\0') {
+            continue;
+        }
+        const size_t gap = at > 0 ? 2 : 0;
+        const size_t len = strlen(notes[i]);
+        if (len + gap >= size - at) {
+            continue;
+        }
+        memcpy(out + at, "\n\n", gap);
+        memcpy(out + at + gap, notes[i], len + 1);
+        at += gap + len;
+    }
+    return at > 0 ? out : NULL;
 }
 
 void ui_shift(unsigned step, int32_t *dx, int32_t *dy)

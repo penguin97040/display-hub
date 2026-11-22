@@ -219,8 +219,10 @@ static void check_ended(dh_fw_reason reason, bool opened)
     CHECK(!glue.set_to_boot && glue.begun == opened);
     CHECK(!opened || glue.aborted || glue.ended);
     /* An image that was given up can't be started: its first sector is erased, once. A
-     * partition that was never opened is left as it was. */
-    CHECK(glue.spare_spoilt == (opened ? 1u : 0u));
+     * partition that was never opened, or was opened and never written to, is left as it was:
+     * it may hold the last good firmware. */
+    CHECK(opened || !glue.write_tried);
+    CHECK(glue.spare_spoilt == (glue.write_tried ? 1u : 0u));
     storage_fw_attempt_ended(reason);
     dh_fw_record r = flash_record();
     CHECK(r.stage == DH_FW_STAGE_IDLE && r.result_state == dh_fw_reason_state(reason) &&
@@ -349,6 +351,8 @@ static void test_flash_failures(void)
     glue.piece_is_external = true;
     CHECK(receive() == DH_FW_REASON_FLASH);
     CHECK(glue.written_len == 0 && glue.aborted);
+    /* So nothing of the partition was touched, and it is left as it was. */
+    CHECK(!glue.write_tried && glue.spare_spoilt == 0);
     check_ended(DH_FW_REASON_FLASH, true);
 }
 
@@ -357,6 +361,7 @@ static void test_abandoned_image(void)
 {
     static uint8_t bad[sizeof form];
     uint8_t start[16];
+    size_t image_at = 0;
 
     /* The whole image arrives and doesn't match the manifest's hash: what was written could be
      * a complete app that nobody signed. Its first sector is erased, after the partition is
@@ -371,12 +376,59 @@ static void test_abandoned_image(void)
     glue.pauses = true;
     CHECK(receive() == DH_FW_REASON_IMAGE_HASH);
     CHECK(glue.aborted && glue.spare_spoilt == 1 && glue.written_when_spoilt > 0);
+    /* Where the image starts in the update form, for the cases below. */
+    const dh_fw_manifest *m = dh_fw_download_manifest(glue.download);
+    CHECK(m != NULL && m->image_size > 0 && m->image_size < form_len);
+    image_at = m != NULL ? form_len - m->image_size : 0;
     CHECK(esp_partition_read(esp_ota_get_next_update_partition(NULL), 0, start, sizeof start) ==
           ESP_OK);
     for (size_t i = 0; i < sizeof start; i++) {
         CHECK(start[i] == 0xff);
     }
     check_ended(DH_FW_REASON_IMAGE_HASH, true);
+
+    /* The download breaks off once the partition has been opened and before a byte of the
+     * image has arrived. Opening it erased nothing (OTA_WITH_SEQUENTIAL_WRITES), so it still
+     * holds whatever it held, which may be the last good firmware: not spoilt. */
+    fresh_display();
+    take_offer();
+    glue.body_len = image_at;
+    glue.piece = 1;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    CHECK(glue.begun && glue.sequential && glue.aborted);
+    CHECK(!glue.write_tried && glue.written_len == 0 && glue.spare_spoilt == 0);
+    check_ended(DH_FW_REASON_DOWNLOAD, true);
+
+    /* The same, given up because the setup went (a factory reset) at that moment. */
+    fresh_display();
+    take_offer();
+    glue.body_len = image_at;
+    glue.stalls = true;
+    stop_at_us = glue.now_us + 1000000LL;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    stop_at_us = 0;
+    CHECK(glue.begun && glue.aborted && !glue.write_tried && glue.spare_spoilt == 0);
+    check_ended(DH_FW_REASON_DOWNLOAD, true);
+
+    /* One byte of the image more, and it is written: spoilt. */
+    fresh_display();
+    take_offer();
+    glue.body_len = image_at + 1;
+    glue.piece = 1;
+    CHECK(receive() == DH_FW_REASON_DOWNLOAD);
+    CHECK(glue.begun && glue.aborted && glue.written_len == 1);
+    CHECK(glue.write_tried && glue.spare_spoilt == 1 && glue.written_when_spoilt == 1);
+    check_ended(DH_FW_REASON_DOWNLOAD, true);
+
+    /* The very first write fails. Nothing counts as written, but the write may have erased
+     * the first sector, or written part of it, before it failed: spoilt all the same. */
+    fresh_display();
+    take_offer();
+    glue.write_fails_after = 0;
+    CHECK(receive() == DH_FW_REASON_FLASH);
+    CHECK(glue.begun && glue.aborted && glue.written_len == 0);
+    CHECK(glue.write_tried && glue.spare_spoilt == 1 && glue.written_when_spoilt == 0);
+    check_ended(DH_FW_REASON_FLASH, true);
 
     /* The erase fails: the update still ends as it would have, and nothing else is touched. */
     fresh_display();

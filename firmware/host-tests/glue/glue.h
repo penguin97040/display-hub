@@ -60,6 +60,9 @@ typedef struct {
     bool aborted;
     bool set_to_boot;
     bool wrote_while_closed;
+    /* esp_ota_write() was called at all, whether or not it then failed: only from then on may
+     * anything of the partition have changed. */
+    bool write_tried;
     /* esp_partition_erase_range(): how often the spare partition's first sector was erased, and
      * how much had been written to the partition when it last was; whether anything else was
      * ever asked for (the running partition, another range, or a partition still open); and a

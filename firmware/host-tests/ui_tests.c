@@ -461,6 +461,99 @@ static void test_storage_stopped(void)
                  ui_storage_stopped_text(UI_STORAGE_NOT_STARTED)) == 0);
 }
 
+/* The line at the foot of each page: a real problem is never hidden by a kept note. */
+static void test_line(void)
+{
+    static const char KEPT[] = "Factory reset didn't happen";
+    ui_line_facts f = {0};
+    ui_line l = ui_line_pick(&f);
+    CHECK(l.text == NULL && !l.problem && l.tone == UI_LINE_QUIET);
+
+    /* Only news: the note, then what the display is doing, then an update. */
+    f.note = "Factory reset cancelled.";
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.note && !l.problem && l.tone == UI_LINE_QUIET);
+    f.doing = "Joining Wi-Fi";
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.doing && !l.problem && l.tone == UI_LINE_QUIET);
+    f.update = "Updating its firmware";
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.update && !l.problem && l.tone == UI_LINE_QUIET);
+
+    /* A kept note comes ahead of all of that, as a problem. */
+    f.kept = KEPT;
+    l = ui_line_pick(&f);
+    CHECK(l.text == KEPT && l.problem && l.tone == UI_LINE_WARNING);
+
+    /* But not ahead of a token that isn't in flash, */
+    f.token_unsaved = true;
+    l = ui_line_pick(&f);
+    CHECK(strcmp(l.text, UI_TOKEN_UNSAVED_LINE) == 0 && l.problem && l.tone == UI_LINE_WARNING);
+    /* nor of a problem with the hub, in its own colour. */
+    f.problem = "Can't reach the hub";
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.problem && l.problem && l.tone == UI_LINE_WARNING);
+    f.problem_is_bad = true;
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.problem && l.problem && l.tone == UI_LINE_BAD);
+    f.token_unsaved = false;
+    l = ui_line_pick(&f);
+    CHECK(l.text == f.problem && l.problem && l.tone == UI_LINE_BAD);
+
+    /* With the problem gone, the kept note has the line again. */
+    f.problem = NULL;
+    l = ui_line_pick(&f);
+    CHECK(l.text == KEPT && l.problem && l.tone == UI_LINE_WARNING);
+
+    /* Every line fits the 80 characters the screen keeps for it. */
+    CHECK(strlen(UI_TOKEN_UNSAVED_LINE) <= 80);
+}
+
+/* The status screen's notes: all that apply, none in place of another. */
+static void test_notes(void)
+{
+    static const char KEPT[] = "The reset couldn't start, and nothing was erased.";
+    static const char NOTE[] = "Its USB setup didn't start.";
+    char out[UI_NOTES_ROOM];
+    char small[60];
+
+    CHECK(ui_notes_text(NULL, false, NULL, out, sizeof out) == NULL);
+    CHECK(ui_notes_text(NULL, false, "", out, sizeof out) == NULL);
+    CHECK(ui_notes_text(NULL, false, NOTE, out, sizeof out) == out && strcmp(out, NOTE) == 0);
+    CHECK(ui_notes_text(KEPT, false, NULL, out, sizeof out) == out && strcmp(out, KEPT) == 0);
+    CHECK(ui_notes_text(NULL, true, NULL, out, sizeof out) == out &&
+          strcmp(out, UI_TOKEN_UNSAVED_NOTE) == 0);
+
+    /* A kept note hides neither the token nor what didn't start: kept, token, note. */
+    CHECK(ui_notes_text(KEPT, true, NOTE, out, sizeof out) == out);
+    const char *kept = strstr(out, KEPT);
+    const char *token = strstr(out, UI_TOKEN_UNSAVED_NOTE);
+    const char *note = strstr(out, NOTE);
+    CHECK(kept == out && token != NULL && note != NULL && kept < token && token < note);
+    CHECK(strlen(out) == strlen(KEPT) + 2 + strlen(UI_TOKEN_UNSAVED_NOTE) + 2 + strlen(NOTE));
+    CHECK(token != NULL && token[-1] == '\n' && token[-2] == '\n');
+    CHECK(strstr(UI_TOKEN_UNSAVED_NOTE, "need setting up again") != NULL);
+
+    /* The same note given twice is said once. */
+    CHECK(ui_notes_text(KEPT, false, KEPT, out, sizeof out) == out && strcmp(out, KEPT) == 0);
+
+    /* One that doesn't fit whole is left out, not cut short; the rest are still said. */
+    CHECK(ui_notes_text(KEPT, true, NOTE, small, sizeof small) == small);
+    CHECK(strcmp(small, KEPT) == 0);
+    CHECK(ui_notes_text(NOTE, true, NULL, small, sizeof small) == small && strcmp(small, NOTE) == 0);
+    CHECK(ui_notes_text(KEPT, false, NULL, small, strlen(KEPT)) == NULL);
+    CHECK(ui_notes_text(KEPT, false, NULL, small, strlen(KEPT) + 1) == small);
+    CHECK(ui_notes_text(KEPT, true, NOTE, small, 0) == NULL);
+
+    /* The longest of each the firmware has, together, fit the room (main.c: the two reset
+     * notes are under 200 bytes, and the start-up note's buffer is 200). */
+    char longest[200];
+    memset(longest, 'x', sizeof longest - 1);
+    longest[sizeof longest - 1] = '\0';
+    CHECK(ui_notes_text(longest, true, longest + 1, out, sizeof out) == out);
+    CHECK(strlen(out) == 199 + 2 + strlen(UI_TOKEN_UNSAVED_NOTE) + 2 + 198);
+}
+
 static void test_unicode_example(void)
 {
     /* The example with macrons in its titles reads, and keeps them as they are. */
@@ -492,6 +585,8 @@ int main(void)
     test_keep_view();
     test_shift();
     test_storage_stopped();
+    test_line();
+    test_notes();
     test_unicode_example();
     printf("ui tests: %d checks, %d failures\n", checks, failures);
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
