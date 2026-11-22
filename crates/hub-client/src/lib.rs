@@ -1205,7 +1205,14 @@ mod tests {
         };
         let c = dev_client(port);
         let e = c.http.get(c.url("v1/health")).send().await.unwrap_err();
-        assert!(matches!(class_of(&e), ClientError::Unreachable(_)), "{e:?}");
+        // Linux refuses at once. Windows tries a closed port again for about 2 s before it
+        // refuses, so with this test's short connect wait the same thing ends as a connect
+        // timeout. Neither is sent again.
+        assert!(
+            matches!(class_of(&e), ClientError::Unreachable(_))
+                || (e.is_connect() && matches!(class_of(&e), ClientError::Timeout)),
+            "{e:?}"
+        );
         assert!(!worth_retrying(&e, true));
     }
 }
