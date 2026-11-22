@@ -15,7 +15,7 @@
 | `crates/os-secrets` | Tokens in the OS credential store, shared by the manager, `hub-send` and `usage-helper`. |
 | `tools/display-simulator` | Emulates a display, for testing without hardware. |
 | `protocol/v1` | JSON Schema and valid and invalid example snapshots. |
-| `design/tokens.json` | The zvx.nz design tokens the manager follows (a copy; see the file's header). |
+| `design/tokens.json` | The app's design tokens, which the manager's `theme.rs` follows (a test keeps them the same). |
 | `assets/fonts` | Geist and Geist Mono, bundled into the manager. |
 | `vendor/gpui-pre-windows` | GPUI's Windows backend, changed so Linux can cross-build it ([vendor/README.md](../vendor/README.md)). |
 

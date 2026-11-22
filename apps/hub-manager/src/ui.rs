@@ -1,5 +1,6 @@
-//! The zvx.nz components in GPUI: panels with corner ticks, labels, meters, the static pattern and
-//! the marks. Stateless; the interactive parts (buttons, fields, navigation) are in `app.rs`.
+//! The app's components in GPUI, drawn with its design tokens: panels with corner ticks, labels,
+//! meters, the static pattern and the marks. Stateless; the interactive parts (buttons, fields,
+//! navigation) are in `app.rs`.
 
 use std::sync::Arc;
 

@@ -1,7 +1,7 @@
-//! zvx.nz design tokens (AGENT_STYLE_GUIDE.md v3.1), as 0xRRGGBB and px at 1x.
+//! The app's design tokens, as 0xRRGGBB and px at 1x.
 //!
 //! The values are written out here so the app has no build step, and a test checks every one
-//! against `design/tokens.json`, a verbatim copy of zvx.nz's `brand/tokens.json`.
+//! against `design/tokens.json`, where the app's design tokens are kept.
 
 /// Page and panel fill.
 pub const BLACK: u32 = 0x000000;

@@ -318,6 +318,7 @@ Rules:
 - A display that is already provisioned answers `already_provisioned`, and keeps its settings, until the owner factory-resets it on the device itself. Someone who plugs a cable in can't silently point it at another hub.
 - A factory reset erases the Wi-Fi settings, trust anchors and token. It keeps the firmware keys and security floor.
 - `firmware_keys_locked` means the display already trusts a different set of firmware keys, and only **Install firmware** (a USB install that erases it) can change them. An older manager shows it as an unrecognised error, with the message.
+- The official firmware saves a bundle's firmware keys before the setup itself. So a display that answered `storage_failed` may already trust that bundle's keys without being set up: the same bundle sent again is taken, and one naming other keys gets `firmware_keys_locked` until **Install firmware** erases it ([firmware-updates.md](firmware-updates.md#what-each-action-may-change)).
 - After `provisioned`, the display joins the Wi-Fi network and enrols. The manager then watches for it to appear in the hub's list of displays.
 
 `tools/display-simulator` stands in for the display at both stages: it enrols from a bundle file, and answers the serial exchange on a pseudo-terminal.
