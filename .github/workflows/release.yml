@@ -49,6 +49,13 @@ jobs:
         run: python3 -I tools/release/check-version.py "$TAG" | tee -a "$GITHUB_OUTPUT"
       - name: Install Rust
         run: rustup show active-toolchain || rustup toolchain install
+      # Every download carries THIRD-PARTY-NOTICES.txt, so it must match this tag's Cargo.lock even
+      # if the tag went on a commit whose CI hadn't passed. Same pinned version as CI.
+      - name: Third-party notices are up to date
+        run: |
+          cargo install --locked --root "$RUNNER_TEMP/cargo-tools" --version 0.9.3 --features cli cargo-about
+          cargo fetch --locked
+          CARGO_ABOUT="$RUNNER_TEMP/cargo-tools/bin/cargo-about" bash tools/notices/generate.sh --check
       - uses: ./.github/actions/zigbuild
       - name: Check the scripts
         run: |
@@ -104,6 +111,9 @@ jobs:
           cp bootloader/bootloader.bin "$GITHUB_WORKSPACE/fw-out/bootloader/"
           cp partition_table/partition-table.bin "$GITHUB_WORKSPACE/fw-out/partition_table/"
           sha256sum display-hub.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin
+      # As in CI: the firmware's notices must have been written from what is in this build.
+      - name: Check the firmware's parts against the notices
+        run: python3 -I tools/notices/firmware-parts.py "$RUNNER_TEMP/fw-build" | diff -u tools/notices/firmware-parts.txt -
       # Not named release-*: it isn't a download.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

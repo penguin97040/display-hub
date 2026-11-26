@@ -152,6 +152,8 @@ typedef struct {
     // when to give up. NULL once the headers are in (link_release).
     const hub_request_t *request;
     int64_t deadline_ms;
+    // A TCP connection was made, whatever came of the handshake.
+    bool tcp_made;
     // Why the link gave up, if it did.
     bool stopped;
     bool timed_out;
@@ -217,12 +219,14 @@ static int link_connect(esp_transport_handle_t transport, const char *host, int 
         return -1;
     }
     link->cfg.timeout_ms = timeout_ms;
+    link->tcp_made = false;
     bool first = true;
     while (true) {
         const int progress =
             esp_tls_conn_new_async(host, (int)strlen(host), port, &link->cfg, link->tls);
         if (progress > 0) {
             // The handshake is done: the other end holds the key of the anchor's certificate.
+            link->tcp_made = true;
             if (esp_tls_get_conn_sockfd(link->tls, &link->fd) == ESP_OK && link->fd >= 0) {
                 return 0;
             }
@@ -247,6 +251,7 @@ static int link_connect(esp_transport_handle_t transport, const char *host, int 
                 link->tls_last = ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT;
                 break;
             }
+            link->tcp_made = true;
         }
         // The handshake wants more from the other end.
         if (!link_may_go_on(link) || link_wait(link, false, LINK_POLL_MS) < 0) {
@@ -411,11 +416,38 @@ static bool link_stopped(esp_transport_handle_t transport)
     return link->stopped;
 }
 
+// What came back from the address, when no connection to the hub was made (hub_reach_t).
+static hub_reach_t reach_of(const link_t *link)
+{
+    if (link->stopped) {
+        return HUB_REACH_UNKNOWN;
+    }
+    // The TCP connection was made, and the handshake (or the request after it) came to nothing.
+    if (link->tcp_made) {
+        return HUB_REACH_HEARD;
+    }
+    // The first step waited its whole time for the TCP connection (link_connect).
+    if (link->tls_last == ESP_ERR_ESP_TLS_CONNECTION_TIMEOUT) {
+        return HUB_REACH_SILENT;
+    }
+    // The connection was settled before the handshake's first step came back: refused (the
+    // handshake's first send then fails at once) or broken off by the other end. Unless Mbed
+    // TLS ran out of memory here.
+    if (link->tls_last == ESP_ERR_MBEDTLS_SSL_HANDSHAKE_FAILED &&
+        link->tls_code != -MBEDTLS_ERR_SSL_ALLOC_FAILED) {
+        return HUB_REACH_HEARD;
+    }
+    // The name wasn't looked up, no socket, no memory: nothing is known about the network.
+    return HUB_REACH_UNKNOWN;
+}
+
 // Why the connection wasn't made: something answered with a certificate the anchor doesn't
-// vouch for, or nothing useful answered at all.
-static dh_try_result connect_failure(esp_transport_handle_t transport, esp_err_t open_err)
+// vouch for, or nothing useful answered at all. *reach says what came back from the address.
+static dh_try_result connect_failure(esp_transport_handle_t transport, esp_err_t open_err,
+                                     hub_reach_t *reach)
 {
     const link_t *link = esp_transport_get_context_data(transport);
+    *reach = reach_of(link);
     if (link->stopped) {
         return DH_TRY_NO_ANSWER;
     }
@@ -458,11 +490,12 @@ static void close_call(hub_call_t *call)
 
 // Sets a request up and connects: looks the name up, does the TLS handshake and sends the
 // request's headers. False, with *result saying why and *was_stopped set if stop() ended it, if
-// no connection was made.
+// no connection was made. *reach says what came back from the address either way.
 static bool open_request(const hub_request_t *request, int64_t started_ms, hub_call_t *call,
-                         dh_try_result *result, bool *was_stopped)
+                         dh_try_result *result, bool *was_stopped, hub_reach_t *reach)
 {
     *result = DH_TRY_NO_ANSWER;
+    *reach = HUB_REACH_UNKNOWN;
     *call = (hub_call_t){0};
     call->link = link_new(request, started_ms);
     if (call->link == NULL) {
@@ -512,12 +545,13 @@ static bool open_request(const hub_request_t *request, int64_t started_ms, hub_c
     err = esp_http_client_open(call->client,
                                request->body != NULL ? (int)request->body_len : 0);
     if (err != ESP_OK) {
-        *result = connect_failure(call->link, err);
+        *result = connect_failure(call->link, err, reach);
         *was_stopped = link_stopped(call->link);
         close_call(call);
         return false;
     }
     // From here the other end has proved it is the hub.
+    *reach = HUB_REACH_HEARD;
     return true;
 }
 
@@ -623,7 +657,8 @@ hub_answer_t hub_http_request(const hub_request_t *request)
 
     const int64_t started_ms = now_ms();
     hub_call_t call;
-    if (!open_request(request, started_ms, &call, &answer.result, &answer.stopped)) {
+    if (!open_request(request, started_ms, &call, &answer.result, &answer.stopped,
+                      &answer.reach)) {
         return answer;
     }
 
@@ -682,7 +717,8 @@ hub_download_answer_t hub_http_download_open(const hub_request_t *request, hub_d
 
     const int64_t started_ms = now_ms();
     hub_call_t call;
-    if (!open_request(request, started_ms, &call, &answer.result, &answer.stopped)) {
+    if (!open_request(request, started_ms, &call, &answer.result, &answer.stopped,
+                      &answer.reach)) {
         return answer;
     }
 

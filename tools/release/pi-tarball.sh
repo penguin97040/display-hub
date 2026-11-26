@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Packs the Raspberry Pi download: a display-hub-pi folder holding hubd, hub-send and everything in
-# deploy/raspberry-pi/, as display-hub-pi-arm64-<version>.tar.gz. The release workflow runs it after
-# building the two programs; it prints the file's path.
+# Packs the Raspberry Pi download: a display-hub-pi folder holding hubd, hub-send, everything in
+# deploy/raspberry-pi/, LICENSE and THIRD-PARTY-NOTICES.txt, as
+# display-hub-pi-arm64-<version>.tar.gz. The release workflow runs it after building the two
+# programs; it prints the file's path.
 #
 #   bash tools/release/pi-tarball.sh <folder with hubd and hub-send> <version> <output folder>
 #
@@ -25,6 +26,7 @@ dir=$stage/display-hub-pi
 mkdir "$dir"
 cp -R "$root/deploy/raspberry-pi/." "$dir/"
 cp "$bins/hubd" "$bins/hub-send" "$dir/"
+cp "$root/LICENSE" "$root/THIRD-PARTY-NOTICES.txt" "$dir/"
 find "$dir" -type d -exec chmod 0755 {} +
 find "$dir" -type f -exec chmod 0644 {} +
 chmod 0755 "$dir/hubd" "$dir/hub-send" "$dir/install.sh" "$dir/display-hub-helper" "$dir/helpers/pi-status"

@@ -2,11 +2,31 @@
 
 The firmware is built with ESP-IDF and a few components from the [ESP Component Registry](https://components.espressif.com). Each component is pinned to one exact version in [`main/idf_component.yml`](main/idf_component.yml), and [`dependencies.lock`](dependencies.lock) records the hash of each one, which the build checks when it downloads them.
 
+The licence texts and copyright notices of everything below that ends up in the firmware are in part 2 of [`THIRD-PARTY-NOTICES.txt`](../THIRD-PARTY-NOTICES.txt), which every download carries. [Keeping the notices up to date](#keeping-the-notices-up-to-date) says how that part is made.
+
 ## The framework
 
 | Name | Version | Licence | Source |
 |---|---|---|---|
-| ESP-IDF | v5.5.6 (commit `880a203ae603d08a94d06aa01e0d6761958e5e9e`) | Apache-2.0, with its own third-party parts (Mbed TLS 3.6 is Apache-2.0) | https://github.com/espressif/esp-idf |
+| ESP-IDF | v5.5.6 (commit `880a203ae603d08a94d06aa01e0d6761958e5e9e`) | Apache-2.0, with its own third-party parts (below) | https://github.com/espressif/esp-idf |
+
+ESP-IDF brings in parts from other projects. These are the ones with code in this firmware, from the linker's map files of a release build (ESP-IDF's own list of them is `docs/en/COPYRIGHT.rst` in its source):
+
+| Part | Licence |
+|---|---|
+| FreeRTOS kernel, with Cadence's Xtensa port | MIT |
+| Xtensa HAL library and headers (Cadence) | MIT |
+| lwIP, the TCP/IP stack | BSD-3-Clause |
+| Mbed TLS 3.6 | Apache-2.0 (offered as Apache-2.0 or GPL-2.0-or-later) |
+| wpa_supplicant, Wi-Fi security | BSD-3-Clause |
+| FreeBSD net80211, inside Espressif's Wi-Fi library | BSD-2-Clause |
+| TLSF memory allocator (ESP-IDF's heap) | BSD-3-Clause |
+| http_parser (ESP-IDF's HTTP client) | MIT |
+| UBSAN runtime (`esp_system/ubsan.c`) | BSD-2-Clause |
+| newlib C library, from Espressif's toolchain | BSD and similar permissive licences (`COPYING.NEWLIB`) |
+| GCC's libgcc and libstdc++ | GPL-3.0 with the GCC Runtime Library Exception (no notice needed) |
+
+Espressif's Wi-Fi and radio libraries (`esp32-wifi-lib`, `esp-phy-lib`) come as object code, under Apache-2.0 like the rest of ESP-IDF. Parts that ESP-IDF has but that aren't in this firmware, such as cJSON, FatFS, SPIFFS, the SD card drivers and Bluetooth, aren't listed.
 
 ## Components
 
@@ -59,6 +79,20 @@ The screens draw Geist, the font the desktop app uses. The two TrueType files ar
 
 LVGL's `COPYRIGHTS.md` lists the libraries it carries. Only those turned on in the settings are built. All are permissive: BSD-2-Clause (barcode, LZ4), BSD-3-Clause (TLSF), MIT (QR code, ThorVG, RapidJSON with a BSD-3-Clause part, printf, FT800 driver), Zlib (LodePNG), MIT or Unlicense (TinyTTF), Apache-2.0 (AnimatedGIF), and TJpgDec's own permissive licence. The firmware turns on Tiny TTF (`CONFIG_LV_USE_TINY_TTF`), which is stb_truetype, MIT or Unlicense. FreeType support needs the separate FreeType component, which isn't used, and the demo font beside it is OFL-1.1.
 
+Three of LVGL's extras end up in the firmware:
+
+- **Tiny TTF** (stb_truetype, MIT or Unlicense), which draws Geist.
+- **printf** (MIT), LVGL's built-in text formatting (`CONFIG_LV_USE_BUILTIN_SPRINTF`).
+- **Montserrat 20**, LVGL's default font (`CONFIG_LV_FONT_DEFAULT_MONTSERRAT_20`). It is Montserrat (OFL-1.1) with a few Font Awesome Free 5 symbols (OFL-1.1 as a font). The screens draw Geist; Montserrat is in the image as LVGL's default.
+
+The board package's other dependencies (`esp_codec_dev`, `esp_lcd_panel_io_additions`, `cmake_utilities`) are part of the build but have no code in the firmware.
+
 ## Updating a component
 
-Change its version in `main/idf_component.yml`, then before building: read its licence file and changelog, and read anything it runs at build time (CMake files, Kconfig, `project_include.cmake`, scripts). Build, check the new `dependencies.lock`, and update the table above.
+Change its version in `main/idf_component.yml`, then before building: read its licence file and changelog, and read anything it runs at build time (CMake files, Kconfig, `project_include.cmake`, scripts). Build, check the new `dependencies.lock`, and update the table above. Then check the notices, as below.
+
+## Keeping the notices up to date
+
+Part 2 of `THIRD-PARTY-NOTICES.txt` comes from [`tools/notices/firmware.txt`](../tools/notices/firmware.txt), written from a release build: its licence texts are copied from the files in ESP-IDF v5.5.6 and the components, and its list of parts from the build's map files. [`tools/notices/firmware-parts.txt`](../tools/notices/firmware-parts.txt) is that list as [`tools/notices/firmware-parts.py`](../tools/notices/firmware-parts.py) prints it: each library with code in the firmware or its bootloader, and LVGL's bundled libraries and built-in fonts that are in it.
+
+CI and the release build the firmware and compare the list with the committed one. If they differ (after a new component, a new ESP-IDF, or a setting that brings in more code), find what is new in the map files, add its licence text and copyright notices to `tools/notices/firmware.txt` (and to the tables here), save the new list with `python3 -I tools/notices/firmware-parts.py <build folder> > tools/notices/firmware-parts.txt`, and run `bash tools/notices/generate.sh`.
