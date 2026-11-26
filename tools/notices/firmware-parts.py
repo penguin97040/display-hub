@@ -15,7 +15,7 @@ import sys
 
 # One input section of the map: its name (on the same line or the line before), its address, its
 # size and the archive member it comes from.
-SECTION = re.compile(r"^(?:\s+| \S+\s+)0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(\S+\.a)\((\S+)\)$", re.M)
+SECTION = re.compile(r"^(?:\s+| \S+\s+)0x([0-9a-f]+)\s+0x([0-9a-f]+)\s+(.+?\.a)\((\S+)\)$", re.M)
 # LVGL's folders for the libraries it bundles (Tiny TTF's wrapper is under src/font/), and its
 # built-in fonts.
 LVGL_BUNDLED = ("/src/libs/", "/src/stdlib/builtin/", "/src/font/tiny_ttf/")

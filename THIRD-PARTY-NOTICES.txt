@@ -1693,7 +1693,29 @@ The programs are built from Rust crates, most of them from crates.io: hub-manage
 hub-firmware, display-simulator, usage-helper and usage-helper-sync in the app downloads, and hubd
 and hub-send in the Raspberry Pi download. This part lists every crate any of them uses on the
 systems the downloads are for, with its licence. Crates used only to build or test Display Hub
-aren't included, nor are Display Hub's own.
+aren't included (crates that only run while it is compiled, such as derive macros, are listed
+all the same), nor are Display Hub's own.
+
+Every program also holds Rust's standard library (std, core and alloc), from
+https://github.com/rust-lang/rust, under the MIT licence or the Apache License 2.0, at the user's
+choice. The Apache License 2.0's text is below. The MIT licence's notice is:
+
+  Copyright (c) The Rust Project Contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+  and associated documentation files (the "Software"), to deal in the Software without
+  restriction, including without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 The crates under the Mozilla Public License 2.0 (MPL-2.0) are dwrote, option-ext and serialport.
 They are used unmodified. The MPL asks that their source code stays available: it is on crates.io

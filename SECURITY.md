@@ -15,7 +15,7 @@ Only you and the maintainer see the report. Please don't open a public issue, a 
 ## What's covered
 
 - **The hub** (`hubd`), including its installer and service for the Raspberry Pi (`deploy/raspberry-pi/`).
-- **The desktop app** (`hub-manager`) and the command-line tools (`hub-send`, `usage-helper`, `hub-firmware`, `display-simulator`).
+- **The desktop app** (`hub-manager`) and the command-line tools (`hub-send`, `usage-helper`, `usage-helper-sync`, `hub-firmware`, `display-simulator`).
 - **The official display firmware** (`firmware/`) and how displays are set up over USB.
 - **Firmware signing and updates:** the signed packages, the keys the app and displays trust, and the checks the release makes ([firmware/official/README.md](firmware/official/README.md)).
 - **The release downloads** and how they're built ([.github/workflows/release.yml](.github/workflows/release.yml)).

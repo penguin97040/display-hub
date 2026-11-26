@@ -14,7 +14,7 @@
 # cargo-about runs offline (--frozen): it reads only the crates already downloaded for this
 # Cargo.lock, never the network. It must be exactly the version below, as CI installs it:
 #   cargo install --locked --features cli --version 0.9.3 cargo-about
-# Give its path in $CARGO_ABOUT if it isn't on PATH. The same Cargo.lock gives the same file.
+# It also needs Python 3.11 or newer. Give cargo-about's path in $CARGO_ABOUT if it isn't on PATH. The same Cargo.lock gives the same file.
 set -euo pipefail
 
 want_about=0.9.3
@@ -38,6 +38,10 @@ trap 'rm -rf "$work"' EXIT
 "$about" generate --frozen --workspace --fail --manifest-path "$root/Cargo.toml" \
   --config "$here/about.toml" --output-file "$work/rust.txt" "$here/rust-crates.hbs"
 
+python3 -I -c 'import sys; sys.exit(sys.version_info < (3, 11))' || {
+  echo "needs Python 3.11 or newer (for tomllib)" >&2
+  exit 2
+}
 python3 -I - "$root" "$work/rust.txt" "$work/notices.txt" <<'PY'
 import pathlib, sys, tomllib
 
@@ -49,6 +53,7 @@ about = tomllib.loads((root / "tools/notices/about.toml").read_text(encoding="ut
 if about["accepted"] != deny["allow"]:
     sys.exit("tools/notices/about.toml's accepted list isn't deny.toml's allow list, in order")
 mpl = sorted(e["crate"] for e in deny["exceptions"] if e["allow"] == ["MPL-2.0"] and e["crate"] != "cbindgen")
+mpl_names = ", ".join(mpl[:-1]) + " and " + mpl[-1] if len(mpl) > 1 else "".join(mpl)
 if sorted(k for k, v in about.items() if isinstance(v, dict) and v.get("accepted") == ["MPL-2.0"]) != mpl:
     sys.exit("tools/notices/about.toml's MPL-2.0 crates aren't deny.toml's shipped ones")
 
@@ -100,13 +105,35 @@ out += """The programs are built from Rust crates, most of them from crates.io: 
 hub-firmware, display-simulator, usage-helper and usage-helper-sync in the app downloads, and hubd
 and hub-send in the Raspberry Pi download. This part lists every crate any of them uses on the
 systems the downloads are for, with its licence. Crates used only to build or test Display Hub
-aren't included, nor are Display Hub's own.
+aren't included (crates that only run while it is compiled, such as derive macros, are listed
+all the same), nor are Display Hub's own.
 
-The crates under the Mozilla Public License 2.0 (MPL-2.0) are """ + ", ".join(mpl[:-1]) + " and " + mpl[-1] + """.
+Every program also holds Rust's standard library (std, core and alloc), from
+https://github.com/rust-lang/rust, under the MIT licence or the Apache License 2.0, at the user's
+choice. The Apache License 2.0's text is below. The MIT licence's notice is:
+
+  Copyright (c) The Rust Project Contributors
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+  and associated documentation files (the "Software"), to deal in the Software without
+  restriction, including without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+  Software is furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all copies or
+  substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING
+  BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+  NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+  DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+""" + (f"""
+The crates under the Mozilla Public License 2.0 (MPL-2.0) are {mpl_names}.
 They are used unmodified. The MPL asks that their source code stays available: it is on crates.io
 (https://crates.io/crates/<name>) and in the repository listed with each crate in the MPL-2.0
 section below.
-
+""" if mpl else "") + """
 gpui-pre-windows 0.3.11 (Apache License 2.0), GPUI's Windows support, is used in a changed copy:
 it compiles the app's Windows shaders when the app first starts, not while it is built. Display
 Hub's source code has the copy in vendor/gpui-pre-windows, and vendor/README.md says what changed.
