@@ -16,6 +16,7 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_AUDIT_VERSION: 0.22.2
   CARGO_DENY_VERSION: 0.20.2
+  CARGO_ABOUT_VERSION: 0.9.3
 
 jobs:
   linux:
@@ -98,16 +99,24 @@ jobs:
         id: tools
         with:
           path: ~/.cargo-tools
-          key: cargo-tools-${{ runner.os }}-audit-${{ env.CARGO_AUDIT_VERSION }}-deny-${{ env.CARGO_DENY_VERSION }}
-      - name: Install cargo-audit and cargo-deny
+          key: cargo-tools-${{ runner.os }}-audit-${{ env.CARGO_AUDIT_VERSION }}-deny-${{ env.CARGO_DENY_VERSION }}-about-${{ env.CARGO_ABOUT_VERSION }}
+      - name: Install cargo-audit, cargo-deny and cargo-about
         if: steps.tools.outputs.cache-hit != 'true'
         run: |
           cargo install --locked --root ~/.cargo-tools --version "$CARGO_AUDIT_VERSION" cargo-audit
           cargo install --locked --root ~/.cargo-tools --version "$CARGO_DENY_VERSION" cargo-deny
+          cargo install --locked --root ~/.cargo-tools --version "$CARGO_ABOUT_VERSION" --features cli cargo-about
       - name: cargo audit
         run: ~/.cargo-tools/bin/cargo-audit audit --deny warnings
       - name: cargo deny
         run: ~/.cargo-tools/bin/cargo-deny --locked check
+      # The notices every download carries must be what this Cargo.lock and the notices' sources
+      # give. The crates for every platform the downloads are for are fetched first: the builds
+      # above fetched Linux's only. cargo-about itself reads only those files, offline.
+      - name: Third-party notices are up to date
+        run: |
+          cargo fetch --locked
+          CARGO_ABOUT=~/.cargo-tools/bin/cargo-about bash tools/notices/generate.sh --check
 
   windows:
     runs-on: windows-2022
@@ -201,7 +210,7 @@ jobs:
             deploy/raspberry-pi/helpers/pi-status tools/pi-container-test/run.sh \
             tools/pi-container-test/probe-helper tools/release/pi-tarball.sh \
             tools/release/package-app.sh tools/release/build-pi.sh tools/release/release-notes.sh \
-            starters/helper/my-helper
+            tools/notices/generate.sh starters/helper/my-helper
       # Built and packed by the release's own scripts, then unpacked: the folder below is the one a
       # release's download unpacks to.
       - name: Build and pack hubd and hub-send for the Pi
@@ -268,6 +277,11 @@ jobs:
           cp bootloader/bootloader.bin "$GITHUB_WORKSPACE/fw-out/bootloader/"
           cp partition_table/partition-table.bin "$GITHUB_WORKSPACE/fw-out/partition_table/"
           sha256sum display-hub.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin
+      # What has code in the firmware, from the linker's map files, against the list the notices
+      # were written from. A difference means THIRD-PARTY-NOTICES.txt's part 2 needs looking at:
+      # firmware/THIRD_PARTY.md says how.
+      - name: Check the firmware's parts against the notices
+        run: python3 -I tools/notices/firmware-parts.py "$RUNNER_TEMP/fw-build" | diff -u tools/notices/firmware-parts.txt -
       # Unsigned, laid out as a build folder, so firmware/tools/package-dev.sh can sign it as it is.
       # The ELF is there to decode a crash's backtrace.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

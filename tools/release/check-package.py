@@ -8,6 +8,9 @@ else 0644 and folders 0755, every entry with the same time, owned by root in a t
 order in a zip. CI runs this on every push, the release workflow on what it publishes. Use relative
 paths on Windows, where Python doesn't read Git Bash's /d/... paths.
 
+Every download holds LICENSE and THIRD-PARTY-NOTICES.txt, the same bytes as the repository's (and
+on macOS a second copy of the notices inside the app, in Display Hub.app/Contents/Resources/).
+
 <firmware> is the official firmware package an app download must hold: under its own name in
 firmware/ beside the app (Display Hub.app/Contents/Resources/firmware/ on macOS), where the app
 looks for it, and the same bytes. Without it, the download must hold no firmware at all.
@@ -24,6 +27,11 @@ TOOLS = ["hub-send", "hub-firmware", "display-simulator", "usage-helper", "usage
 # The Pi download's programs and scripts, besides what deploy/raspberry-pi/ holds as plain files.
 PI_PROGRAMS = ["hubd", "hub-send", "install.sh", "display-hub-helper", "helpers/pi-status"]
 APP = "Display Hub.app/Contents"
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+NOTICES = "THIRD-PARTY-NOTICES.txt"
+# Files that must be the repository's own, byte for byte: (where the repository has it, where the
+# download has it).
+COPIES = [("LICENSE", "LICENSE"), (NOTICES, NOTICES)]
 
 
 def firmware_path(platform: str, firmware: str) -> str:
@@ -35,30 +43,32 @@ def firmware_path(platform: str, firmware: str) -> str:
 def expected(platform: str, version: str, firmware: str | None) -> tuple[str, str, dict[str, int], set[str]]:
     """The file's name, its folder, each file in the folder with its mode, and the folders."""
     if platform == "pi":
-        deploy = pathlib.Path(__file__).resolve().parents[2] / "deploy" / "raspberry-pi"
+        deploy = ROOT / "deploy" / "raspberry-pi"
         files = {p.relative_to(deploy).as_posix(): 0o644 for p in deploy.rglob("*") if p.is_file()}
         dirs = {p.relative_to(deploy).as_posix() for p in deploy.rglob("*") if p.is_dir()}
         files.update({p: 0o755 for p in PI_PROGRAMS})
+        files.update({"LICENSE": 0o644, NOTICES: 0o644})
         return f"display-hub-pi-arm64-{version}.tar.gz", "display-hub-pi", files, dirs
     exe = ".exe" if platform == "windows" else ""
     arch = {"windows": "windows-x64", "macos": "macos-arm64", "linux": "linux-x64"}[platform]
     top = f"display-hub-{arch}-{version}"
-    files = {"LICENSE": 0o644} | {t + exe: 0o755 for t in TOOLS}
+    files = {"LICENSE": 0o644, NOTICES: 0o644} | {t + exe: 0o755 for t in TOOLS}
     dirs: set[str] = set()
     if platform == "macos":
         files |= {
             f"{APP}/Info.plist": 0o644,
             f"{APP}/MacOS/hub-manager": 0o755,
             f"{APP}/_CodeSignature/CodeResources": 0o644,
+            f"{APP}/Resources/{NOTICES}": 0o644,
         }
-        dirs |= {"Display Hub.app", APP, f"{APP}/MacOS", f"{APP}/_CodeSignature"}
+        dirs |= {"Display Hub.app", APP, f"{APP}/MacOS", f"{APP}/Resources", f"{APP}/_CodeSignature"}
     else:
         files["hub-manager" + exe] = 0o755
     if firmware is not None:
         inside = firmware_path(platform, firmware)
         files[inside] = 0o644
         parent = pathlib.PurePosixPath(inside).parent
-        dirs |= {parent.as_posix()} | ({f"{APP}/Resources"} if platform == "macos" else set())
+        dirs.add(parent.as_posix())
     ext = ".zip" if platform in ("windows", "macos") else ".tar.gz"
     return top + ext, top, files, dirs
 
@@ -145,6 +155,11 @@ def main() -> int:
         names = [e[0] + ("/" if e[1] else "") for e in found]
         if names != sorted(names):
             problems.append("the zip's entries aren't in name order")
+    if not problems:
+        copies = COPIES + ([(NOTICES, f"{APP}/Resources/{NOTICES}")] if platform == "macos" else [])
+        for ours, inside in copies:
+            if content(path, f"{top}/{inside}") != (ROOT / ours).read_bytes():
+                problems.append(f"{top}/{inside} isn't the same as the repository's {ours}")
     said = ""
     if firmware is not None and not problems:
         inside = firmware_path(platform, firmware)

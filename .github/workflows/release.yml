@@ -104,6 +104,9 @@ jobs:
           cp bootloader/bootloader.bin "$GITHUB_WORKSPACE/fw-out/bootloader/"
           cp partition_table/partition-table.bin "$GITHUB_WORKSPACE/fw-out/partition_table/"
           sha256sum display-hub.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin
+      # As in CI: the firmware's notices must have been written from what is in this build.
+      - name: Check the firmware's parts against the notices
+        run: python3 -I tools/notices/firmware-parts.py "$RUNNER_TEMP/fw-build" | diff -u tools/notices/firmware-parts.txt -
       # Not named release-*: it isn't a download.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:

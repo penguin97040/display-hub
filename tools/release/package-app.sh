@@ -7,8 +7,9 @@
 #   bash tools/release/package-app.sh macos   <version> <bin-dir> <out-dir> [<firmware>]   display-hub-macos-arm64-<version>.zip
 #   bash tools/release/package-app.sh linux   <version> <bin-dir> <out-dir> [<firmware>]   display-hub-linux-x64-<version>.tar.gz
 #
-# Each holds one folder of the same name with the programs and LICENSE. On macOS the app is
-# "Display Hub.app", signed ad hoc (no paid certificate, but Apple silicon runs nothing unsigned).
+# Each holds one folder of the same name with the programs, LICENSE and THIRD-PARTY-NOTICES.txt. On
+# macOS the app is "Display Hub.app", signed ad hoc (no paid certificate, but Apple silicon runs
+# nothing unsigned), with its own copy of THIRD-PARTY-NOTICES.txt in Contents/Resources/.
 #
 # <firmware> is the official firmware package (.dhfw), already checked by
 # check-official-firmware.py. It goes in under its own name where the app looks for it: firmware/
@@ -100,6 +101,7 @@ trap 'rm -rf "$stage"' EXIT
 dir=$stage/$name
 mkdir -m 0755 "$dir"
 cp "$root/LICENSE" "$dir/LICENSE"
+cp "$root/THIRD-PARTY-NOTICES.txt" "$dir/THIRD-PARTY-NOTICES.txt"
 for b in "${tools[@]}"; do
   cp "$bins/$b$exe" "$dir/$b$exe"
   chmod 0755 "$dir/$b$exe"
@@ -129,11 +131,11 @@ case $platform in
     mkdir -p "$app/Contents/MacOS"
     cp "$bins/hub-manager" "$app/Contents/MacOS/hub-manager"
     chmod 0755 "$app/Contents/MacOS/hub-manager"
-    # Before signing, so the app's signature covers it.
-    if [ -n "$firmware" ]; then
-      mkdir -m 0755 "$app/Contents/Resources"
-      add_firmware "$app/Contents/Resources"
-    fi
+    # Before signing, so the app's signature covers them: the notices travel inside the app too,
+    # for when it is copied to Applications without the rest of the folder.
+    mkdir -m 0755 "$app/Contents/Resources"
+    cp "$root/THIRD-PARTY-NOTICES.txt" "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+    add_firmware "$app/Contents/Resources"
     # Apple's version fields take numbers only, so a release candidate's suffix is left off.
     short=${version%%-*}
     cat > "$app/Contents/Info.plist" <<PLIST
@@ -189,7 +191,7 @@ PLIST
   linux)
     cp "$bins/hub-manager" "$dir/hub-manager"
     chmod 0755 "$dir/hub-manager"
-    chmod 0644 "$dir/LICENSE"
+    chmod 0644 "$dir/LICENSE" "$dir/THIRD-PARTY-NOTICES.txt"
     add_firmware "$dir"
     tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$stamp" --format=gnu \
       -C "$stage" -cf - "$name" | gzip -9 -n > "$out/$name.tar.gz"

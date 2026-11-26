@@ -58,6 +58,15 @@ cargo audit                 # RustSec advisories (cargo install cargo-audit)
 
 The tests need no network, hardware or credentials. Hubs run in-process on `127.0.0.1` with a fake clock.
 
+`THIRD-PARTY-NOTICES.txt` lists the licences of everything the downloads carry, and CI fails if it is out of date. After any change to `Cargo.lock`, write it again with cargo-about 0.9.3 (`cargo install --locked --features cli --version 0.9.3 cargo-about`), then commit it:
+
+```sh
+cargo fetch --locked             # the crates for every platform, not just this one
+bash tools/notices/generate.sh   # --check only compares
+```
+
+The firmware's part of it has its own steps: [firmware/THIRD_PARTY.md](../firmware/THIRD_PARTY.md), "Keeping the notices up to date".
+
 ## Run the demo hub and a simulated display
 
 ```sh

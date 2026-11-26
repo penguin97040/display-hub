@@ -1,0 +1,22 @@
+{{!-- The Rust part of THIRD-PARTY-NOTICES.txt, filled in by cargo-about (tools/notices/generate.sh). Triple braces: this is plain text, so nothing is escaped as HTML. --}}
+The licences:
+
+{{#each overview}}
+  {{{name}}} ({{{id}}})
+{{/each}}
+
+Each licence text below is followed by the crates it covers. Some crates have more than one text,
+for example one for each of their files. A crate that offers a choice of licences is listed under
+the one Display Hub uses it under.
+{{#each licenses}}
+
+------------------------------------------------------------------------------------------------
+{{{name}}} ({{{id}}})
+
+Used by:
+{{#each used_by}}
+  {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}}, {{{crate.repository}}}{{/if}}
+{{/each}}
+
+{{{text}}}
+{{/each}}
