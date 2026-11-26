@@ -30,7 +30,7 @@ The app doesn't need to stay open. When your computer is off, the displays keep 
 ## Getting going
 
 <!-- RELEASE DOWNLOADS: where the ready-made downloads are. -->
-> **Ready-made downloads** for Windows, Apple silicon Macs, Linux and the Raspberry Pi hub are coming as previews on the [releases page](https://github.com/penguin97040/display-hub/releases). [Installing Display Hub](docs/install.md) says how to check them, open them and set up the hub with one line. If no release is listed yet, or you'd rather, build Display Hub from this repository as below.
+> **Ready-made downloads** for Windows, Apple silicon Macs, Linux and the Raspberry Pi hub are on the [releases page](https://github.com/penguin97040/display-hub/releases). They're previews: Display Hub works, but it's young, so expect rough edges. [Installing Display Hub](docs/install.md) says how to check them, open them and set up the hub with one line. If you'd rather, build Display Hub from this repository as below.
 <!-- END RELEASE DOWNLOADS -->
 
 You need [Rust](https://rustup.rs). `rust-toolchain.toml` pins the version, and `cargo` installs it the first time.
@@ -100,7 +100,7 @@ What I want:
 
 ## Status
 
-This is under active development, heading for a first preview release. [docs/architecture.md](docs/architecture.md) explains how it fits together.
+This is under active development. The first releases are previews: they work, but expect rough edges. [docs/architecture.md](docs/architecture.md) explains how it fits together.
 
 | Part | Where it stands |
 |---|---|
@@ -113,8 +113,8 @@ This is under active development, heading for a first preview release. [docs/arc
 | Official firmware for the Waveshare ESP32-S3-Touch-AMOLED-1.8 | Working, on the V2 board: [firmware/README.md](firmware/README.md). Tested on real boards: setup over USB, encrypted storage, Wi-Fi, enrolment, pages, factory reset and signed updates with rollback. It comes with the app downloads. |
 | The usage-limits example (`apps/usage-helper`, `crates/usage`) | Forwards subscription usage figures that tools on your computer already report. Tested against stand-ins, not yet with the live tools: [docs/providers.md](docs/providers.md). |
 
-[docs/developer-setup.md](docs/developer-setup.md) covers building, testing and the platform details, and [docs/security.md](docs/security.md) how it is kept safe.
+[docs/developer-setup.md](docs/developer-setup.md) covers building, testing and the platform details, and [docs/security.md](docs/security.md) how it is kept safe. To report a security problem, see [SECURITY.md](SECURITY.md).
 
 ## Licence
 
-MIT, in [LICENSE](LICENSE). The Geist fonts in `assets/fonts` are under the SIL Open Font License (`assets/fonts/OFL-Geist.txt`). `vendor/gpui-pre-windows` is Apache-2.0, as described in [vendor/README.md](vendor/README.md).
+MIT, in [LICENSE](LICENSE). The Geist fonts in `assets/fonts` are under the SIL Open Font License (`assets/fonts/OFL-Geist.txt`). `vendor/gpui-pre-windows` is Apache-2.0, as described in [vendor/README.md](vendor/README.md). Every download also carries [THIRD-PARTY-NOTICES.txt](THIRD-PARTY-NOTICES.txt), with the licences and copyright notices of the other people's work in it: the fonts, the parts of the official firmware and the Rust crates.
