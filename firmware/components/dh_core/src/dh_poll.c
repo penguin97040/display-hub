@@ -1,5 +1,7 @@
 #include "dh_poll.h"
 
+#include <string.h>
+
 uint32_t dh_backoff_seconds(uint32_t failures)
 {
     uint32_t doublings = failures > 0 ? failures - 1 : 0;
@@ -68,4 +70,41 @@ uint32_t dh_poll_answered(dh_poll_state *st, const dh_response *r, uint32_t refr
 uint32_t dh_poll_failed(dh_poll_state *st, dh_problem problem, dh_random_fn rnd, void *ctx)
 {
     return failed(st, problem, problem == DH_PROBLEM_SETTINGS, rnd, ctx);
+}
+
+bool dh_radio_restart_due(const dh_radio_facts *f)
+{
+    return f->silent_rounds >= DH_RADIO_RESTART_ROUNDS && f->wifi_steady && f->address_silent &&
+           f->restarts < DH_RADIO_RESTARTS_MAX && !f->heard_this_start && !f->token_unsaved &&
+           !f->on_trial && !f->updating;
+}
+
+/* Four parts of one to three digits, each 255 at most, as the app writes an IPv4 address. */
+static bool is_ipv4(const char *s, size_t n)
+{
+    unsigned parts = 0, digits = 0, value = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i == n || s[i] == '.') {
+            if (digits == 0 || value > 255u || ++parts > 4u) {
+                return false;
+            }
+            digits = 0;
+            value = 0;
+        } else if (s[i] >= '0' && s[i] <= '9' && digits < 3u) {
+            value = value * 10u + (unsigned)(s[i] - '0');
+            digits++;
+        } else {
+            return false;
+        }
+    }
+    return parts == 4u;
+}
+
+bool dh_host_is_address(const char *host, size_t len)
+{
+    if (host == NULL || len == 0) {
+        return false;
+    }
+    /* No host name holds a colon, so one means an IPv6 address. */
+    return memchr(host, ':', len) != NULL || is_ipv4(host, len);
 }

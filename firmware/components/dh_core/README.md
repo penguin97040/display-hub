@@ -10,7 +10,7 @@ It follows the reference display, `tools/display-simulator`, with `crates/hub-pr
 |---|---|
 | `dh_json.h` | A small, strict JSON reader for untrusted input. |
 | `dh_snapshot.h` | `dh_read_response()`: an HTTP status and body in; what to do, and the snapshot as plain structs, out. Ages, staleness and reset countdowns on the hub's clock. |
-| `dh_poll.h` | When to poll next (refresh ±10%, back-off from 15 s to 15 minutes ±20%, hourly), and the problem to show. Randomness comes from the caller. |
+| `dh_poll.h` | When to poll next (refresh ±10%, back-off from 15 s to 15 minutes ±20%, hourly), and the problem to show. Randomness comes from the caller. Also when to restart a display whose Wi-Fi is joined but reaches no hub address (`dh_radio_restart_due`), and whether a hub address is an IP address. |
 | `dh_hub.h` | Everything else said to the hub: the enrolment request and the heartbeat, the enrolment response, error answers from any route, the device ID and token with their stored form, which hub address and trust anchor to try next, when a heartbeat is due, and when the last good snapshot is worth saving. |
 | `dh_text.h` | UTF-8, the text rules for titles and labels, and an exact NFC check. |
 | `dh_time.h` | Timestamps in the wire form. |

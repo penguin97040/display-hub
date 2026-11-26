@@ -10,6 +10,7 @@ idf_component_register(
         "wifi.c"
         "hub_http.c"
         "hub.c"
+        "radio.c"
         "update.c"
         "reset_button.c"
         "ui.c"
@@ -26,7 +27,7 @@ idf_component_register(
     PRIV_REQUIRES app_update esp_app_format log efuse bootloader_support heap esp_driver_i2c
                   esp_lcd esp_hw_support esp_partition esp_system hal nvs_flash nvs_sec_provider
                   esp_driver_usb_serial_jtag esp_driver_gpio esp_timer esp_wifi esp_netif
-                  esp_event esp_http_client esp-tls tcp_transport mbedtls dh_core
+                  esp_event esp_http_client esp-tls tcp_transport mbedtls esp_phy dh_core
 )
 
 # TEST ONLY. A build made with -DDH_TEST_TRIAL=no-check-in or -DDH_TEST_TRIAL=crash fails its

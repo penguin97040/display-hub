@@ -29,6 +29,7 @@
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include "hub.h"
+#include "radio.h"
 #include "report.h"
 #include "reset_button.h"
 #include "storage.h"
@@ -385,6 +386,9 @@ void app_main(void)
     storage_fw_on_stopped(on_updates_stopped);
     storage_start(&s_efuse);
     storage_log();
+    // Before the USB task and the BOOT button start, so the setup held now is the one a restart
+    // came back to, and any later one counts as new (radio.h).
+    radio_start();
     // New firmware on its trial boot has five minutes from here to reach the hub.
     update_trial_start();
 

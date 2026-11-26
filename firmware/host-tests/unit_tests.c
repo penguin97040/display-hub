@@ -462,6 +462,83 @@ static void test_poll(void)
     CHECK(strcmp(dh_problem_headline(DH_PROBLEM_BUSY), "The hub is busy") == 0);
 }
 
+static void test_radio_restart(void)
+{
+    const dh_radio_facts due = {
+        .silent_rounds = DH_RADIO_RESTART_ROUNDS,
+        .wifi_steady = true,
+        .address_silent = true,
+    };
+    CHECK(dh_radio_restart_due(&due));
+    dh_radio_facts f = due;
+    f.silent_rounds = DH_RADIO_RESTART_ROUNDS - 1;
+    CHECK(!dh_radio_restart_due(&f));
+    f.silent_rounds = DH_RADIO_RESTART_ROUNDS + 5;
+    CHECK(dh_radio_restart_due(&f));
+    f = due;
+    f.wifi_steady = false;
+    CHECK(!dh_radio_restart_due(&f));
+    f = due;
+    f.address_silent = false; /* only names, which may just not be looked up */
+    CHECK(!dh_radio_restart_due(&f));
+    f = due;
+    f.restarts = DH_RADIO_RESTARTS_MAX - 1;
+    CHECK(dh_radio_restart_due(&f));
+    f.restarts = DH_RADIO_RESTARTS_MAX;
+    CHECK(!dh_radio_restart_due(&f));
+    f.restarts = UINT32_MAX;
+    CHECK(!dh_radio_restart_due(&f));
+    /* A start that has heard from the hub once has a radio that works. */
+    f = due;
+    f.heard_this_start = true;
+    CHECK(!dh_radio_restart_due(&f));
+    f.restarts = 1;
+    CHECK(!dh_radio_restart_due(&f));
+    /* A token only in memory would be lost. */
+    f = due;
+    f.token_unsaved = true;
+    CHECK(!dh_radio_restart_due(&f));
+    f = due;
+    f.on_trial = true;
+    CHECK(!dh_radio_restart_due(&f));
+    f = due;
+    f.updating = true;
+    CHECK(!dh_radio_restart_due(&f));
+    const dh_radio_facts none = {0};
+    CHECK(!dh_radio_restart_due(&none));
+    /* About a minute and a half of trying (dh_poll.h): fewer rounds would restart a display
+     * whose hub is only being restarted itself. */
+    CHECK(DH_RADIO_RESTART_ROUNDS == 3 && DH_RADIO_RESTARTS_MAX == 2);
+
+#define IS_ADDRESS(s) dh_host_is_address(s, sizeof(s) - 1)
+    CHECK(IS_ADDRESS("192.168.1.20"));
+    CHECK(IS_ADDRESS("10.0.0.1"));
+    CHECK(IS_ADDRESS("255.255.255.255"));
+    CHECK(IS_ADDRESS("0.0.0.0"));
+    CHECK(IS_ADDRESS("fd00::1"));
+    CHECK(IS_ADDRESS("::1"));
+    CHECK(IS_ADDRESS("fe80::1%wlan0"));
+    CHECK(!IS_ADDRESS("display-hub.local"));
+    CHECK(!IS_ADDRESS("hub"));
+    CHECK(!IS_ADDRESS("256.1.1.1"));
+    CHECK(!IS_ADDRESS("1.2.3"));
+    CHECK(!IS_ADDRESS("1.2.3.4.5"));
+    CHECK(!IS_ADDRESS("1.2.3.4."));
+    CHECK(!IS_ADDRESS(".1.2.3.4"));
+    CHECK(!IS_ADDRESS("1..2.3"));
+    CHECK(!IS_ADDRESS("1.2.3.1000"));
+    CHECK(!IS_ADDRESS("1.2.3.a"));
+    CHECK(!IS_ADDRESS("1.2.3.4x"));
+    CHECK(!IS_ADDRESS("1.2.3.4.example.com"));
+    CHECK(!IS_ADDRESS("10.0.0.1.nip.io"));
+    CHECK(!dh_host_is_address("", 0));
+    CHECK(!dh_host_is_address(NULL, 4));
+    /* Only `len` bytes count. */
+    CHECK(dh_host_is_address("10.0.0.1x", 8));
+    CHECK(!dh_host_is_address("10.0.0.1", 6));
+#undef IS_ADDRESS
+}
+
 static dh_usb_line_reader reader;
 
 /* Feeds s in pieces of `piece` bytes and writes the events and lines into out. */
@@ -659,6 +736,7 @@ int main(void)
     test_nfc();
     test_time();
     test_poll();
+    test_radio_restart();
     test_usb_lines();
     test_snapshot_details();
     printf("unit: %d checks, %d failed\n", checks, failures);

@@ -23,6 +23,18 @@
 extern "C" {
 #endif
 
+// What came back from an address, whatever came of the request: for the safety net for a radio
+// that is joined but gets nothing through (radio.h).
+typedef enum {
+    // Nothing is known: the request was stopped, the name couldn't be looked up, or something
+    // here failed (no memory, say) before anything was sent.
+    HUB_REACH_UNKNOWN,
+    // Nothing came back at all: no TCP connection was made in the time allowed.
+    HUB_REACH_SILENT,
+    // Something came back: a TCP connection was made, or refused, or a TLS handshake began.
+    HUB_REACH_HEARD,
+} hub_reach_t;
+
 typedef struct {
     const char *host; // one of the setup's hub addresses, NUL-terminated
     uint16_t port;
@@ -51,6 +63,7 @@ typedef struct {
     // allowed: it was not read to the end, and must be treated as too large.
     size_t len;
     bool stopped;
+    hub_reach_t reach;
 } hub_answer_t;
 
 hub_answer_t hub_http_request(const hub_request_t *request);
@@ -71,6 +84,7 @@ typedef struct {
     int status;
     size_t len;
     bool stopped;
+    hub_reach_t reach;
     // For a 200 answer: whether it came with a Content-Length (and not chunked), and its value.
     bool has_length;
     uint64_t length;

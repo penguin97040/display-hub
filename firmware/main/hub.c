@@ -50,6 +50,7 @@
 #include "freertos/task.h"
 #include "hub_http.h"
 #include "mbedtls/x509_crt.h"
+#include "radio.h"
 #include "storage.h"
 #include "update.h"
 #include "usb_setup.h"
@@ -102,6 +103,9 @@ static char s_request[DH_HUB_REQUEST_MAX];
 static char s_authorization[DH_AUTHORIZATION_MAX];
 // Counts every change to what storage_fw_facts() says, so the screen is told (hub_status_t).
 static uint32_t s_fw_seq;
+// Something has come back from a hub address since this start, in any session: the radio works,
+// and the safety net for a stuck one stays off until the next start (dh_poll.h).
+static bool s_heard_since_start;
 
 // One session: from finding a setup to that setup being erased.
 typedef struct {
@@ -128,6 +132,20 @@ typedef struct {
     bool hub_answered;
     bool fresh_snapshot;
     hub_update_t update;
+
+    // The safety net for a radio that is joined but gets nothing through (radio.h). For the walk
+    // under way: whether anything answered at any address, whether an IP address made no
+    // connection, and the Wi-Fi drop count and the time when it began. Then the walks in a row
+    // that nothing answered, whether in one of them an IP address made no connection, and the
+    // drop count and time when the first of them began.
+    bool walk_heard;
+    bool walk_address_silent;
+    uint32_t walk_drops;
+    int64_t walk_started_ms;
+    uint32_t silent_rounds;
+    bool silent_address;
+    uint32_t silent_drops;
+    int64_t silent_since_ms;
 
     bool wifi_started; // the radio is on with this setup's Wi-Fi details
     bool wifi_was_up;
@@ -175,6 +193,25 @@ static uint32_t random32(void *ctx)
 static bool gone(void)
 {
     return storage_setup_generation() != s.generation;
+}
+
+// Wipes every secret the session holds in memory: the setup (the enrolment secret and, until
+// the driver has them, the Wi-Fi details), the token, the requests and the answers. `extra` is
+// another copy of the setup to wipe as well, or NULL. At the end of a session, and before a
+// restart, which leaves RAM and PSRAM as they are.
+static void wipe_secrets(void *extra)
+{
+    if (extra != NULL && extra != s_setup) {
+        dh_setup_wipe(extra);
+    }
+    dh_setup_wipe(s_setup);
+    dh_device_wipe(&s.device);
+    dh_wipe(s_request, sizeof(s_request));
+    dh_wipe(s_authorization, sizeof(s_authorization));
+    dh_wipe(s_body, DH_MAX_SNAPSHOT_BYTES + 1);
+    dh_wipe(s_saved, DH_MAX_SNAPSHOT_BYTES);
+    dh_wipe(s_current, sizeof(*s_current));
+    dh_wipe(s_spare, sizeof(*s_spare));
 }
 
 // Sleeps until woken, for at most `ms` and never past the next minute's log.
@@ -312,11 +349,64 @@ static void log_try(uint8_t host, uint8_t anchor, dh_try_result result)
     }
 }
 
-// Ends a walk: the address that answered is the one the next request tries first.
-static dh_problem walk_ended(const dh_hub_walk *walk)
+static void walk_began(void)
+{
+    s.walk_heard = false;
+    s.walk_address_silent = false;
+    s.walk_drops = wifi_drops();
+    s.walk_started_ms = now_ms();
+}
+
+// One try of a walk, for the safety net: anything that came back at all shows the network
+// works (a refused connection included), and only an IP address that sent nothing back in the
+// time allowed counts as silent. A name that couldn't be looked up, or a request that couldn't
+// be set up here, says nothing either way.
+static void walk_tried(uint8_t host, dh_try_result result, hub_reach_t reach)
+{
+    if (result != DH_TRY_NO_ANSWER || reach == HUB_REACH_HEARD) {
+        s.walk_heard = true;
+    } else if (reach == HUB_REACH_SILENT &&
+               dh_host_is_address(s_setup->hosts[host].text, s_setup->hosts[host].len)) {
+        s.walk_address_silent = true;
+    }
+}
+
+// Counts a walk that nothing answered at any address, or starts the count again.
+static void count_round(void)
+{
+    if (s.walk_heard) {
+        s.silent_rounds = 0;
+        s.silent_address = false;
+        return;
+    }
+    if (s.silent_rounds == 0) {
+        s.silent_address = false;
+        s.silent_drops = s.walk_drops;
+        s.silent_since_ms = s.walk_started_ms;
+    }
+    if (s.silent_rounds < UINT32_MAX) {
+        s.silent_rounds++;
+    }
+    s.silent_address = s.silent_address || s.walk_address_silent;
+}
+
+// Ends a walk: the address that answered is the one the next request tries first. `counted` is
+// for enrolments and polls, the walks the safety net counts in rounds (dh_poll.h): a heartbeat,
+// a report or a download comes only after a poll was answered, so counting them as well would
+// make the rounds come faster than the back-off it was timed against.
+static dh_problem walk_ended(const dh_hub_walk *walk, bool counted)
 {
     dh_wipe(s_authorization, sizeof(s_authorization));
     const dh_problem problem = dh_hub_walk_problem(walk);
+    if (s.walk_heard) {
+        // Something came back (an answer, an error, a refusal, a certificate that isn't the
+        // hub's): the radio works.
+        s_heard_since_start = true;
+        radio_heard();
+    }
+    if (counted) {
+        count_round();
+    }
     if (problem == DH_PROBLEM_NONE) {
         const uint8_t answered = dh_hub_walk_answered_host(walk);
         if (answered != s.first_host) {
@@ -332,9 +422,10 @@ static dh_problem walk_ended(const dh_hub_walk *walk)
 // Tries the hub address that answered last, then the others in the setup's order, and at each
 // one each trust anchor while the certificate doesn't match, and stops at the first answer from
 // the real hub (dh_hub_walk). Returns DH_PROBLEM_NONE with the answer in *answer and its body in
-// s_body, or why there was no answer. `stopped` in the answer means the setup has gone.
+// s_body, or why there was no answer. `stopped` in the answer means the setup has gone. `counted`
+// as for walk_ended().
 static dh_problem ask_hub(const char *path, const char *body, size_t body_len, bool with_token,
-                          size_t ok_cap, hub_answer_t *answer)
+                          size_t ok_cap, bool counted, hub_answer_t *answer)
 {
     *answer = (hub_answer_t){.result = DH_TRY_NO_ANSWER};
     if (with_token && dh_authorization(&s.device, s_authorization, sizeof(s_authorization)) == 0) {
@@ -343,6 +434,7 @@ static dh_problem ask_hub(const char *path, const char *body, size_t body_len, b
     dh_hub_walk walk;
     uint8_t host = 0, anchor = 0;
     dh_hub_walk_begin_at(&walk, s_setup->host_count, s.anchor_count, s.first_host);
+    walk_began();
     while (dh_hub_walk_next(&walk, &host, &anchor)) {
         const hub_request_t request = {
             .host = s_setup->hosts[host].text,
@@ -361,10 +453,12 @@ static dh_problem ask_hub(const char *path, const char *body, size_t body_len, b
         if (answer->stopped) {
             break;
         }
+        walk_tried(host, answer->result, answer->reach);
         log_try(host, anchor, answer->result);
         dh_hub_walk_tried(&walk, answer->result);
     }
-    return walk_ended(&walk);
+    // A walk cut short because the setup has gone says nothing about the radio.
+    return walk_ended(&walk, counted && !answer->stopped);
 }
 
 // The same walk for a firmware download, always with the token. With DH_PROBLEM_NONE and status
@@ -381,6 +475,7 @@ static dh_problem ask_hub_for_download(const char *path, hub_download_answer_t *
     dh_hub_walk walk;
     uint8_t host = 0, anchor = 0;
     dh_hub_walk_begin_at(&walk, s_setup->host_count, s.anchor_count, s.first_host);
+    walk_began();
     while (dh_hub_walk_next(&walk, &host, &anchor)) {
         const hub_request_t request = {
             .host = s_setup->hosts[host].text,
@@ -396,10 +491,11 @@ static dh_problem ask_hub_for_download(const char *path, hub_download_answer_t *
         if (answer->stopped) {
             break;
         }
+        walk_tried(host, answer->result, answer->reach);
         log_try(host, anchor, answer->result);
         dh_hub_walk_tried(&walk, answer->result);
     }
-    return walk_ended(&walk);
+    return walk_ended(&walk, false);
 }
 
 // Writes the body of an enrolment request or a heartbeat into s_request. What the display says
@@ -455,6 +551,35 @@ static void save_token(void)
     }
 }
 
+// ---- A radio that is joined but gets nothing through (radio.h) ----
+
+// After a walk that no address answered: restarts the display if dh_radio_restart_due() says so.
+// That is only ever on a start that hasn't heard from the hub yet, so the screen already shows
+// what it shows after the restart: the snapshot saved in flash, if there is one, and that the hub
+// can't be reached.
+static void restart_if_radio_stuck(void)
+{
+    const dh_radio_facts facts = {
+        .silent_rounds = s.silent_rounds,
+        .wifi_steady = wifi_link() == WIFI_LINK_UP && wifi_drops() == s.silent_drops,
+        .address_silent = s.silent_address,
+        .restarts = radio_stuck_restarts(),
+        .heard_this_start = s_heard_since_start,
+        .token_unsaved = s.enrolled && !s.token_saved,
+        .on_trial = storage_fw_on_trial(),
+        .updating = s.update != HUB_UPDATE_NONE,
+    };
+    if (!dh_radio_restart_due(&facts) || gone()) {
+        return;
+    }
+    ESP_LOGW(TAG, "Wi-Fi is up but no hub address has answered for %" PRId64 " s (%" PRIu32
+                  " rounds); restarting to reset the radio (%" PRIu32 " of %u)",
+             (now_ms() - s.silent_since_ms) / 1000, s.silent_rounds, facts.restarts + 1,
+             DH_RADIO_RESTARTS_MAX);
+    // Returns only if a new setup was stored just now: this session then ends.
+    radio_restart(RADIO_RESTART_STUCK, s.generation, wipe_secrets, NULL);
+}
+
 // ---- Enrolment ----
 
 static void enrol(void)
@@ -465,7 +590,8 @@ static void enrol(void)
     const size_t len = build_request(true);
     hub_answer_t answer = {.result = DH_TRY_NO_ANSWER};
     const dh_problem problem =
-        len > 0 ? ask_hub(DH_PATH_ENROL, s_request, len, false, DH_MAX_HUB_ANSWER_BYTES, &answer)
+        len > 0 ? ask_hub(DH_PATH_ENROL, s_request, len, false, DH_MAX_HUB_ANSWER_BYTES, true,
+                          &answer)
                 : DH_PROBLEM_SETTINGS;
     dh_wipe(s_request, sizeof(s_request));
     if (answer.stopped || gone()) {
@@ -481,6 +607,7 @@ static void enrol(void)
                  dh_problem_headline(problem), wait / 1000);
         s.next_try_ms = now_ms() + wait;
         set_state(HUB_TROUBLE, HUB_DETAIL_NONE);
+        restart_if_radio_stuck();
         return;
     }
 
@@ -567,7 +694,7 @@ static void poll(void)
     s.fresh_snapshot = false;
     hub_answer_t answer;
     const dh_problem problem =
-        ask_hub(DH_PATH_SNAPSHOT, NULL, 0, true, DH_MAX_SNAPSHOT_BYTES, &answer);
+        ask_hub(DH_PATH_SNAPSHOT, NULL, 0, true, DH_MAX_SNAPSHOT_BYTES, true, &answer);
     if (answer.stopped || gone()) {
         return;
     }
@@ -577,6 +704,7 @@ static void poll(void)
                  wait / 1000);
         s.next_try_ms = now_ms() + wait;
         set_state(HUB_TROUBLE, HUB_DETAIL_NONE);
+        restart_if_radio_stuck();
         return;
     }
     s.hub_answered = true;
@@ -648,7 +776,7 @@ static void heartbeat_if_due(void)
     }
     hub_answer_t answer;
     const dh_problem problem =
-        ask_hub(DH_PATH_HEARTBEAT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, &answer);
+        ask_hub(DH_PATH_HEARTBEAT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, false, &answer);
     if (answer.stopped || gone()) {
         return;
     }
@@ -699,7 +827,8 @@ static report_result_t send_report(const dh_fw_report *report)
     }
     hub_answer_t answer;
     const dh_problem problem =
-        ask_hub(DH_PATH_FIRMWARE_REPORT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, &answer);
+        ask_hub(DH_PATH_FIRMWARE_REPORT, s_request, len, true, DH_MAX_HUB_ANSWER_BYTES, false,
+                &answer);
     if (answer.stopped || gone()) {
         return REPORT_NOT_NOW;
     }
@@ -922,10 +1051,30 @@ static uint32_t wifi_failed(void)
     return wait;
 }
 
+// Wi-Fi has just started for the first time in this start, and that start made and stored a new
+// radio calibration. Restarts once, so that the session runs on a start that loads it (radio.h).
+// `setup` is the copy Wi-Fi was started from, wiped with the rest. The USB task sent its answer
+// to the bundle before this task was woken, and radio_restart() waits for the computer to take
+// it; the port stays as it is over a restart. Never on a trial boot, which would go back to the
+// firmware before.
+static void restart_after_calibration(dh_setup *setup)
+{
+    if (storage_fw_on_trial() || gone()) {
+        return;
+    }
+    ESP_LOGW(TAG, "the radio has made and stored a new calibration: restarting once, so that "
+                  "Wi-Fi runs on a start that loads it");
+    // Returns only if a new setup was stored just now: this session then ends.
+    radio_restart(RADIO_RESTART_CALIBRATED, s.generation, wipe_secrets, setup);
+}
+
 // Turns the radio on with `setup`'s Wi-Fi details. If that fails (out of memory, say), it is
 // tried again on the same back-off as joining (start_wifi_again).
-static void start_wifi(const dh_setup *setup)
+static void start_wifi(dh_setup *setup)
 {
+    // Before each try until Wi-Fi has started once in this start: the start that succeeds is
+    // the one that calibrates the radio.
+    radio_calibration_before();
     esp_err_t err = wifi_prepare(s_task);
     if (err == ESP_OK) {
         err = wifi_start(setup);
@@ -939,11 +1088,15 @@ static void start_wifi(const dh_setup *setup)
         return;
     }
     s.wifi_started = true;
+    const bool calibrated = radio_wifi_started();
     s.wifi_failures = 0;
     s.wifi_drops_seen = wifi_drops();
     // Join straight away.
     s.wifi_retry_ms = now_ms();
     show_wifi(HUB_JOINING_WIFI, HUB_DETAIL_NONE);
+    if (calibrated) {
+        restart_after_calibration(setup);
+    }
 }
 
 // The session's copy of the setup has had its Wi-Fi details wiped, so another try at starting
@@ -1003,8 +1156,10 @@ static bool wifi_ready(void)
     if (drops != s.wifi_drops_seen) {
         s.wifi_drops_seen = drops;
         if (s.wifi_was_up) {
-            // It was joined and has dropped: try once straight away.
+            // It was joined and has dropped: try once straight away. Rounds that nothing
+            // answered are counted again from the next join.
             s.wifi_was_up = false;
+            s.silent_rounds = 0;
             s.wifi_failures = 0;
             s.wifi_retry_ms = now + 1000;
             const unsigned reason = wifi_last_reason();
@@ -1247,14 +1402,7 @@ static void run_session(void)
 static void end_session(void)
 {
     wifi_stop();
-    dh_setup_wipe(s_setup);
-    dh_device_wipe(&s.device);
-    dh_wipe(s_request, sizeof(s_request));
-    dh_wipe(s_authorization, sizeof(s_authorization));
-    dh_wipe(s_body, DH_MAX_SNAPSHOT_BYTES + 1);
-    dh_wipe(s_saved, DH_MAX_SNAPSHOT_BYTES);
-    dh_wipe(s_current, sizeof(*s_current));
-    dh_wipe(s_spare, sizeof(*s_spare));
+    wipe_secrets(NULL);
     const int64_t minute = s.minute_ms;
     memset(&s, 0, sizeof(s));
     s.minute_ms = minute;
@@ -1278,6 +1426,11 @@ static void hub_task(void *arg)
             continue;
         }
         s.generation = generation;
+        if (generation != radio_start_generation()) {
+            // A new setup: the restarts for a stuck radio are counted afresh. The setup that
+            // was held at start-up, which a restart comes back to, keeps the count it had.
+            radio_setup_changed();
+        }
         ESP_LOGI(TAG, "set up: starting to talk to the hub (%u %s)", (unsigned)s_setup->host_count,
                  s_setup->host_count == 1 ? "address" : "addresses");
         run_session();
